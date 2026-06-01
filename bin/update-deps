@@ -1,0 +1,180 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/common.sh
+source "${SCRIPT_DIR}/../lib/common.sh"
+
+usage() {
+  cat <<'USAGE'
+Usage: update-deps [--manifest PATH] [--lock PATH] [--dry-run]
+
+Manifest grammar:
+  image <LOCK_KEY> <IMAGE_REF>
+  release <LOCK_KEY> <URL> <FILE_NAME>
+
+Blank lines and lines starting with # are ignored.
+USAGE
+}
+
+MANIFEST_PATH="${DEPS_MANIFEST_PATH:-${REPO_ROOT}/deps.manifest}"
+LOCK_PATH="${DEPS_LOCK_PATH:-${REPO_ROOT}/deps.lock}"
+DRY_RUN=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --manifest)
+      MANIFEST_PATH="$2"
+      shift 2
+      ;;
+    --lock)
+      LOCK_PATH="$2"
+      shift 2
+      ;;
+    --dry-run)
+      DRY_RUN=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      die "unknown argument: $1"
+      ;;
+  esac
+done
+
+[[ -f "${LOCK_PATH}" ]] || die "deps lock not found: ${LOCK_PATH}"
+[[ -f "${MANIFEST_PATH}" ]] || die "deps manifest not found: ${MANIFEST_PATH}"
+
+set -a
+# shellcheck disable=SC1090
+source "${LOCK_PATH}"
+set +a
+
+interpolate_vars() {
+  local value="$1"
+  while [[ "${value}" =~ \$\{([A-Za-z_][A-Za-z0-9_]*)\} ]]; do
+    local var_name="${BASH_REMATCH[1]}"
+    if [[ -z "${!var_name+x}" ]]; then
+      die "manifest uses undefined variable \${${var_name}}"
+    fi
+    value="${value//\$\{${var_name}\}/${!var_name}}"
+  done
+  echo "${value}"
+}
+
+resolve_image_digest() {
+  local ref="$1"
+
+  if command -v skopeo >/dev/null 2>&1; then
+    skopeo inspect --format '{{.Digest}}' "docker://${ref}"
+    return 0
+  fi
+
+  if command -v docker >/dev/null 2>&1; then
+    local digest
+    digest="$(docker buildx imagetools inspect "${ref}" 2>/dev/null | awk '/^Digest:/ {print $2; exit}')"
+    if [[ -n "${digest}" ]]; then
+      echo "${digest}"
+      return 0
+    fi
+  fi
+
+  die "unable to resolve image digest for ${ref}; install skopeo or docker buildx"
+}
+
+resolve_release_sha256() {
+  local url="$1"
+  local file_name="$2"
+
+  ensure_command curl
+  ensure_command sha256sum
+
+  local tmp_dir tmp_file
+  tmp_dir="$(mktemp -d)"
+  tmp_file="${tmp_dir}/${file_name}"
+  trap 'rm -rf "${tmp_dir}"' RETURN
+
+  curl -fsSL -o "${tmp_file}" "${url}"
+  sha256sum "${tmp_file}" | awk '{print $1}'
+}
+
+update_lock_value() {
+  local key="$1"
+  local value="$2"
+
+  [[ "${key}" =~ ^[A-Z0-9_]+$ ]] || die "invalid lock key: ${key}"
+
+  if [[ "${DRY_RUN}" == "1" ]]; then
+    log_info "Would set ${key}=\"${value}\""
+    return 0
+  fi
+
+  local tmp_file
+  tmp_file="$(mktemp)"
+
+  awk -v key="${key}" -v value="${value}" '
+    BEGIN { done=0 }
+    $0 ~ "^" key "=" {
+      print key "=\"" value "\""
+      done=1
+      next
+    }
+    { print }
+    END {
+      if (!done) {
+        print key "=\"" value "\""
+      }
+    }
+  ' "${LOCK_PATH}" > "${tmp_file}"
+
+  mv "${tmp_file}" "${LOCK_PATH}"
+}
+
+line_number=0
+while IFS= read -r raw_line || [[ -n "${raw_line}" ]]; do
+  line_number=$((line_number + 1))
+
+  local_line="${raw_line#${raw_line%%[![:space:]]*}}"
+  [[ -z "${local_line}" || "${local_line}" == \#* ]] && continue
+
+  kind=""
+  key=""
+  arg1=""
+  arg2=""
+  extra=""
+
+  read -r kind key arg1 arg2 extra <<< "${local_line}"
+
+  if [[ -z "${kind}" || -z "${key}" || -n "${extra}" ]]; then
+    die "invalid manifest entry at line ${line_number}: ${raw_line}"
+  fi
+
+  case "${kind}" in
+    image)
+      [[ -n "${arg1}" && -z "${arg2}" ]] || die "image entry must be: image <LOCK_KEY> <IMAGE_REF> (line ${line_number})"
+      image_ref="$(interpolate_vars "${arg1}")"
+      digest="$(resolve_image_digest "${image_ref}")"
+      [[ "${digest}" == sha256:* ]] || die "invalid digest for ${image_ref}: ${digest}"
+      log_info "Resolved ${image_ref} => ${digest}"
+      update_lock_value "${key}" "${digest}"
+      ;;
+    release)
+      [[ -n "${arg1}" && -n "${arg2}" ]] || die "release entry must be: release <LOCK_KEY> <URL> <FILE_NAME> (line ${line_number})"
+      release_url="$(interpolate_vars "${arg1}")"
+      file_name="$(interpolate_vars "${arg2}")"
+      release_sha="$(resolve_release_sha256 "${release_url}" "${file_name}")"
+      log_info "Resolved ${release_url} (${file_name}) => ${release_sha}"
+      update_lock_value "${key}" "${release_sha}"
+      ;;
+    *)
+      die "unknown manifest entry kind '${kind}' at line ${line_number}"
+      ;;
+  esac
+done < "${MANIFEST_PATH}"
+
+if [[ "${DRY_RUN}" != "1" ]]; then
+  log_info "Updated ${LOCK_PATH} from ${MANIFEST_PATH}"
+fi
