@@ -1,0 +1,89 @@
+name: shasset
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: cargo test
+      run: cargo test --locked
+
+    - name: cargo clippy
+      run: cargo clippy --locked -- -D warnings
+
+    - name: cargo fmt check
+      run: cargo fmt --check
+
+  build:
+    name: Build${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && ' and push' || '' }}
+    runs-on: ubuntu-latest
+    needs: test
+    env:
+      EARTHBUILD_VERSION: v0.8.17
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Install EarthBuild
+      run: |
+        set -euo pipefail
+        tmp="$(mktemp -d)"
+        base="https://github.com/EarthBuild/earthbuild/releases/download/${EARTHBUILD_VERSION}"
+        curl -fsSL -o "${tmp}/earth-linux-amd64" "${base}/earth-linux-amd64"
+        curl -fsSL -o "${tmp}/checksum.asc" "${base}/checksum.asc"
+        ( cd "${tmp}" && grep ' earth-linux-amd64$' checksum.asc | sha256sum -c - )
+        sudo install -m 0755 "${tmp}/earth-linux-amd64" /usr/local/bin/earthly
+
+    - name: Log in to GHCR
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.version.outputs.is_release == 'true'
+      uses: docker/login-action@v3
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Determine version tag
+      id: version
+      run: |
+        set -euo pipefail
+        if [ -f VERSION ]; then
+          raw="$(tr -d '[:space:]' < VERSION)"
+        else
+          raw="$(git rev-parse --short HEAD)"
+        fi
+        echo "tag=${raw}" >> "$GITHUB_OUTPUT"
+        if [[ "${raw}" == *-* ]]; then
+          echo "is_release=false" >> "$GITHUB_OUTPUT"
+        else
+          echo "is_release=true" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Build with EarthBuild
+      run: earthly +shasset-image
+
+    - name: Tag image for GHCR
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.version.outputs.is_release == 'true'
+      run: |
+        docker tag botwork/shasset:local ghcr.io/botworkz/tools/shasset:latest
+        docker tag botwork/shasset:local ghcr.io/botworkz/tools/shasset:${{ steps.version.outputs.tag }}
+
+    - name: Push image tags
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.version.outputs.is_release == 'true'
+      run: |
+        docker push ghcr.io/botworkz/tools/shasset:latest
+        docker push ghcr.io/botworkz/tools/shasset:${{ steps.version.outputs.tag }}
