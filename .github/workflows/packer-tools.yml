@@ -17,12 +17,23 @@ jobs:
   build:
     name: Build${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && ' and push' || '' }}
     runs-on: ubuntu-latest
+    env:
+      EARTHBUILD_VERSION: v0.8.17
     steps:
     - name: Checkout
       uses: actions/checkout@v4
 
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v3
+    - name: Install EarthBuild
+      run: |
+        set -euo pipefail
+        tmp="$(mktemp -d)"
+        base="https://github.com/EarthBuild/earthbuild/releases/download/${EARTHBUILD_VERSION}"
+        curl -fsSL -o "${tmp}/earth-linux-amd64" "${base}/earth-linux-amd64"
+        curl -fsSL -o "${tmp}/checksum.asc" "${base}/checksum.asc"
+        # checksum.asc is a clearsigned manifest; the sha256 lines are plaintext.
+        # Pin the binary to the exact release asset by verifying its checksum.
+        ( cd "${tmp}" && grep ' earth-linux-amd64$' checksum.asc | sha256sum -c - )
+        sudo install -m 0755 "${tmp}/earth-linux-amd64" /usr/local/bin/earthly
 
     - name: Log in to GHCR
       if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
@@ -41,13 +52,17 @@ jobs:
           echo "tag=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
         fi
 
-    - name: Build and push
-      uses: docker/build-push-action@v6
-      with:
-        context: containers/packer-tools
-        file: containers/packer-tools/Dockerfile
-        platforms: linux/amd64
-        push: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
-        tags: |
-          ghcr.io/botworkz/tools/packer-tools:latest
-          ghcr.io/botworkz/tools/packer-tools:${{ steps.version.outputs.tag }}
+    - name: Build with EarthBuild
+      run: earthly +packer-tools-image
+
+    - name: Tag image for GHCR
+      if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+      run: |
+        docker tag botwork/packer-tools:local ghcr.io/botworkz/tools/packer-tools:latest
+        docker tag botwork/packer-tools:local ghcr.io/botworkz/tools/packer-tools:${{ steps.version.outputs.tag }}
+
+    - name: Push image tags
+      if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+      run: |
+        docker push ghcr.io/botworkz/tools/packer-tools:latest
+        docker push ghcr.io/botworkz/tools/packer-tools:${{ steps.version.outputs.tag }}

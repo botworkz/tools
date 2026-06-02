@@ -1,0 +1,15 @@
+.git
+.github
+README.md
+LICENSE
+VERSION
+bin
+lib
+build
+dist
+tmp
+*.tar
+*.tar.gz
+*.zip
+*.img
+*.qcow2
