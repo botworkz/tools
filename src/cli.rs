@@ -56,9 +56,9 @@ pub struct AddArgs {
     /// Auth template, e.g. `${GH_TOKEN}`. Stored as-is; resolved at fetch time.
     #[arg(long)]
     pub auth: Option<String>,
-    /// Directory for the downloaded file when `--compute` is used.
+    /// Cache directory (default: `~/.cache/shasset`).
     #[arg(long)]
-    pub out: Option<PathBuf>,
+    pub cache_dir: Option<PathBuf>,
 }
 
 // ── remove ───────────────────────────────────────────────────────────────────
@@ -89,9 +89,18 @@ pub struct FetchArgs {
     /// Output directory; required. Each asset is written to `<out>/<name>/<filename>`.
     #[arg(long, required = true)]
     pub out: PathBuf,
+    /// Cache directory (default: `~/.cache/shasset`).
+    #[arg(long)]
+    pub cache_dir: Option<PathBuf>,
     /// Override concurrency (parallel downloads).
     #[arg(long)]
     pub concurrency: Option<usize>,
+    /// Materialize fetched files as symlinks into the cache instead of copying.
+    #[arg(long)]
+    pub link: bool,
+    /// Skip re-verifying cache blobs before use.
+    #[arg(long)]
+    pub no_reverify: bool,
 }
 
 // ── verify ────────────────────────────────────────────────────────────────────

@@ -148,15 +148,21 @@ Global flag: `--config <path>` — path to the manifest file (default: `shasset.
 
 | Command | Description |
 |---|---|
-| `add <name> --url <url> --version <ver> [--checksum <cs>] [--filename <f>] [--auth <tpl>]` | Add or update an asset. Use `--compute` instead of `--checksum` to download and auto-populate the checksum (requires `--out`). |
+| `add <name> --url <url> --version <ver> [--checksum <cs>] [--filename <f>] [--auth <tpl>] [--cache-dir <dir>]` | Add or update an asset. Use `--compute` instead of `--checksum` to download once into cache and auto-populate the checksum. |
 | `remove <name>` | Remove a named asset. |
 | `get [<name>] [--json]` | Show one or all assets. Displays the auth template, never the resolved secret. |
-| `fetch [<name>] --out <dir> [--concurrency <n>]` | Download and verify one or all assets into `<dir>/<name>/<filename>`. |
+| `fetch [<name>] --out <dir> [--cache-dir <dir>] [--concurrency <n>] [--link] [--no-reverify]` | Download and verify one or all assets via the local blob cache, then materialize to `<dir>/<name>/<filename>`. |
 | `verify [<name>] --out <dir> [--json]` | Verify on-disk files against manifest checksums (no network). |
 
-### Output path model
+### Cache + output model
 
-`--out <dir>` is **required** for `fetch` and `verify` and is **not stored** in the manifest. For each asset `<name>`, shasset writes `<out>/<name>/<filename>`.
+- Cache root defaults to `~/.cache/shasset` (override with `--cache-dir`).
+- Verified blobs are stored content-addressed at `blobs/sha256/<hex>`.
+- Downloads stream into a quarantine temp file and are promoted only after successful checksum/truncation checks.
+- `--out <dir>` is **required** for `fetch` and `verify` and is **not stored** in the manifest.
+- Default `fetch` materialization copies cache blobs to `<out>/<name>/<filename>`.
+- `fetch --link` creates `<out>/<name>/<filename>` as a symlink to the cache blob instead of copying.
+- By default, cache blobs are re-verified before use; `--no-reverify` skips that check.
 
 ### Retry and backoff
 
@@ -182,4 +188,3 @@ This produces the stable local tag `botwork/shasset:local`.
 `bin/update-deps` is a bash tool that resolves and writes digest/sha256 **pins** into a consumer `deps.lock` file (and also handles container image digest pins via `skopeo`). It operates at pin-update time.
 
 `shasset` is a standalone **fetch-time** verified downloader that owns its own `shasset.yaml` registry. The two tools are **complementary**: `update-deps` manages the pinning workflow (and image digests), while `shasset` handles declarative asset downloads with built-in verification. Both may exist in the same repo. This PR does not modify or remove `update-deps`.
-

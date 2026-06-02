@@ -7,10 +7,10 @@ use clap::Parser;
 use rayon::prelude::*;
 use serde_json::json;
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use cli::{Cli, Command};
-use fetch::{fetch_asset, verify_on_disk, FetchParams};
+use fetch::{fetch_asset, verify_on_disk, FetchParams, MaterializeMode};
 use manifest::{load, save, Asset, Manifest, ParsedChecksum};
 
 fn main() {
@@ -29,6 +29,13 @@ fn run() -> Result<()> {
         Command::Fetch(args) => cmd_fetch(&cli.config, args),
         Command::Verify(args) => cmd_verify(&cli.config, args),
     }
+}
+
+fn default_cache_dir() -> PathBuf {
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home).join(".cache").join("shasset");
+    }
+    PathBuf::from(".cache").join("shasset")
 }
 
 // ── add ──────────────────────────────────────────────────────────────────────
@@ -56,14 +63,17 @@ fn cmd_add(config: &Path, args: cli::AddArgs) -> Result<()> {
     };
 
     let checksum = if args.compute {
-        let out = args.out.as_deref().unwrap_or_else(|| Path::new("."));
+        let cache_dir = args.cache_dir.clone().unwrap_or_else(default_cache_dir);
         let result = fetch_asset(FetchParams {
             name: &args.name,
             asset: &asset,
-            out_dir: out,
+            out_dir: None,
+            cache_dir: &cache_dir,
             retries: manifest.settings.retries,
             backoff: &manifest.settings.backoff,
             compute_checksum: true,
+            no_reverify: false,
+            materialize_mode: MaterializeMode::Copy,
             transport: None,
         })?;
         println!(
@@ -162,6 +172,7 @@ fn cmd_get(config: &Path, args: cli::GetArgs) -> Result<()> {
 
 fn cmd_fetch(config: &Path, args: cli::FetchArgs) -> Result<()> {
     let manifest = load(config)?;
+    let cache_dir = args.cache_dir.clone().unwrap_or_else(default_cache_dir);
     let concurrency = args
         .concurrency
         .unwrap_or(manifest.settings.concurrency)
@@ -186,30 +197,47 @@ fn cmd_fetch(config: &Path, args: cli::FetchArgs) -> Result<()> {
         return Ok(());
     }
 
-    rayon::ThreadPoolBuilder::new()
+    let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(concurrency)
-        .build_global()
-        .ok(); // ignore if already initialised
+        .build()
+        .context("failed to build rayon thread pool")?;
 
-    let results: Vec<Result<()>> = targets
-        .par_iter()
-        .map(|(name, asset)| {
-            let result = fetch_asset(FetchParams {
-                name,
-                asset,
-                out_dir: &args.out,
-                retries: manifest.settings.retries,
-                backoff: &manifest.settings.backoff,
-                compute_checksum: false,
-                transport: None,
-            });
-            match &result {
-                Ok(r) => println!("fetched '{}' → {}", name, r.path.display()),
-                Err(e) => eprintln!("error: failed to fetch '{name}': {e:#}"),
-            }
-            result.map(|_| ())
-        })
-        .collect();
+    let materialize_mode = if args.link {
+        MaterializeMode::Symlink
+    } else {
+        MaterializeMode::Copy
+    };
+
+    let results: Vec<Result<()>> = pool.install(|| {
+        targets
+            .par_iter()
+            .map(|(name, asset)| {
+                let result = fetch_asset(FetchParams {
+                    name,
+                    asset,
+                    out_dir: Some(&args.out),
+                    cache_dir: &cache_dir,
+                    retries: manifest.settings.retries,
+                    backoff: &manifest.settings.backoff,
+                    compute_checksum: false,
+                    no_reverify: args.no_reverify,
+                    materialize_mode,
+                    transport: None,
+                });
+                match &result {
+                    Ok(r) => {
+                        if let Some(path) = &r.path {
+                            println!("fetched '{}' → {}", name, path.display())
+                        } else {
+                            println!("fetched '{}' → {}", name, r.blob_path.display())
+                        }
+                    }
+                    Err(e) => eprintln!("error: failed to fetch '{name}': {e:#}"),
+                }
+                result.map(|_| ())
+            })
+            .collect()
+    });
 
     let errors: Vec<_> = results.into_iter().filter_map(|r| r.err()).collect();
     if !errors.is_empty() {
@@ -453,11 +481,14 @@ mod tests {
     }
 
     impl fetch::Transport for MockTransport {
-        fn get(&self, _url: &str, _auth: Option<&str>) -> Result<Vec<u8>> {
+        fn get(&self, _url: &str, _auth: Option<&str>) -> Result<fetch::DownloadResponse> {
             if let Some(status) = self.status_override {
                 bail!("HTTP {status} fetching mock");
             }
-            Ok(self.body.clone())
+            Ok(fetch::DownloadResponse {
+                body: Box::new(std::io::Cursor::new(self.body.clone())),
+                content_length: None,
+            })
         }
     }
 
@@ -483,10 +514,13 @@ mod tests {
         let result = fetch_asset(FetchParams {
             name: "mytool",
             asset: &asset,
-            out_dir: tmp.path(),
+            out_dir: Some(tmp.path()),
+            cache_dir: tmp.path(),
             retries: 0,
             backoff: &manifest::Backoff::default(),
             compute_checksum: false,
+            no_reverify: false,
+            materialize_mode: MaterializeMode::Copy,
             transport: Some(Box::new(MockTransport {
                 body: data.to_vec(),
                 status_override: None,
@@ -494,7 +528,7 @@ mod tests {
         })
         .unwrap();
 
-        assert!(result.path.exists());
+        assert!(result.path.unwrap().exists());
         assert_eq!(result.computed_sha256, hex);
     }
 
@@ -515,10 +549,13 @@ mod tests {
         let err = fetch_asset(FetchParams {
             name: "mytool",
             asset: &asset,
-            out_dir: tmp.path(),
+            out_dir: Some(tmp.path()),
+            cache_dir: tmp.path(),
             retries: 0,
             backoff: &manifest::Backoff::default(),
             compute_checksum: false,
+            no_reverify: false,
+            materialize_mode: MaterializeMode::Copy,
             transport: Some(Box::new(MockTransport {
                 body: data.to_vec(),
                 status_override: None,
@@ -543,10 +580,13 @@ mod tests {
         let err = fetch_asset(FetchParams {
             name: "mytool",
             asset: &asset,
-            out_dir: tmp.path(),
+            out_dir: Some(tmp.path()),
+            cache_dir: tmp.path(),
             retries: 0,
             backoff: &manifest::Backoff::default(),
             compute_checksum: false,
+            no_reverify: false,
+            materialize_mode: MaterializeMode::Copy,
             transport: Some(Box::new(MockTransport {
                 body: b"data".to_vec(),
                 status_override: None,
@@ -574,10 +614,13 @@ mod tests {
         let err = fetch_asset(FetchParams {
             name: "mytool",
             asset: &asset,
-            out_dir: tmp.path(),
+            out_dir: Some(tmp.path()),
+            cache_dir: tmp.path(),
             retries: 0,
             backoff: &manifest::Backoff::default(),
             compute_checksum: false,
+            no_reverify: false,
+            materialize_mode: MaterializeMode::Copy,
             transport: Some(Box::new(MockTransport {
                 body: vec![],
                 status_override: None,
@@ -602,7 +645,8 @@ mod tests {
         let err = fetch_asset(FetchParams {
             name: "mytool",
             asset: &asset,
-            out_dir: tmp.path(),
+            out_dir: Some(tmp.path()),
+            cache_dir: tmp.path(),
             retries: 3,
             backoff: &manifest::Backoff {
                 base_ms: 0,
@@ -610,6 +654,8 @@ mod tests {
                 factor: 1,
             },
             compute_checksum: false,
+            no_reverify: false,
+            materialize_mode: MaterializeMode::Copy,
             transport: Some(Box::new(MockTransport {
                 body: vec![],
                 status_override: Some(404),

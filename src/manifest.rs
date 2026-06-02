@@ -203,7 +203,29 @@ pub fn load(path: &Path) -> Result<Manifest> {
 pub fn save(path: &Path, manifest: &Manifest) -> Result<()> {
     let content =
         serde_yaml::to_string(manifest).context("failed to serialise manifest to YAML")?;
-    std::fs::write(path, content)
-        .with_context(|| format!("cannot write manifest: {}", path.display()))?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("cannot create manifest dir: {}", parent.display()))?;
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("shasset.yaml");
+    let tmp_path = parent.join(format!(
+        ".{file_name}.tmp-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::write(&tmp_path, content)
+        .with_context(|| format!("cannot write temp manifest: {}", tmp_path.display()))?;
+    std::fs::rename(&tmp_path, path).with_context(|| {
+        format!(
+            "cannot atomically replace manifest {} from {}",
+            path.display(),
+            tmp_path.display()
+        )
+    })?;
     Ok(())
 }
