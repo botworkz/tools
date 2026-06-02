@@ -7,6 +7,7 @@ use clap::Parser;
 use rayon::prelude::*;
 use serde_json::json;
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use cli::{Cli, Command};
@@ -31,14 +32,43 @@ fn run() -> Result<()> {
     }
 }
 
-fn default_cache_dir() -> PathBuf {
-    if let Some(home) = std::env::var_os("HOME") {
+/// Resolve the cache directory from environment lookups.
+///
+/// Precedence (the `--cache-dir` flag is handled by callers and takes priority
+/// over all of these):
+///   1. `SHASSET_CACHE`
+///   2. `$XDG_CACHE_HOME/shasset`
+///   3. `$HOME/.cache/shasset`
+///   4. `.cache/shasset` (last-resort relative fallback)
+///
+/// Kept as a pure function (taking the looked-up values explicitly) so it can
+/// be unit-tested without mutating process-global environment state.
+fn resolve_cache_dir(
+    shasset_cache: Option<OsString>,
+    xdg_cache_home: Option<OsString>,
+    home: Option<OsString>,
+) -> PathBuf {
+    if let Some(dir) = shasset_cache.filter(|s| !s.is_empty()) {
+        return PathBuf::from(dir);
+    }
+    if let Some(xdg) = xdg_cache_home.filter(|s| !s.is_empty()) {
+        return PathBuf::from(xdg).join("shasset");
+    }
+    if let Some(home) = home.filter(|s| !s.is_empty()) {
         return PathBuf::from(home).join(".cache").join("shasset");
     }
     PathBuf::from(".cache").join("shasset")
 }
 
-// ── add ──────────────────────────────────────────────────────────────────────
+fn default_cache_dir() -> PathBuf {
+    resolve_cache_dir(
+        std::env::var_os("SHASSET_CACHE"),
+        std::env::var_os("XDG_CACHE_HOME"),
+        std::env::var_os("HOME"),
+    )
+}
+
+// ── add ───────────────────────────────────────────────────────────────────────
 
 fn cmd_add(config: &Path, args: cli::AddArgs) -> Result<()> {
     let mut manifest = if config.exists() {
@@ -99,7 +129,7 @@ fn cmd_add(config: &Path, args: cli::AddArgs) -> Result<()> {
     Ok(())
 }
 
-// ── remove ───────────────────────────────────────────────────────────────────
+// ── remove ─────────────────────────────────────────────────────────────────────
 
 fn cmd_remove(config: &Path, args: cli::RemoveArgs) -> Result<()> {
     let mut manifest = load(config)?;
@@ -111,7 +141,7 @@ fn cmd_remove(config: &Path, args: cli::RemoveArgs) -> Result<()> {
     Ok(())
 }
 
-// ── get ──────────────────────────────────────────────────────────────────────
+// ── get ────────────────────────────────────────────────────────────────────────
 
 fn cmd_get(config: &Path, args: cli::GetArgs) -> Result<()> {
     let manifest = load(config)?;
@@ -168,7 +198,7 @@ fn cmd_get(config: &Path, args: cli::GetArgs) -> Result<()> {
     Ok(())
 }
 
-// ── fetch ─────────────────────────────────────────────────────────────────────
+// ── fetch ──────────────────────────────────────────────────────────────────────
 
 fn cmd_fetch(config: &Path, args: cli::FetchArgs) -> Result<()> {
     let manifest = load(config)?;
@@ -246,7 +276,7 @@ fn cmd_fetch(config: &Path, args: cli::FetchArgs) -> Result<()> {
     Ok(())
 }
 
-// ── verify ────────────────────────────────────────────────────────────────────
+// ── verify ─────────────────────────────────────────────────────────────────────
 
 fn cmd_verify(config: &Path, args: cli::VerifyArgs) -> Result<()> {
     let manifest = load(config)?;
@@ -375,7 +405,53 @@ fn cmd_verify(config: &Path, args: cli::VerifyArgs) -> Result<()> {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+    use std::ffi::OsString;
     use tempfile::TempDir;
+
+    // ── cache-dir resolution ─────────────────────────────────────────────────
+
+    fn os(s: &str) -> Option<OsString> {
+        Some(OsString::from(s))
+    }
+
+    #[test]
+    fn cache_dir_prefers_shasset_cache() {
+        // SHASSET_CACHE wins over XDG_CACHE_HOME and HOME.
+        let resolved = resolve_cache_dir(
+            os("/tmp/shacache"),
+            os("/home/u/.xdgcache"),
+            os("/home/u"),
+        );
+        assert_eq!(resolved, PathBuf::from("/tmp/shacache"));
+    }
+
+    #[test]
+    fn cache_dir_falls_back_to_xdg() {
+        // No SHASSET_CACHE → XDG_CACHE_HOME/shasset.
+        let resolved = resolve_cache_dir(None, os("/home/u/.xdgcache"), os("/home/u"));
+        assert_eq!(resolved, PathBuf::from("/home/u/.xdgcache/shasset"));
+    }
+
+    #[test]
+    fn cache_dir_falls_back_to_home() {
+        // No SHASSET_CACHE, no XDG → $HOME/.cache/shasset.
+        let resolved = resolve_cache_dir(None, None, os("/home/u"));
+        assert_eq!(resolved, PathBuf::from("/home/u/.cache/shasset"));
+    }
+
+    #[test]
+    fn cache_dir_relative_last_resort() {
+        // Nothing set → relative .cache/shasset.
+        let resolved = resolve_cache_dir(None, None, None);
+        assert_eq!(resolved, PathBuf::from(".cache/shasset"));
+    }
+
+    #[test]
+    fn cache_dir_ignores_empty_values() {
+        // Empty env values are treated as unset and skipped.
+        let resolved = resolve_cache_dir(os(""), os(""), os("/home/u"));
+        assert_eq!(resolved, PathBuf::from("/home/u/.cache/shasset"));
+    }
 
     // ── manifest round-trip ──────────────────────────────────────────────────
 
