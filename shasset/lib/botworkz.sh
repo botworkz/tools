@@ -15,7 +15,7 @@ ensure_botworkz_sibling() {
   if [[ ! -f "${BOTWORKZ_MCP_DIR}/Makefile" ]]; then
     die "botworkz/mcp sibling not found or incomplete at ${BOTWORKZ_MCP_DIR} (missing Makefile). Clone https://github.com/botworkz/mcp next to this repo or set BOTWORKZ_MCP_DIR."
   fi
-  if [[ ! -f "${BOTWORKZ_MCP_DIR}/containers/Makefile" ]]; then
-    die "botworkz/mcp sibling not found or incomplete at ${BOTWORKZ_MCP_DIR} (missing containers/Makefile). Clone https://github.com/botworkz/mcp next to this repo or set BOTWORKZ_MCP_DIR."
+  if [[ ! -f "$(botworkz_containers_dir)/Makefile" ]]; then
+    die "botworkz/mcp sibling not found or incomplete at ${BOTWORKZ_MCP_DIR} (missing $(botworkz_containers_dir)/Makefile). Clone https://github.com/botworkz/mcp next to this repo or set BOTWORKZ_MCP_DIR."
   fi
 }

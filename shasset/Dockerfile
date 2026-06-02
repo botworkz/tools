@@ -4,13 +4,13 @@ FROM rust:1-slim-bookworm AS builder
 WORKDIR /build
 
 # Cache dependency compilation separately from source changes.
-COPY shasset/Cargo.toml shasset/Cargo.lock ./
+COPY Cargo.toml Cargo.lock ./
 RUN mkdir src && echo 'fn main(){}' > src/main.rs \
     && cargo build --release --locked \
     && rm -rf src
 
 # Build the real binary.
-COPY shasset/src ./src
+COPY src ./src
 RUN touch src/main.rs \
     && cargo build --release --locked
 

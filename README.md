@@ -64,12 +64,12 @@ docker pull ghcr.io/botworkz/tools/packer-tools:latest
 
 **Build locally with Docker:**
 ```sh
-docker build -f containers/packer-tools/Dockerfile -t packer-tools:local containers/packer-tools
+docker build -f packer-tools/Dockerfile -t packer-tools:local packer-tools
 ```
 
 ### Building the container image with Earthly (EarthBuild)
 
-This repository uses the maintained [EarthBuild/earthbuild](https://github.com/EarthBuild/earthbuild) fork, not sunset upstream Earthly. The Earthfile wraps `containers/packer-tools/Dockerfile`, which remains the source of truth for the image contents.
+This repository uses the maintained [EarthBuild/earthbuild](https://github.com/EarthBuild/earthbuild) fork, not sunset upstream Earthly. The Earthfile wraps `packer-tools/Dockerfile`, which remains the source of truth for the image contents.
 
 Install the pinned EarthBuild `v0.8.17` binary locally:
 
