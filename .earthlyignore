@@ -13,3 +13,4 @@ tmp
 *.zip
 *.img
 *.qcow2
+target
