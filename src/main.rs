@@ -6,7 +6,7 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 use rayon::prelude::*;
 use serde_json::json;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
@@ -28,6 +28,7 @@ fn run() -> Result<()> {
         Command::Remove(args) => cmd_remove(&cli.config, args),
         Command::Get(args) => cmd_get(&cli.config, args),
         Command::Fetch(args) => cmd_fetch(&cli.config, args),
+        Command::Prune(args) => cmd_prune(&cli.config, args),
         Command::Verify(args) => cmd_verify(&cli.config, args),
     }
 }
@@ -276,6 +277,182 @@ fn cmd_fetch(config: &Path, args: cli::FetchArgs) -> Result<()> {
     Ok(())
 }
 
+// ── prune ──────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct PruneSummary {
+    blobs_removed: usize,
+    bytes_reclaimed: u64,
+    quarantine_entries_cleared: usize,
+}
+
+#[derive(Debug, Default)]
+struct PrunePlan {
+    blob_paths: Vec<PathBuf>,
+    quarantine_paths: Vec<PathBuf>,
+    summary: PruneSummary,
+}
+
+fn cmd_prune(config: &Path, args: cli::PruneArgs) -> Result<()> {
+    let manifest = load(config)?;
+    let cache_dir = args.cache_dir.clone().unwrap_or_else(default_cache_dir);
+    let summary = prune_cache(&cache_dir, &manifest, args.dry_run)?;
+    println!("{}", format_prune_summary(&summary, args.dry_run));
+    Ok(())
+}
+
+fn prune_cache(cache_dir: &Path, manifest: &Manifest, dry_run: bool) -> Result<PruneSummary> {
+    let referenced = referenced_blob_hexes(manifest)?;
+    let plan = compute_prune_plan(cache_dir, &referenced)?;
+    apply_prune_plan(plan, dry_run)
+}
+
+fn referenced_blob_hexes(manifest: &Manifest) -> Result<HashSet<String>> {
+    let mut referenced = HashSet::new();
+    for asset in manifest.assets.values() {
+        if let Some(checksum) = &asset.checksum {
+            let parsed = ParsedChecksum::parse(checksum)?;
+            referenced.insert(parsed.hex.to_ascii_lowercase());
+        }
+    }
+    Ok(referenced)
+}
+
+fn compute_prune_plan(cache_dir: &Path, referenced: &HashSet<String>) -> Result<PrunePlan> {
+    let mut plan = PrunePlan::default();
+    let blobs_dir = cache_dir.join("blobs").join("sha256");
+    if blobs_dir.exists() {
+        for entry in std::fs::read_dir(&blobs_dir)
+            .with_context(|| format!("cannot read cache blobs dir: {}", blobs_dir.display()))?
+        {
+            let entry = entry.with_context(|| {
+                format!("cannot read cache blob entry under {}", blobs_dir.display())
+            })?;
+            if !entry
+                .file_type()
+                .with_context(|| {
+                    format!(
+                        "cannot inspect cache blob entry: {}",
+                        entry.path().display()
+                    )
+                })?
+                .is_file()
+            {
+                continue;
+            }
+
+            let hex = entry.file_name().to_string_lossy().to_ascii_lowercase();
+            if referenced.contains(&hex) {
+                continue;
+            }
+
+            let size = entry
+                .metadata()
+                .with_context(|| format!("cannot stat cache blob: {}", entry.path().display()))?
+                .len();
+            plan.summary.blobs_removed += 1;
+            plan.summary.bytes_reclaimed = plan.summary.bytes_reclaimed.saturating_add(size);
+            plan.blob_paths.push(entry.path());
+        }
+    }
+
+    let quarantine_dir = cache_dir.join("quarantine");
+    if quarantine_dir.exists() {
+        for entry in std::fs::read_dir(&quarantine_dir).with_context(|| {
+            format!(
+                "cannot read cache quarantine dir: {}",
+                quarantine_dir.display()
+            )
+        })? {
+            let entry = entry.with_context(|| {
+                format!(
+                    "cannot read quarantine entry under {}",
+                    quarantine_dir.display()
+                )
+            })?;
+            plan.summary.quarantine_entries_cleared += 1;
+            plan.quarantine_paths.push(entry.path());
+        }
+    }
+
+    Ok(plan)
+}
+
+fn apply_prune_plan(plan: PrunePlan, dry_run: bool) -> Result<PruneSummary> {
+    if dry_run {
+        return Ok(plan.summary);
+    }
+
+    for path in plan.blob_paths {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("cannot remove cache blob: {}", path.display()));
+            }
+        }
+    }
+
+    for path in plan.quarantine_paths {
+        remove_quarantine_entry(&path)?;
+    }
+
+    Ok(plan.summary)
+}
+
+fn remove_quarantine_entry(path: &Path) -> Result<()> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("cannot inspect quarantine entry: {}", path.display()));
+        }
+    };
+
+    if metadata.file_type().is_dir() {
+        std::fs::remove_dir_all(path)
+            .with_context(|| format!("cannot remove quarantine dir: {}", path.display()))?;
+    } else {
+        std::fs::remove_file(path)
+            .with_context(|| format!("cannot remove quarantine entry: {}", path.display()))?;
+    }
+
+    Ok(())
+}
+
+fn format_prune_summary(summary: &PruneSummary, dry_run: bool) -> String {
+    let reclaimed = format_bytes(summary.bytes_reclaimed);
+    if dry_run {
+        format!(
+            "dry run: would prune {} blob(s), reclaim {}; would clear {} quarantine entr(y/ies)",
+            summary.blobs_removed, reclaimed, summary.quarantine_entries_cleared
+        )
+    } else {
+        format!(
+            "pruned {} blob(s), reclaimed {}; cleared {} quarantine entr(y/ies)",
+            summary.blobs_removed, reclaimed, summary.quarantine_entries_cleared
+        )
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+
+    let mut value = bytes as f64;
+    let mut unit = 0usize;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+
+    format!("{value:.1} {}", UNITS[unit])
+}
+
 // ── verify ─────────────────────────────────────────────────────────────────────
 
 fn cmd_verify(config: &Path, args: cli::VerifyArgs) -> Result<()> {
@@ -417,11 +594,8 @@ mod tests {
     #[test]
     fn cache_dir_prefers_shasset_cache() {
         // SHASSET_CACHE wins over XDG_CACHE_HOME and HOME.
-        let resolved = resolve_cache_dir(
-            os("/tmp/shacache"),
-            os("/home/u/.xdgcache"),
-            os("/home/u"),
-        );
+        let resolved =
+            resolve_cache_dir(os("/tmp/shacache"), os("/home/u/.xdgcache"), os("/home/u"));
         assert_eq!(resolved, PathBuf::from("/tmp/shacache"));
     }
 
@@ -451,6 +625,131 @@ mod tests {
         // Empty env values are treated as unset and skipped.
         let resolved = resolve_cache_dir(os(""), os(""), os("/home/u"));
         assert_eq!(resolved, PathBuf::from("/home/u/.cache/shasset"));
+    }
+
+    fn asset_with_checksum(hex: &str) -> Asset {
+        Asset {
+            url: "https://example.com/v1/tool".to_string(),
+            version: "1".to_string(),
+            checksum: Some(format!("sha256:{hex}")),
+            filename: Some("tool.bin".to_string()),
+            auth: None,
+        }
+    }
+
+    #[test]
+    fn prune_removes_unreferenced_blob_and_keeps_referenced_blob() {
+        let cache = TempDir::new().unwrap();
+        let kept_hex = "a".repeat(64);
+        let removed_hex = "b".repeat(64);
+        let blobs_dir = cache.path().join("blobs").join("sha256");
+        std::fs::create_dir_all(&blobs_dir).unwrap();
+        std::fs::write(blobs_dir.join(&kept_hex), b"keep").unwrap();
+        std::fs::write(blobs_dir.join(&removed_hex), b"gone!").unwrap();
+
+        let manifest = Manifest {
+            settings: Default::default(),
+            assets: BTreeMap::from([("kept".to_string(), asset_with_checksum(&kept_hex))]),
+        };
+
+        let summary = prune_cache(cache.path(), &manifest, false).unwrap();
+
+        assert!(blobs_dir.join(&kept_hex).exists());
+        assert!(!blobs_dir.join(&removed_hex).exists());
+        assert_eq!(
+            summary,
+            PruneSummary {
+                blobs_removed: 1,
+                bytes_reclaimed: 5,
+                quarantine_entries_cleared: 0,
+            }
+        );
+        assert_eq!(
+            format_prune_summary(&summary, false),
+            "pruned 1 blob(s), reclaimed 5 B; cleared 0 quarantine entr(y/ies)"
+        );
+    }
+
+    #[test]
+    fn prune_dry_run_removes_nothing() {
+        let cache = TempDir::new().unwrap();
+        let kept_hex = "a".repeat(64);
+        let removed_hex = "b".repeat(64);
+        let blobs_dir = cache.path().join("blobs").join("sha256");
+        std::fs::create_dir_all(&blobs_dir).unwrap();
+        std::fs::write(blobs_dir.join(&kept_hex), b"keep").unwrap();
+        std::fs::write(blobs_dir.join(&removed_hex), b"gone!").unwrap();
+
+        let manifest = Manifest {
+            settings: Default::default(),
+            assets: BTreeMap::from([("kept".to_string(), asset_with_checksum(&kept_hex))]),
+        };
+
+        let summary = prune_cache(cache.path(), &manifest, true).unwrap();
+
+        assert!(blobs_dir.join(&kept_hex).exists());
+        assert!(blobs_dir.join(&removed_hex).exists());
+        assert_eq!(summary.blobs_removed, 1);
+        assert_eq!(summary.bytes_reclaimed, 5);
+        assert_eq!(
+            format_prune_summary(&summary, true),
+            "dry run: would prune 1 blob(s), reclaim 5 B; would clear 0 quarantine entr(y/ies)"
+        );
+    }
+
+    #[test]
+    fn prune_clears_stale_quarantine_entries() {
+        let cache = TempDir::new().unwrap();
+        let quarantine_dir = cache.path().join("quarantine");
+        std::fs::create_dir_all(&quarantine_dir).unwrap();
+        let stale = quarantine_dir.join("download-x.part");
+        std::fs::write(&stale, b"partial").unwrap();
+
+        let summary = prune_cache(cache.path(), &Manifest::default(), false).unwrap();
+        assert!(!stale.exists());
+        assert_eq!(summary.quarantine_entries_cleared, 1);
+
+        std::fs::write(&stale, b"partial").unwrap();
+        let dry_run_summary = prune_cache(cache.path(), &Manifest::default(), true).unwrap();
+        assert!(stale.exists());
+        assert_eq!(dry_run_summary.quarantine_entries_cleared, 1);
+    }
+
+    #[test]
+    fn prune_missing_cache_root_is_empty_and_non_creating() {
+        let tmp = TempDir::new().unwrap();
+        let missing_cache = tmp.path().join("missing-cache");
+        let summary = prune_cache(&missing_cache, &Manifest::default(), false).unwrap();
+        assert_eq!(summary, PruneSummary::default());
+        assert!(!missing_cache.exists());
+    }
+
+    #[test]
+    fn assets_without_checksums_do_not_keep_blobs() {
+        let cache = TempDir::new().unwrap();
+        let blobs_dir = cache.path().join("blobs").join("sha256");
+        std::fs::create_dir_all(&blobs_dir).unwrap();
+        let blob_hex = "c".repeat(64);
+        let blob_path = blobs_dir.join(&blob_hex);
+        std::fs::write(&blob_path, b"orphan").unwrap();
+
+        let manifest = Manifest {
+            settings: Default::default(),
+            assets: BTreeMap::from([(
+                "tool".to_string(),
+                Asset {
+                    url: "https://example.com/tool".to_string(),
+                    version: "1".to_string(),
+                    checksum: None,
+                    filename: None,
+                    auth: None,
+                },
+            )]),
+        };
+
+        let summary = prune_cache(cache.path(), &manifest, false).unwrap();
+        assert_eq!(summary.blobs_removed, 1);
+        assert!(!blob_path.exists());
     }
 
     // ── manifest round-trip ──────────────────────────────────────────────────
@@ -557,9 +856,20 @@ mod tests {
     }
 
     impl fetch::Transport for MockTransport {
-        fn get(&self, _url: &str, _auth: Option<&str>) -> Result<fetch::DownloadResponse> {
+        fn get(
+            &self,
+            _url: &str,
+            _auth: Option<&str>,
+        ) -> std::result::Result<fetch::DownloadResponse, fetch::FetchError> {
             if let Some(status) = self.status_override {
-                bail!("HTTP {status} fetching mock");
+                return Err(match fetch::classify_status(status) {
+                    fetch::RetryClass::Retry => {
+                        fetch::FetchError::retryable(anyhow::anyhow!("HTTP {status} fetching mock"))
+                    }
+                    fetch::RetryClass::NoRetry => fetch::FetchError::permanent(anyhow::anyhow!(
+                        "HTTP {status} (non-retryable) fetching mock"
+                    )),
+                });
             }
             Ok(fetch::DownloadResponse {
                 body: Box::new(std::io::Cursor::new(self.body.clone())),

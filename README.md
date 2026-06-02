@@ -152,21 +152,23 @@ Global flag: `--config <path>` — path to the manifest file (default: `shasset.
 | `remove <name>` | Remove a named asset. |
 | `get [<name>] [--json]` | Show one or all assets. Displays the auth template, never the resolved secret. |
 | `fetch [<name>] --out <dir> [--cache-dir <dir>] [--concurrency <n>] [--link] [--no-reverify]` | Download and verify one or all assets via the local blob cache, then materialize to `<dir>/<name>/<filename>`. |
+| `prune [--cache-dir <dir>] [--dry-run]` | Remove unreferenced cached blobs from `blobs/sha256/<hex>` and clear stale `quarantine/*` entries while keeping blobs still referenced by the manifest. |
 | `verify [<name>] --out <dir> [--json]` | Verify on-disk files against manifest checksums (no network). |
 
 ### Cache + output model
 
-- Cache root defaults to `~/.cache/shasset` (override with `--cache-dir`).
+- Cache root resolution precedence is: `--cache-dir`, `SHASSET_CACHE`, `$XDG_CACHE_HOME/shasset`, `$HOME/.cache/shasset`, then `.cache/shasset`.
 - Verified blobs are stored content-addressed at `blobs/sha256/<hex>`.
 - Downloads stream into a quarantine temp file and are promoted only after successful checksum/truncation checks.
 - `--out <dir>` is **required** for `fetch` and `verify` and is **not stored** in the manifest.
 - Default `fetch` materialization copies cache blobs to `<out>/<name>/<filename>`.
 - `fetch --link` creates `<out>/<name>/<filename>` as a symlink to the cache blob instead of copying.
 - By default, cache blobs are re-verified before use; `--no-reverify` skips that check.
+- `prune` removes cached blobs not referenced by the current manifest and clears stale `quarantine/*` entries. Use `--dry-run` to report what would be removed without deleting anything; the command prints a human-readable summary of blobs removed, bytes reclaimed, and quarantine entries cleared.
 
 ### Retry and backoff
 
-Transient errors (HTTP 5xx, 429, connection failures) are retried with exponential backoff up to the configured `retries` count. HTTP 4xx errors (except 429) and checksum mismatches are **not** retried — they fail immediately. Empty/zero-byte downloads are always errors.
+Transient errors (HTTP 5xx, 429, connection/DNS/timeout failures, and other transport-level read failures) are retried with exponential backoff up to the configured `retries` count. HTTP 4xx errors (except 429) and checksum mismatches are **not** retried — they fail immediately. Empty/zero-byte downloads are always errors.
 
 ### Container usage
 

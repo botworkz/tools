@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -19,6 +19,48 @@ pub fn classify_status(status: u16) -> RetryClass {
     match status {
         429 | 500..=599 => RetryClass::Retry,
         _ => RetryClass::NoRetry,
+    }
+}
+
+#[derive(Debug)]
+pub enum FetchError {
+    Retryable(anyhow::Error),
+    Permanent(anyhow::Error),
+}
+
+impl FetchError {
+    pub fn retryable(error: impl Into<anyhow::Error>) -> Self {
+        Self::Retryable(error.into())
+    }
+
+    pub fn permanent(error: impl Into<anyhow::Error>) -> Self {
+        Self::Permanent(error.into())
+    }
+
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, Self::Retryable(_))
+    }
+
+    fn into_anyhow(self) -> anyhow::Error {
+        match self {
+            Self::Retryable(error) | Self::Permanent(error) => error,
+        }
+    }
+}
+
+impl std::fmt::Display for FetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Retryable(error) | Self::Permanent(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for FetchError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Retryable(error) | Self::Permanent(error) => error.source(),
+        }
     }
 }
 
@@ -52,7 +94,11 @@ pub struct DownloadResponse {
 /// Minimal transport abstraction so tests can inject a mock.
 pub trait Transport: Send + Sync {
     /// Fetch `url` (with optional auth token) and return a streaming body reader.
-    fn get(&self, url: &str, auth: Option<&str>) -> Result<DownloadResponse>;
+    fn get(
+        &self,
+        url: &str,
+        auth: Option<&str>,
+    ) -> std::result::Result<DownloadResponse, FetchError>;
 }
 
 /// Real reqwest-based transport.
@@ -72,22 +118,25 @@ impl Default for ReqwestTransport {
 }
 
 impl Transport for ReqwestTransport {
-    fn get(&self, url: &str, auth: Option<&str>) -> Result<DownloadResponse> {
+    fn get(
+        &self,
+        url: &str,
+        auth: Option<&str>,
+    ) -> std::result::Result<DownloadResponse, FetchError> {
         let mut req = self.client.get(url);
         if let Some(token) = auth {
             let header_val = ["Bearer ", token].concat();
             req = req.header("Authorization", header_val);
         }
-        let resp = req
-            .send()
-            .with_context(|| format!("HTTP request failed: {url}"))?;
+        let resp = req.send().map_err(|error| {
+            FetchError::retryable(
+                anyhow::Error::new(error).context(format!("HTTP request failed: {url}")),
+            )
+        })?;
         let status = resp.status();
         if !status.is_success() {
             let code = status.as_u16();
-            if classify_status(code) == RetryClass::NoRetry {
-                bail!("HTTP {code} (non-retryable) fetching {url}");
-            }
-            bail!("HTTP {code} fetching {url}");
+            return Err(http_status_error(code, url));
         }
         let content_length = resp.content_length();
         Ok(DownloadResponse {
@@ -180,14 +229,14 @@ pub fn fetch_asset(params: FetchParams<'_>) -> Result<FetchResult> {
         match try_download(transport_ref, cache_dir, &url, auth.as_deref()) {
             Ok(result) => break result,
             Err(e) => {
-                let msg = e.to_string();
-                let retryable = is_retryable_error(&msg);
+                let retryable = e.is_retryable();
+                let error = e.into_anyhow();
                 if !retryable || attempt > retries {
-                    return Err(e.context(format!("fetch failed for asset '{name}'")));
+                    return Err(error.context(format!("fetch failed for asset '{name}'")));
                 }
                 let wait = compute_backoff(backoff, attempt);
                 eprintln!(
-                    "[shasset] warning: transient error for '{name}' (attempt {attempt}/{retries}): {e}; retrying in {wait}ms"
+                    "[shasset] warning: transient error for '{name}' (attempt {attempt}/{retries}): {error}; retrying in {wait}ms"
                 );
                 std::thread::sleep(Duration::from_millis(wait));
             }
@@ -270,7 +319,7 @@ fn try_download(
     cache_dir: &Path,
     url: &str,
     auth: Option<&str>,
-) -> Result<DownloadedFile> {
+) -> std::result::Result<DownloadedFile, FetchError> {
     let mut response = transport.get(url, auth)?;
 
     let quarantine_path = cache_dir.join("quarantine").join(format!(
@@ -286,11 +335,11 @@ fn try_download(
         .create_new(true)
         .write(true)
         .open(&quarantine_path)
-        .with_context(|| {
-            format!(
+        .map_err(|error| {
+            FetchError::permanent(anyhow::Error::new(error).context(format!(
                 "cannot create quarantine file for download: {}",
                 quarantine_path.display()
-            )
+            )))
         })?;
 
     let mut hasher = Sha256::new();
@@ -298,27 +347,29 @@ fn try_download(
     let mut buf = [0u8; 64 * 1024];
 
     loop {
-        let n = response
-            .body
-            .read(&mut buf)
-            .with_context(|| format!("failed to read response body from {url}"))?;
+        let n = response.body.read(&mut buf).map_err(|error| {
+            FetchError::retryable(
+                anyhow::Error::new(error)
+                    .context(format!("failed to read response body from {url}")),
+            )
+        })?;
         if n == 0 {
             break;
         }
-        file.write_all(&buf[..n]).with_context(|| {
-            format!(
+        file.write_all(&buf[..n]).map_err(|error| {
+            FetchError::permanent(anyhow::Error::new(error).context(format!(
                 "cannot write quarantine file for download: {}",
                 quarantine_path.display()
-            )
+            )))
         })?;
         hasher.update(&buf[..n]);
         total = total.saturating_add(n as u64);
     }
-    file.flush().with_context(|| {
-        format!(
+    file.flush().map_err(|error| {
+        FetchError::permanent(anyhow::Error::new(error).context(format!(
             "cannot flush quarantine file for download: {}",
             quarantine_path.display()
-        )
+        )))
     })?;
 
     Ok(DownloadedFile {
@@ -327,6 +378,18 @@ fn try_download(
         bytes_written: total,
         content_length: response.content_length,
     })
+}
+
+fn http_status_error(status: u16, url: &str) -> FetchError {
+    let class = classify_status(status);
+    let error = match class {
+        RetryClass::Retry => anyhow!("HTTP {status} fetching {url}"),
+        RetryClass::NoRetry => anyhow!("HTTP {status} (non-retryable) fetching {url}"),
+    };
+    match class {
+        RetryClass::Retry => FetchError::retryable(error),
+        RetryClass::NoRetry => FetchError::permanent(error),
+    }
 }
 
 fn promote_to_cache_blob(quarantine_path: &Path, blob_path: &Path) -> Result<()> {
@@ -459,20 +522,6 @@ pub fn verify_on_disk(name: &str, path: &Path, expected_hex: &str) -> Result<()>
     Ok(())
 }
 
-fn is_retryable_error(msg: &str) -> bool {
-    // HTTP status codes surfaced in the error message.
-    for code in [429u16, 500, 502, 503, 504] {
-        if msg.contains(&format!("HTTP {code}")) {
-            return true;
-        }
-    }
-    // Connection-level errors.
-    if msg.contains("connection") || msg.contains("timeout") || msg.contains("connect") {
-        return true;
-    }
-    false
-}
-
 fn compute_backoff(backoff: &Backoff, attempt: u32) -> u64 {
     let exp = backoff.factor.pow(attempt.saturating_sub(1));
     let ms = backoff.base_ms.saturating_mul(exp);
@@ -482,39 +531,50 @@ fn compute_backoff(backoff: &Backoff, attempt: u32) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::Mutex;
     use tempfile::TempDir;
+
+    enum MockOutcome {
+        Body {
+            body: Vec<u8>,
+            content_length: Option<u64>,
+        },
+        Error {
+            retryable: bool,
+            message: String,
+        },
+        HttpStatus(u16),
+    }
 
     struct MockTransport {
         calls: Arc<AtomicUsize>,
-        body: Vec<u8>,
-        content_length: Option<u64>,
-        status_override: Option<u16>,
+        outcomes: Mutex<VecDeque<MockOutcome>>,
     }
 
     impl MockTransport {
         fn new(body: Vec<u8>) -> (Self, Arc<AtomicUsize>) {
-            let calls = Arc::new(AtomicUsize::new(0));
-            (
-                Self {
-                    calls: calls.clone(),
-                    body,
-                    content_length: None,
-                    status_override: None,
-                },
-                calls,
-            )
+            Self::with_outcomes(vec![MockOutcome::Body {
+                body,
+                content_length: None,
+            }])
         }
 
         fn with_content_length(body: Vec<u8>, content_length: u64) -> (Self, Arc<AtomicUsize>) {
+            Self::with_outcomes(vec![MockOutcome::Body {
+                body,
+                content_length: Some(content_length),
+            }])
+        }
+
+        fn with_outcomes(outcomes: Vec<MockOutcome>) -> (Self, Arc<AtomicUsize>) {
             let calls = Arc::new(AtomicUsize::new(0));
             (
                 Self {
                     calls: calls.clone(),
-                    body,
-                    content_length: Some(content_length),
-                    status_override: None,
+                    outcomes: Mutex::new(VecDeque::from(outcomes)),
                 },
                 calls,
             )
@@ -526,15 +586,36 @@ mod tests {
     }
 
     impl Transport for MockTransport {
-        fn get(&self, _url: &str, _auth: Option<&str>) -> Result<DownloadResponse> {
+        fn get(
+            &self,
+            _url: &str,
+            _auth: Option<&str>,
+        ) -> std::result::Result<DownloadResponse, FetchError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            if let Some(status) = self.status_override {
-                bail!("HTTP {status} fetching mock")
+            let outcome = self
+                .outcomes
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("mock transport exhausted");
+            match outcome {
+                MockOutcome::Body {
+                    body,
+                    content_length,
+                } => Ok(DownloadResponse {
+                    body: Box::new(std::io::Cursor::new(body)),
+                    content_length,
+                }),
+                MockOutcome::Error { retryable, message } => {
+                    let error = anyhow!(message);
+                    if retryable {
+                        Err(FetchError::retryable(error))
+                    } else {
+                        Err(FetchError::permanent(error))
+                    }
+                }
+                MockOutcome::HttpStatus(status) => Err(http_status_error(status, "mock")),
             }
-            Ok(DownloadResponse {
-                body: Box::new(std::io::Cursor::new(self.body.clone())),
-                content_length: self.content_length,
-            })
         }
     }
 
@@ -864,12 +945,115 @@ mod tests {
     }
 
     #[test]
-    fn is_retryable_matches_http_codes() {
-        assert!(is_retryable_error("HTTP 429 fetching http://x"));
-        assert!(is_retryable_error("HTTP 503 fetching http://x"));
-        assert!(!is_retryable_error(
-            "HTTP 404 (non-retryable) fetching http://x"
-        ));
-        assert!(!is_retryable_error("HTTP 401 fetching http://x"));
+    fn retryable_transport_error_retries_until_exhausted() {
+        let tmp = TempDir::new().unwrap();
+        let asset = test_asset(&"a".repeat(64));
+        let (transport, calls) = MockTransport::with_outcomes(vec![
+            MockOutcome::Error {
+                retryable: true,
+                message: "client error (Connect): dns error: Temporary failure in name resolution"
+                    .to_string(),
+            },
+            MockOutcome::Error {
+                retryable: true,
+                message: "client error (Connect): dns error: Temporary failure in name resolution"
+                    .to_string(),
+            },
+            MockOutcome::Error {
+                retryable: true,
+                message: "client error (Connect): dns error: Temporary failure in name resolution"
+                    .to_string(),
+            },
+        ]);
+
+        let err = fetch_asset(FetchParams {
+            name: "mytool",
+            asset: &asset,
+            out_dir: Some(tmp.path()),
+            cache_dir: tmp.path(),
+            retries: 2,
+            backoff: &Backoff {
+                base_ms: 0,
+                max_ms: 0,
+                factor: 1,
+            },
+            compute_checksum: false,
+            no_reverify: false,
+            materialize_mode: MaterializeMode::Copy,
+            transport: Some(Box::new(transport)),
+        })
+        .unwrap_err();
+
+        assert_eq!(MockTransport::call_count(&calls), 3);
+        assert!(format!("{err:#}").contains("Temporary failure in name resolution"));
+    }
+
+    #[test]
+    fn retryable_transport_error_then_success_retries_once() {
+        let data = b"hello world";
+        let hex = sha256_hex(data);
+        let asset = test_asset(&hex);
+        let out = TempDir::new().unwrap();
+        let cache = TempDir::new().unwrap();
+        let (transport, calls) = MockTransport::with_outcomes(vec![
+            MockOutcome::Error {
+                retryable: true,
+                message: "client error (Connect): dns error: Temporary failure in name resolution"
+                    .to_string(),
+            },
+            MockOutcome::Body {
+                body: data.to_vec(),
+                content_length: None,
+            },
+        ]);
+
+        let result = fetch_asset(FetchParams {
+            name: "mytool",
+            asset: &asset,
+            out_dir: Some(out.path()),
+            cache_dir: cache.path(),
+            retries: 3,
+            backoff: &Backoff {
+                base_ms: 0,
+                max_ms: 0,
+                factor: 1,
+            },
+            compute_checksum: false,
+            no_reverify: false,
+            materialize_mode: MaterializeMode::Copy,
+            transport: Some(Box::new(transport)),
+        })
+        .unwrap();
+
+        assert_eq!(MockTransport::call_count(&calls), 2);
+        assert_eq!(std::fs::read(result.path.unwrap()).unwrap(), data);
+    }
+
+    #[test]
+    fn permanent_http_error_is_not_retried() {
+        let tmp = TempDir::new().unwrap();
+        let asset = test_asset(&"a".repeat(64));
+        let (transport, calls) = MockTransport::with_outcomes(vec![MockOutcome::HttpStatus(404)]);
+
+        let err = fetch_asset(FetchParams {
+            name: "mytool",
+            asset: &asset,
+            out_dir: Some(tmp.path()),
+            cache_dir: tmp.path(),
+            retries: 3,
+            backoff: &Backoff {
+                base_ms: 0,
+                max_ms: 0,
+                factor: 1,
+            },
+            compute_checksum: false,
+            no_reverify: false,
+            materialize_mode: MaterializeMode::Copy,
+            transport: Some(Box::new(transport)),
+        })
+        .unwrap_err();
+
+        assert_eq!(MockTransport::call_count(&calls), 1);
+        assert!(format!("{err:#}").contains("HTTP 404"));
     }
 }

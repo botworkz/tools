@@ -28,6 +28,8 @@ pub enum Command {
     Get(GetArgs),
     /// Download one or all assets, verifying checksums.
     Fetch(FetchArgs),
+    /// Prune unreferenced cache blobs and stale quarantine entries.
+    Prune(PruneArgs),
     /// Verify on-disk files against manifest checksums (no network).
     Verify(VerifyArgs),
 }
@@ -101,6 +103,18 @@ pub struct FetchArgs {
     /// Skip re-verifying cache blobs before use.
     #[arg(long)]
     pub no_reverify: bool,
+}
+
+// ── prune ─────────────────────────────────────────────────────────────────────
+
+#[derive(clap::Args, Debug)]
+pub struct PruneArgs {
+    /// Cache directory (default: `~/.cache/shasset`).
+    #[arg(long)]
+    pub cache_dir: Option<PathBuf>,
+    /// Show what would be removed without deleting anything.
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 // ── verify ────────────────────────────────────────────────────────────────────
