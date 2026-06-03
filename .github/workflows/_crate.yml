@@ -19,32 +19,66 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+    # Host toolchain is used only by Swatinem/rust-cache to compute cache keys;
+    # all cargo commands run inside the bookworm container below.
     - uses: dtolnay/rust-toolchain@stable
-      with:
-        components: rustfmt, clippy
     - uses: Swatinem/rust-cache@v2
     - uses: docker/setup-buildx-action@v3
+
+    - name: Build CI toolchain image (rust:1-slim-bookworm + rustfmt + clippy)
+      run: |
+        docker build -t ci-tools:local - <<'EOF'
+        FROM rust:1-slim-bookworm
+        RUN rustup component add rustfmt clippy
+        EOF
 
     - name: cargo fmt
       run: |
         set -euo pipefail
-        cd "$CRATE"
-        cargo fmt -- --check
+        docker run --rm \
+          --user "$(id -u):$(id -g)" \
+          -v "$GITHUB_WORKSPACE:/workspace" \
+          -v "$HOME/.cargo:/cargo" \
+          -w /workspace \
+          -e CARGO_HOME=/cargo \
+          ci-tools:local \
+          cargo fmt -p "$CRATE" -- --check
 
     - name: cargo clippy
       run: |
         set -euo pipefail
-        cargo clippy -p "$CRATE" --all-targets --locked -- -D warnings
+        docker run --rm \
+          --user "$(id -u):$(id -g)" \
+          -v "$GITHUB_WORKSPACE:/workspace" \
+          -v "$HOME/.cargo:/cargo" \
+          -w /workspace \
+          -e CARGO_HOME=/cargo \
+          ci-tools:local \
+          cargo clippy -p "$CRATE" --all-targets --locked -- -D warnings
 
     - name: cargo test
       run: |
         set -euo pipefail
-        cargo test -p "$CRATE" --locked
+        docker run --rm \
+          --user "$(id -u):$(id -g)" \
+          -v "$GITHUB_WORKSPACE:/workspace" \
+          -v "$HOME/.cargo:/cargo" \
+          -w /workspace \
+          -e CARGO_HOME=/cargo \
+          ci-tools:local \
+          cargo test -p "$CRATE" --locked
 
     - name: cargo build
       run: |
         set -euo pipefail
-        cargo build -p "$CRATE" --release --locked
+        docker run --rm \
+          --user "$(id -u):$(id -g)" \
+          -v "$GITHUB_WORKSPACE:/workspace" \
+          -v "$HOME/.cargo:/cargo" \
+          -w /workspace \
+          -e CARGO_HOME=/cargo \
+          ci-tools:local \
+          cargo build -p "$CRATE" --release --locked
 
     - name: Install hadolint
       run: |
