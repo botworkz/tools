@@ -96,11 +96,25 @@ This produces the stable local tag `botwork/packer-tools:local`.
 
 Current commands:
 
-- `botforge deps --out <dir> [--executable] [<name>]` — fetches from `shasset.yaml` using the `shasset` library and stages each asset flat at `<dir>/<asset-filename>`, where the filename comes from the manifest `filename` field or the URI basename (not the manifest key).
+- `botforge deps --out <dir> [--executable] [<name>]` — fetches file assets from `shasset.yaml` using the `shasset` library and stages each asset flat at `<dir>/<asset-filename>`, where the filename comes from the manifest `filename` field or the URI basename (not the manifest key). It also handles `oci://` image assets in the same manifest: `docker pull` by digest, `docker tag` to `botwork/<asset-key>:local`, then `docker save` flat to `<dir>/<asset-filename>` (or `<dir>/<asset-key>.tar` when `filename` is unset). `docker` must be on `PATH`; `oci://` URIs must be pinned with `@sha256:<64-hex>`; manifest `checksum` is ignored for `oci://` assets.
 - `botforge iso --src <dir> --out <file.iso> [--volume-id <id>]` — builds an ISO from a directory tree using `xorriso` (or `genisoimage` fallback).
 - `botforge pack [--repo-root <dir>] [--compress] [--key <path>] [--compose-service <name>] [--compose-file <path>]` — runs a KVM-only Packer build of the base VM image via docker compose, then optionally compresses the qcow2. Requires `/dev/kvm`; dependencies and baked images must already be staged beforehand because botforge v1 does not build them. KVM is required; there are no tcg/accelerator options.
 
-Planned subcommands remain forthcoming: `run`, `smoke`, `payload`, and `images`.
+Planned subcommands remain forthcoming: `run`, `smoke`, and `payload`.
+
+Example mixed manifest for `deps`:
+
+```yaml
+assets:
+  session-broker:
+    uri: oci://ghcr.io/botworkz/botwork/session-broker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  botwork-launcher:
+    uri: github-release://botworkz/botwork/v${version}/botwork-launcher
+    version: 0.0.1
+    checksum: sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+```
+
+For v1, image resolution is registry-only (`oci://` pull-by-digest). Image build-from-source (sibling/earthly) is intentionally deferred to a future `dev-pack` flow.
 
 ## shasset
 
