@@ -120,6 +120,52 @@ jobs:
           docker run --rm --entrypoint xorriso "botwork/botforge:ci" -version
           docker run --rm --entrypoint ssh "botwork/botforge:ci" -V
           docker run --rm --entrypoint docker "botwork/botforge:ci" --version
+
+          rm -rf .ci-deps-smoke
+          mkdir -p .ci-deps-smoke/out
+          ASSET_URL="https://raw.githubusercontent.com/github/gitignore/main/README.md"
+          curl -fsSL "$ASSET_URL" -o .ci-deps-smoke/fixture.bin
+          ASSET_SHA="$(sha256sum .ci-deps-smoke/fixture.bin | awk '{print $1}')"
+
+          cat > .ci-deps-smoke/shasset.yaml <<EOF
+          settings:
+            retries: 0
+          assets:
+            fixture:
+              uri: $ASSET_URL
+              version: "1"
+              checksum: sha256:$ASSET_SHA
+              filename: fixture.bin
+          EOF
+
+          docker run --rm \
+            -v "$PWD/.ci-deps-smoke:/work" \
+            -w /work \
+            "botwork/botforge:ci" \
+            -c shasset.yaml deps --out out --executable fixture
+
+          cmp -s .ci-deps-smoke/fixture.bin .ci-deps-smoke/out/fixture.bin
+          test -x .ci-deps-smoke/out/fixture.bin
+
+          cat > .ci-deps-smoke/shasset-bad.yaml <<EOF
+          settings:
+            retries: 0
+          assets:
+            fixture:
+              uri: $ASSET_URL
+              version: "1"
+              checksum: sha256:0000000000000000000000000000000000000000000000000000000000000000
+              filename: fixture.bin
+          EOF
+
+          if docker run --rm \
+            -v "$PWD/.ci-deps-smoke:/work" \
+            -w /work \
+            "botwork/botforge:ci" \
+            -c shasset-bad.yaml deps --out out fixture; then
+            echo "expected checksum mismatch failure"
+            exit 1
+          fi
         fi
 
     - uses: actions/upload-artifact@v4
