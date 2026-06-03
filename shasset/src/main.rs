@@ -6,13 +6,13 @@ use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+#[cfg(test)]
+use shasset::fetch;
 use shasset::{
     cli::{self, Cli, Command},
     fetch::{fetch_asset, verify_on_disk, FetchParams, MaterializeMode},
     manifest::{self, load, save, Asset, Manifest, ParsedChecksum},
 };
-#[cfg(test)]
-use shasset::fetch;
 
 fn main() {
     if let Err(e) = run() {

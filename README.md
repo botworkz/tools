@@ -96,8 +96,11 @@ This produces the stable local tag `botwork/packer-tools:local`.
 
 Current commands:
 
-- `botforge deps --out <dir> [<name>]` — fetches from `shasset.yaml` using the `shasset` library and stages flat files at `<dir>/<asset-name>`.
+- `botforge deps --out <dir> [--executable] [<name>]` — fetches from `shasset.yaml` using the `shasset` library and stages each asset flat at `<dir>/<asset-filename>`, where the filename comes from the manifest `filename` field or the URI basename (not the manifest key).
 - `botforge iso --src <dir> --out <file.iso> [--volume-id <id>]` — builds an ISO from a directory tree using `xorriso` (or `genisoimage` fallback).
+- `botforge pack [--repo-root <dir>] [--compress] [--key <path>] [--compose-service <name>] [--compose-file <path>]` — runs a KVM-only Packer build of the base VM image via docker compose, then optionally compresses the qcow2. Requires `/dev/kvm`; dependencies and baked images must already be staged beforehand because botforge v1 does not build them. KVM is required; there are no tcg/accelerator options.
+
+Planned subcommands remain forthcoming: `run`, `smoke`, `payload`, and `images`.
 
 ## shasset
 
