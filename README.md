@@ -97,14 +97,14 @@ This produces the stable local tag `botwork/packer-tools:local`.
 Current commands:
 
 - `botforge deps --out <dir> [--executable] [<name>]` — fetches file assets from `shasset.yaml` using the `shasset` library and stages each asset flat at `<dir>/<asset-filename>`, where the filename comes from the manifest `filename` field or the URI basename (not the manifest key). It also handles `oci://` image assets in the same manifest: `docker pull` by digest, `docker tag` to `botwork/<asset-key>:local`, then `docker save` flat to `<dir>/<asset-filename>` (or `<dir>/<asset-key>.tar` when `filename` is unset). `docker` must be on `PATH`; `oci://` URIs must be pinned with `@sha256:<64-hex>`; manifest `checksum` is ignored for `oci://` assets.
-- `botforge iso --src <dir> --out <file.iso> [--volume-id <id>]` — builds an ISO from a directory tree using `xorriso` (or `genisoimage` fallback). Seed ISO mode is folded in: pass `--ssh-public-key <KEY>` or `--ssh-public-key-file <PATH>` (and optional `--user-data-template <PATH>`) to generate cloud-init `user-data`/`meta-data` and build from that temp tree. Use `--volume-id cidata` for NoCloud seed images.
+- `botforge iso [--src <dir>] --out <file.iso> [--volume-id <id>]` — builds an ISO from a directory tree using `xorriso` (or `genisoimage` fallback). Seed ISO mode is folded in: pass `--ssh-public-key <KEY>` or `--ssh-public-key-file <PATH>` (and optional `--user-data-template <PATH>`) to generate cloud-init `user-data`/`meta-data` and build from that temp tree; `--src` is not required in seed mode. Use `--volume-id cidata` for NoCloud seed images.
 - `botforge pack [--repo-root <dir>] [--compress] [--key <path>] [--compose-service <name>] [--compose-file <path>]` — runs a KVM-only Packer build of the base VM image via docker compose, then optionally compresses the qcow2. Requires `/dev/kvm`; dependencies and baked images must already be staged beforehand because botforge v1 does not build them. KVM is required; there are no tcg/accelerator options.
 - `botforge run --base-image <qcow2> --overlay-image <overlay.qcow2> --seed-iso <cidata.iso> [--payload-iso <payload.iso>] [--ssh-port 2222] [--foreground]` — KVM-only qemu launcher. Creates the overlay via `qemu-img create -f qcow2 -F qcow2 -b <base> <overlay>`, then boots qemu with host SSH forwarding to guest port 22.
-- `botforge smoke --smoke-config <smoke.yaml> --base-image <qcow2> --ssh-key <private-key> [--ssh-host 127.0.0.1] [--ssh-port 2222] [--ssh-user bot] [--repo-root <dir>] [--keep-running]` — KVM-only config-driven smoke orchestration: builds cidata seed from `<ssh-key>.pub`, creates overlay, boots qemu in background, waits for SSH/cloud-init, runs upload+command validation steps, and collects diagnostics on failure.
+- `botforge test --test-config <test.yaml> --base-image <qcow2> --ssh-key <private-key> [--ssh-host 127.0.0.1] [--ssh-port 2222] [--ssh-user bot] [--repo-root <dir>] [--keep-running]` — KVM-only config-driven test orchestration: builds cidata seed from `<ssh-key>.pub`, creates overlay, boots qemu in background, waits for SSH/cloud-init, runs upload+command validation steps, and collects diagnostics on failure.
 
 Planned subcommands remain forthcoming: `payload`.
 
-Example `smoke.yaml`:
+Example `test.yaml`:
 
 ```yaml
 isos:

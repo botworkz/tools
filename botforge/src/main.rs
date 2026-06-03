@@ -35,8 +35,8 @@ enum Commands {
     Pack(PackArgs),
     /// Launch a VM with qemu (KVM-only).
     Run(RunArgs),
-    /// Boot and validate a packed VM from a smoke config.
-    Smoke(SmokeArgs),
+    /// Boot and validate a packed VM from a test config.
+    Test(TestArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -59,9 +59,9 @@ struct DepsArgs {
 
 #[derive(clap::Args, Debug)]
 struct IsoArgs {
-    /// Source directory tree to include in the ISO.
-    #[arg(long, required = true)]
-    src: PathBuf,
+    /// Source directory tree to include in the ISO (required in plain mode; ignored in seed mode).
+    #[arg(long)]
+    src: Option<PathBuf>,
     /// Output ISO file path.
     #[arg(long, required = true)]
     out: PathBuf,
@@ -121,10 +121,10 @@ struct RunArgs {
 }
 
 #[derive(clap::Args, Debug)]
-struct SmokeArgs {
-    /// Path to smoke.yaml config.
-    #[arg(long = "smoke-config", required = true)]
-    smoke_config: PathBuf,
+struct TestArgs {
+    /// Path to test.yaml config.
+    #[arg(long = "test-config", required = true)]
+    test_config: PathBuf,
     /// Base qcow2 image path.
     #[arg(long, required = true)]
     base_image: PathBuf,
@@ -140,7 +140,7 @@ struct SmokeArgs {
     /// SSH user.
     #[arg(long, default_value = "bot")]
     ssh_user: String,
-    /// Repo root for resolving relative smoke paths (default: current dir).
+    /// Repo root for resolving relative test paths (default: current dir).
     #[arg(long)]
     repo_root: Option<PathBuf>,
     /// Leave VM running and preserve overlay on exit.
@@ -149,36 +149,36 @@ struct SmokeArgs {
 }
 
 #[derive(Debug, Deserialize, Default)]
-struct SmokeConfig {
+struct TestConfig {
     #[serde(default)]
     isos: Vec<PathBuf>,
     #[serde(default)]
-    steps: Vec<SmokeStep>,
+    steps: Vec<TestStep>,
     #[serde(default)]
     diagnostics_units: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
-struct SmokeStep {
+struct TestStep {
     name: String,
     #[serde(default)]
-    uploads: Vec<SmokeUpload>,
+    uploads: Vec<TestUpload>,
     run: String,
 }
 
 #[derive(Debug, Deserialize)]
-struct SmokeUpload {
+struct TestUpload {
     src: PathBuf,
     dest: String,
 }
 
 const USER_DATA_PLACEHOLDER: &str = "REPLACE_WITH_SSH_PUBLIC_KEY";
-const SMOKE_SSH_READY_TIMEOUT: Duration = Duration::from_secs(300);
-const SMOKE_CLOUD_INIT_TIMEOUT: Duration = Duration::from_secs(300);
-const SMOKE_TRANSPORT_RETRIES: usize = 10;
-const SMOKE_TRANSPORT_RETRY_DELAY: Duration = Duration::from_secs(2);
-const SMOKE_STABLE_SSH_ATTEMPTS: usize = 5;
-const SMOKE_STABLE_SSH_REQUIRED: usize = 2;
+const TEST_SSH_READY_TIMEOUT: Duration = Duration::from_secs(300);
+const TEST_CLOUD_INIT_TIMEOUT: Duration = Duration::from_secs(300);
+const TEST_TRANSPORT_RETRIES: usize = 10;
+const TEST_TRANSPORT_RETRY_DELAY: Duration = Duration::from_secs(2);
+const TEST_STABLE_SSH_ATTEMPTS: usize = 5;
+const TEST_STABLE_SSH_REQUIRED: usize = 2;
 
 fn main() {
     if let Err(e) = run() {
@@ -194,7 +194,7 @@ fn run() -> Result<()> {
         Commands::Iso(args) => cmd_iso(args),
         Commands::Pack(args) => cmd_pack(args),
         Commands::Run(args) => cmd_run(args),
-        Commands::Smoke(args) => cmd_smoke(args),
+        Commands::Test(args) => cmd_test(args),
     }
 }
 
@@ -433,10 +433,15 @@ fn cmd_iso(args: IsoArgs) -> Result<()> {
         std::fs::remove_dir_all(&temp_dir)
             .with_context(|| format!("cannot remove temp seed dir: {}", temp_dir.display()))?;
     } else {
-        if !args.src.is_dir() {
-            bail!("source directory does not exist: {}", args.src.display());
+        let src = args.src.ok_or_else(|| {
+            anyhow::anyhow!(
+                "--src is required when no SSH key flag (--ssh-public-key or --ssh-public-key-file) is provided"
+            )
+        })?;
+        if !src.is_dir() {
+            bail!("source directory does not exist: {}", src.display());
         }
-        build_iso(&args.src, &args.out, &args.volume_id)?;
+        build_iso(&src, &args.out, &args.volume_id)?;
     }
 
     println!("built ISO at {}", args.out.display());
@@ -748,7 +753,6 @@ fn cmd_run(args: RunArgs) -> Result<()> {
 
     create_overlay_image(&base_image, &overlay_image)?;
     let mut qemu_args = qemu_run_args(
-        &base_image,
         &overlay_image,
         &seed_iso,
         &payload_isos,
@@ -762,7 +766,7 @@ fn cmd_run(args: RunArgs) -> Result<()> {
     Ok(())
 }
 
-fn cmd_smoke(args: SmokeArgs) -> Result<()> {
+fn cmd_test(args: TestArgs) -> Result<()> {
     require_kvm()?;
     ensure_command("qemu-system-x86_64")?;
     ensure_command("qemu-img")?;
@@ -775,19 +779,19 @@ fn cmd_smoke(args: SmokeArgs) -> Result<()> {
             .unwrap_or(std::env::current_dir().context("failed to determine current directory")?),
     )
     .context("failed to resolve repo root")?;
-    let smoke_config_path = resolve_under_root(&repo_root, args.smoke_config);
+    let test_config_path = resolve_under_root(&repo_root, args.test_config);
     let base_image = resolve_under_root(&repo_root, args.base_image);
     let ssh_key = resolve_under_root(&repo_root, args.ssh_key);
     let ssh_pub = PathBuf::from(format!("{}.pub", ssh_key.display()));
 
-    let smoke_config = load_smoke_config(&smoke_config_path)?;
+    let test_config = load_test_config(&test_config_path)?;
     let build_dir = repo_root.join("build");
     std::fs::create_dir_all(&build_dir)
         .with_context(|| format!("cannot create build dir: {}", build_dir.display()))?;
-    let overlay_image = build_dir.join("smoke-overlay.qcow2");
-    let seed_iso = build_dir.join("smoke-seed.iso");
-    let vm_log = build_dir.join("smoke-vm.log");
-    let seed_dir = create_temp_dir("botforge-smoke-seed")?;
+    let overlay_image = build_dir.join("test-overlay.qcow2");
+    let seed_iso = build_dir.join("test-seed.iso");
+    let vm_log = build_dir.join("test-vm.log");
+    let seed_dir = create_temp_dir("botforge-test-seed")?;
 
     let ssh_public_key = std::fs::read_to_string(&ssh_pub)
         .with_context(|| format!("cannot read SSH public key: {}", ssh_pub.display()))?;
@@ -800,11 +804,10 @@ fn cmd_smoke(args: SmokeArgs) -> Result<()> {
     create_overlay_image(&base_image, &overlay_image)?;
 
     let mut extra_isos = Vec::new();
-    for iso in &smoke_config.isos {
+    for iso in &test_config.isos {
         extra_isos.push(resolve_under_root(&repo_root, iso.clone()));
     }
     let qemu_args = qemu_run_args(
-        &base_image,
         &overlay_image,
         &seed_iso,
         &extra_isos,
@@ -819,21 +822,21 @@ fn cmd_smoke(args: SmokeArgs) -> Result<()> {
         key: ssh_key.clone(),
     };
 
-    let smoke_result = run_smoke_flow(&repo_root, &smoke_config, &ssh_options);
-    if let Err(err) = smoke_result {
-        eprintln!("smoke failed: {err:#}");
-        collect_smoke_diagnostics(&ssh_options, &smoke_config.diagnostics_units);
+    let test_result = run_test_flow(&repo_root, &test_config, &ssh_options);
+    if let Err(err) = test_result {
+        eprintln!("test failed: {err:#}");
+        collect_test_diagnostics(&ssh_options, &test_config.diagnostics_units);
         print_log_tail(&vm_log, 200);
         if !args.keep_running {
-            cleanup_smoke(&mut vm_child, &overlay_image);
+            cleanup_test(&mut vm_child, &overlay_image);
         }
         return Err(err);
     }
 
     if !args.keep_running {
-        cleanup_smoke(&mut vm_child, &overlay_image);
+        cleanup_test(&mut vm_child, &overlay_image);
     }
-    println!("smoke test passed");
+    println!("test passed");
     Ok(())
 }
 
@@ -845,16 +848,16 @@ struct SshOptions {
     key: PathBuf,
 }
 
-fn run_smoke_flow(repo_root: &Path, config: &SmokeConfig, ssh: &SshOptions) -> Result<()> {
-    wait_for_ssh(ssh, SMOKE_SSH_READY_TIMEOUT)?;
+fn run_test_flow(repo_root: &Path, config: &TestConfig, ssh: &SshOptions) -> Result<()> {
+    wait_for_ssh(ssh, TEST_SSH_READY_TIMEOUT)?;
     ssh_with_retry(
         ssh,
         "sudo cloud-init status --wait",
-        SMOKE_TRANSPORT_RETRIES,
-        SMOKE_TRANSPORT_RETRY_DELAY,
-        SMOKE_CLOUD_INIT_TIMEOUT,
+        TEST_TRANSPORT_RETRIES,
+        TEST_TRANSPORT_RETRY_DELAY,
+        TEST_CLOUD_INIT_TIMEOUT,
     )?;
-    require_stable_ssh(ssh, SMOKE_STABLE_SSH_ATTEMPTS, SMOKE_STABLE_SSH_REQUIRED)?;
+    require_stable_ssh(ssh, TEST_STABLE_SSH_ATTEMPTS, TEST_STABLE_SSH_REQUIRED)?;
 
     for step in &config.steps {
         for upload in &step.uploads {
@@ -863,27 +866,27 @@ fn run_smoke_flow(repo_root: &Path, config: &SmokeConfig, ssh: &SshOptions) -> R
                 ssh,
                 &src,
                 &upload.dest,
-                SMOKE_TRANSPORT_RETRIES,
-                SMOKE_TRANSPORT_RETRY_DELAY,
+                TEST_TRANSPORT_RETRIES,
+                TEST_TRANSPORT_RETRY_DELAY,
             )
-            .with_context(|| format!("smoke step '{}' upload failed", step.name))?;
+            .with_context(|| format!("test step '{}' upload failed", step.name))?;
         }
         ssh_with_retry(
             ssh,
             &step.run,
-            SMOKE_TRANSPORT_RETRIES,
-            SMOKE_TRANSPORT_RETRY_DELAY,
+            TEST_TRANSPORT_RETRIES,
+            TEST_TRANSPORT_RETRY_DELAY,
             Duration::from_secs(300),
         )
-        .with_context(|| format!("smoke step '{}' command failed", step.name))?;
+        .with_context(|| format!("test step '{}' command failed", step.name))?;
     }
     Ok(())
 }
 
-fn load_smoke_config(path: &Path) -> Result<SmokeConfig> {
+fn load_test_config(path: &Path) -> Result<TestConfig> {
     let yaml = std::fs::read_to_string(path)
-        .with_context(|| format!("cannot read smoke config: {}", path.display()))?;
-    serde_yaml::from_str(&yaml).with_context(|| format!("invalid smoke config: {}", path.display()))
+        .with_context(|| format!("cannot read test config: {}", path.display()))?;
+    serde_yaml::from_str(&yaml).with_context(|| format!("invalid test config: {}", path.display()))
 }
 
 fn require_kvm() -> Result<()> {
@@ -926,7 +929,6 @@ fn qemu_img_create_args(base_image: &Path, overlay_image: &Path) -> Vec<String> 
 }
 
 fn qemu_run_args(
-    base_image: &Path,
     overlay_image: &Path,
     seed_iso: &Path,
     extra_isos: &[PathBuf],
@@ -942,15 +944,13 @@ fn qemu_run_args(
         "-cpu".into(),
         "host".into(),
         "-drive".into(),
-        format!("file={},if=virtio,format=qcow2", base_image.display()),
-        "-drive".into(),
         format!("file={},if=virtio,format=qcow2", overlay_image.display()),
         "-drive".into(),
-        format!("file={},media=cdrom", seed_iso.display()),
+        format!("file={},media=cdrom,readonly=on", seed_iso.display()),
     ];
     for iso in extra_isos {
         args.push("-drive".into());
-        args.push(format!("file={},media=cdrom", iso.display()));
+        args.push(format!("file={},media=cdrom,readonly=on", iso.display()));
     }
     args.extend([
         "-netdev".into(),
@@ -1119,7 +1119,7 @@ fn retry_transport_cmd(
     }
 }
 
-fn collect_smoke_diagnostics(ssh: &SshOptions, units: &[String]) {
+fn collect_test_diagnostics(ssh: &SshOptions, units: &[String]) {
     let _ = ssh_with_retry(
         ssh,
         "systemctl --failed",
@@ -1157,7 +1157,7 @@ fn print_log_tail(path: &Path, line_count: usize) {
     }
 }
 
-fn cleanup_smoke(vm_child: &mut Option<Child>, overlay_image: &Path) {
+fn cleanup_test(vm_child: &mut Option<Child>, overlay_image: &Path) {
     if let Some(child) = vm_child.as_mut() {
         let _ = child.kill();
         let _ = child.wait();
@@ -1779,11 +1779,15 @@ mod tests {
     #[test]
     fn qemu_run_args_match_expected_argv() {
         let args = qemu_run_args(
-            Path::new("/base.qcow2"),
             Path::new("/overlay.qcow2"),
             Path::new("/seed.iso"),
             &[Path::new("/payload.iso").to_path_buf()],
             2222,
+        );
+        // base image must NOT appear in the argv
+        assert!(
+            !args.iter().any(|a| a.contains("/base.qcow2")),
+            "base image must not appear in qemu args"
         );
         assert_eq!(
             args,
@@ -1797,13 +1801,11 @@ mod tests {
                 "-cpu",
                 "host",
                 "-drive",
-                "file=/base.qcow2,if=virtio,format=qcow2",
-                "-drive",
                 "file=/overlay.qcow2,if=virtio,format=qcow2",
                 "-drive",
-                "file=/seed.iso,media=cdrom",
+                "file=/seed.iso,media=cdrom,readonly=on",
                 "-drive",
-                "file=/payload.iso,media=cdrom",
+                "file=/payload.iso,media=cdrom,readonly=on",
                 "-netdev",
                 "user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22",
                 "-device",
