@@ -90,6 +90,15 @@ This produces the stable local tag `botwork/packer-tools:local`.
 
 `botworkz/vm` consumes this target cross-repo via `FROM ../tools+packer-tools-image` for sibling/local build mode, so the `+packer-tools-image` target name and `botwork/packer-tools:local` tag are a stable contract.
 
+## botforge
+
+`botforge` is the build-time companion CLI for VM artifact workflows.
+
+Current commands:
+
+- `botforge deps --out <dir> [<name>]` — fetches from `shasset.yaml` using the `shasset` library and stages flat files at `<dir>/<asset-name>`.
+- `botforge iso --src <dir> --out <file.iso> [--volume-id <id>]` — builds an ISO from a directory tree using `xorriso` (or `genisoimage` fallback).
+
 ## shasset
 
 `shasset` is a **generic, verified-asset downloader and registry manager**. It maintains a declarative manifest (`shasset.yaml`) of named assets — each with a URI, version, and mandatory SHA-256 checksum — and downloads and verifies those assets on demand.

@@ -1,7 +1,3 @@
-mod cli;
-mod fetch;
-mod manifest;
-
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use rayon::prelude::*;
@@ -10,9 +6,13 @@ use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use cli::{Cli, Command};
-use fetch::{fetch_asset, verify_on_disk, FetchParams, MaterializeMode};
-use manifest::{load, save, Asset, Manifest, ParsedChecksum};
+use shasset::{
+    cli::{self, Cli, Command},
+    fetch::{fetch_asset, verify_on_disk, FetchParams, MaterializeMode},
+    manifest::{self, load, save, Asset, Manifest, ParsedChecksum},
+};
+#[cfg(test)]
+use shasset::fetch;
 
 fn main() {
     if let Err(e) = run() {
