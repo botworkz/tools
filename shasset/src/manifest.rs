@@ -75,6 +75,7 @@ fn default_factor() -> u64 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Asset {
     pub uri: String,
+    #[serde(default)]
     pub version: String,
     /// `sha256:<64-hex>` — required for fetch/verify unless being computed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -228,4 +229,25 @@ pub fn save(path: &Path, manifest: &Manifest) -> Result<()> {
         )
     })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Manifest;
+
+    #[test]
+    fn version_defaults_empty_for_versionless_asset() {
+        let digest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let manifest: Manifest = serde_yaml::from_str(&format!(
+            "assets:\n  image:\n    uri: oci://ghcr.io/botworkz/session-broker@sha256:{digest}\n    filename: session-broker.tar\n"
+        ))
+        .unwrap();
+        let asset = &manifest.assets["image"];
+        assert_eq!(asset.version, "");
+        assert_eq!(
+            asset.expanded_uri(),
+            format!("oci://ghcr.io/botworkz/session-broker@sha256:{digest}")
+        );
+        assert_eq!(asset.output_filename().unwrap(), "session-broker.tar");
+    }
 }
