@@ -1,0 +1,94 @@
+name: Crate
+
+on:
+  workflow_call:
+    inputs:
+      crate:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    env:
+      CRATE: ${{ inputs.crate }}
+      DOCKERFILE: ${{ inputs.crate }}/Dockerfile
+
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt, clippy
+    - uses: Swatinem/rust-cache@v2
+    - uses: docker/setup-buildx-action@v3
+
+    - name: cargo fmt
+      run: |
+        set -euo pipefail
+        cd "$CRATE"
+        cargo fmt -- --check
+
+    - name: cargo clippy
+      run: |
+        set -euo pipefail
+        cargo clippy -p "$CRATE" --all-targets --locked -- -D warnings
+
+    - name: cargo test
+      run: |
+        set -euo pipefail
+        cargo test -p "$CRATE" --locked
+
+    - name: cargo build
+      run: |
+        set -euo pipefail
+        cargo build -p "$CRATE" --release --locked
+
+    - name: Install hadolint
+      run: |
+        set -euo pipefail
+        HADOLINT_VERSION=v2.12.0
+        curl -fsSL -o /usr/local/bin/hadolint \
+          "https://github.com/hadolint/hadolint/releases/download/${HADOLINT_VERSION}/hadolint-Linux-x86_64"
+        chmod +x /usr/local/bin/hadolint
+        hadolint --version
+
+    - name: Lint Dockerfile
+      run: hadolint --failure-threshold error "$DOCKERFILE"
+
+    - name: Stage prebuilt binary
+      run: |
+        set -euo pipefail
+        install -D -m 0755 "target/release/$CRATE" ".ci-prebuilt/$CRATE/$CRATE"
+
+    - name: Build runtime image
+      run: |
+        set -euo pipefail
+        docker buildx build \
+          --platform linux/amd64 \
+          --load \
+          --build-arg BINARY_SOURCE=prebuilt \
+          -t "botwork/$CRATE:ci" \
+          -f "$DOCKERFILE" \
+          .
+
+    - name: Smoke test image
+      run: |
+        set -euo pipefail
+        # Verify the entrypoint runs and exits cleanly on --help
+        docker run --rm "botwork/$CRATE:ci" --help
+
+        # For botforge: also verify the baked orchestration tools are present
+        if [ "$CRATE" = "botforge" ]; then
+          docker run --rm --entrypoint qemu-img "botwork/botforge:ci" --version
+          docker run --rm --entrypoint xorriso "botwork/botforge:ci" -version
+          docker run --rm --entrypoint ssh "botwork/botforge:ci" -V
+          docker run --rm --entrypoint docker "botwork/botforge:ci" --version
+        fi
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.crate }}-binary
+        path: target/release/${{ inputs.crate }}

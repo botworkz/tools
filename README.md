@@ -158,6 +158,39 @@ assets:
 
 For v1, image resolution is registry-only (`oci://` pull-by-digest). Image build-from-source (sibling/earthly) is intentionally deferred to a future `dev-pack` flow.
 
+### Container usage
+
+`botforge` is distributed as a **batteries-included** container image: the QEMU toolchain (`qemu-system-x86_64`, `qemu-img`), ISO utilities (`xorriso`, `genisoimage`), and the Docker and OpenSSH clients are baked into the image so subcommands work reproducibly without installing exact tool versions on your host.
+
+**Published image:** `ghcr.io/botworkz/tools/botforge`
+
+**Pull:**
+```sh
+docker pull ghcr.io/botworkz/tools/botforge:latest
+```
+
+**Runtime requirements:** botforge drives KVM and the host Docker daemon, so the container needs device and socket access, plus a mount of your working repository:
+
+```sh
+docker run --rm \
+  --device /dev/kvm \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v "$PWD:/work" \
+  -w /work \
+  ghcr.io/botworkz/tools/botforge <command> [args...]
+```
+
+- `--device /dev/kvm` — required for `pack`, `run`, and `test` (KVM-only; no TCG fallback).
+- `-v /var/run/docker.sock:/var/run/docker.sock` — required for `deps` (OCI pull/save) and `pack` (Packer via docker compose). This mounts the **host** Docker socket; there is no Docker-in-Docker daemon inside the image.
+- `-v "$PWD:/work" -w /work` — mount your repo so botforge can read manifests, write artifacts, and invoke compose files relative to the project root.
+
+**Build the image locally with Earthly (EarthBuild):**
+```sh
+earthly +botforge-image
+```
+
+This produces the stable local tag `botwork/botforge:local`.
+
 ## shasset
 
 `shasset` is a **generic, verified-asset downloader and registry manager**. It maintains a declarative manifest (`shasset.yaml`) of named assets — each with a URI, optional version, and mandatory SHA-256 checksum for fetch/verify — and downloads and verifies those assets on demand.
