@@ -364,15 +364,15 @@ fn image_tarball_name(asset_key: &str, filename: Option<&str>) -> Result<String>
     Ok(name)
 }
 
-fn docker_pull_args(ref_with_digest: &str) -> Vec<String> {
+fn oci_pull_args(ref_with_digest: &str) -> Vec<String> {
     vec!["pull".into(), ref_with_digest.into()]
 }
 
-fn docker_tag_args(ref_with_digest: &str, local_tag: &str) -> Vec<String> {
+fn oci_tag_args(ref_with_digest: &str, local_tag: &str) -> Vec<String> {
     vec!["tag".into(), ref_with_digest.into(), local_tag.into()]
 }
 
-fn docker_save_args(local_tag: &str, out_tarball_path: &Path) -> Vec<String> {
+fn oci_save_args(local_tag: &str, out_tarball_path: &Path) -> Vec<String> {
     vec![
         "save".into(),
         local_tag.into(),
@@ -423,7 +423,7 @@ fn stage_oci_asset(asset_key: &str, asset: &Asset, out_dir: &Path) -> Result<Pat
     let local_tag = local_tag_for(asset_key);
     run_command(
         "docker",
-        &docker_pull_args(&oci.ref_with_digest),
+        &oci_pull_args(&oci.ref_with_digest),
         &[],
         &format!(
             "asset '{asset_key}': docker pull failed for {}",
@@ -432,13 +432,13 @@ fn stage_oci_asset(asset_key: &str, asset: &Asset, out_dir: &Path) -> Result<Pat
     )?;
     run_command(
         "docker",
-        &docker_tag_args(&oci.ref_with_digest, &local_tag),
+        &oci_tag_args(&oci.ref_with_digest, &local_tag),
         &[],
         &format!("asset '{asset_key}': docker tag failed"),
     )?;
     if let Err(err) = run_command(
         "docker",
-        &docker_save_args(&local_tag, &tmp_path),
+        &oci_save_args(&local_tag, &tmp_path),
         &[],
         &format!("asset '{asset_key}': docker save failed"),
     ) {
@@ -1716,7 +1716,7 @@ fn validate_flat_filename(filename: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        docker_pull_args, docker_save_args, docker_tag_args, image_tarball_name, iso_args,
+        image_tarball_name, iso_args, oci_pull_args, oci_save_args, oci_tag_args,
         journalctl_command, local_tag_for, materialize_flat, packer_build_args, parse_oci_uri,
         qemu_img_create_args, qemu_run_args, render_payload_bootstrap, render_user_data,
         repo_relative_path, resolve_host_kvm_gid, scp_command_args, shell_single_quote,
@@ -1946,17 +1946,17 @@ mod tests {
     }
 
     #[test]
-    fn docker_pull_args_match_expected_argv() {
+    fn oci_pull_args_match_expected_argv() {
         assert_eq!(
-            docker_pull_args("ghcr.io/botworkz/svc@sha256:abc"),
+            oci_pull_args("ghcr.io/botworkz/svc@sha256:abc"),
             vec!["pull", "ghcr.io/botworkz/svc@sha256:abc"]
         );
     }
 
     #[test]
-    fn docker_tag_args_match_expected_argv() {
+    fn oci_tag_args_match_expected_argv() {
         assert_eq!(
-            docker_tag_args("ghcr.io/botworkz/svc@sha256:abc", "botwork/svc:local"),
+            oci_tag_args("ghcr.io/botworkz/svc@sha256:abc", "botwork/svc:local"),
             vec![
                 "tag",
                 "ghcr.io/botworkz/svc@sha256:abc",
@@ -1966,10 +1966,10 @@ mod tests {
     }
 
     #[test]
-    fn docker_save_args_match_expected_argv() {
+    fn oci_save_args_match_expected_argv() {
         let out = Path::new("/tmp/out/svc.tar");
         assert_eq!(
-            docker_save_args("botwork/svc:local", out),
+            oci_save_args("botwork/svc:local", out),
             vec!["save", "botwork/svc:local", "-o", "/tmp/out/svc.tar"]
         );
     }
