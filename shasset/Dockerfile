@@ -5,13 +5,13 @@ WORKDIR /build
 
 # Cache dependency compilation separately from source changes.
 COPY Cargo.toml Cargo.lock ./
-RUN mkdir src && echo 'fn main(){}' > src/main.rs \
+RUN mkdir src && echo 'fn main(){}' > src/main.rs && echo '' > src/lib.rs \
     && cargo build --release --locked \
     && rm -rf src
 
 # Build the real binary.
 COPY src ./src
-RUN touch src/main.rs \
+RUN touch src/main.rs src/lib.rs \
     && cargo build --release --locked
 
 # ── Stage 2: runtime ──────────────────────────────────────────────────────────
