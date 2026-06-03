@@ -97,10 +97,35 @@ This produces the stable local tag `botwork/packer-tools:local`.
 Current commands:
 
 - `botforge deps --out <dir> [--executable] [<name>]` — fetches file assets from `shasset.yaml` using the `shasset` library and stages each asset flat at `<dir>/<asset-filename>`, where the filename comes from the manifest `filename` field or the URI basename (not the manifest key). It also handles `oci://` image assets in the same manifest: `docker pull` by digest, `docker tag` to `botwork/<asset-key>:local`, then `docker save` flat to `<dir>/<asset-filename>` (or `<dir>/<asset-key>.tar` when `filename` is unset). `docker` must be on `PATH`; `oci://` URIs must be pinned with `@sha256:<64-hex>`; manifest `checksum` is ignored for `oci://` assets.
-- `botforge iso --src <dir> --out <file.iso> [--volume-id <id>]` — builds an ISO from a directory tree using `xorriso` (or `genisoimage` fallback).
+- `botforge iso --src <dir> --out <file.iso> [--volume-id <id>]` — builds an ISO from a directory tree using `xorriso` (or `genisoimage` fallback). Seed ISO mode is folded in: pass `--ssh-public-key <KEY>` or `--ssh-public-key-file <PATH>` (and optional `--user-data-template <PATH>`) to generate cloud-init `user-data`/`meta-data` and build from that temp tree. Use `--volume-id cidata` for NoCloud seed images.
 - `botforge pack [--repo-root <dir>] [--compress] [--key <path>] [--compose-service <name>] [--compose-file <path>]` — runs a KVM-only Packer build of the base VM image via docker compose, then optionally compresses the qcow2. Requires `/dev/kvm`; dependencies and baked images must already be staged beforehand because botforge v1 does not build them. KVM is required; there are no tcg/accelerator options.
+- `botforge run --base-image <qcow2> --overlay-image <overlay.qcow2> --seed-iso <cidata.iso> [--payload-iso <payload.iso>] [--ssh-port 2222] [--foreground]` — KVM-only qemu launcher. Creates the overlay via `qemu-img create -f qcow2 -F qcow2 -b <base> <overlay>`, then boots qemu with host SSH forwarding to guest port 22.
+- `botforge smoke --smoke-config <smoke.yaml> --base-image <qcow2> --ssh-key <private-key> [--ssh-host 127.0.0.1] [--ssh-port 2222] [--ssh-user bot] [--repo-root <dir>] [--keep-running]` — KVM-only config-driven smoke orchestration: builds cidata seed from `<ssh-key>.pub`, creates overlay, boots qemu in background, waits for SSH/cloud-init, runs upload+command validation steps, and collects diagnostics on failure.
 
-Planned subcommands remain forthcoming: `run`, `smoke`, and `payload`.
+Planned subcommands remain forthcoming: `payload`.
+
+Example `smoke.yaml`:
+
+```yaml
+isos:
+  - build/botspace-payload.iso
+steps:
+  - name: base-goss
+    uploads:
+      - { src: build/goss-0.4.9, dest: /tmp/goss }
+      - { src: ../vm/test/goss.yaml, dest: /tmp/goss.yaml }
+    run: sudo install -m0755 /tmp/goss /usr/local/bin/goss && sudo goss -g /tmp/goss.yaml validate
+  - name: payload-goss
+    uploads:
+      - { src: test/goss-payload.yaml, dest: /tmp/goss-payload.yaml }
+    run: sudo goss -g /tmp/goss-payload.yaml validate
+diagnostics_units:
+  - ssh
+  - botwork-launcher
+  - botwork-envoy
+  - botwork-session-broker
+  - botwork-auth-broker
+```
 
 Example mixed manifest for `deps`:
 
@@ -118,10 +143,10 @@ For v1, image resolution is registry-only (`oci://` pull-by-digest). Image build
 
 ## shasset
 
-`shasset` is a **generic, verified-asset downloader and registry manager**. It maintains a declarative manifest (`shasset.yaml`) of named assets — each with a URI, version, and mandatory SHA-256 checksum — and downloads and verifies those assets on demand.
+`shasset` is a **generic, verified-asset downloader and registry manager**. It maintains a declarative manifest (`shasset.yaml`) of named assets — each with a URI, optional version, and mandatory SHA-256 checksum for fetch/verify — and downloads and verifies those assets on demand.
 
 **What shasset IS:**
-- A registry (`shasset.yaml`) of named assets: URI, version, checksum, optional filename, optional auth.
+- A registry (`shasset.yaml`) of named assets: URI, optional version, checksum, optional filename, optional auth.
 - CRUD operations on that registry (`add`, `remove`, `get`).
 - A verified downloader: fetch one or all named assets, verify each against its checksum, and fail loudly on any mismatch or error.
 
@@ -152,14 +177,14 @@ settings:                 # all optional; CLI flags override
 assets:
   <name>:
     uri: https://example.com/releases/download/v${version}/tool-${version}.tar.gz
-    version: 0.0.1
+    version: 0.0.1                     # OPTIONAL; defaults to empty string
     checksum: sha256:<64-hex>        # REQUIRED for fetch/verify
     filename: tool-0.0.1.tar.gz     # OPTIONAL: forced output filename
     auth: ${GH_TOKEN}               # OPTIONAL: env-var template, resolved at runtime
 ```
 
 Rules:
-- `${version}` in `uri` and `filename` is expanded to the asset's `version` value.
+- `${version}` in `uri` and `filename` is expanded to the asset's `version` value (empty when omitted).
 - URI schemes are dispatch-based:
   - `http` / `https`: direct download (optional bearer auth).
   - `github-release://<owner>/<repo>/<tag>/<asset-name>`: `${version}` is expanded before parsing, the asset name is the final path segment, and the tag is everything between `<repo>` and the asset name so tags may contain `/` (for example `github-release://owner/repo/release/0.0.3/asset`). The handler resolves the release asset id via GitHub API, then downloads via `releases/assets/{id}`.

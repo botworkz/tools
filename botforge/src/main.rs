@@ -1,10 +1,14 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
+use serde::Deserialize;
 use shasset::fetch::{fetch_asset, FetchParams, MaterializeMode};
 use shasset::manifest::{load, Asset};
 use std::ffi::OsString;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -29,6 +33,10 @@ enum Commands {
     Iso(IsoArgs),
     /// Run the KVM-only Packer build flow inside docker compose.
     Pack(PackArgs),
+    /// Launch a VM with qemu (KVM-only).
+    Run(RunArgs),
+    /// Boot and validate a packed VM from a smoke config.
+    Smoke(SmokeArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -60,6 +68,15 @@ struct IsoArgs {
     /// ISO volume ID.
     #[arg(long, default_value = "BOTFORGE")]
     volume_id: String,
+    /// Inject this SSH public key into generated cloud-init user-data.
+    #[arg(long)]
+    ssh_public_key: Option<String>,
+    /// Read SSH public key from this file and inject into generated cloud-init user-data.
+    #[arg(long)]
+    ssh_public_key_file: Option<PathBuf>,
+    /// Optional cloud-init user-data template; replaces REPLACE_WITH_SSH_PUBLIC_KEY.
+    #[arg(long)]
+    user_data_template: Option<PathBuf>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -81,6 +98,88 @@ struct PackArgs {
     compose_file: Option<PathBuf>,
 }
 
+#[derive(clap::Args, Debug)]
+struct RunArgs {
+    /// Base qcow2 image path.
+    #[arg(long, required = true)]
+    base_image: PathBuf,
+    /// Overlay qcow2 image path to create.
+    #[arg(long, required = true)]
+    overlay_image: PathBuf,
+    /// NoCloud seed ISO path.
+    #[arg(long, required = true)]
+    seed_iso: PathBuf,
+    /// Optional payload ISO path.
+    #[arg(long)]
+    payload_iso: Option<PathBuf>,
+    /// Host SSH forward port to guest 22.
+    #[arg(long, default_value_t = 2222)]
+    ssh_port: u16,
+    /// Run qemu in the foreground.
+    #[arg(long)]
+    foreground: bool,
+}
+
+#[derive(clap::Args, Debug)]
+struct SmokeArgs {
+    /// Path to smoke.yaml config.
+    #[arg(long = "smoke-config", required = true)]
+    smoke_config: PathBuf,
+    /// Base qcow2 image path.
+    #[arg(long, required = true)]
+    base_image: PathBuf,
+    /// SSH private key path for guest access.
+    #[arg(long, required = true)]
+    ssh_key: PathBuf,
+    /// SSH host forwarded port.
+    #[arg(long, default_value_t = 2222)]
+    ssh_port: u16,
+    /// SSH host.
+    #[arg(long, default_value = "127.0.0.1")]
+    ssh_host: String,
+    /// SSH user.
+    #[arg(long, default_value = "bot")]
+    ssh_user: String,
+    /// Repo root for resolving relative smoke paths (default: current dir).
+    #[arg(long)]
+    repo_root: Option<PathBuf>,
+    /// Leave VM running and preserve overlay on exit.
+    #[arg(long)]
+    keep_running: bool,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct SmokeConfig {
+    #[serde(default)]
+    isos: Vec<PathBuf>,
+    #[serde(default)]
+    steps: Vec<SmokeStep>,
+    #[serde(default)]
+    diagnostics_units: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SmokeStep {
+    name: String,
+    #[serde(default)]
+    uploads: Vec<SmokeUpload>,
+    run: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SmokeUpload {
+    src: PathBuf,
+    dest: String,
+}
+
+const USER_DATA_PLACEHOLDER: &str = "REPLACE_WITH_SSH_PUBLIC_KEY";
+const SMOKE_SSH_READY_TIMEOUT: Duration = Duration::from_secs(300);
+const SMOKE_CLOUD_INIT_TIMEOUT: Duration = Duration::from_secs(300);
+const SMOKE_TRANSPORT_RETRIES: usize = 10;
+const SMOKE_TRANSPORT_RETRY_DELAY: Duration = Duration::from_secs(2);
+const SMOKE_STABLE_SSH_ATTEMPTS: usize = 5;
+const SMOKE_STABLE_SSH_REQUIRED: usize = 2;
+
 fn main() {
     if let Err(e) = run() {
         eprintln!("error: {e:#}");
@@ -94,6 +193,8 @@ fn run() -> Result<()> {
         Commands::Deps(args) => cmd_deps(&cli.config, args),
         Commands::Iso(args) => cmd_iso(args),
         Commands::Pack(args) => cmd_pack(args),
+        Commands::Run(args) => cmd_run(args),
+        Commands::Smoke(args) => cmd_smoke(args),
     }
 }
 
@@ -315,39 +416,154 @@ fn stage_oci_asset(asset_key: &str, asset: &Asset, out_dir: &Path) -> Result<Pat
 }
 
 fn cmd_iso(args: IsoArgs) -> Result<()> {
-    if !args.src.is_dir() {
-        bail!("source directory does not exist: {}", args.src.display());
+    let ssh_public_key = read_ssh_public_key(args.ssh_public_key, args.ssh_public_key_file)?;
+    if let Some(key) = ssh_public_key {
+        let template_content = args
+            .user_data_template
+            .as_ref()
+            .map(|path| {
+                std::fs::read_to_string(path)
+                    .with_context(|| format!("cannot read user-data template: {}", path.display()))
+            })
+            .transpose()?;
+        let temp_dir = create_temp_dir("botforge-seed")?;
+        let user_data = render_user_data(template_content.as_deref(), &key, None);
+        write_seed_files(&temp_dir, &user_data)?;
+        build_iso(&temp_dir, &args.out, &args.volume_id)?;
+        std::fs::remove_dir_all(&temp_dir)
+            .with_context(|| format!("cannot remove temp seed dir: {}", temp_dir.display()))?;
+    } else {
+        if !args.src.is_dir() {
+            bail!("source directory does not exist: {}", args.src.display());
+        }
+        build_iso(&args.src, &args.out, &args.volume_id)?;
     }
 
-    if let Some(parent) = args.out.parent() {
+    println!("built ISO at {}", args.out.display());
+    Ok(())
+}
+
+fn read_ssh_public_key(
+    ssh_public_key: Option<String>,
+    ssh_public_key_file: Option<PathBuf>,
+) -> Result<Option<String>> {
+    match (ssh_public_key, ssh_public_key_file) {
+        (Some(_), Some(_)) => {
+            bail!("provide only one of --ssh-public-key or --ssh-public-key-file")
+        }
+        (Some(key), None) => Ok(Some(key.trim().to_string())),
+        (None, Some(path)) => {
+            let key = std::fs::read_to_string(&path)
+                .with_context(|| format!("cannot read SSH public key file: {}", path.display()))?;
+            Ok(Some(key.trim().to_string()))
+        }
+        (None, None) => Ok(None),
+    }
+}
+
+fn render_user_data(
+    template: Option<&str>,
+    ssh_public_key: &str,
+    ssh_user: Option<&str>,
+) -> String {
+    if let Some(template) = template {
+        return template.replace(USER_DATA_PLACEHOLDER, ssh_public_key);
+    }
+    if let Some(user) = ssh_user {
+        return format!(
+            "#cloud-config\nusers:\n  - default\n  - name: {user}\n    ssh_authorized_keys:\n      - {ssh_public_key}\n"
+        );
+    }
+    format!("#cloud-config\nssh_authorized_keys:\n  - {ssh_public_key}\n")
+}
+
+fn write_seed_files(seed_dir: &Path, user_data: &str) -> Result<()> {
+    std::fs::create_dir_all(seed_dir)
+        .with_context(|| format!("cannot create seed dir: {}", seed_dir.display()))?;
+    std::fs::write(
+        seed_dir.join("meta-data"),
+        "instance-id: iid-local01\nlocal-hostname: botforge\n",
+    )
+    .with_context(|| format!("cannot write seed meta-data in {}", seed_dir.display()))?;
+    std::fs::write(seed_dir.join("user-data"), user_data)
+        .with_context(|| format!("cannot write seed user-data in {}", seed_dir.display()))?;
+    Ok(())
+}
+
+fn build_iso(src_dir: &Path, out: &Path, volume_id: &str) -> Result<()> {
+    if !src_dir.is_dir() {
+        bail!("source directory does not exist: {}", src_dir.display());
+    }
+    if let Some(parent) = out.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("cannot create output dir: {}", parent.display()))?;
     }
 
     let tool = detect_iso_tool()?;
-    let mut command = Command::new(tool);
-    if tool == "xorriso" {
-        command.arg("-as").arg("mkisofs");
-    }
-    command
-        .arg("-r")
-        .arg("-J")
-        .arg("-V")
-        .arg(&args.volume_id)
-        .arg("-o")
-        .arg(&args.out)
-        .arg(&args.src);
+    let file_name = out
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("out.iso");
+    let tmp_out = out
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!(".{file_name}.{}.tmp", unique_suffix()));
 
-    let output = command
-        .output()
-        .with_context(|| format!("failed to execute {tool}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("{tool} failed: {}", stderr.trim());
+    let args = iso_args(tool, src_dir, &tmp_out, volume_id)?;
+    if let Err(err) = run_command(tool, &args, &[], &format!("{tool} failed")) {
+        let _ = std::fs::remove_file(&tmp_out);
+        return Err(err);
     }
 
-    println!("built ISO at {}", args.out.display());
+    if out.exists() {
+        std::fs::remove_file(out)
+            .with_context(|| format!("cannot replace output file: {}", out.display()))?;
+    }
+    std::fs::rename(&tmp_out, out).with_context(|| {
+        format!(
+            "cannot atomically materialize output from {} to {}",
+            tmp_out.display(),
+            out.display()
+        )
+    })?;
     Ok(())
+}
+
+fn iso_args(tool: &str, src_dir: &Path, out: &Path, volume_id: &str) -> Result<Vec<String>> {
+    let mut args = match tool {
+        "xorriso" => vec!["-as".into(), "mkisofs".into()],
+        "genisoimage" => Vec::new(),
+        _ => bail!("unsupported iso tool '{tool}'"),
+    };
+    args.extend([
+        "-r".into(),
+        "-J".into(),
+        "-V".into(),
+        volume_id.into(),
+        "-o".into(),
+        out.display().to_string(),
+        src_dir.display().to_string(),
+    ]);
+    Ok(args)
+}
+
+fn create_temp_dir(prefix: &str) -> Result<PathBuf> {
+    let base = std::env::temp_dir();
+    let path = base.join(format!("{prefix}-{}", unique_suffix()));
+    std::fs::create_dir_all(&path)
+        .with_context(|| format!("cannot create temp dir: {}", path.display()))?;
+    Ok(path)
+}
+
+fn unique_suffix() -> String {
+    format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    )
 }
 
 /// Run the simplified v1 Packer flow in docker compose.
@@ -377,17 +593,6 @@ fn cmd_pack(args: PackArgs) -> Result<()> {
             .unwrap_or_else(|| PathBuf::from("compose.yaml")),
     );
     let build_dir = repo_root.join("build");
-    if build_dir.exists() {
-        let build_dir_real = std::fs::canonicalize(&build_dir)
-            .with_context(|| format!("cannot resolve build dir: {}", build_dir.display()))?;
-        let build_rel = repo_relative_path(&repo_root, &build_dir_real)?;
-        if build_rel != "build" {
-            bail!(
-                "refusing to use non-standard build directory under repo root: {}",
-                build_dir.display()
-            );
-        }
-    }
     let build_rel = repo_relative_path(&repo_root, &build_dir)?;
     if build_rel != "build" {
         bail!(
@@ -527,6 +732,440 @@ fn cmd_pack(args: PackArgs) -> Result<()> {
     Ok(())
 }
 
+fn cmd_run(args: RunArgs) -> Result<()> {
+    require_kvm()?;
+    ensure_command("qemu-system-x86_64")?;
+    ensure_command("qemu-img")?;
+
+    let base_image = normalize_path(&args.base_image);
+    let overlay_image = normalize_path(&args.overlay_image);
+    let seed_iso = normalize_path(&args.seed_iso);
+    let payload_isos: Vec<PathBuf> = args
+        .payload_iso
+        .as_ref()
+        .map(|path| vec![normalize_path(path)])
+        .unwrap_or_default();
+
+    create_overlay_image(&base_image, &overlay_image)?;
+    let mut qemu_args = qemu_run_args(
+        &base_image,
+        &overlay_image,
+        &seed_iso,
+        &payload_isos,
+        args.ssh_port,
+    );
+    if !args.foreground {
+        qemu_args.push("-daemonize".into());
+    }
+
+    run_command("qemu-system-x86_64", &qemu_args, &[], "qemu launch failed")?;
+    Ok(())
+}
+
+fn cmd_smoke(args: SmokeArgs) -> Result<()> {
+    require_kvm()?;
+    ensure_command("qemu-system-x86_64")?;
+    ensure_command("qemu-img")?;
+    ensure_command("ssh")?;
+    ensure_command("scp")?;
+    detect_iso_tool()?;
+
+    let repo_root = std::fs::canonicalize(
+        args.repo_root
+            .unwrap_or(std::env::current_dir().context("failed to determine current directory")?),
+    )
+    .context("failed to resolve repo root")?;
+    let smoke_config_path = resolve_under_root(&repo_root, args.smoke_config);
+    let base_image = resolve_under_root(&repo_root, args.base_image);
+    let ssh_key = resolve_under_root(&repo_root, args.ssh_key);
+    let ssh_pub = PathBuf::from(format!("{}.pub", ssh_key.display()));
+
+    let smoke_config = load_smoke_config(&smoke_config_path)?;
+    let build_dir = repo_root.join("build");
+    std::fs::create_dir_all(&build_dir)
+        .with_context(|| format!("cannot create build dir: {}", build_dir.display()))?;
+    let overlay_image = build_dir.join("smoke-overlay.qcow2");
+    let seed_iso = build_dir.join("smoke-seed.iso");
+    let vm_log = build_dir.join("smoke-vm.log");
+    let seed_dir = create_temp_dir("botforge-smoke-seed")?;
+
+    let ssh_public_key = std::fs::read_to_string(&ssh_pub)
+        .with_context(|| format!("cannot read SSH public key: {}", ssh_pub.display()))?;
+    let user_data = render_user_data(None, ssh_public_key.trim(), Some(args.ssh_user.as_str()));
+    write_seed_files(&seed_dir, &user_data)?;
+    build_iso(&seed_dir, &seed_iso, "cidata")?;
+    std::fs::remove_dir_all(&seed_dir)
+        .with_context(|| format!("cannot remove temp seed dir: {}", seed_dir.display()))?;
+
+    create_overlay_image(&base_image, &overlay_image)?;
+
+    let mut extra_isos = Vec::new();
+    for iso in &smoke_config.isos {
+        extra_isos.push(resolve_under_root(&repo_root, iso.clone()));
+    }
+    let qemu_args = qemu_run_args(
+        &base_image,
+        &overlay_image,
+        &seed_iso,
+        &extra_isos,
+        args.ssh_port,
+    );
+
+    let mut vm_child = Some(spawn_qemu_with_log(&qemu_args, &vm_log)?);
+    let ssh_options = SshOptions {
+        host: args.ssh_host.clone(),
+        port: args.ssh_port,
+        user: args.ssh_user.clone(),
+        key: ssh_key.clone(),
+    };
+
+    let smoke_result = run_smoke_flow(&repo_root, &smoke_config, &ssh_options);
+    if let Err(err) = smoke_result {
+        eprintln!("smoke failed: {err:#}");
+        collect_smoke_diagnostics(&ssh_options, &smoke_config.diagnostics_units);
+        print_log_tail(&vm_log, 200);
+        if !args.keep_running {
+            cleanup_smoke(&mut vm_child, &overlay_image);
+        }
+        return Err(err);
+    }
+
+    if !args.keep_running {
+        cleanup_smoke(&mut vm_child, &overlay_image);
+    }
+    println!("smoke test passed");
+    Ok(())
+}
+
+#[derive(Clone)]
+struct SshOptions {
+    host: String,
+    port: u16,
+    user: String,
+    key: PathBuf,
+}
+
+fn run_smoke_flow(repo_root: &Path, config: &SmokeConfig, ssh: &SshOptions) -> Result<()> {
+    wait_for_ssh(ssh, SMOKE_SSH_READY_TIMEOUT)?;
+    ssh_with_retry(
+        ssh,
+        "sudo cloud-init status --wait",
+        SMOKE_TRANSPORT_RETRIES,
+        SMOKE_TRANSPORT_RETRY_DELAY,
+        SMOKE_CLOUD_INIT_TIMEOUT,
+    )?;
+    require_stable_ssh(ssh, SMOKE_STABLE_SSH_ATTEMPTS, SMOKE_STABLE_SSH_REQUIRED)?;
+
+    for step in &config.steps {
+        for upload in &step.uploads {
+            let src = resolve_under_root(repo_root, upload.src.clone());
+            scp_with_retry(
+                ssh,
+                &src,
+                &upload.dest,
+                SMOKE_TRANSPORT_RETRIES,
+                SMOKE_TRANSPORT_RETRY_DELAY,
+            )
+            .with_context(|| format!("smoke step '{}' upload failed", step.name))?;
+        }
+        ssh_with_retry(
+            ssh,
+            &step.run,
+            SMOKE_TRANSPORT_RETRIES,
+            SMOKE_TRANSPORT_RETRY_DELAY,
+            Duration::from_secs(300),
+        )
+        .with_context(|| format!("smoke step '{}' command failed", step.name))?;
+    }
+    Ok(())
+}
+
+fn load_smoke_config(path: &Path) -> Result<SmokeConfig> {
+    let yaml = std::fs::read_to_string(path)
+        .with_context(|| format!("cannot read smoke config: {}", path.display()))?;
+    serde_yaml::from_str(&yaml).with_context(|| format!("invalid smoke config: {}", path.display()))
+}
+
+fn require_kvm() -> Result<()> {
+    if !Path::new("/dev/kvm").exists() {
+        bail!("KVM is required: /dev/kvm not found");
+    }
+    Ok(())
+}
+
+fn ensure_command(program: &str) -> Result<()> {
+    if !command_exists(program) {
+        bail!("'{program}' is not available on PATH");
+    }
+    Ok(())
+}
+
+fn create_overlay_image(base_image: &Path, overlay_image: &Path) -> Result<()> {
+    if !base_image.is_file() {
+        bail!("base image not found: {}", base_image.display());
+    }
+    if let Some(parent) = overlay_image.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("cannot create overlay dir: {}", parent.display()))?;
+    }
+    let args = qemu_img_create_args(base_image, overlay_image);
+    run_command("qemu-img", &args, &[], "qemu-img create overlay failed")
+}
+
+fn qemu_img_create_args(base_image: &Path, overlay_image: &Path) -> Vec<String> {
+    vec![
+        "create".into(),
+        "-f".into(),
+        "qcow2".into(),
+        "-F".into(),
+        "qcow2".into(),
+        "-b".into(),
+        base_image.display().to_string(),
+        overlay_image.display().to_string(),
+    ]
+}
+
+fn qemu_run_args(
+    base_image: &Path,
+    overlay_image: &Path,
+    seed_iso: &Path,
+    extra_isos: &[PathBuf],
+    ssh_port: u16,
+) -> Vec<String> {
+    let mut args = vec![
+        "-accel".into(),
+        "kvm".into(),
+        "-m".into(),
+        "2048".into(),
+        "-smp".into(),
+        "2".into(),
+        "-cpu".into(),
+        "host".into(),
+        "-drive".into(),
+        format!("file={},if=virtio,format=qcow2", base_image.display()),
+        "-drive".into(),
+        format!("file={},if=virtio,format=qcow2", overlay_image.display()),
+        "-drive".into(),
+        format!("file={},media=cdrom", seed_iso.display()),
+    ];
+    for iso in extra_isos {
+        args.push("-drive".into());
+        args.push(format!("file={},media=cdrom", iso.display()));
+    }
+    args.extend([
+        "-netdev".into(),
+        format!("user,id=net0,hostfwd=tcp:127.0.0.1:{ssh_port}-:22"),
+        "-device".into(),
+        "virtio-net-pci,netdev=net0".into(),
+        "-nographic".into(),
+    ]);
+    args
+}
+
+fn spawn_qemu_with_log(args: &[String], log_path: &Path) -> Result<Child> {
+    let log = File::create(log_path)
+        .with_context(|| format!("cannot create VM log file: {}", log_path.display()))?;
+    let log_err = log
+        .try_clone()
+        .with_context(|| format!("cannot clone VM log file handle: {}", log_path.display()))?;
+    Command::new("qemu-system-x86_64")
+        .args(args)
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(log_err))
+        .spawn()
+        .context("failed to launch qemu in background")
+}
+
+fn ssh_command_args(
+    ssh: &SshOptions,
+    remote_command: &str,
+    connect_timeout_secs: u64,
+) -> Vec<String> {
+    vec![
+        "-o".into(),
+        "StrictHostKeyChecking=no".into(),
+        "-o".into(),
+        "UserKnownHostsFile=/dev/null".into(),
+        "-o".into(),
+        format!("ConnectTimeout={connect_timeout_secs}"),
+        "-i".into(),
+        ssh.key.display().to_string(),
+        "-p".into(),
+        ssh.port.to_string(),
+        format!("{}@{}", ssh.user, ssh.host),
+        remote_command.into(),
+    ]
+}
+
+fn scp_command_args(ssh: &SshOptions, src: &Path, dest: &str) -> Vec<String> {
+    vec![
+        "-o".into(),
+        "StrictHostKeyChecking=no".into(),
+        "-o".into(),
+        "UserKnownHostsFile=/dev/null".into(),
+        "-i".into(),
+        ssh.key.display().to_string(),
+        "-P".into(),
+        ssh.port.to_string(),
+        src.display().to_string(),
+        format!("{}@{}:{dest}", ssh.user, ssh.host),
+    ]
+}
+
+fn journalctl_command(units: &[String]) -> String {
+    if units.is_empty() {
+        return "sudo journalctl --no-pager -n 200".into();
+    }
+    let mut parts = vec!["sudo journalctl".to_string()];
+    for unit in units {
+        parts.push(format!("-u {unit}"));
+    }
+    parts.push("--no-pager -n 200".to_string());
+    parts.join(" ")
+}
+
+fn wait_for_ssh(ssh: &SshOptions, timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if ssh_with_retry(
+            ssh,
+            "true",
+            1,
+            Duration::from_secs(0),
+            Duration::from_secs(10),
+        )
+        .is_ok()
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!("timed out waiting for SSH");
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+}
+
+fn require_stable_ssh(
+    ssh: &SshOptions,
+    attempts: usize,
+    required_consecutive: usize,
+) -> Result<()> {
+    let mut consecutive = 0usize;
+    for _ in 0..attempts {
+        if ssh_with_retry(
+            ssh,
+            "true",
+            1,
+            Duration::from_secs(0),
+            Duration::from_secs(10),
+        )
+        .is_ok()
+        {
+            consecutive += 1;
+            if consecutive >= required_consecutive {
+                return Ok(());
+            }
+        } else {
+            consecutive = 0;
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    bail!("SSH was not stable enough after {attempts} probes")
+}
+
+fn ssh_with_retry(
+    ssh: &SshOptions,
+    remote_command: &str,
+    retries: usize,
+    retry_delay: Duration,
+    connect_timeout: Duration,
+) -> Result<()> {
+    let args = ssh_command_args(ssh, remote_command, connect_timeout.as_secs());
+    retry_transport_cmd("ssh", &args, retries, retry_delay, "ssh command failed")
+}
+
+fn scp_with_retry(
+    ssh: &SshOptions,
+    src: &Path,
+    dest: &str,
+    retries: usize,
+    retry_delay: Duration,
+) -> Result<()> {
+    let args = scp_command_args(ssh, src, dest);
+    retry_transport_cmd("scp", &args, retries, retry_delay, "scp command failed")
+}
+
+fn retry_transport_cmd(
+    program: &str,
+    args: &[String],
+    retries: usize,
+    retry_delay: Duration,
+    failure_context: &str,
+) -> Result<()> {
+    let mut attempts = 0usize;
+    loop {
+        let status = Command::new(program)
+            .args(args)
+            .status()
+            .with_context(|| format!("failed to execute {program}"))?;
+        if status.success() {
+            return Ok(());
+        }
+        attempts += 1;
+        if status.code() != Some(255) || attempts >= retries {
+            bail!("{failure_context} (exit status: {status})");
+        }
+        std::thread::sleep(retry_delay);
+    }
+}
+
+fn collect_smoke_diagnostics(ssh: &SshOptions, units: &[String]) {
+    let _ = ssh_with_retry(
+        ssh,
+        "systemctl --failed",
+        1,
+        Duration::from_secs(0),
+        Duration::from_secs(10),
+    );
+    let _ = ssh_with_retry(
+        ssh,
+        &journalctl_command(units),
+        1,
+        Duration::from_secs(0),
+        Duration::from_secs(10),
+    );
+    let _ = ssh_with_retry(
+        ssh,
+        "cloud-init status --long",
+        1,
+        Duration::from_secs(0),
+        Duration::from_secs(10),
+    );
+}
+
+fn print_log_tail(path: &Path, line_count: usize) {
+    let Ok(file) = File::open(path) else {
+        return;
+    };
+    let lines: Vec<String> = BufReader::new(file)
+        .lines()
+        .map_while(|line| line.ok())
+        .collect();
+    let start = lines.len().saturating_sub(line_count);
+    for line in &lines[start..] {
+        eprintln!("{line}");
+    }
+}
+
+fn cleanup_smoke(vm_child: &mut Option<Child>, overlay_image: &Path) {
+    if let Some(child) = vm_child.as_mut() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    *vm_child = None;
+    let _ = std::fs::remove_file(overlay_image);
+}
+
 fn detect_iso_tool() -> Result<&'static str> {
     if command_exists("xorriso") {
         return Ok("xorriso");
@@ -540,9 +1179,10 @@ fn detect_iso_tool() -> Result<&'static str> {
 fn command_exists(program: &str) -> bool {
     Command::new(program)
         .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok()
 }
 
 fn resolve_under_root(repo_root: &Path, path: PathBuf) -> PathBuf {
@@ -808,9 +1448,10 @@ fn validate_flat_filename(filename: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        docker_pull_args, docker_save_args, docker_tag_args, image_tarball_name, local_tag_for,
-        materialize_flat, packer_build_args, parse_oci_uri, repo_relative_path,
-        resolve_host_kvm_gid,
+        docker_pull_args, docker_save_args, docker_tag_args, image_tarball_name, iso_args,
+        journalctl_command, local_tag_for, materialize_flat, packer_build_args, parse_oci_uri,
+        qemu_img_create_args, qemu_run_args, render_user_data, repo_relative_path,
+        resolve_host_kvm_gid, scp_command_args, ssh_command_args, SshOptions,
     };
     use std::path::Path;
     use tempfile::TempDir;
@@ -1059,6 +1700,177 @@ mod tests {
         assert_eq!(
             docker_save_args("botwork/svc:local", out),
             vec!["save", "botwork/svc:local", "-o", "/tmp/out/svc.tar"]
+        );
+    }
+
+    #[test]
+    fn render_user_data_replaces_placeholder() {
+        let template = "#cloud-config\nssh_authorized_keys:\n  - REPLACE_WITH_SSH_PUBLIC_KEY\n";
+        let rendered = render_user_data(Some(template), "ssh-ed25519 AAAA test", None);
+        assert!(rendered.contains("ssh-ed25519 AAAA test"));
+        assert!(!rendered.contains("REPLACE_WITH_SSH_PUBLIC_KEY"));
+    }
+
+    #[test]
+    fn iso_args_xorriso_match_expected_argv() {
+        let args = iso_args(
+            "xorriso",
+            Path::new("/tmp/src"),
+            Path::new("/tmp/out.iso"),
+            "cidata",
+        )
+        .unwrap();
+        assert_eq!(
+            args,
+            vec![
+                "-as",
+                "mkisofs",
+                "-r",
+                "-J",
+                "-V",
+                "cidata",
+                "-o",
+                "/tmp/out.iso",
+                "/tmp/src"
+            ]
+        );
+    }
+
+    #[test]
+    fn iso_args_genisoimage_match_expected_argv() {
+        let args = iso_args(
+            "genisoimage",
+            Path::new("/tmp/src"),
+            Path::new("/tmp/out.iso"),
+            "BOTFORGE",
+        )
+        .unwrap();
+        assert_eq!(
+            args,
+            vec![
+                "-r",
+                "-J",
+                "-V",
+                "BOTFORGE",
+                "-o",
+                "/tmp/out.iso",
+                "/tmp/src"
+            ]
+        );
+    }
+
+    #[test]
+    fn qemu_img_create_args_match_expected_argv() {
+        assert_eq!(
+            qemu_img_create_args(Path::new("/base.qcow2"), Path::new("/overlay.qcow2")),
+            vec![
+                "create",
+                "-f",
+                "qcow2",
+                "-F",
+                "qcow2",
+                "-b",
+                "/base.qcow2",
+                "/overlay.qcow2"
+            ]
+        );
+    }
+
+    #[test]
+    fn qemu_run_args_match_expected_argv() {
+        let args = qemu_run_args(
+            Path::new("/base.qcow2"),
+            Path::new("/overlay.qcow2"),
+            Path::new("/seed.iso"),
+            &[Path::new("/payload.iso").to_path_buf()],
+            2222,
+        );
+        assert_eq!(
+            args,
+            vec![
+                "-accel",
+                "kvm",
+                "-m",
+                "2048",
+                "-smp",
+                "2",
+                "-cpu",
+                "host",
+                "-drive",
+                "file=/base.qcow2,if=virtio,format=qcow2",
+                "-drive",
+                "file=/overlay.qcow2,if=virtio,format=qcow2",
+                "-drive",
+                "file=/seed.iso,media=cdrom",
+                "-drive",
+                "file=/payload.iso,media=cdrom",
+                "-netdev",
+                "user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22",
+                "-device",
+                "virtio-net-pci,netdev=net0",
+                "-nographic"
+            ]
+        );
+    }
+
+    #[test]
+    fn ssh_command_args_match_expected_argv() {
+        let ssh = SshOptions {
+            host: "127.0.0.1".into(),
+            port: 2222,
+            user: "bot".into(),
+            key: Path::new("/tmp/key").to_path_buf(),
+        };
+        assert_eq!(
+            ssh_command_args(&ssh, "true", 10),
+            vec![
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                "UserKnownHostsFile=/dev/null",
+                "-o",
+                "ConnectTimeout=10",
+                "-i",
+                "/tmp/key",
+                "-p",
+                "2222",
+                "bot@127.0.0.1",
+                "true"
+            ]
+        );
+    }
+
+    #[test]
+    fn scp_command_args_match_expected_argv() {
+        let ssh = SshOptions {
+            host: "127.0.0.1".into(),
+            port: 2222,
+            user: "bot".into(),
+            key: Path::new("/tmp/key").to_path_buf(),
+        };
+        assert_eq!(
+            scp_command_args(&ssh, Path::new("/tmp/local"), "/tmp/remote"),
+            vec![
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                "UserKnownHostsFile=/dev/null",
+                "-i",
+                "/tmp/key",
+                "-P",
+                "2222",
+                "/tmp/local",
+                "bot@127.0.0.1:/tmp/remote"
+            ]
+        );
+    }
+
+    #[test]
+    fn journalctl_command_includes_units() {
+        let cmd = journalctl_command(&["ssh".to_string(), "botwork-launcher".to_string()]);
+        assert_eq!(
+            cmd,
+            "sudo journalctl -u ssh -u botwork-launcher --no-pager -n 200"
         );
     }
 }
