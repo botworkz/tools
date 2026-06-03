@@ -5,6 +5,10 @@ edition = "2021"
 description = "Generic verified-asset downloader and registry manager"
 license = "MIT"
 
+[lib]
+name = "shasset"
+path = "src/lib.rs"
+
 [[bin]]
 name = "shasset"
 path = "src/main.rs"
