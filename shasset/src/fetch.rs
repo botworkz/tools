@@ -390,8 +390,8 @@ fn parse_github_release_uri(uri: &str) -> std::result::Result<GithubReleaseRef, 
         )));
     }
     let repo = segments[0].to_string();
-    let tag = segments[1].to_string();
-    let asset_name = segments[2..].join("/");
+    let asset_name = segments[segments.len() - 1].to_string();
+    let tag = segments[1..segments.len() - 1].join("/");
     if asset_name.is_empty() {
         return Err(FetchError::permanent(anyhow!(
             "github-release uri is missing asset name: {uri}"
@@ -1143,6 +1143,94 @@ mod tests {
     }
 
     #[test]
+    fn parse_github_release_uri_allows_slashes_in_tag() {
+        let slash_tag = parse_github_release_uri(
+            "github-release://botworkz/botwork-extra/release/0.0.3/botwork-vault",
+        )
+        .unwrap();
+        assert_eq!(slash_tag.owner, "botworkz");
+        assert_eq!(slash_tag.repo, "botwork-extra");
+        assert_eq!(slash_tag.tag, "release/0.0.3");
+        assert_eq!(slash_tag.asset_name, "botwork-vault");
+
+        let single_segment_tag =
+            parse_github_release_uri("github-release://botworkz/tools/v1.2.3/tool.tar.gz").unwrap();
+        assert_eq!(single_segment_tag.owner, "botworkz");
+        assert_eq!(single_segment_tag.repo, "tools");
+        assert_eq!(single_segment_tag.tag, "v1.2.3");
+        assert_eq!(single_segment_tag.asset_name, "tool.tar.gz");
+    }
+
+    #[test]
+    fn github_release_scheme_supports_slashes_in_tag() {
+        let data = b"hello from github release with slash tag";
+        let hex = sha256_hex(data);
+        let asset = Asset {
+            uri: "github-release://botworkz/botwork-extra/release/0.0.3/botwork-vault".to_string(),
+            version: "1".to_string(),
+            checksum: Some(format!("sha256:{hex}")),
+            filename: None,
+            auth: Some("${SHASSET_TEST_TOKEN}".to_string()),
+        };
+        std::env::set_var("SHASSET_TEST_TOKEN", "token123");
+
+        let out = TempDir::new().unwrap();
+        let cache = TempDir::new().unwrap();
+
+        let release_json = serde_json::json!({
+            "assets": [
+                {"id": 7u64, "name": "botwork-vault"},
+                {"id": 99u64, "name": "other.tar.gz"}
+            ]
+        })
+        .to_string()
+        .into_bytes();
+
+        let (transport, calls) = MockTransport::with_expectations(
+            vec![
+                MockOutcome::Body {
+                    body: release_json,
+                    content_length: None,
+                },
+                MockOutcome::Body {
+                    body: data.to_vec(),
+                    content_length: None,
+                },
+            ],
+            vec![
+                (
+                    "https://api.github.com/repos/botworkz/botwork-extra/releases/tags/release/0.0.3"
+                        .to_string(),
+                    Some("application/vnd.github+json".to_string()),
+                ),
+                (
+                    "https://api.github.com/repos/botworkz/botwork-extra/releases/assets/7"
+                        .to_string(),
+                    Some("application/octet-stream".to_string()),
+                ),
+            ],
+        );
+
+        let result = fetch_asset(FetchParams {
+            name: "mytool",
+            asset: &asset,
+            out_dir: Some(out.path()),
+            cache_dir: cache.path(),
+            retries: 0,
+            backoff: &Backoff::default(),
+            compute_checksum: false,
+            no_reverify: false,
+            materialize_mode: MaterializeMode::Copy,
+            transport: Some(Box::new(transport)),
+        })
+        .unwrap();
+
+        assert_eq!(MockTransport::call_count(&calls), 2);
+        assert_eq!(result.computed_sha256, hex);
+        assert_eq!(std::fs::read(result.path.unwrap()).unwrap(), data);
+    }
+
+    #[test]
     fn github_release_scheme_errors_when_asset_missing() {
         let asset = Asset {
             uri: "github-release://botworkz/tools/v1.2.3/missing.tar.gz".to_string(),
@@ -1178,6 +1266,27 @@ mod tests {
 
         assert_eq!(MockTransport::call_count(&calls), 1);
         assert!(format!("{err:#}").contains("asset 'missing.tar.gz' not found"));
+    }
+
+    #[test]
+    fn unsupported_uri_scheme_is_permanent_error() {
+        let cache = TempDir::new().unwrap();
+        let (transport, calls) = MockTransport::new(b"ignored".to_vec());
+
+        let err =
+            download_via_scheme(&transport, cache.path(), "ftp://example.com/x", None).unwrap_err();
+
+        assert_eq!(MockTransport::call_count(&calls), 0);
+        assert!(format!("{err:#}").contains("unsupported uri scheme 'ftp'"));
+    }
+
+    #[test]
+    fn parse_github_release_uri_requires_repo_tag_and_asset_segments() {
+        let err = parse_github_release_uri("github-release://botworkz/botwork-extra").unwrap_err();
+
+        assert!(format!("{err:#}").contains(
+            "github-release uri must be github-release://<owner>/<repo>/<tag>/<asset-name>"
+        ));
     }
 
     #[test]

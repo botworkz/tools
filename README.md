@@ -136,7 +136,7 @@ Rules:
 - `${version}` in `uri` and `filename` is expanded to the asset's `version` value.
 - URI schemes are dispatch-based:
   - `http` / `https`: direct download (optional bearer auth).
-  - `github-release://<owner>/<repo>/<tag>/<asset-name>`: resolve the release asset id via GitHub API, then download via `releases/assets/{id}`.
+  - `github-release://<owner>/<repo>/<tag>/<asset-name>`: `${version}` is expanded before parsing, the asset name is the final path segment, and the tag is everything between `<repo>` and the asset name so tags may contain `/` (for example `github-release://owner/repo/release/0.0.3/asset`). The handler resolves the release asset id via GitHub API, then downloads via `releases/assets/{id}`.
 - `checksum` must be `sha256:<64-hex>`. An asset without a checksum cannot be fetched; use `add --compute` to populate it.
 - `filename`: when set, the downloaded file is always written with this exact name (after `${version}` expansion). When absent, the URI basename is used.
 - `auth`: the `${ENV_VAR}` template is stored as-is and resolved from the process environment at fetch time. The resolved secret is sent as `Authorization: ****** **The secret is never written back to the manifest file.** If the referenced variable is unset, shasset errors clearly.
