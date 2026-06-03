@@ -74,12 +74,12 @@ fn default_factor() -> u64 {
 /// A single named asset entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Asset {
-    pub url: String,
+    pub uri: String,
     pub version: String,
     /// `sha256:<64-hex>` — required for fetch/verify unless being computed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checksum: Option<String>,
-    /// Forced output filename; when absent the URL basename is used.
+    /// Forced output filename; when absent the URI basename is used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filename: Option<String>,
     /// `${ENV_VAR}` template resolved at runtime; NEVER written back resolved.
@@ -88,30 +88,30 @@ pub struct Asset {
 }
 
 impl Asset {
-    /// Expand `${version}` inside `url` (and `filename` if present).
-    pub fn expanded_url(&self) -> String {
-        self.url.replace("${version}", &self.version)
+    /// Expand `${version}` inside `uri` (and `filename` if present).
+    pub fn expanded_uri(&self) -> String {
+        self.uri.replace("${version}", &self.version)
     }
 
     /// Derive the output filename: manifest `filename` (version-expanded) if set,
-    /// else basename of the expanded URL.
+    /// else basename of the expanded URI.
     pub fn output_filename(&self) -> Result<String> {
         if let Some(tpl) = &self.filename {
             return Ok(tpl.replace("${version}", &self.version));
         }
-        let url = self.expanded_url();
-        let path = url
+        let uri = self.expanded_uri();
+        let path = uri
             .split('?')
             .next()
-            .unwrap_or(&url)
+            .unwrap_or(&uri)
             .split('#')
             .next()
-            .unwrap_or(&url);
+            .unwrap_or(&uri);
         let basename = path
             .rsplit('/')
             .next()
             .filter(|s| !s.is_empty())
-            .with_context(|| format!("cannot derive output filename from URL: {url}"))?;
+            .with_context(|| format!("cannot derive output filename from URI: {uri}"))?;
         Ok(basename.to_string())
     }
 

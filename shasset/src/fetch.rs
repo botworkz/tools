@@ -93,12 +93,34 @@ pub struct DownloadResponse {
 
 /// Minimal transport abstraction so tests can inject a mock.
 pub trait Transport: Send + Sync {
-    /// Fetch `url` (with optional auth token) and return a streaming body reader.
+    /// Fetch `uri` (with optional auth token) and return a streaming body reader.
     fn get(
         &self,
-        url: &str,
+        uri: &str,
         auth: Option<&str>,
+        accept: Option<&str>,
     ) -> std::result::Result<DownloadResponse, FetchError>;
+
+    fn get_json(
+        &self,
+        uri: &str,
+        auth: Option<&str>,
+    ) -> std::result::Result<serde_json::Value, FetchError> {
+        let mut response = self.get(uri, auth, Some("application/vnd.github+json"))?;
+        let mut body = String::new();
+        response.body.read_to_string(&mut body).map_err(|error| {
+            FetchError::retryable(
+                anyhow::Error::new(error)
+                    .context(format!("failed to read response body from {uri}")),
+            )
+        })?;
+        serde_json::from_str::<serde_json::Value>(&body).map_err(|error| {
+            FetchError::permanent(
+                anyhow::Error::new(error)
+                    .context(format!("failed to parse JSON response from {uri}")),
+            )
+        })
+    }
 }
 
 /// Real reqwest-based transport.
@@ -120,23 +142,27 @@ impl Default for ReqwestTransport {
 impl Transport for ReqwestTransport {
     fn get(
         &self,
-        url: &str,
+        uri: &str,
         auth: Option<&str>,
+        accept: Option<&str>,
     ) -> std::result::Result<DownloadResponse, FetchError> {
-        let mut req = self.client.get(url);
+        let mut req = self.client.get(uri).header("User-Agent", "shasset");
         if let Some(token) = auth {
             let header_val = ["Bearer ", token].concat();
             req = req.header("Authorization", header_val);
         }
+        if let Some(accept_header) = accept {
+            req = req.header("Accept", accept_header);
+        }
         let resp = req.send().map_err(|error| {
             FetchError::retryable(
-                anyhow::Error::new(error).context(format!("HTTP request failed: {url}")),
+                anyhow::Error::new(error).context(format!("HTTP request failed: {uri}")),
             )
         })?;
         let status = resp.status();
         if !status.is_success() {
             let code = status.as_u16();
-            return Err(http_status_error(code, url));
+            return Err(http_status_error(code, uri));
         }
         let content_length = resp.content_length();
         Ok(DownloadResponse {
@@ -168,7 +194,7 @@ pub fn fetch_asset(params: FetchParams<'_>) -> Result<FetchResult> {
         transport,
     } = params;
 
-    let url = asset.expanded_url();
+    let uri = asset.expanded_uri();
     let auth = asset.resolved_auth()?;
 
     if !compute_checksum && asset.checksum.is_none() {
@@ -226,7 +252,7 @@ pub fn fetch_asset(params: FetchParams<'_>) -> Result<FetchResult> {
             None => &ReqwestTransport::default(),
         };
 
-        match try_download(transport_ref, cache_dir, &url, auth.as_deref()) {
+        match download_via_scheme(transport_ref, cache_dir, &uri, auth.as_deref()) {
             Ok(result) => break result,
             Err(e) => {
                 let retryable = e.is_retryable();
@@ -314,13 +340,133 @@ struct DownloadedFile {
     content_length: Option<u64>,
 }
 
+fn download_via_scheme(
+    transport: &dyn Transport,
+    cache_dir: &Path,
+    uri: &str,
+    auth: Option<&str>,
+) -> std::result::Result<DownloadedFile, FetchError> {
+    let parsed = reqwest::Url::parse(uri).map_err(|error| {
+        FetchError::permanent(anyhow::Error::new(error).context(format!("invalid uri: {uri}")))
+    })?;
+    match parsed.scheme() {
+        "http" | "https" => try_download(transport, cache_dir, uri, auth, None),
+        "github-release" => try_download_github_release(transport, cache_dir, uri, auth),
+        other => Err(FetchError::permanent(anyhow!(
+            "unsupported uri scheme '{other}' in asset uri: {uri}"
+        ))),
+    }
+}
+
+#[derive(Debug)]
+struct GithubReleaseRef {
+    owner: String,
+    repo: String,
+    tag: String,
+    asset_name: String,
+}
+
+fn parse_github_release_uri(uri: &str) -> std::result::Result<GithubReleaseRef, FetchError> {
+    let parsed = reqwest::Url::parse(uri).map_err(|error| {
+        FetchError::permanent(
+            anyhow::Error::new(error).context(format!("invalid github-release uri: {uri}")),
+        )
+    })?;
+    if parsed.scheme() != "github-release" {
+        return Err(FetchError::permanent(anyhow!(
+            "invalid github-release uri scheme in: {uri}"
+        )));
+    }
+    let owner = parsed.host_str().filter(|s| !s.is_empty()).ok_or_else(|| {
+        FetchError::permanent(anyhow!("github-release uri is missing owner: {uri}"))
+    })?;
+    let segments: Vec<_> = parsed
+        .path_segments()
+        .map(|parts| parts.filter(|s| !s.is_empty()).collect())
+        .unwrap_or_default();
+    if segments.len() < 3 {
+        return Err(FetchError::permanent(anyhow!(
+            "github-release uri must be github-release://<owner>/<repo>/<tag>/<asset-name>: {uri}"
+        )));
+    }
+    let repo = segments[0].to_string();
+    let tag = segments[1].to_string();
+    let asset_name = segments[2..].join("/");
+    if asset_name.is_empty() {
+        return Err(FetchError::permanent(anyhow!(
+            "github-release uri is missing asset name: {uri}"
+        )));
+    }
+    Ok(GithubReleaseRef {
+        owner: owner.to_string(),
+        repo,
+        tag,
+        asset_name,
+    })
+}
+
+fn try_download_github_release(
+    transport: &dyn Transport,
+    cache_dir: &Path,
+    uri: &str,
+    auth: Option<&str>,
+) -> std::result::Result<DownloadedFile, FetchError> {
+    let reference = parse_github_release_uri(uri)?;
+    let release_uri = format!(
+        "https://api.github.com/repos/{}/{}/releases/tags/{}",
+        reference.owner, reference.repo, reference.tag
+    );
+    let release = transport.get_json(&release_uri, auth)?;
+    let assets = release
+        .get("assets")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            FetchError::permanent(anyhow!(
+                "GitHub release response did not include an assets array for {release_uri}"
+            ))
+        })?;
+
+    let asset_id = assets
+        .iter()
+        .find_map(|asset| {
+            let name = asset.get("name")?.as_str()?;
+            if name == reference.asset_name {
+                asset.get("id")?.as_u64()
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| {
+            FetchError::permanent(anyhow!(
+                "asset '{}' not found in GitHub release {} for repo {}/{}",
+                reference.asset_name,
+                reference.tag,
+                reference.owner,
+                reference.repo
+            ))
+        })?;
+
+    let asset_uri = format!(
+        "https://api.github.com/repos/{}/{}/releases/assets/{asset_id}",
+        reference.owner, reference.repo
+    );
+    try_download(
+        transport,
+        cache_dir,
+        &asset_uri,
+        auth,
+        Some("application/octet-stream"),
+    )
+}
+
 fn try_download(
     transport: &dyn Transport,
     cache_dir: &Path,
-    url: &str,
+    uri: &str,
     auth: Option<&str>,
+    accept: Option<&str>,
 ) -> std::result::Result<DownloadedFile, FetchError> {
-    let mut response = transport.get(url, auth)?;
+    let mut response = transport.get(uri, auth, accept)?;
 
     let quarantine_path = cache_dir.join("quarantine").join(format!(
         "download-{}-{}.part",
@@ -350,7 +496,7 @@ fn try_download(
         let n = response.body.read(&mut buf).map_err(|error| {
             FetchError::retryable(
                 anyhow::Error::new(error)
-                    .context(format!("failed to read response body from {url}")),
+                    .context(format!("failed to read response body from {uri}")),
             )
         })?;
         if n == 0 {
@@ -552,6 +698,7 @@ mod tests {
     struct MockTransport {
         calls: Arc<AtomicUsize>,
         outcomes: Mutex<VecDeque<MockOutcome>>,
+        expected_requests: Mutex<VecDeque<(String, Option<String>)>>,
     }
 
     impl MockTransport {
@@ -575,9 +722,19 @@ mod tests {
                 Self {
                     calls: calls.clone(),
                     outcomes: Mutex::new(VecDeque::from(outcomes)),
+                    expected_requests: Mutex::new(VecDeque::new()),
                 },
                 calls,
             )
+        }
+
+        fn with_expectations(
+            outcomes: Vec<MockOutcome>,
+            expected_requests: Vec<(String, Option<String>)>,
+        ) -> (Self, Arc<AtomicUsize>) {
+            let (mut transport, calls) = Self::with_outcomes(outcomes);
+            transport.expected_requests = Mutex::new(VecDeque::from(expected_requests));
+            (transport, calls)
         }
 
         fn call_count(calls: &Arc<AtomicUsize>) -> usize {
@@ -588,10 +745,17 @@ mod tests {
     impl Transport for MockTransport {
         fn get(
             &self,
-            _url: &str,
+            uri: &str,
             _auth: Option<&str>,
+            accept: Option<&str>,
         ) -> std::result::Result<DownloadResponse, FetchError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            if let Some((expected_uri, expected_accept)) =
+                self.expected_requests.lock().unwrap().pop_front()
+            {
+                assert_eq!(uri, expected_uri);
+                assert_eq!(accept.map(str::to_string), expected_accept);
+            }
             let outcome = self
                 .outcomes
                 .lock()
@@ -626,7 +790,7 @@ mod tests {
 
     fn test_asset(hex: &str) -> Asset {
         Asset {
-            url: "https://example.com/v1/tool".to_string(),
+            uri: "https://example.com/v1/tool".to_string(),
             version: "1".to_string(),
             checksum: Some(format!("sha256:{hex}")),
             filename: Some("tool.bin".to_string()),
@@ -852,7 +1016,7 @@ mod tests {
         let data = b"hello world";
         let hex = sha256_hex(data);
         let asset = Asset {
-            url: "https://example.com/v1/tool".to_string(),
+            uri: "https://example.com/v1/tool".to_string(),
             version: "1".to_string(),
             checksum: None,
             filename: Some("tool.bin".to_string()),
@@ -910,6 +1074,110 @@ mod tests {
             link_target,
             cache.path().join("blobs").join("sha256").join(hex)
         );
+    }
+
+    #[test]
+    fn github_release_scheme_resolves_asset_then_downloads_bytes() {
+        let data = b"hello from github release";
+        let hex = sha256_hex(data);
+        let asset = Asset {
+            uri: "github-release://botworkz/tools/v1.2.3/tool.tar.gz".to_string(),
+            version: "1".to_string(),
+            checksum: Some(format!("sha256:{hex}")),
+            filename: None,
+            auth: Some("${SHASSET_TEST_TOKEN}".to_string()),
+        };
+        std::env::set_var("SHASSET_TEST_TOKEN", "token123");
+
+        let out = TempDir::new().unwrap();
+        let cache = TempDir::new().unwrap();
+
+        let release_json = serde_json::json!({
+            "assets": [
+                {"id": 42u64, "name": "tool.tar.gz"},
+                {"id": 99u64, "name": "other.tar.gz"}
+            ]
+        })
+        .to_string()
+        .into_bytes();
+
+        let (transport, calls) = MockTransport::with_expectations(
+            vec![
+                MockOutcome::Body {
+                    body: release_json,
+                    content_length: None,
+                },
+                MockOutcome::Body {
+                    body: data.to_vec(),
+                    content_length: None,
+                },
+            ],
+            vec![
+                (
+                    "https://api.github.com/repos/botworkz/tools/releases/tags/v1.2.3".to_string(),
+                    Some("application/vnd.github+json".to_string()),
+                ),
+                (
+                    "https://api.github.com/repos/botworkz/tools/releases/assets/42".to_string(),
+                    Some("application/octet-stream".to_string()),
+                ),
+            ],
+        );
+
+        let result = fetch_asset(FetchParams {
+            name: "mytool",
+            asset: &asset,
+            out_dir: Some(out.path()),
+            cache_dir: cache.path(),
+            retries: 0,
+            backoff: &Backoff::default(),
+            compute_checksum: false,
+            no_reverify: false,
+            materialize_mode: MaterializeMode::Copy,
+            transport: Some(Box::new(transport)),
+        })
+        .unwrap();
+
+        assert_eq!(MockTransport::call_count(&calls), 2);
+        assert_eq!(std::fs::read(result.path.unwrap()).unwrap(), data);
+    }
+
+    #[test]
+    fn github_release_scheme_errors_when_asset_missing() {
+        let asset = Asset {
+            uri: "github-release://botworkz/tools/v1.2.3/missing.tar.gz".to_string(),
+            version: "1".to_string(),
+            checksum: Some(format!("sha256:{}", "a".repeat(64))),
+            filename: None,
+            auth: None,
+        };
+        let out = TempDir::new().unwrap();
+        let cache = TempDir::new().unwrap();
+        let release_json = serde_json::json!({
+            "assets": [
+                {"id": 42u64, "name": "tool.tar.gz"}
+            ]
+        })
+        .to_string()
+        .into_bytes();
+        let (transport, calls) = MockTransport::new(release_json);
+
+        let err = fetch_asset(FetchParams {
+            name: "mytool",
+            asset: &asset,
+            out_dir: Some(out.path()),
+            cache_dir: cache.path(),
+            retries: 0,
+            backoff: &Backoff::default(),
+            compute_checksum: false,
+            no_reverify: false,
+            materialize_mode: MaterializeMode::Copy,
+            transport: Some(Box::new(transport)),
+        })
+        .unwrap_err();
+
+        assert_eq!(MockTransport::call_count(&calls), 1);
+        assert!(format!("{err:#}").contains("asset 'missing.tar.gz' not found"));
     }
 
     #[test]

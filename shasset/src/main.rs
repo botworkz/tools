@@ -86,7 +86,7 @@ fn cmd_add(config: &Path, args: cli::AddArgs) -> Result<()> {
     }
 
     let asset = Asset {
-        url: args.url.clone(),
+        uri: args.uri.clone(),
         version: args.version.clone(),
         checksum: args.checksum.clone(),
         filename: args.filename.clone(),
@@ -117,7 +117,7 @@ fn cmd_add(config: &Path, args: cli::AddArgs) -> Result<()> {
     };
 
     let stored = Asset {
-        url: args.url,
+        uri: args.uri,
         version: args.version,
         checksum,
         filename: args.filename,
@@ -167,7 +167,7 @@ fn cmd_get(config: &Path, args: cli::GetArgs) -> Result<()> {
             .iter()
             .map(|(name, a)| {
                 let mut obj = json!({
-                    "url": a.url,
+                    "uri": a.uri,
                     "version": a.version,
                     "checksum": a.checksum,
                 });
@@ -184,7 +184,7 @@ fn cmd_get(config: &Path, args: cli::GetArgs) -> Result<()> {
     } else {
         for (name, a) in &assets {
             println!("name:     {name}");
-            println!("  url:      {}", a.url);
+            println!("  uri:      {}", a.uri);
             println!("  version:  {}", a.version);
             println!("  checksum: {}", a.checksum.as_deref().unwrap_or("<none>"));
             if let Some(f) = &a.filename {
@@ -629,7 +629,7 @@ mod tests {
 
     fn asset_with_checksum(hex: &str) -> Asset {
         Asset {
-            url: "https://example.com/v1/tool".to_string(),
+            uri: "https://example.com/v1/tool".to_string(),
             version: "1".to_string(),
             checksum: Some(format!("sha256:{hex}")),
             filename: Some("tool.bin".to_string()),
@@ -738,7 +738,7 @@ mod tests {
             assets: BTreeMap::from([(
                 "tool".to_string(),
                 Asset {
-                    url: "https://example.com/tool".to_string(),
+                    uri: "https://example.com/tool".to_string(),
                     version: "1".to_string(),
                     checksum: None,
                     filename: None,
@@ -763,7 +763,7 @@ mod tests {
         m.assets.insert(
             "mytool".to_string(),
             Asset {
-                url: "https://example.com/v${version}/mytool".to_string(),
+                uri: "https://example.com/v${version}/mytool".to_string(),
                 version: "1.2.3".to_string(),
                 checksum: Some(
                     "sha256:0000000000000000000000000000000000000000000000000000000000000000"
@@ -787,16 +787,16 @@ mod tests {
     // ── version interpolation ────────────────────────────────────────────────
 
     #[test]
-    fn url_version_interpolation() {
+    fn uri_version_interpolation() {
         let a = Asset {
-            url: "https://example.com/releases/v${version}/tool-${version}.tar.gz".to_string(),
+            uri: "https://example.com/releases/v${version}/tool-${version}.tar.gz".to_string(),
             version: "2.0.0".to_string(),
             checksum: None,
             filename: None,
             auth: None,
         };
         assert_eq!(
-            a.expanded_url(),
+            a.expanded_uri(),
             "https://example.com/releases/v2.0.0/tool-2.0.0.tar.gz"
         );
     }
@@ -804,7 +804,7 @@ mod tests {
     #[test]
     fn filename_interpolation() {
         let a = Asset {
-            url: "https://example.com/releases/v${version}/tool-${version}.tar.gz".to_string(),
+            uri: "https://example.com/releases/v${version}/tool-${version}.tar.gz".to_string(),
             version: "2.0.0".to_string(),
             checksum: None,
             filename: Some("tool-${version}.tar.gz".to_string()),
@@ -814,9 +814,9 @@ mod tests {
     }
 
     #[test]
-    fn url_basename_fallback() {
+    fn uri_basename_fallback() {
         let a = Asset {
-            url: "https://example.com/releases/v1.0/archive.zip".to_string(),
+            uri: "https://example.com/releases/v1.0/archive.zip".to_string(),
             version: "1.0".to_string(),
             checksum: None,
             filename: None,
@@ -858,8 +858,9 @@ mod tests {
     impl fetch::Transport for MockTransport {
         fn get(
             &self,
-            _url: &str,
+            _uri: &str,
             _auth: Option<&str>,
+            _accept: Option<&str>,
         ) -> std::result::Result<fetch::DownloadResponse, fetch::FetchError> {
             if let Some(status) = self.status_override {
                 return Err(match fetch::classify_status(status) {
@@ -890,7 +891,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
 
         let asset = Asset {
-            url: "https://example.com/v1/tool".to_string(),
+            uri: "https://example.com/v1/tool".to_string(),
             version: "1".to_string(),
             checksum: Some(format!("sha256:{hex}")),
             filename: Some("tool".to_string()),
@@ -925,7 +926,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
 
         let asset = Asset {
-            url: "https://example.com/v1/tool".to_string(),
+            uri: "https://example.com/v1/tool".to_string(),
             version: "1".to_string(),
             checksum: Some(format!("sha256:{wrong_hex}")),
             filename: Some("tool".to_string()),
@@ -956,7 +957,7 @@ mod tests {
     fn fetch_fails_on_missing_checksum() {
         let tmp = TempDir::new().unwrap();
         let asset = Asset {
-            url: "https://example.com/v1/tool".to_string(),
+            uri: "https://example.com/v1/tool".to_string(),
             version: "1".to_string(),
             checksum: None,
             filename: Some("tool".to_string()),
@@ -987,7 +988,7 @@ mod tests {
     fn fetch_rejects_empty_download() {
         let tmp = TempDir::new().unwrap();
         let asset = Asset {
-            url: "https://example.com/v1/tool".to_string(),
+            uri: "https://example.com/v1/tool".to_string(),
             version: "1".to_string(),
             checksum: Some(format!(
                 "sha256:{}",
@@ -1021,7 +1022,7 @@ mod tests {
     fn fetch_non_retryable_http_error() {
         let tmp = TempDir::new().unwrap();
         let asset = Asset {
-            url: "https://example.com/v1/tool".to_string(),
+            uri: "https://example.com/v1/tool".to_string(),
             version: "1".to_string(),
             checksum: Some(format!("sha256:{}", "a".repeat(64))),
             filename: Some("tool".to_string()),
@@ -1059,7 +1060,7 @@ mod tests {
     fn auth_env_interpolation() {
         std::env::set_var("TEST_SHASSET_TOKEN_ABC", "supersecret");
         let a = Asset {
-            url: "https://example.com".to_string(),
+            uri: "https://example.com".to_string(),
             version: "1".to_string(),
             checksum: None,
             filename: None,
@@ -1072,7 +1073,7 @@ mod tests {
     fn auth_env_missing_errors() {
         // Use a unique env var name that is almost certainly not set
         let a = Asset {
-            url: "https://example.com".to_string(),
+            uri: "https://example.com".to_string(),
             version: "1".to_string(),
             checksum: None,
             filename: None,
@@ -1108,7 +1109,7 @@ mod tests {
     fn get_json_shows_template_not_secret() {
         // This tests that the `auth` field in JSON output is the raw template.
         let a = Asset {
-            url: "https://example.com".to_string(),
+            uri: "https://example.com".to_string(),
             version: "1.0".to_string(),
             checksum: Some("sha256:".to_string() + &"a".repeat(64)),
             filename: None,

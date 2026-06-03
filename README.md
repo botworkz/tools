@@ -92,10 +92,10 @@ This produces the stable local tag `botwork/packer-tools:local`.
 
 ## shasset
 
-`shasset` is a **generic, verified-asset downloader and registry manager**. It maintains a declarative manifest (`shasset.yaml`) of named assets — each with a URL, version, and mandatory SHA-256 checksum — and downloads and verifies those assets on demand.
+`shasset` is a **generic, verified-asset downloader and registry manager**. It maintains a declarative manifest (`shasset.yaml`) of named assets — each with a URI, version, and mandatory SHA-256 checksum — and downloads and verifies those assets on demand.
 
 **What shasset IS:**
-- A registry (`shasset.yaml`) of named assets: URL, version, checksum, optional filename, optional auth.
+- A registry (`shasset.yaml`) of named assets: URI, version, checksum, optional filename, optional auth.
 - CRUD operations on that registry (`add`, `remove`, `get`).
 - A verified downloader: fetch one or all named assets, verify each against its checksum, and fail loudly on any mismatch or error.
 
@@ -125,7 +125,7 @@ settings:                 # all optional; CLI flags override
 
 assets:
   <name>:
-    url: https://example.com/releases/download/v${version}/tool-${version}.tar.gz
+    uri: https://example.com/releases/download/v${version}/tool-${version}.tar.gz
     version: 0.0.1
     checksum: sha256:<64-hex>        # REQUIRED for fetch/verify
     filename: tool-0.0.1.tar.gz     # OPTIONAL: forced output filename
@@ -133,9 +133,12 @@ assets:
 ```
 
 Rules:
-- `${version}` in `url` and `filename` is expanded to the asset's `version` value.
+- `${version}` in `uri` and `filename` is expanded to the asset's `version` value.
+- URI schemes are dispatch-based:
+  - `http` / `https`: direct download (optional bearer auth).
+  - `github-release://<owner>/<repo>/<tag>/<asset-name>`: resolve the release asset id via GitHub API, then download via `releases/assets/{id}`.
 - `checksum` must be `sha256:<64-hex>`. An asset without a checksum cannot be fetched; use `add --compute` to populate it.
-- `filename`: when set, the downloaded file is always written with this exact name (after `${version}` expansion). When absent, the URL basename is used.
+- `filename`: when set, the downloaded file is always written with this exact name (after `${version}` expansion). When absent, the URI basename is used.
 - `auth`: the `${ENV_VAR}` template is stored as-is and resolved from the process environment at fetch time. The resolved secret is sent as `Authorization: ****** **The secret is never written back to the manifest file.** If the referenced variable is unset, shasset errors clearly.
 
 ### Commands
@@ -148,7 +151,7 @@ Global flag: `--config <path>` — path to the manifest file (default: `shasset.
 
 | Command | Description |
 |---|---|
-| `add <name> --url <url> --version <ver> [--checksum <cs>] [--filename <f>] [--auth <tpl>] [--cache-dir <dir>]` | Add or update an asset. Use `--compute` instead of `--checksum` to download once into cache and auto-populate the checksum. |
+| `add <name> --uri <uri> --version <ver> [--checksum <cs>] [--filename <f>] [--auth <tpl>] [--cache-dir <dir>]` | Add or update an asset. Use `--compute` instead of `--checksum` to download once into cache and auto-populate the checksum. |
 | `remove <name>` | Remove a named asset. |
 | `get [<name>] [--json]` | Show one or all assets. Displays the auth template, never the resolved secret. |
 | `fetch [<name>] --out <dir> [--cache-dir <dir>] [--concurrency <n>] [--link] [--no-reverify]` | Download and verify one or all assets via the local blob cache, then materialize to `<dir>/<name>/<filename>`. |
