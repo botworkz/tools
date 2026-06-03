@@ -5,7 +5,7 @@ use std::path::PathBuf;
 #[command(
     name = "shasset",
     about = "Generic verified-asset downloader and registry manager",
-    long_about = "shasset maintains a declarative manifest of named assets (each with a URL, \
+    long_about = "shasset maintains a declarative manifest of named assets (each with a URI, \
 version, and mandatory checksum) and downloads + verifies those assets.\n\n\
 Run `shasset <COMMAND> --help` for details on each command."
 )]
@@ -40,10 +40,10 @@ pub enum Command {
 pub struct AddArgs {
     /// Name of the asset.
     pub name: String,
-    /// Download URL (may contain `${version}`).
+    /// Download URI (may contain `${version}`).
     #[arg(long)]
-    pub url: String,
-    /// Version string (used to expand `${version}` in url/filename).
+    pub uri: String,
+    /// Version string (used to expand `${version}` in uri/filename).
     #[arg(long)]
     pub version: String,
     /// Checksum in `sha256:<hex>` format. Mutually exclusive with `--compute`.
@@ -52,7 +52,7 @@ pub struct AddArgs {
     /// Download the asset, compute its sha256 checksum, and store it.
     #[arg(long, conflicts_with = "checksum")]
     pub compute: bool,
-    /// Forced output filename. When absent the URL basename is used.
+    /// Forced output filename. When absent the URI basename is used.
     #[arg(long)]
     pub filename: Option<String>,
     /// Auth template, e.g. `${GH_TOKEN}`. Stored as-is; resolved at fetch time.
