@@ -1,0 +1,12 @@
+.git
+.github
+target
+shasset/target
+*.tar
+*.tar.gz
+*.zip
+*.img
+*.qcow2
+dist
+build
+tmp
