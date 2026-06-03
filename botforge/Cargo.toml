@@ -1,0 +1,17 @@
+[package]
+name = "botforge"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[[bin]]
+name = "botforge"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+shasset = { path = "../shasset" }
+
+[dev-dependencies]
+tempfile = "3"
