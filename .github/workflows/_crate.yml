@@ -123,22 +123,24 @@ jobs:
 
           rm -rf .ci-deps-smoke
           mkdir -p .ci-deps-smoke/out
-          ASSET_URL="https://raw.githubusercontent.com/github/gitignore/main/README.md"
-          curl -fsSL "$ASSET_URL" -o .ci-deps-smoke/fixture.bin
+          printf 'botforge deps smoke fixture\n' > .ci-deps-smoke/fixture.bin
           ASSET_SHA="$(sha256sum .ci-deps-smoke/fixture.bin | awk '{print $1}')"
-
-          cat > .ci-deps-smoke/shasset.yaml <<EOF
-          settings:
-            retries: 0
-          assets:
-            fixture:
-              uri: $ASSET_URL
-              version: "1"
-              checksum: sha256:$ASSET_SHA
-              filename: fixture.bin
-          EOF
+          SERVER_PORT=18080
+          python3 -m http.server "$SERVER_PORT" --directory .ci-deps-smoke >/dev/null 2>&1 &
+          SERVER_PID=$!
+          trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
+          ASSET_URL="http://127.0.0.1:${SERVER_PORT}/fixture.bin"
+          for _ in $(seq 1 30); do
+            if curl -fsS "$ASSET_URL" -o /dev/null; then
+              break
+            fi
+            sleep 0.1
+          done
+          curl -fsS "$ASSET_URL" -o /dev/null
+          printf 'settings:\n  retries: 0\nassets:\n  fixture:\n    uri: %s\n    version: "1"\n    checksum: sha256:%s\n    filename: fixture.bin\n' "$ASSET_URL" "$ASSET_SHA" > .ci-deps-smoke/shasset.yaml
 
           docker run --rm \
+            --network host \
             -v "$PWD/.ci-deps-smoke:/work" \
             -w /work \
             "botwork/botforge:ci" \
@@ -147,18 +149,10 @@ jobs:
           cmp -s .ci-deps-smoke/fixture.bin .ci-deps-smoke/out/fixture.bin
           test -x .ci-deps-smoke/out/fixture.bin
 
-          cat > .ci-deps-smoke/shasset-bad.yaml <<EOF
-          settings:
-            retries: 0
-          assets:
-            fixture:
-              uri: $ASSET_URL
-              version: "1"
-              checksum: sha256:0000000000000000000000000000000000000000000000000000000000000000
-              filename: fixture.bin
-          EOF
+          printf 'settings:\n  retries: 0\nassets:\n  fixture:\n    uri: %s\n    version: "1"\n    checksum: sha256:0000000000000000000000000000000000000000000000000000000000000000\n    filename: fixture.bin\n' "$ASSET_URL" > .ci-deps-smoke/shasset-bad.yaml
 
           if docker run --rm \
+            --network host \
             -v "$PWD/.ci-deps-smoke:/work" \
             -w /work \
             "botwork/botforge:ci" \
