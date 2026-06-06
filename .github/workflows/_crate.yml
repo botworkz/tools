@@ -116,6 +116,7 @@ jobs:
 
         # For botforge: also verify the baked orchestration tools are present
         if [ "$CRATE" = "botforge" ]; then
+          docker run --rm --user 1001:1001 "botwork/botforge:ci" --help
           docker run --rm --entrypoint qemu-img "botwork/botforge:ci" --version
           docker run --rm --entrypoint xorriso "botwork/botforge:ci" -version
           docker run --rm --entrypoint ssh "botwork/botforge:ci" -V
