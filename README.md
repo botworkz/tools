@@ -99,7 +99,7 @@ Current commands:
 - `botforge deps --out <dir> [--executable] [<name>]` — fetches file assets from `shasset.yaml` using the `shasset` library and stages each asset flat at `<dir>/<asset-filename>`, where the filename comes from the manifest `filename` field or the URI basename (not the manifest key). It also handles `oci://` image assets in the same manifest: pull OCI image refs from registries by digest, tag to `botwork/<asset-key>:local`, then save flat to `<dir>/<asset-filename>` (or `<dir>/<asset-key>.tar` when `filename` is unset). `docker` must be on `PATH`; `oci://` URIs must be pinned with `@sha256:<64-hex>`; manifest `checksum` is ignored for `oci://` assets.
 - `botforge iso [--src <dir>] --out <file.iso> [--volume-id <id>]` — builds an ISO from a directory tree using `xorriso` (or `genisoimage` fallback). Seed ISO mode is folded in: pass `--ssh-public-key <KEY>` or `--ssh-public-key-file <PATH>` (and optional `--user-data-template <PATH>`) to generate cloud-init `user-data`/`meta-data` and build from that temp tree; `--src` is not required in seed mode. Use `--volume-id cidata` for NoCloud seed images.
 - `botforge payload --config <payload.yaml> --out <payload.iso> [--staging-dir <dir>] [--volume-id botwork-payload]` — config-driven payload builder. It stages configured image tarballs into `images/`, stages configured overlay/systemd files at their configured relative payload paths, writes `bootstrap.sh` to load images/install files/reload+manage services, and then builds an ISO from the staged tree (layout preserved, not flattened).
-- `botforge pack [--repo-root <dir>] [--compress] [--key <path>] [--compose-service <name>] [--compose-file <path>]` — runs a KVM-only Packer build of the base VM image via docker compose, then optionally compresses the qcow2. Requires `/dev/kvm`; dependencies and baked images must already be staged beforehand because botforge v1 does not build them. KVM is required; there are no tcg/accelerator options.
+- `botforge pack [--repo-root <dir>] [--compress] [--key <path>]` — runs a KVM-only Packer build of the base VM image natively inside the botforge container, then optionally compresses the qcow2. Requires `/dev/kvm`; dependencies and baked images must already be staged beforehand because botforge v1 does not build them. KVM is required; there are no tcg/accelerator options.
 - `botforge run --base-image <qcow2> --overlay-image <overlay.qcow2> --seed-iso <cidata.iso> [--payload-iso <payload.iso>] [--ssh-port 2222] [--foreground]` — KVM-only qemu launcher. Creates the overlay via `qemu-img create -f qcow2 -F qcow2 -b <base> <overlay>`, then boots qemu with host SSH forwarding to guest port 22.
 - `botforge test --test-config <test.yaml> --base-image <qcow2> --ssh-key <private-key> [--ssh-host 127.0.0.1] [--ssh-port 2222] [--ssh-user bot] [--repo-root <dir>] [--keep-running]` — KVM-only config-driven test orchestration: builds cidata seed from `<ssh-key>.pub`, creates overlay, boots qemu in background, waits for SSH/cloud-init, runs upload+command validation steps, and collects diagnostics on failure.
 
@@ -160,7 +160,7 @@ For v1, image resolution is registry-only (`oci://` pull-by-digest). Image build
 
 ### Container usage
 
-`botforge` is distributed as a **batteries-included** container image: the QEMU toolchain (`qemu-system-x86_64`, `qemu-img`), ISO utilities (`xorriso`, `genisoimage`), and the Docker and OpenSSH clients are baked into the image so subcommands work reproducibly without installing exact tool versions on your host.
+`botforge` is distributed as a **batteries-included** container image: the QEMU toolchain (`qemu-system-x86_64`, `qemu-img`), Packer (`packer`), ISO utilities (`xorriso`, `genisoimage`), and the Docker and OpenSSH clients are baked into the image so subcommands work reproducibly without installing exact tool versions on your host.
 
 **Published image:** `ghcr.io/botworkz/tools/botforge`
 
@@ -181,8 +181,8 @@ docker run --rm \
 ```
 
 - `--device /dev/kvm` — required for `pack`, `run`, and `test` (KVM-only; no TCG fallback).
-- `-v /var/run/docker.sock:/var/run/docker.sock` — required for `deps` (OCI pull/save) and `pack` (Packer via docker compose). This mounts the **host** Docker socket; there is no Docker-in-Docker daemon inside the image.
-- `-v "$PWD:/work" -w /work` — mount your repo so botforge can read manifests, write artifacts, and invoke compose files relative to the project root.
+- `-v /var/run/docker.sock:/var/run/docker.sock` — required only for `deps` (OCI pull/save). This mounts the **host** Docker socket; there is no Docker-in-Docker daemon inside the image.
+- `-v "$PWD:/work" -w /work` — mount your repo so botforge can read manifests, write artifacts, and resolve project-relative paths.
 
 **Build the image locally with Earthly (EarthBuild):**
 ```sh

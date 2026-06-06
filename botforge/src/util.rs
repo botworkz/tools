@@ -25,9 +25,32 @@ pub(crate) fn run_command(
     envs: &[(&str, &str)],
     failure_context: &str,
 ) -> Result<()> {
-    let status = Command::new(program)
-        .args(args)
-        .envs(envs.iter().copied())
+    run_command_internal(program, args, envs, None, failure_context)
+}
+
+pub(crate) fn run_command_in_dir(
+    program: &str,
+    args: &[String],
+    envs: &[(&str, &str)],
+    current_dir: &Path,
+    failure_context: &str,
+) -> Result<()> {
+    run_command_internal(program, args, envs, Some(current_dir), failure_context)
+}
+
+fn run_command_internal(
+    program: &str,
+    args: &[String],
+    envs: &[(&str, &str)],
+    current_dir: Option<&Path>,
+    failure_context: &str,
+) -> Result<()> {
+    let mut command = Command::new(program);
+    command.args(args).envs(envs.iter().copied());
+    if let Some(dir) = current_dir {
+        command.current_dir(dir);
+    }
+    let status = command
         .status()
         .with_context(|| format!("failed to execute {program}"))?;
     if !status.success() {
