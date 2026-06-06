@@ -47,15 +47,12 @@ ARG PACKER_VERSION=1.11.2
 #   xorriso / genisoimage          — ISO building
 #   openssh-client                 — ssh, scp, ssh-keygen
 #   ca-certificates                — TLS roots
-# Docker CE CLI is added via the official Docker apt repository below;
-# it talks to a mounted host socket (no daemon / no DinD).
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
         cloud-image-utils \
         curl \
         genisoimage \
-        gnupg \
         jq \
         libnss-wrapper \
         openssh-client \
@@ -63,14 +60,6 @@ RUN apt-get update \
         qemu-utils \
         unzip \
         xorriso \
-    && install -m 0755 -d /etc/apt/keyrings \
-    && curl -fsSL https://download.docker.com/linux/debian/gpg \
-        -o /etc/apt/keyrings/docker.asc \
-    && chmod a+r /etc/apt/keyrings/docker.asc \
-    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
-        > /etc/apt/sources.list.d/docker.list \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends docker-ce-cli \
     && curl -fsSL -o /tmp/packer.zip "https://releases.hashicorp.com/packer/${PACKER_VERSION}/packer_${PACKER_VERSION}_linux_amd64.zip" \
     && unzip /tmp/packer.zip -d /usr/local/bin \
     && rm /tmp/packer.zip \
