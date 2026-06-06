@@ -39,9 +39,11 @@ FROM ${BINARY_SOURCE} AS binary-source
 FROM debian:bookworm-slim
 
 ARG BINARY_SOURCE=source
+ARG PACKER_VERSION=1.11.2
 
 # Install orchestration toolchain:
 #   qemu-system-x86 / qemu-utils  — qemu-system-x86_64, qemu-img
+#   packer                         — VM image build orchestration
 #   xorriso / genisoimage          — ISO building
 #   openssh-client                 — ssh, scp, ssh-keygen
 #   ca-certificates                — TLS roots
@@ -50,13 +52,16 @@ ARG BINARY_SOURCE=source
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
+        cloud-image-utils \
         curl \
         genisoimage \
         gnupg \
+        jq \
         libnss-wrapper \
         openssh-client \
         qemu-system-x86 \
         qemu-utils \
+        unzip \
         xorriso \
     && install -m 0755 -d /etc/apt/keyrings \
     && curl -fsSL https://download.docker.com/linux/debian/gpg \
@@ -65,7 +70,10 @@ RUN apt-get update \
     && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
         > /etc/apt/sources.list.d/docker.list \
     && apt-get update \
-    && apt-get install -y --no-install-recommends docker-ce-cli docker-compose-plugin \
+    && apt-get install -y --no-install-recommends docker-ce-cli \
+    && curl -fsSL -o /tmp/packer.zip "https://releases.hashicorp.com/packer/${PACKER_VERSION}/packer_${PACKER_VERSION}_linux_amd64.zip" \
+    && unzip /tmp/packer.zip -d /usr/local/bin \
+    && rm /tmp/packer.zip \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=binary-source /botforge /usr/local/bin/botforge
