@@ -120,6 +120,46 @@ jobs:
           docker run --rm --entrypoint xorriso "botwork/botforge:ci" -version
           docker run --rm --entrypoint ssh "botwork/botforge:ci" -V
           docker run --rm --entrypoint docker "botwork/botforge:ci" --version
+
+          rm -rf .ci-deps-smoke
+          mkdir -p .ci-deps-smoke/out
+          printf 'botforge deps smoke fixture\n' > .ci-deps-smoke/fixture.bin
+          ASSET_SHA="$(sha256sum .ci-deps-smoke/fixture.bin | awk '{print $1}')"
+          SERVER_PORT=18080
+          python3 -m http.server "$SERVER_PORT" --directory .ci-deps-smoke >/dev/null 2>&1 &
+          SERVER_PID=$!
+          trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
+          ASSET_URL="http://127.0.0.1:${SERVER_PORT}/fixture.bin"
+          for _ in $(seq 1 30); do
+            if curl -fsS "$ASSET_URL" -o /dev/null; then
+              break
+            fi
+            sleep 0.1
+          done
+          curl -fsS "$ASSET_URL" -o /dev/null
+          printf 'settings:\n  retries: 0\nassets:\n  fixture:\n    uri: %s\n    version: "1"\n    checksum: sha256:%s\n    filename: fixture.bin\n' "$ASSET_URL" "$ASSET_SHA" > .ci-deps-smoke/shasset.yaml
+
+          docker run --rm \
+            --network host \
+            -v "$PWD/.ci-deps-smoke:/work" \
+            -w /work \
+            "botwork/botforge:ci" \
+            -c shasset.yaml deps --out out --executable fixture
+
+          cmp -s .ci-deps-smoke/fixture.bin .ci-deps-smoke/out/fixture.bin
+          test -x .ci-deps-smoke/out/fixture.bin
+
+          printf 'settings:\n  retries: 0\nassets:\n  fixture:\n    uri: %s\n    version: "1"\n    checksum: sha256:0000000000000000000000000000000000000000000000000000000000000000\n    filename: fixture.bin\n' "$ASSET_URL" > .ci-deps-smoke/shasset-bad.yaml
+
+          if docker run --rm \
+            --network host \
+            -v "$PWD/.ci-deps-smoke:/work" \
+            -w /work \
+            "botwork/botforge:ci" \
+            -c shasset-bad.yaml deps --out out fixture; then
+            echo "expected checksum mismatch failure"
+            exit 1
+          fi
         fi
 
     - uses: actions/upload-artifact@v4
