@@ -47,49 +47,6 @@ image AUTH_BROKER_IMAGE_DIGEST ghcr.io/botworkz/botwork-extra/auth-broker:${BOTW
 release BOTWORK_LAUNCHER_SHA256 https://github.com/botworkz/botwork/releases/download/v${BOTWORK_TOOLS_IMAGES_VERSION_LOCK}/botwork-launcher botwork-launcher
 ```
 
-## Images
-
-### packer-tools
-
-A Debian-based container image bundling [Packer](https://www.packer.io/), QEMU, and image-creation utilities for building virtual machine images.
-
-**Included tools:** `packer`, `qemu-system-x86`, `qemu-utils`, `cloud-image-utils`, `genisoimage`, `xorriso`, `jq`, `curl`, `openssh-client`.
-
-**Published image:** `ghcr.io/botworkz/tools/packer-tools`
-
-**Pull:**
-```sh
-docker pull ghcr.io/botworkz/tools/packer-tools:latest
-```
-
-**Build locally with Docker:**
-```sh
-docker build -f packer-tools/Dockerfile -t packer-tools:local packer-tools
-```
-
-### Building the container image with Earthly (EarthBuild)
-
-This repository uses the maintained [EarthBuild/earthbuild](https://github.com/EarthBuild/earthbuild) fork, not sunset upstream Earthly. The Earthfile wraps `packer-tools/Dockerfile`, which remains the source of truth for the image contents.
-
-Install the pinned EarthBuild `v0.8.17` binary locally:
-
-```sh
-sudo curl -fsSL -o /usr/local/bin/earthly \
-  https://github.com/EarthBuild/earthbuild/releases/download/v0.8.17/earth-linux-amd64
-sudo chmod +x /usr/local/bin/earthly
-earthly bootstrap
-```
-
-Build the local development image:
-
-```sh
-earthly +packer-tools-image
-```
-
-This produces the stable local tag `botwork/packer-tools:local`.
-
-`botworkz/vm` consumes this target cross-repo via `FROM ../tools+packer-tools-image` for sibling/local build mode, so the `+packer-tools-image` target name and `botwork/packer-tools:local` tag are a stable contract.
-
 ## botforge
 
 `botforge` is the build-time companion CLI for VM artifact workflows.

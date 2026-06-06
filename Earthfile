@@ -1,9 +1,5 @@
 VERSION 0.8
 
-packer-tools-image:
-    FROM DOCKERFILE --platform=linux/amd64 -f packer-tools/Dockerfile packer-tools
-    SAVE IMAGE botwork/packer-tools:local
-
 shasset-image:
     ARG BINARY_SOURCE=source
     ARG TAG=latest
@@ -29,6 +25,5 @@ botforge-image:
     END
 
 images:
-    BUILD +packer-tools-image
     BUILD +shasset-image
     BUILD +botforge-image
