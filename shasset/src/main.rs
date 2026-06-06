@@ -6,7 +6,6 @@ use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-#[cfg(test)]
 use shasset::fetch;
 use shasset::{
     cli::{self, Cli, Command},
@@ -302,23 +301,44 @@ fn cmd_prune(config: &Path, args: cli::PruneArgs) -> Result<()> {
 }
 
 fn prune_cache(cache_dir: &Path, manifest: &Manifest, dry_run: bool) -> Result<PruneSummary> {
-    let referenced = referenced_blob_hexes(manifest)?;
-    let plan = compute_prune_plan(cache_dir, &referenced)?;
+    let referenced = referenced_blob_hexes(manifest, cache_dir)?;
+    let oci_referenced_manifest_hexes = oci_referenced_manifest_hexes(manifest);
+    let plan = compute_prune_plan(cache_dir, &referenced, &oci_referenced_manifest_hexes)?;
     apply_prune_plan(plan, dry_run)
 }
 
-fn referenced_blob_hexes(manifest: &Manifest) -> Result<HashSet<String>> {
+fn oci_referenced_manifest_hexes(manifest: &Manifest) -> HashSet<String> {
+    manifest.assets.values()
+        .filter_map(|asset| {
+            let uri = asset.expanded_uri();
+            fetch::oci_manifest_hex_from_uri(&uri)
+        })
+        .collect()
+}
+
+fn referenced_blob_hexes(manifest: &Manifest, cache_dir: &Path) -> Result<HashSet<String>> {
     let mut referenced = HashSet::new();
     for asset in manifest.assets.values() {
         if let Some(checksum) = &asset.checksum {
             let parsed = ParsedChecksum::parse(checksum)?;
             referenced.insert(parsed.hex.to_ascii_lowercase());
         }
+        // For OCI assets, look up the assembled-tar sha256 from the oci-index
+        let uri = asset.expanded_uri();
+        if uri.starts_with("oci://") {
+            if let Some(tar_hex) = fetch::oci_index_tar_hex_from_cache(cache_dir, &uri) {
+                referenced.insert(tar_hex);
+            }
+        }
     }
     Ok(referenced)
 }
 
-fn compute_prune_plan(cache_dir: &Path, referenced: &HashSet<String>) -> Result<PrunePlan> {
+fn compute_prune_plan(
+    cache_dir: &Path,
+    referenced: &HashSet<String>,
+    oci_manifest_hexes: &HashSet<String>,
+) -> Result<PrunePlan> {
     let mut plan = PrunePlan::default();
     let blobs_dir = cache_dir.join("blobs").join("sha256");
     if blobs_dir.exists() {
@@ -372,6 +392,21 @@ fn compute_prune_plan(cache_dir: &Path, referenced: &HashSet<String>) -> Result<
             })?;
             plan.summary.quarantine_entries_cleared += 1;
             plan.quarantine_paths.push(entry.path());
+        }
+    }
+
+    // Scan oci-index dir for orphaned entries
+    let oci_index_dir = cache_dir.join("oci-index");
+    if oci_index_dir.exists() {
+        for entry in std::fs::read_dir(&oci_index_dir).with_context(|| {
+            format!("cannot read oci-index dir: {}", oci_index_dir.display())
+        })? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+            if !oci_manifest_hexes.contains(&name) {
+                plan.summary.quarantine_entries_cleared += 1;  // reuse field for simplicity
+                plan.quarantine_paths.push(entry.path());
+            }
         }
     }
 

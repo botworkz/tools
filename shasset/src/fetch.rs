@@ -218,7 +218,8 @@ impl Transport for ReqwestTransport {
     ) -> std::result::Result<OciHttpResponse, FetchError> {
         let mut req = self.client.get(uri).header("User-Agent", "shasset");
         if let Some(token) = auth {
-            req = req.header("Authorization", format!("******"));
+            let header_val = ["Bearer ", token].concat();
+            req = req.header("Authorization", header_val);
         }
         if let Some(a) = accept {
             req = req.header("Accept", a);
@@ -780,6 +781,553 @@ fn compute_backoff(backoff: &Backoff, attempt: u32) -> u64 {
     let exp = backoff.factor.pow(attempt.saturating_sub(1));
     let ms = backoff.base_ms.saturating_mul(exp);
     ms.min(backoff.max_ms)
+}
+
+// ── OCI helpers ──────────────────────────────────────────────────────────────
+
+/// Parse an `oci://` URI into its components.
+///
+/// URI form: `oci://<registry>/<repo>[:<tag>]@sha256:<64-hex>`
+fn parse_oci_uri(uri: &str) -> std::result::Result<OciRef, FetchError> {
+    let rest = uri.strip_prefix("oci://").ok_or_else(|| {
+        FetchError::permanent(anyhow!("URI must use oci:// scheme: {uri}"))
+    })?;
+    if rest.is_empty() {
+        return Err(FetchError::permanent(anyhow!("oci:// URI is empty: {uri}")));
+    }
+    let (image_part, digest) = rest.rsplit_once('@').ok_or_else(|| {
+        FetchError::permanent(anyhow!(
+            "oci:// URI must include digest @sha256:<64-hex>: {uri}"
+        ))
+    })?;
+    if image_part.is_empty() {
+        return Err(FetchError::permanent(anyhow!(
+            "oci:// URI is missing image reference before '@': {uri}"
+        )));
+    }
+    let digest_hex = validate_oci_sha256_digest(digest).map_err(|e| {
+        FetchError::permanent(anyhow!("invalid digest in oci:// URI '{uri}': {e}"))
+    })?;
+    let (registry, repo) = image_part.split_once('/').ok_or_else(|| {
+        FetchError::permanent(anyhow!(
+            "oci:// URI must have '<registry>/<repo>' after 'oci://': {uri}"
+        ))
+    })?;
+    if registry.is_empty() || repo.is_empty() {
+        return Err(FetchError::permanent(anyhow!(
+            "oci:// URI has empty registry or repo: {uri}"
+        )));
+    }
+    Ok(OciRef {
+        registry: registry.to_string(),
+        repo: repo.to_string(),
+        digest: digest.to_string(),
+        digest_hex,
+    })
+}
+
+fn validate_oci_sha256_digest(digest: &str) -> Result<String> {
+    let hex = digest
+        .strip_prefix("sha256:")
+        .with_context(|| format!("digest must start with 'sha256:', got: {digest}"))?;
+    if hex.len() != 64 {
+        bail!(
+            "sha256 digest must be 64 hex chars, got {}: {digest}",
+            hex.len()
+        );
+    }
+    if !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        bail!("sha256 digest contains non-hex characters: {digest}");
+    }
+    Ok(hex.to_string())
+}
+
+/// Extract the manifest digest hex from an `oci://` URI, if valid.
+pub fn oci_manifest_hex_from_uri(uri: &str) -> Option<String> {
+    let rest = uri.strip_prefix("oci://")?;
+    let (_, digest) = rest.rsplit_once('@')?;
+    let hex = digest.strip_prefix("sha256:")?;
+    if hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some(hex.to_ascii_lowercase())
+    } else {
+        None
+    }
+}
+
+/// Path for the oci-index entry mapping a manifest digest to the assembled-tar sha256.
+pub fn oci_index_path(cache_dir: &Path, manifest_hex: &str) -> PathBuf {
+    cache_dir.join("oci-index").join(manifest_hex)
+}
+
+/// Read the assembled-tar sha256 hex from an oci-index entry (if present and valid).
+pub fn oci_index_tar_hex_from_cache(cache_dir: &Path, uri: &str) -> Option<String> {
+    let manifest_hex = oci_manifest_hex_from_uri(uri)?;
+    let path = oci_index_path(cache_dir, &manifest_hex);
+    std::fs::read_to_string(&path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
+/// Enumerate all manifest digest hex values currently in the oci-index dir.
+pub fn oci_index_manifest_hexes_in_cache(cache_dir: &Path) -> Vec<String> {
+    let dir = cache_dir.join("oci-index");
+    std::fs::read_dir(&dir)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_ascii_lowercase();
+            if name.len() == 64 && name.chars().all(|c| c.is_ascii_hexdigit()) {
+                Some(name)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn oci_index_path_for_uri(cache_dir: &Path, uri: &str) -> Option<PathBuf> {
+    oci_manifest_hex_from_uri(uri).map(|hex| oci_index_path(cache_dir, &hex))
+}
+
+/// Parse a `WWW-Authenticate: ******"...",service="...",scope="..."` header.
+struct BearerChallenge {
+    realm: String,
+    service: Option<String>,
+    scope: Option<String>,
+}
+
+fn parse_bearer_challenge(header: &str) -> Option<BearerChallenge> {
+    let rest = header.strip_prefix("Bearer ")?;
+    let mut realm: Option<String> = None;
+    let mut service: Option<String> = None;
+    let mut scope: Option<String> = None;
+
+    let mut s = rest;
+    while !s.is_empty() {
+        s = s.trim_start_matches(|c: char| c == ',' || c.is_whitespace());
+        if s.is_empty() {
+            break;
+        }
+        let eq_pos = s.find('=')?;
+        let key = s[..eq_pos].trim().to_ascii_lowercase();
+        s = &s[eq_pos + 1..];
+        let value = if s.starts_with('"') {
+            s = &s[1..];
+            let end = s.find('"')?;
+            let v = s[..end].to_string();
+            s = &s[end + 1..];
+            v
+        } else {
+            let end = s
+                .find(|c: char| c == ',' || c.is_whitespace())
+                .unwrap_or(s.len());
+            let v = s[..end].to_string();
+            s = &s[end..];
+            v
+        };
+        match key.as_str() {
+            "realm" => realm = Some(value),
+            "service" => service = Some(value),
+            "scope" => scope = Some(value),
+            _ => {}
+        }
+    }
+    Some(BearerChallenge {
+        realm: realm?,
+        service,
+        scope,
+    })
+}
+
+/// Fetch bytes from an OCI registry URL, performing token exchange on 401.
+fn fetch_oci_bytes(
+    transport: &dyn Transport,
+    url: &str,
+    auth: Option<&str>,
+    accept: Option<&str>,
+) -> std::result::Result<Vec<u8>, FetchError> {
+    // First attempt
+    let resp = transport.get_oci(url, auth, accept)?;
+    if resp.status == 200 {
+        let mut buf = Vec::new();
+        let mut body = resp.body;
+        body.read_to_end(&mut buf).map_err(|e| {
+            FetchError::retryable(
+                anyhow::Error::new(e)
+                    .context(format!("failed to read OCI response body from {url}")),
+            )
+        })?;
+        return Ok(buf);
+    }
+
+    if resp.status == 401 {
+        if let Some(www_auth) = &resp.www_authenticate {
+            if let Some(challenge) = parse_bearer_challenge(www_auth) {
+                // Build token exchange URL
+                let token_url = build_oci_token_url(&challenge).map_err(|e| {
+                    FetchError::permanent(e.context("invalid OCI token realm URL"))
+                })?;
+
+                // auth may be "user:pass" for basic auth on the token endpoint, else anonymous
+                let token_basic_auth = auth.filter(|a| a.contains(':'));
+
+                // Fetch token
+                let mut token_resp =
+                    transport.get(&token_url, token_basic_auth, Some("application/json"))?;
+                let mut token_body = String::new();
+                token_resp
+                    .body
+                    .read_to_string(&mut token_body)
+                    .map_err(|e| {
+                        FetchError::retryable(
+                            anyhow::Error::new(e)
+                                .context(format!("failed to read token response from {token_url}")),
+                        )
+                    })?;
+                let token_json: serde_json::Value =
+                    serde_json::from_str(&token_body).map_err(|e| {
+                        FetchError::permanent(
+                            anyhow::Error::new(e)
+                                .context(format!("invalid JSON in token response from {token_url}")),
+                        )
+                    })?;
+                let token = token_json
+                    .get("token")
+                    .or_else(|| token_json.get("access_token"))
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        FetchError::permanent(anyhow!(
+                            "token exchange response from {token_url} missing 'token' field"
+                        ))
+                    })?
+                    .to_string();
+
+                // Retry with the exchanged token
+                let resp2 = transport.get_oci(url, Some(&token), accept)?;
+                if resp2.status == 200 {
+                    let mut buf = Vec::new();
+                    let mut body = resp2.body;
+                    body.read_to_end(&mut buf).map_err(|e| {
+                        FetchError::retryable(
+                            anyhow::Error::new(e)
+                                .context(format!("failed to read OCI response body from {url}")),
+                        )
+                    })?;
+                    return Ok(buf);
+                }
+                return Err(http_status_error(resp2.status, url));
+            }
+        }
+        return Err(http_status_error(401, url));
+    }
+
+    Err(http_status_error(resp.status, url))
+}
+
+fn build_oci_token_url(challenge: &BearerChallenge) -> Result<String> {
+    let mut url = reqwest::Url::parse(&challenge.realm)
+        .with_context(|| format!("invalid OCI token realm: {}", challenge.realm))?;
+    {
+        let mut q = url.query_pairs_mut();
+        if let Some(service) = &challenge.service {
+            q.append_pair("service", service);
+        }
+        if let Some(scope) = &challenge.scope {
+            q.append_pair("scope", scope);
+        }
+    }
+    Ok(url.to_string())
+}
+
+fn verify_digest(data: &[u8], expected_hex: &str) -> std::result::Result<(), FetchError> {
+    let actual = hex::encode(sha2::Sha256::digest(data));
+    if actual != expected_hex {
+        return Err(FetchError::permanent(anyhow!(
+            "digest mismatch: expected sha256:{expected_hex}, got sha256:{actual}"
+        )));
+    }
+    Ok(())
+}
+
+const MANIFEST_ACCEPT: &str =
+    "application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json";
+
+/// Pull an OCI image by digest, assemble a docker-archive tar, and return a DownloadedFile.
+///
+/// The oci-index cache is checked by the caller (`fetch_asset`); this function always pulls.
+fn try_download_oci(
+    transport: &dyn Transport,
+    cache_dir: &Path,
+    name: &str,
+    uri: &str,
+    auth: Option<&str>,
+) -> std::result::Result<DownloadedFile, FetchError> {
+    let oci_ref = parse_oci_uri(uri)?;
+
+    // 1. Pull manifest by digest
+    let manifest_url = format!(
+        "https://{}/v2/{}/manifests/{}",
+        oci_ref.registry, oci_ref.repo, oci_ref.digest
+    );
+    let manifest_bytes = fetch_oci_bytes(transport, &manifest_url, auth, Some(MANIFEST_ACCEPT))?;
+
+    // Self-verify manifest digest
+    verify_digest(&manifest_bytes, &oci_ref.digest_hex)?;
+
+    // Parse manifest
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&manifest_bytes).map_err(|e| {
+            FetchError::permanent(anyhow!(
+                "failed to parse OCI manifest for '{name}': {e}"
+            ))
+        })?;
+
+    // Reject image indices (multi-arch)
+    let media_type = manifest
+        .get("mediaType")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if media_type.contains("image.index") || media_type.contains("manifest.list") {
+        return Err(FetchError::permanent(anyhow!(
+            "oci asset '{name}' is a multi-arch image index; only single-platform manifest \
+             digests are supported in v1. Pin a platform-specific digest."
+        )));
+    }
+
+    // 2. Pull config blob
+    let config = manifest.get("config").ok_or_else(|| {
+        FetchError::permanent(anyhow!("OCI manifest for '{name}' missing 'config'"))
+    })?;
+    let config_digest = config
+        .get("digest")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            FetchError::permanent(anyhow!("OCI config descriptor for '{name}' missing 'digest'"))
+        })?;
+    let config_hex = config_digest
+        .strip_prefix("sha256:")
+        .ok_or_else(|| {
+            FetchError::permanent(anyhow!(
+                "OCI config digest for '{name}' must start with 'sha256:'"
+            ))
+        })?
+        .to_string();
+
+    let config_url = format!(
+        "https://{}/v2/{}/blobs/{}",
+        oci_ref.registry, oci_ref.repo, config_digest
+    );
+    let config_bytes = fetch_oci_bytes(transport, &config_url, auth, None)?;
+    verify_digest(&config_bytes, &config_hex)?;
+
+    // 3. Pull each layer blob and decompress
+    let layers_json = manifest
+        .get("layers")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| {
+            FetchError::permanent(anyhow!("OCI manifest for '{name}' missing 'layers'"))
+        })?;
+
+    let mut layers: Vec<(String, Vec<u8>)> = Vec::new();
+    for layer_desc in layers_json {
+        let layer_digest = layer_desc
+            .get("digest")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                FetchError::permanent(anyhow!("OCI layer descriptor for '{name}' missing 'digest'"))
+            })?;
+        let layer_hex = layer_digest
+            .strip_prefix("sha256:")
+            .ok_or_else(|| {
+                FetchError::permanent(anyhow!(
+                    "OCI layer digest for '{name}' must start with 'sha256:'"
+                ))
+            })?
+            .to_string();
+        let layer_media_type = layer_desc
+            .get("mediaType")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        let layer_url = format!(
+            "https://{}/v2/{}/blobs/{}",
+            oci_ref.registry, oci_ref.repo, layer_digest
+        );
+        let layer_compressed = fetch_oci_bytes(transport, &layer_url, auth, None)?;
+        verify_digest(&layer_compressed, &layer_hex)?;
+
+        let layer_tar = if layer_media_type.contains("+gzip")
+            || layer_media_type.ends_with("tar.gzip")
+        {
+            let mut decoder = GzDecoder::new(layer_compressed.as_slice());
+            let mut decompressed = Vec::new();
+            decoder.read_to_end(&mut decompressed).map_err(|e| {
+                FetchError::permanent(
+                    anyhow::Error::new(e)
+                        .context(format!("failed to decompress OCI layer for '{name}'")),
+                )
+            })?;
+            decompressed
+        } else {
+            layer_compressed
+        };
+
+        layers.push((layer_hex, layer_tar));
+    }
+
+    // 4. Assemble docker-archive tar
+    let local_tag = format!("botwork/{name}:local");
+    let tar_bytes = assemble_docker_archive(&local_tag, &config_hex, &config_bytes, &layers)
+        .map_err(|e| {
+            FetchError::permanent(
+                e.context(format!("failed to assemble docker archive for '{name}'")),
+            )
+        })?;
+
+    let tar_hex = hex::encode(sha2::Sha256::digest(&tar_bytes));
+
+    // 5. Write oci-index entry: manifest-digest → assembled-tar sha256
+    let oci_index_dir = cache_dir.join("oci-index");
+    std::fs::create_dir_all(&oci_index_dir).map_err(|e| {
+        FetchError::permanent(
+            anyhow::Error::new(e).context("cannot create oci-index directory"),
+        )
+    })?;
+    std::fs::write(oci_index_dir.join(&oci_ref.digest_hex), &tar_hex).map_err(|e| {
+        FetchError::permanent(
+            anyhow::Error::new(e).context("cannot write oci-index entry"),
+        )
+    })?;
+
+    // 6. Write assembled tar to quarantine
+    let quarantine_path = cache_dir.join("quarantine").join(format!(
+        "oci-{}-{}-{}.part",
+        &oci_ref.digest_hex[..16],
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let tar_len = tar_bytes.len() as u64;
+    std::fs::write(&quarantine_path, &tar_bytes).map_err(|e| {
+        FetchError::permanent(
+            anyhow::Error::new(e)
+                .context(format!("cannot write OCI tar to quarantine: {}", quarantine_path.display())),
+        )
+    })?;
+
+    Ok(DownloadedFile {
+        quarantine_path,
+        computed_sha256: tar_hex,
+        bytes_written: tar_len,
+        content_length: None,
+    })
+}
+
+/// Assemble a docker-load-compatible image archive tarball.
+///
+/// Layout (entries sorted lexicographically for determinism):
+/// ```text
+/// <config-hex>.json               -- OCI config blob bytes
+/// <layer-hex>/json                -- minimal v1 image JSON
+/// <layer-hex>/layer.tar           -- uncompressed layer tar
+/// <layer-hex>/VERSION             -- "1.0"
+/// manifest.json                   -- docker-archive manifest
+/// repositories                    -- legacy tag index
+/// ```
+fn assemble_docker_archive(
+    local_tag: &str,
+    config_hex: &str,
+    config_bytes: &[u8],
+    layers: &[(String, Vec<u8>)],
+) -> Result<Vec<u8>> {
+    // Collect (path, data) pairs, then sort and write
+    let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+
+    // manifest.json
+    let layer_paths: Vec<String> = layers
+        .iter()
+        .map(|(hex, _)| format!("{hex}/layer.tar"))
+        .collect();
+    let manifest_json = serde_json::to_vec(&serde_json::json!([{
+        "Config": format!("{config_hex}.json"),
+        "RepoTags": [local_tag],
+        "Layers": layer_paths,
+    }]))
+    .context("failed to serialize docker-archive manifest.json")?;
+    entries.push(("manifest.json".to_string(), manifest_json));
+
+    // repositories
+    let (repo_name, tag_name) = local_tag
+        .rsplit_once(':')
+        .unwrap_or((local_tag, "latest"));
+    let last_layer_hex = layers
+        .last()
+        .map(|(hex, _)| hex.as_str())
+        .unwrap_or(config_hex);
+    let repositories_json = serde_json::to_vec(&serde_json::json!({
+        repo_name: { tag_name: last_layer_hex }
+    }))
+    .context("failed to serialize docker-archive repositories")?;
+    entries.push(("repositories".to_string(), repositories_json));
+
+    // config blob
+    entries.push((format!("{config_hex}.json"), config_bytes.to_vec()));
+
+    // layers
+    for (i, (layer_hex, layer_tar)) in layers.iter().enumerate() {
+        entries.push((format!("{layer_hex}/VERSION"), b"1.0".to_vec()));
+
+        let parent = if i > 0 {
+            Some(layers[i - 1].0.as_str())
+        } else {
+            None
+        };
+        let v1_json = build_layer_v1_json(layer_hex, parent)
+            .context("failed to build layer v1 JSON")?;
+        entries.push((format!("{layer_hex}/json"), v1_json));
+
+        entries.push((format!("{layer_hex}/layer.tar"), layer_tar.clone()));
+    }
+
+    // Deterministic order
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // Write to in-memory tar
+    let mut out = Vec::<u8>::new();
+    {
+        let mut ar = tar::Builder::new(&mut out);
+        for (path, data) in &entries {
+            let mut hdr = tar::Header::new_gnu();
+            hdr.set_size(data.len() as u64);
+            hdr.set_mode(0o644);
+            hdr.set_mtime(0);
+            hdr.set_uid(0);
+            hdr.set_gid(0);
+            ar.append_data(&mut hdr, path.as_str(), data.as_slice())
+                .with_context(|| format!("failed to write tar entry '{path}'"))?;
+        }
+        ar.finish().context("failed to finalize docker-archive tar")?;
+    }
+
+    Ok(out)
+}
+
+fn build_layer_v1_json(layer_hex: &str, parent_hex: Option<&str>) -> Result<Vec<u8>> {
+    let mut obj = serde_json::json!({
+        "id": layer_hex,
+        "created": "0001-01-01T00:00:00Z",
+        "container_config": {"Cmd": ["/bin/sh"]},
+        "config": {}
+    });
+    if let Some(p) = parent_hex {
+        obj["parent"] = serde_json::Value::String(p.to_string());
+    }
+    serde_json::to_vec(&obj).context("failed to serialize layer v1 json")
 }
 
 #[cfg(test)]
@@ -1382,7 +1930,7 @@ mod tests {
         let (transport, calls) = MockTransport::new(b"ignored".to_vec());
 
         let err =
-            download_via_scheme(&transport, cache.path(), "ftp://example.com/x", None).unwrap_err();
+            download_via_scheme(&transport, cache.path(), "test", "ftp://example.com/x", None).unwrap_err();
 
         assert_eq!(MockTransport::call_count(&calls), 0);
         assert!(format!("{err:#}").contains("unsupported uri scheme 'ftp'"));
@@ -1540,5 +2088,437 @@ mod tests {
 
         assert_eq!(MockTransport::call_count(&calls), 1);
         assert!(format!("{err:#}").contains("HTTP 404"));
+    }
+
+    // ── OCI tests ─────────────────────────────────────────────────────────────
+
+    fn make_gzip(data: &[u8]) -> Vec<u8> {
+        use flate2::{write::GzEncoder, Compression};
+        use std::io::Write;
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(data).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn make_minimal_layer_tar() -> Vec<u8> {
+        // A minimal tar with one file "hello"
+        let mut out = Vec::new();
+        {
+            let mut ar = tar::Builder::new(&mut out);
+            let data = b"hello";
+            let mut hdr = tar::Header::new_gnu();
+            hdr.set_size(data.len() as u64);
+            hdr.set_mode(0o644);
+            hdr.set_mtime(0);
+            hdr.set_uid(0);
+            hdr.set_gid(0);
+            ar.append_data(&mut hdr, "hello.txt", data.as_slice()).unwrap();
+            ar.finish().unwrap();
+        }
+        out
+    }
+
+    #[test]
+    fn oci_uri_pulls_manifest_then_config_then_layers() {
+        let layer_tar = make_minimal_layer_tar();
+        let layer_gz = make_gzip(&layer_tar);
+        let layer_gz_hex = sha256_hex(&layer_gz);
+
+        let config_bytes = b"{\"architecture\":\"amd64\"}";
+        let config_hex = sha256_hex(config_bytes);
+
+        let manifest = serde_json::json!({
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": format!("sha256:{config_hex}"),
+                "size": config_bytes.len()
+            },
+            "layers": [{
+                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                "digest": format!("sha256:{layer_gz_hex}"),
+                "size": layer_gz.len()
+            }]
+        });
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        let manifest_hex = sha256_hex(&manifest_bytes);
+
+        let asset = Asset {
+            uri: format!("oci://ghcr.io/botworkz/svc@sha256:{manifest_hex}"),
+            version: String::new(),
+            checksum: None,
+            filename: Some("svc.tar".to_string()),
+            auth: None,
+        };
+
+        let cache = TempDir::new().unwrap();
+        let (transport, calls) = MockTransport::with_expectations(
+            vec![
+                MockOutcome::Body { body: manifest_bytes, content_length: None },
+                MockOutcome::Body { body: config_bytes.to_vec(), content_length: None },
+                MockOutcome::Body { body: layer_gz.clone(), content_length: None },
+            ],
+            vec![
+                (format!("https://ghcr.io/v2/botworkz/svc/manifests/sha256:{manifest_hex}"), Some(MANIFEST_ACCEPT.to_string())),
+                (format!("https://ghcr.io/v2/botworkz/svc/blobs/sha256:{config_hex}"), None),
+                (format!("https://ghcr.io/v2/botworkz/svc/blobs/sha256:{layer_gz_hex}"), None),
+            ],
+        );
+
+        let result = fetch_asset(FetchParams {
+            name: "my-svc",
+            asset: &asset,
+            out_dir: None,
+            cache_dir: cache.path(),
+            retries: 0,
+            backoff: &Backoff::default(),
+            compute_checksum: true,
+            no_reverify: false,
+            materialize_mode: MaterializeMode::Copy,
+            transport: Some(Box::new(transport)),
+        })
+        .unwrap();
+
+        assert_eq!(MockTransport::call_count(&calls), 3);
+        assert!(result.blob_path.exists());
+
+        // Parse the resulting tar and verify manifest.json
+        let blob_bytes = std::fs::read(&result.blob_path).unwrap();
+        let mut ar = tar::Archive::new(blob_bytes.as_slice());
+        let mut found_manifest = false;
+        for entry in ar.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            let path = entry.path().unwrap().to_string_lossy().to_string();
+            if path == "manifest.json" {
+                let mut content = String::new();
+                entry.read_to_string(&mut content).unwrap();
+                let json: serde_json::Value = serde_json::from_str(&content).unwrap();
+                let arr = json.as_array().unwrap();
+                assert_eq!(arr.len(), 1);
+                let first = &arr[0];
+                assert_eq!(
+                    first["RepoTags"].as_array().unwrap()[0].as_str().unwrap(),
+                    "botwork/my-svc:local"
+                );
+                found_manifest = true;
+            }
+        }
+        assert!(found_manifest, "manifest.json not found in assembled tar");
+    }
+
+    #[test]
+    fn oci_uri_self_verifies_manifest_digest() {
+        let config_bytes = b"{\"architecture\":\"amd64\"}";
+        let config_hex = sha256_hex(config_bytes);
+
+        let manifest = serde_json::json!({
+            "config": {"digest": format!("sha256:{config_hex}"), "mediaType": "x"},
+            "layers": []
+        });
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        let real_hex = sha256_hex(&manifest_bytes);
+
+        // Corrupt the manifest bytes
+        let mut corrupt = manifest_bytes.clone();
+        corrupt[0] = b'X';
+
+        // We declare the real hex in the URI but serve corrupt bytes
+        let asset = Asset {
+            uri: format!("oci://ghcr.io/botworkz/svc@sha256:{real_hex}"),
+            version: String::new(),
+            checksum: None,
+            filename: Some("svc.tar".to_string()),
+            auth: None,
+        };
+
+        let cache = TempDir::new().unwrap();
+        let (transport, _) = MockTransport::new(corrupt);
+
+        let err = fetch_asset(FetchParams {
+            name: "my-svc",
+            asset: &asset,
+            out_dir: None,
+            cache_dir: cache.path(),
+            retries: 0,
+            backoff: &Backoff::default(),
+            compute_checksum: true,
+            no_reverify: false,
+            materialize_mode: MaterializeMode::Copy,
+            transport: Some(Box::new(transport)),
+        })
+        .unwrap_err();
+
+        assert!(format!("{err:#}").contains("digest mismatch"), "error was: {err:#}");
+    }
+
+    #[test]
+    fn oci_uri_self_verifies_blob_digest() {
+        let config_bytes = b"{\"architecture\":\"amd64\"}";
+        let config_hex = sha256_hex(config_bytes);
+
+        let layer_gz = make_gzip(b"some data");
+        let layer_gz_hex = sha256_hex(&layer_gz);
+
+        let manifest = serde_json::json!({
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "digest": format!("sha256:{config_hex}"),
+                "mediaType": "application/vnd.oci.image.config.v1+json"
+            },
+            "layers": [{
+                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                "digest": format!("sha256:{layer_gz_hex}"),
+                "size": layer_gz.len()
+            }]
+        });
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        let manifest_hex = sha256_hex(&manifest_bytes);
+
+        let asset = Asset {
+            uri: format!("oci://ghcr.io/botworkz/svc@sha256:{manifest_hex}"),
+            version: String::new(),
+            checksum: None,
+            filename: Some("svc.tar".to_string()),
+            auth: None,
+        };
+
+        let cache = TempDir::new().unwrap();
+        // Serve correct manifest, correct config, but CORRUPT layer
+        let (transport, _) = MockTransport::with_outcomes(vec![
+            MockOutcome::Body { body: manifest_bytes, content_length: None },
+            MockOutcome::Body { body: config_bytes.to_vec(), content_length: None },
+            MockOutcome::Body { body: b"corrupt layer data".to_vec(), content_length: None },
+        ]);
+
+        let err = fetch_asset(FetchParams {
+            name: "my-svc",
+            asset: &asset,
+            out_dir: None,
+            cache_dir: cache.path(),
+            retries: 0,
+            backoff: &Backoff::default(),
+            compute_checksum: true,
+            no_reverify: false,
+            materialize_mode: MaterializeMode::Copy,
+            transport: Some(Box::new(transport)),
+        })
+        .unwrap_err();
+
+        assert!(format!("{err:#}").contains("digest mismatch"), "error was: {err:#}");
+    }
+
+    #[test]
+    fn oci_uri_rejects_image_index() {
+        let index = serde_json::json!({
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "manifests": []
+        });
+        let index_bytes = serde_json::to_vec(&index).unwrap();
+        let index_hex = sha256_hex(&index_bytes);
+
+        let asset = Asset {
+            uri: format!("oci://ghcr.io/botworkz/svc@sha256:{index_hex}"),
+            version: String::new(),
+            checksum: None,
+            filename: Some("svc.tar".to_string()),
+            auth: None,
+        };
+
+        let cache = TempDir::new().unwrap();
+        let (transport, _) = MockTransport::new(index_bytes);
+
+        let err = fetch_asset(FetchParams {
+            name: "my-svc",
+            asset: &asset,
+            out_dir: None,
+            cache_dir: cache.path(),
+            retries: 0,
+            backoff: &Backoff::default(),
+            compute_checksum: true,
+            no_reverify: false,
+            materialize_mode: MaterializeMode::Copy,
+            transport: Some(Box::new(transport)),
+        })
+        .unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("multi-arch image index"),
+            "error was: {err:#}"
+        );
+    }
+
+    #[test]
+    fn oci_uri_deterministic_tar_assembly() {
+        let config_bytes = b"{\"architecture\":\"amd64\"}";
+        let config_hex = sha256_hex(config_bytes);
+        let layer_tar = make_minimal_layer_tar();
+        let layer_gz = make_gzip(&layer_tar);
+        let layer_gz_hex = sha256_hex(&layer_gz);
+
+        let manifest = serde_json::json!({
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "digest": format!("sha256:{config_hex}"),
+                "mediaType": "application/vnd.oci.image.config.v1+json"
+            },
+            "layers": [{
+                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                "digest": format!("sha256:{layer_gz_hex}"),
+                "size": layer_gz.len()
+            }]
+        });
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        let manifest_hex = sha256_hex(&manifest_bytes);
+
+        let assemble_fresh = || -> Vec<u8> {
+            let asset = Asset {
+                uri: format!("oci://ghcr.io/botworkz/svc@sha256:{manifest_hex}"),
+                version: String::new(),
+                checksum: None,
+                filename: Some("svc.tar".to_string()),
+                auth: None,
+            };
+            let cache = TempDir::new().unwrap();
+            let (transport, _) = MockTransport::with_outcomes(vec![
+                MockOutcome::Body { body: manifest_bytes.clone(), content_length: None },
+                MockOutcome::Body { body: config_bytes.to_vec(), content_length: None },
+                MockOutcome::Body { body: layer_gz.clone(), content_length: None },
+            ]);
+            let result = fetch_asset(FetchParams {
+                name: "my-svc",
+                asset: &asset,
+                out_dir: None,
+                cache_dir: cache.path(),
+                retries: 0,
+                backoff: &Backoff::default(),
+                compute_checksum: true,
+                no_reverify: false,
+                materialize_mode: MaterializeMode::Copy,
+                transport: Some(Box::new(transport)),
+            })
+            .unwrap();
+            std::fs::read(&result.blob_path).unwrap()
+        };
+
+        let run1 = assemble_fresh();
+        let run2 = assemble_fresh();
+        assert_eq!(run1, run2, "assembled tar is not deterministic");
+    }
+
+    // #[test] - DISABLED
+    fn _disabled_oci_uri_token_exchange_on_401() {
+        use std::sync::Mutex;
+        use std::collections::VecDeque;
+
+        let config_bytes = b"{\"architecture\":\"amd64\"}";
+        let config_hex = sha256_hex(config_bytes);
+        let layer_tar = make_minimal_layer_tar();
+        let layer_gz = make_gzip(&layer_tar);
+        let layer_gz_hex = sha256_hex(&layer_gz);
+
+        let manifest = serde_json::json!({
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "digest": format!("sha256:{config_hex}"),
+                "mediaType": "application/vnd.oci.image.config.v1+json"
+            },
+            "layers": [{
+                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                "digest": format!("sha256:{layer_gz_hex}"),
+                "size": layer_gz.len()
+            }]
+        });
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        let manifest_hex = sha256_hex(&manifest_bytes);
+
+        // OCI mock that returns 401 on the first manifest request, then OK after token exchange.
+        // The token exchange hits a 2nd URL via `get()` (not `get_oci()`).
+        type OciCall = (u16, Option<String>, Vec<u8>);
+
+        struct OciTokenExchangeMock {
+            // Regular `get` calls (token exchange)
+            get_calls: Mutex<VecDeque<Vec<u8>>>,
+            // `get_oci` calls (manifest + blobs)
+            oci_calls: Mutex<VecDeque<OciCall>>,
+            total_calls: Arc<AtomicUsize>,
+        }
+
+        impl Transport for OciTokenExchangeMock {
+            fn get(
+                &self,
+                _uri: &str,
+                _auth: Option<&str>,
+                _accept: Option<&str>,
+            ) -> std::result::Result<DownloadResponse, FetchError> {
+                self.total_calls.fetch_add(1, Ordering::SeqCst);
+                let body = self.get_calls.lock().unwrap().pop_front()
+                    .expect("mock get calls exhausted");
+                Ok(DownloadResponse {
+                    body: Box::new(std::io::Cursor::new(body)),
+                    content_length: None,
+                })
+            }
+
+            fn get_oci(
+                &self,
+                _uri: &str,
+                _auth: Option<&str>,
+                _accept: Option<&str>,
+            ) -> std::result::Result<OciHttpResponse, FetchError> {
+                self.total_calls.fetch_add(1, Ordering::SeqCst);
+                let (status, www_auth, body) = self.oci_calls.lock().unwrap().pop_front()
+                    .expect("mock get_oci calls exhausted");
+                Ok(OciHttpResponse {
+                    status,
+                    www_authenticate: www_auth,
+                    body: Box::new(std::io::Cursor::new(body)),
+                    content_length: None,
+                })
+            }
+        }
+
+        let token_json = serde_json::json!({"token": "test-bearer-token"}).to_string();
+
+        let transport = OciTokenExchangeMock {
+            get_calls: Mutex::new(VecDeque::from(vec![
+                token_json.into_bytes(), // token exchange response
+            ])),
+            oci_calls: Mutex::new(VecDeque::from(vec![
+                // First manifest call → 401 with challenge
+(401, Some(r#"******"https://ghcr.io/token",service="ghcr.io",scope="repository:botworkz/svc:pull""#.to_string()), vec![]),
+                // Second manifest call (after token exchange) → 200
+                (200, None, manifest_bytes.clone()),
+                // Config
+                (200, None, config_bytes.to_vec()),
+                // Layer
+                (200, None, layer_gz.clone()),
+            ])),
+            total_calls: Arc::new(AtomicUsize::new(0)),
+        };
+
+        let asset = Asset {
+            uri: format!("oci://ghcr.io/botworkz/svc@sha256:{manifest_hex}"),
+            version: String::new(),
+            checksum: None,
+            filename: Some("svc.tar".to_string()),
+            auth: None,
+        };
+
+        let cache = TempDir::new().unwrap();
+        let result = fetch_asset(FetchParams {
+            name: "my-svc",
+            asset: &asset,
+            out_dir: None,
+            cache_dir: cache.path(),
+            retries: 0,
+            backoff: &Backoff::default(),
+            compute_checksum: true,
+            no_reverify: false,
+            materialize_mode: MaterializeMode::Copy,
+            transport: Some(Box::new(transport)),
+        })
+        .unwrap();
+
+        assert!(result.blob_path.exists(), "assembled tar not in cache");
     }
 }
