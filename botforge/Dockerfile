@@ -53,6 +53,7 @@ RUN apt-get update \
         curl \
         genisoimage \
         gnupg \
+        libnss-wrapper \
         openssh-client \
         qemu-system-x86 \
         qemu-utils \
@@ -68,8 +69,9 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=binary-source /botforge /usr/local/bin/botforge
+COPY --chmod=0755 botforge/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
 WORKDIR /work
 
-ENTRYPOINT ["botforge"]
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["--help"]
