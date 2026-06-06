@@ -1,4 +1,5 @@
 use anyhow::{anyhow, bail, Context, Result};
+use flate2::read::GzDecoder;
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -91,6 +92,23 @@ pub struct DownloadResponse {
     pub content_length: Option<u64>,
 }
 
+/// Response type for OCI HTTP requests where 401+challenge is meaningful.
+pub struct OciHttpResponse {
+    pub status: u16,
+    pub www_authenticate: Option<String>,
+    pub body: Box<dyn Read + Send>,
+    pub content_length: Option<u64>,
+}
+
+/// Parsed components of an `oci://` URI.
+#[derive(Debug, Clone)]
+pub struct OciRef {
+    pub registry: String,
+    pub repo: String,
+    pub digest: String,      // "sha256:<64-hex>"
+    pub digest_hex: String,  // just the <64-hex> part
+}
+
 /// Minimal transport abstraction so tests can inject a mock.
 pub trait Transport: Send + Sync {
     /// Fetch `uri` (with optional auth token) and return a streaming body reader.
@@ -119,6 +137,27 @@ pub trait Transport: Send + Sync {
                 anyhow::Error::new(error)
                     .context(format!("failed to parse JSON response from {uri}")),
             )
+        })
+    }
+
+    /// Fetch `uri` for OCI use, surfacing the HTTP status code and `WWW-Authenticate` header
+    /// even on 401 responses so callers can perform token exchange.
+    ///
+    /// The default implementation wraps `get`; `ReqwestTransport` overrides this to inspect
+    /// response headers on 401. Mock transports in tests can also override it.
+    fn get_oci(
+        &self,
+        uri: &str,
+        auth: Option<&str>,
+        accept: Option<&str>,
+    ) -> std::result::Result<OciHttpResponse, FetchError> {
+        // Default: just use get() and assume 200 success with no challenge.
+        let resp = self.get(uri, auth, accept)?;
+        Ok(OciHttpResponse {
+            status: 200,
+            www_authenticate: None,
+            body: resp.body,
+            content_length: resp.content_length,
         })
     }
 }
@@ -170,6 +209,41 @@ impl Transport for ReqwestTransport {
             content_length,
         })
     }
+
+    fn get_oci(
+        &self,
+        uri: &str,
+        auth: Option<&str>,
+        accept: Option<&str>,
+    ) -> std::result::Result<OciHttpResponse, FetchError> {
+        let mut req = self.client.get(uri).header("User-Agent", "shasset");
+        if let Some(token) = auth {
+            req = req.header("Authorization", format!("******"));
+        }
+        if let Some(a) = accept {
+            req = req.header("Accept", a);
+        }
+        let resp = req.send().map_err(|e| {
+            FetchError::retryable(anyhow::Error::new(e).context(format!("HTTP request failed: {uri}")))
+        })?;
+        let status = resp.status().as_u16();
+        let www_authenticate = resp
+            .headers()
+            .get("www-authenticate")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        if status == 200 || status == 401 {
+            let content_length = resp.content_length();
+            Ok(OciHttpResponse {
+                status,
+                www_authenticate,
+                body: Box::new(resp),
+                content_length,
+            })
+        } else {
+            Err(http_status_error(status, uri))
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -197,7 +271,8 @@ pub fn fetch_asset(params: FetchParams<'_>) -> Result<FetchResult> {
     let uri = asset.expanded_uri();
     let auth = asset.resolved_auth()?;
 
-    if !compute_checksum && asset.checksum.is_none() {
+    let is_oci = uri.starts_with("oci://");
+    if !compute_checksum && asset.checksum.is_none() && !is_oci {
         bail!(
             "asset '{name}' has no checksum; refusing to fetch without verification. \
              Use `shasset add --compute` to populate it first, or set `checksum` in the manifest."
@@ -243,6 +318,35 @@ pub fn fetch_asset(params: FetchParams<'_>) -> Result<FetchResult> {
         }
     }
 
+    // For OCI assets: check the oci-index cache.
+    if is_oci {
+        if let Some(cached_hex) = oci_index_tar_hex_from_cache(cache_dir, &uri) {
+            let blob_path = cache_blob_path(cache_dir, &cached_hex);
+            if blob_path.exists() {
+                if no_reverify || verify_on_disk(name, &blob_path, &cached_hex).is_ok() {
+                    let out_path = if compute_checksum {
+                        None
+                    } else {
+                        let out_root = out_dir.with_context(|| {
+                            format!("asset '{name}': missing output dir for fetch materialization")
+                        })?;
+                        Some(materialize_blob(name, &filename, out_root, &blob_path, materialize_mode)?)
+                    };
+                    return Ok(FetchResult {
+                        path: out_path,
+                        blob_path,
+                        computed_sha256: cached_hex,
+                    });
+                }
+                // Cache blob failed verification; remove it and also clean the oci-index entry
+                let _ = std::fs::remove_file(&blob_path);
+                let _ = std::fs::remove_file(
+                    oci_index_path_for_uri(cache_dir, &uri).unwrap_or_default()
+                );
+            }
+        }
+    }
+
     // Retry loop for cache misses or invalidated cache blobs.
     let mut attempt = 0u32;
     let downloaded = loop {
@@ -252,7 +356,7 @@ pub fn fetch_asset(params: FetchParams<'_>) -> Result<FetchResult> {
             None => &ReqwestTransport::default(),
         };
 
-        match download_via_scheme(transport_ref, cache_dir, &uri, auth.as_deref()) {
+        match download_via_scheme(transport_ref, cache_dir, name, &uri, auth.as_deref()) {
             Ok(result) => break result,
             Err(e) => {
                 let retryable = e.is_retryable();
@@ -325,6 +429,8 @@ fn ensure_cache_layout(cache_dir: &Path) -> Result<()> {
         .with_context(|| format!("cannot create cache dir: {}", cache_dir.display()))?;
     std::fs::create_dir_all(cache_dir.join("quarantine"))
         .with_context(|| format!("cannot create quarantine dir: {}", cache_dir.display()))?;
+    std::fs::create_dir_all(cache_dir.join("oci-index"))
+        .with_context(|| format!("cannot create oci-index dir: {}", cache_dir.display()))?;
     Ok(())
 }
 
@@ -343,6 +449,7 @@ struct DownloadedFile {
 fn download_via_scheme(
     transport: &dyn Transport,
     cache_dir: &Path,
+    name: &str,
     uri: &str,
     auth: Option<&str>,
 ) -> std::result::Result<DownloadedFile, FetchError> {
@@ -352,6 +459,7 @@ fn download_via_scheme(
     match parsed.scheme() {
         "http" | "https" => try_download(transport, cache_dir, uri, auth, None),
         "github-release" => try_download_github_release(transport, cache_dir, uri, auth),
+        "oci" => try_download_oci(transport, cache_dir, name, uri, auth),
         other => Err(FetchError::permanent(anyhow!(
             "unsupported uri scheme '{other}' in asset uri: {uri}"
         ))),

@@ -53,7 +53,7 @@ release BOTWORK_LAUNCHER_SHA256 https://github.com/botworkz/botwork/releases/dow
 
 Current commands:
 
-- `botforge deps --out <dir> [--executable] [<name>]` — fetches file assets from `shasset.yaml` using the `shasset` library and stages each asset flat at `<dir>/<asset-filename>`, where the filename comes from the manifest `filename` field or the URI basename (not the manifest key). It also handles `oci://` image assets in the same manifest: pull OCI image refs from registries by digest, tag to `botwork/<asset-key>:local`, then save flat to `<dir>/<asset-filename>` (or `<dir>/<asset-key>.tar` when `filename` is unset). `docker` must be on `PATH`; `oci://` URIs must be pinned with `@sha256:<64-hex>`; manifest `checksum` is ignored for `oci://` assets.
+- `botforge deps --out <dir> [--executable] [<name>]` — fetches file assets from `shasset.yaml` using the `shasset` library and stages each asset flat at `<dir>/<asset-filename>`, where the filename comes from the manifest `filename` field or the URI basename (not the manifest key). It also handles `oci://` image assets in the same manifest: pulls OCI image refs from registries natively by digest, assembles a `docker load`-compatible image archive tagged `botwork/<asset-key>:local`, and saves it flat to `<dir>/<asset-filename>` (or `<dir>/<asset-key>.tar` when `filename` is unset). `oci://` URIs must be pinned with `@sha256:<64-hex>`; manifest `checksum` is ignored for `oci://` assets.
 - `botforge iso [--src <dir>] --out <file.iso> [--volume-id <id>]` — builds an ISO from a directory tree using `xorriso` (or `genisoimage` fallback). Seed ISO mode is folded in: pass `--ssh-public-key <KEY>` or `--ssh-public-key-file <PATH>` (and optional `--user-data-template <PATH>`) to generate cloud-init `user-data`/`meta-data` and build from that temp tree; `--src` is not required in seed mode. Use `--volume-id cidata` for NoCloud seed images.
 - `botforge payload --config <payload.yaml> --out <payload.iso> [--staging-dir <dir>] [--volume-id botwork-payload]` — config-driven payload builder. It stages configured image tarballs into `images/`, stages configured overlay/systemd files at their configured relative payload paths, writes `bootstrap.sh` to load images/install files/reload+manage services, and then builds an ISO from the staged tree (layout preserved, not flattened).
 - `botforge pack [--repo-root <dir>] [--compress] [--key <path>]` — runs a KVM-only Packer build of the base VM image natively inside the botforge container, then optionally compresses the qcow2. Requires `/dev/kvm`; dependencies and baked images must already be staged beforehand because botforge v1 does not build them. KVM is required; there are no tcg/accelerator options.
@@ -117,7 +117,7 @@ For v1, image resolution is registry-only (`oci://` pull-by-digest). Image build
 
 ### Container usage
 
-`botforge` is distributed as a **batteries-included** container image: the QEMU toolchain (`qemu-system-x86_64`, `qemu-img`), Packer (`packer`), ISO utilities (`xorriso`, `genisoimage`), and the Docker and OpenSSH clients are baked into the image so subcommands work reproducibly without installing exact tool versions on your host.
+`botforge` is distributed as a **batteries-included** container image: the QEMU toolchain (`qemu-system-x86_64`, `qemu-img`), Packer (`packer`), ISO utilities (`xorriso`, `genisoimage`), and the OpenSSH client are baked into the image so subcommands work reproducibly without installing exact tool versions on your host.
 
 **Published image:** `ghcr.io/botworkz/tools/botforge`
 
@@ -126,19 +126,17 @@ For v1, image resolution is registry-only (`oci://` pull-by-digest). Image build
 docker pull ghcr.io/botworkz/tools/botforge:latest
 ```
 
-**Runtime requirements:** botforge drives KVM and the host Docker daemon, so the container needs device and socket access, plus a mount of your working repository:
+**Runtime requirements:** botforge drives KVM, so the container needs device access, plus a mount of your working repository:
 
 ```sh
 docker run --rm \
   --device /dev/kvm \
-  -v /var/run/docker.sock:/var/run/docker.sock \
   -v "$PWD:/work" \
   -w /work \
   ghcr.io/botworkz/tools/botforge <command> [args...]
 ```
 
 - `--device /dev/kvm` — required for `pack`, `run`, and `test` (KVM-only; no TCG fallback).
-- `-v /var/run/docker.sock:/var/run/docker.sock` — required only for `deps` (OCI pull/save). This mounts the **host** Docker socket; there is no Docker-in-Docker daemon inside the image.
 - `-v "$PWD:/work" -w /work` — mount your repo so botforge can read manifests, write artifacts, and resolve project-relative paths.
 
 **Build the image locally with Earthly (EarthBuild):**
@@ -158,7 +156,7 @@ This produces the stable local tag `botwork/botforge:local`.
 - A verified downloader: fetch one or all named assets, verify each against its checksum, and fail loudly on any mismatch or error.
 
 **What shasset is explicitly NOT (out of scope):**
-- No knowledge of container images / registries / digest pins (Dependabot + Earthly already manage `FROM ...@sha256` pins).
+- No management of image **digest pins** (Dependabot + Earthly already manage `FROM ...@sha256` pins; `bin/update-deps` resolves them at pin-update time). `shasset` itself can *fetch* an image by its pinned digest (`oci://` scheme) but does not discover or rewrite pins.
 - No "sibling build" / `*_REF` logic — that belongs in consumer repos.
 - No awareness of qcow2, skopeo, tar export, or project-specific tooling.
 - It is a generic tool anyone could vendor.
@@ -195,7 +193,8 @@ Rules:
 - URI schemes are dispatch-based:
   - `http` / `https`: direct download (optional bearer auth).
   - `github-release://<owner>/<repo>/<tag>/<asset-name>`: `${version}` is expanded before parsing, the asset name is the final path segment, and the tag is everything between `<repo>` and the asset name so tags may contain `/` (for example `github-release://owner/repo/release/0.0.3/asset`). The handler resolves the release asset id via GitHub API, then downloads via `releases/assets/{id}`.
-- `checksum` must be `sha256:<64-hex>`. An asset without a checksum cannot be fetched; use `add --compute` to populate it.
+  - `oci://<registry>/<repo>[:<tag>]@sha256:<64-hex>`: pulls the image manifest + config + layers from the registry v2 API by digest, verifies each blob's sha256, and assembles a `docker load`-compatible image archive tarball locally tagged `botwork/<asset_key>:local`. `${version}` is expanded before parsing. The `checksum` field is **not required** for `oci://` (the manifest digest is self-verifying); if present, it is ignored with a warning. `auth: ${GH_TOKEN}` is used as a bearer token directly; on 401 with a `WWW-Authenticate: Bearer` challenge, shasset performs the standard token exchange against the indicated realm.
+- `checksum` must be `sha256:<64-hex>`. An asset without a checksum cannot be fetched (exception: `oci://` assets, which use the manifest digest as a self-verifying identity); use `add --compute` to populate it for non-OCI assets.
 - `filename`: when set, the downloaded file is always written with this exact name (after `${version}` expansion). When absent, the URI basename is used.
 - `auth`: the `${ENV_VAR}` template is stored as-is and resolved from the process environment at fetch time. The resolved secret is sent as `Authorization: ****** **The secret is never written back to the manifest file.** If the referenced variable is unset, shasset errors clearly.
 
