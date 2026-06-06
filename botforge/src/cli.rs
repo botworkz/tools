@@ -26,7 +26,7 @@ pub(crate) enum Commands {
     Iso(commands::iso::IsoArgs),
     /// Build a payload ISO from a config-driven staging plan.
     Payload(commands::payload::PayloadArgs),
-    /// Run the KVM-only Packer build flow inside docker compose.
+    /// Run the KVM-only Packer build flow in a Docker container.
     Pack(commands::pack::PackArgs),
     /// Launch a VM with qemu (KVM-only).
     Run(commands::run::RunArgs),
