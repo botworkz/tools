@@ -120,6 +120,7 @@ jobs:
           docker run --rm --entrypoint xorriso "botwork/botforge:ci" -version
           docker run --rm --entrypoint ssh "botwork/botforge:ci" -V
           docker run --rm --entrypoint docker "botwork/botforge:ci" --version
+          docker run --rm --entrypoint docker "botwork/botforge:ci" compose version
 
           rm -rf .ci-deps-smoke
           mkdir -p .ci-deps-smoke/out
