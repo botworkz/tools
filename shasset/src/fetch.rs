@@ -1005,8 +1005,10 @@ fn fetch_oci_bytes(
     auth: Option<&str>,
     accept: Option<&str>,
 ) -> std::result::Result<Vec<u8>, FetchError> {
-    // First attempt
-    let resp = transport.get_oci(url, auth, accept)?;
+    // Always start OCI fetches unauthenticated and follow the 401 challenge flow.
+    // `auth` here is used for token-endpoint credentials (HTTP Basic), not as a
+    // pre-issued bearer token for manifest/blob requests.
+    let resp = transport.get_oci(url, None, accept)?;
     if resp.status == 200 {
         let mut buf = Vec::new();
         let mut body = resp.body;
@@ -2525,131 +2527,6 @@ mod tests {
         assert_eq!(run1, run2, "assembled tar is not deterministic");
     }
 
-    // #[test] - DISABLED
-    fn _disabled_oci_uri_token_exchange_on_401() {
-        use std::collections::VecDeque;
-        use std::sync::Mutex;
-
-        let config_bytes = b"{\"architecture\":\"amd64\"}";
-        let config_hex = sha256_hex(config_bytes);
-        let layer_tar = make_minimal_layer_tar();
-        let layer_gz = make_gzip(&layer_tar);
-        let layer_gz_hex = sha256_hex(&layer_gz);
-
-        let manifest = serde_json::json!({
-            "mediaType": "application/vnd.oci.image.manifest.v1+json",
-            "config": {
-                "digest": format!("sha256:{config_hex}"),
-                "mediaType": "application/vnd.oci.image.config.v1+json"
-            },
-            "layers": [{
-                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
-                "digest": format!("sha256:{layer_gz_hex}"),
-                "size": layer_gz.len()
-            }]
-        });
-        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
-        let manifest_hex = sha256_hex(&manifest_bytes);
-
-        // OCI mock that returns 401 on the first manifest request, then OK after token exchange.
-        // The token exchange hits a 2nd URL via `get()` (not `get_oci()`).
-        type OciCall = (u16, Option<String>, Vec<u8>);
-
-        struct OciTokenExchangeMock {
-            // Regular `get` calls (token exchange)
-            get_calls: Mutex<VecDeque<Vec<u8>>>,
-            // `get_oci` calls (manifest + blobs)
-            oci_calls: Mutex<VecDeque<OciCall>>,
-            total_calls: Arc<AtomicUsize>,
-        }
-
-        impl Transport for OciTokenExchangeMock {
-            fn get(
-                &self,
-                _uri: &str,
-                _auth: Option<&str>,
-                _accept: Option<&str>,
-            ) -> std::result::Result<DownloadResponse, FetchError> {
-                self.total_calls.fetch_add(1, Ordering::SeqCst);
-                let body = self
-                    .get_calls
-                    .lock()
-                    .unwrap()
-                    .pop_front()
-                    .expect("mock get calls exhausted");
-                Ok(DownloadResponse {
-                    body: Box::new(std::io::Cursor::new(body)),
-                    content_length: None,
-                })
-            }
-
-            fn get_oci(
-                &self,
-                _uri: &str,
-                _auth: Option<&str>,
-                _accept: Option<&str>,
-            ) -> std::result::Result<OciHttpResponse, FetchError> {
-                self.total_calls.fetch_add(1, Ordering::SeqCst);
-                let (status, www_auth, body) = self
-                    .oci_calls
-                    .lock()
-                    .unwrap()
-                    .pop_front()
-                    .expect("mock get_oci calls exhausted");
-                Ok(OciHttpResponse {
-                    status,
-                    www_authenticate: www_auth,
-                    body: Box::new(std::io::Cursor::new(body)),
-                    content_length: None,
-                })
-            }
-        }
-
-        let token_json = serde_json::json!({"token": "test-bearer-token"}).to_string();
-
-        let transport = OciTokenExchangeMock {
-            get_calls: Mutex::new(VecDeque::from(vec![
-                token_json.into_bytes(), // token exchange response
-            ])),
-            oci_calls: Mutex::new(VecDeque::from(vec![
-                // First manifest call → 401 with challenge
-(401, Some(r#"Bearer realm="https://ghcr.io/token",service="ghcr.io",scope="repository:botworkz/svc:pull""#.to_string()), vec![]),
-                // Second manifest call (after token exchange) → 200
-                (200, None, manifest_bytes.clone()),
-                // Config
-                (200, None, config_bytes.to_vec()),
-                // Layer
-                (200, None, layer_gz.clone()),
-            ])),
-            total_calls: Arc::new(AtomicUsize::new(0)),
-        };
-
-        let asset = Asset {
-            uri: format!("oci://ghcr.io/botworkz/svc@sha256:{manifest_hex}"),
-            version: String::new(),
-            checksum: None,
-            filename: Some("svc.tar".to_string()),
-            auth: None,
-        };
-
-        let cache = TempDir::new().unwrap();
-        let result = fetch_asset(FetchParams {
-            name: "my-svc",
-            asset: &asset,
-            out_dir: None,
-            cache_dir: cache.path(),
-            retries: 0,
-            backoff: &Backoff::default(),
-            compute_checksum: true,
-            no_reverify: false,
-            materialize_mode: MaterializeMode::Copy,
-            transport: Some(Box::new(transport)),
-        })
-        .unwrap();
-
-        assert!(result.blob_path.exists(), "assembled tar not in cache");
-    }
-
     // Helper: build a minimal OCI manifest + blobs for mock transport tests.
     fn make_oci_test_fixtures() -> (Vec<u8>, Vec<u8>, Vec<u8>, String) {
         let config_bytes: Vec<u8> = b"{\"architecture\":\"amd64\"}".to_vec();
@@ -2676,24 +2553,26 @@ mod tests {
 
     const OCI_WWW_AUTH: &str = r#"Bearer realm="https://ghcr.io/token",service="ghcr.io",scope="repository:botworkz/svc:pull""#;
 
+    type OciExchangeRun = (Vec<(String, String)>, Vec<Option<String>>, usize, bool);
+
     /// Run `fetch_asset` against an OCI mock that returns 401+challenge on the first manifest
-    /// request, then succeeds after token exchange. Returns (basic_auth_calls, anonymous_get_calls,
-    /// fetch_succeeded).
-    fn run_oci_basic_auth_exchange(
-        auth_value: Option<&str>,
-    ) -> (Vec<(String, String)>, usize, bool) {
+    /// request, then succeeds after token exchange. Returns (basic_auth_calls, oci_auths,
+    /// anonymous_get_calls, fetch_succeeded).
+    fn run_oci_basic_auth_exchange(auth_value: Option<&str>) -> OciExchangeRun {
         use std::sync::Arc;
 
         let (manifest_bytes, config_bytes, layer_gz, manifest_hex) = make_oci_test_fixtures();
         let token_json = serde_json::json!({"token": "test-bearer-token"}).to_string();
 
         let basic_auth_calls = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+        let oci_auths = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
         let anon_get_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
         type OciCallOutcome = (u16, Option<String>, Vec<u8>);
 
         struct InnerMock {
             basic_auth_calls: Arc<Mutex<Vec<(String, String)>>>,
+            oci_auths: Arc<Mutex<Vec<Option<String>>>>,
             anon_get_count: Arc<std::sync::atomic::AtomicUsize>,
             get_calls: Mutex<VecDeque<Vec<u8>>>,
             basic_auth_responses: Mutex<VecDeque<Vec<u8>>>,
@@ -2749,9 +2628,13 @@ mod tests {
             fn get_oci(
                 &self,
                 _uri: &str,
-                _auth: Option<&str>,
+                auth: Option<&str>,
                 _accept: Option<&str>,
             ) -> std::result::Result<OciHttpResponse, FetchError> {
+                self.oci_auths
+                    .lock()
+                    .unwrap()
+                    .push(auth.map(str::to_string));
                 let (status, www_auth, body) = self
                     .oci_calls
                     .lock()
@@ -2770,6 +2653,7 @@ mod tests {
         let token_bytes = token_json.into_bytes();
         let transport = InnerMock {
             basic_auth_calls: Arc::clone(&basic_auth_calls),
+            oci_auths: Arc::clone(&oci_auths),
             anon_get_count: Arc::clone(&anon_get_count),
             get_calls: Mutex::new(VecDeque::from(vec![token_bytes.clone()])),
             basic_auth_responses: Mutex::new(VecDeque::from(vec![token_bytes])),
@@ -2805,15 +2689,16 @@ mod tests {
         .is_ok();
 
         let calls = basic_auth_calls.lock().unwrap().clone();
+        let oci = oci_auths.lock().unwrap().clone();
         let anon = anon_get_count.load(std::sync::atomic::Ordering::SeqCst);
-        (calls, anon, ok)
+        (calls, oci, anon, ok)
     }
 
     /// Bug regression: a bare token (no colon) must be sent as Basic auth with
     /// username "x-access-token", not discarded or sent as an anonymous request.
     #[test]
     fn oci_token_exchange_bare_token_uses_x_access_token_basic_auth() {
-        let (calls, _anon, ok) = run_oci_basic_auth_exchange(Some("ghs_test_token_no_colon"));
+        let (calls, _oci, _anon, ok) = run_oci_basic_auth_exchange(Some("ghs_test_token_no_colon"));
         assert!(ok, "fetch should succeed");
         assert_eq!(
             calls.len(),
@@ -2833,7 +2718,7 @@ mod tests {
     /// A `user:pass` auth value must be split on the first colon and sent as Basic auth.
     #[test]
     fn oci_token_exchange_user_colon_pass_splits_correctly() {
-        let (calls, _anon, ok) = run_oci_basic_auth_exchange(Some("alice:s3cret"));
+        let (calls, _oci, _anon, ok) = run_oci_basic_auth_exchange(Some("alice:s3cret"));
         assert!(ok, "fetch should succeed");
         assert_eq!(calls.len(), 1);
         assert_eq!(
@@ -2846,7 +2731,7 @@ mod tests {
     /// Passwords that themselves contain colons must not be truncated (split_once, not splitn).
     #[test]
     fn oci_token_exchange_password_with_colons_preserved() {
-        let (calls, _anon, ok) = run_oci_basic_auth_exchange(Some("alice:s3:cret"));
+        let (calls, _oci, _anon, ok) = run_oci_basic_auth_exchange(Some("alice:s3:cret"));
         assert!(ok, "fetch should succeed");
         assert_eq!(calls.len(), 1);
         assert_eq!(
@@ -2860,7 +2745,7 @@ mod tests {
     /// `get_with_basic_auth`.
     #[test]
     fn oci_token_exchange_no_auth_falls_back_to_anonymous() {
-        let (calls, anon, ok) = run_oci_basic_auth_exchange(None);
+        let (calls, _oci, anon, ok) = run_oci_basic_auth_exchange(None);
         assert!(ok, "fetch should succeed");
         assert!(
             calls.is_empty(),
@@ -2869,6 +2754,40 @@ mod tests {
         assert!(
             anon > 0,
             "anonymous token exchange should use get() not get_with_basic_auth()"
+        );
+    }
+
+    #[test]
+    fn oci_initial_request_is_unauthenticated_and_uses_exchanged_token_on_retry() {
+        let (basic_auth_calls, oci_auths, _anon, ok) =
+            run_oci_basic_auth_exchange(Some("phlax:ghs_test_token"));
+        assert!(ok, "fetch should succeed");
+        assert_eq!(
+            oci_auths.len(),
+            4,
+            "expected manifest/config/layer OCI calls"
+        );
+
+        assert_eq!(
+            oci_auths[0], None,
+            "initial manifest request must be unauthenticated"
+        );
+        assert_eq!(oci_auths[1], Some("test-bearer-token".to_string()));
+        assert_ne!(
+            oci_auths[2],
+            Some("phlax:ghs_test_token".to_string()),
+            "config request must never send raw operator credentials as bearer auth"
+        );
+        assert_ne!(
+            oci_auths[3],
+            Some("phlax:ghs_test_token".to_string()),
+            "layer request must never send raw operator credentials as bearer auth"
+        );
+
+        assert_eq!(basic_auth_calls.len(), 1);
+        assert_eq!(
+            basic_auth_calls[0],
+            ("phlax".to_string(), "ghs_test_token".to_string())
         );
     }
 }
