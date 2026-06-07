@@ -43,9 +43,11 @@ pub struct AddArgs {
     /// Download URI (may contain `${version}`).
     #[arg(long)]
     pub uri: String,
-    /// Version string (used to expand `${version}` in uri/filename).
+    /// Version string used to expand `${version}` in uri/filename. Optional;
+    /// defaults to empty. Useful for informational tracking on OCI /
+    /// digest-pinned assets where the URI does not reference `${version}`.
     #[arg(long)]
-    pub version: String,
+    pub version: Option<String>,
     /// Checksum in `sha256:<hex>` format. Mutually exclusive with `--compute`.
     #[arg(long, conflicts_with = "compute")]
     pub checksum: Option<String>,

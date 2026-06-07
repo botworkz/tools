@@ -86,7 +86,7 @@ fn cmd_add(config: &Path, args: cli::AddArgs) -> Result<()> {
 
     let asset = Asset {
         uri: args.uri.clone(),
-        version: args.version.clone(),
+        version: args.version.clone().unwrap_or_default(),
         checksum: args.checksum.clone(),
         filename: args.filename.clone(),
         auth: args.auth.clone(),
@@ -118,7 +118,7 @@ fn cmd_add(config: &Path, args: cli::AddArgs) -> Result<()> {
 
     let stored = Asset {
         uri: args.uri,
-        version: args.version,
+        version: args.version.unwrap_or_default(),
         checksum,
         filename: args.filename,
         auth: args.auth,
@@ -1193,5 +1193,95 @@ mod tests {
         assert_eq!(m.settings.backoff.base_ms, 500);
         assert_eq!(m.settings.backoff.max_ms, 8000);
         assert_eq!(m.settings.backoff.factor, 2);
+    }
+
+    // ── version optional on add ───────────────────────────────────────────────
+
+    #[test]
+    fn add_args_version_optional_parses_without_flag() {
+        use clap::Parser;
+        let hex = "a".repeat(64);
+        let args = Cli::try_parse_from([
+            "shasset",
+            "add",
+            "tool",
+            "--uri",
+            "https://example.com/tool",
+            "--checksum",
+            &format!("sha256:{hex}"),
+        ])
+        .unwrap();
+        let Command::Add(add) = args.command else {
+            panic!("expected Add command");
+        };
+        assert_eq!(add.version, None);
+    }
+
+    #[test]
+    fn add_args_version_parses_when_provided() {
+        use clap::Parser;
+        let hex = "a".repeat(64);
+        let args = Cli::try_parse_from([
+            "shasset",
+            "add",
+            "tool",
+            "--uri",
+            "https://example.com/tool",
+            "--version",
+            "1.2.3",
+            "--checksum",
+            &format!("sha256:{hex}"),
+        ])
+        .unwrap();
+        let Command::Add(add) = args.command else {
+            panic!("expected Add command");
+        };
+        assert_eq!(add.version.as_deref(), Some("1.2.3"));
+    }
+
+    #[test]
+    fn cmd_add_without_version_stores_empty_string() {
+        let tmp = TempDir::new().unwrap();
+        let config = tmp.path().join("shasset.yaml");
+        let hex = "a".repeat(64);
+        let args = cli::AddArgs {
+            name: "tool".to_string(),
+            uri: "https://example.com/tool".to_string(),
+            version: None,
+            checksum: Some(format!("sha256:{hex}")),
+            compute: false,
+            filename: Some("tool.bin".to_string()),
+            auth: None,
+            cache_dir: None,
+        };
+        cmd_add(&config, args).unwrap();
+        let manifest = manifest::load(&config).unwrap();
+        let asset = &manifest.assets["tool"];
+        assert_eq!(asset.version, "");
+        // Round-trip: save and reload, version stays empty
+        manifest::save(&config, &manifest).unwrap();
+        let reloaded = manifest::load(&config).unwrap();
+        assert_eq!(reloaded.assets["tool"].version, "");
+    }
+
+    #[test]
+    fn cmd_add_with_version_stores_version_string() {
+        let tmp = TempDir::new().unwrap();
+        let config = tmp.path().join("shasset.yaml");
+        let hex = "a".repeat(64);
+        let args = cli::AddArgs {
+            name: "tool".to_string(),
+            uri: "https://example.com/v${version}/tool".to_string(),
+            version: Some("1.2.3".to_string()),
+            checksum: Some(format!("sha256:{hex}")),
+            compute: false,
+            filename: Some("tool.bin".to_string()),
+            auth: None,
+            cache_dir: None,
+        };
+        cmd_add(&config, args).unwrap();
+        let manifest = manifest::load(&config).unwrap();
+        let asset = &manifest.assets["tool"];
+        assert_eq!(asset.version, "1.2.3");
     }
 }
