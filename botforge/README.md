@@ -31,3 +31,8 @@ The `--config / -c` flag (default `shasset.yaml`) is global; it points `deps` at
 | Command | Summary |
 |---|---|
 | `botforge deps --out  [--volume-id 
+
+For `botforge test`, the `isos:` list in test config supports two forms:
+
+- A bare string path (attach only).
+- A mapping with `path:`, `label:`, `mount:`, and optional `bootstrap:` (default `bootstrap.sh`) to attach the ISO, mount it by label in the guest, and run the bootstrap script with `sudo` before configured `steps:`.
