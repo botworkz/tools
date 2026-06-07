@@ -372,7 +372,7 @@ pub fn fetch_asset(params: FetchParams<'_>) -> Result<FetchResult> {
 
     // For OCI assets: check the oci-index cache.
     if is_oci {
-        if let Some(cached_hex) = oci_index_tar_hex_from_cache(cache_dir, &uri) {
+        if let Some(cached_hex) = oci_index_tar_hex_from_cache(cache_dir, &uri, asset) {
             let blob_path = cache_blob_path(cache_dir, &cached_hex);
             if blob_path.exists() {
                 if no_reverify || verify_on_disk(name, &blob_path, &cached_hex).is_ok() {
@@ -399,7 +399,7 @@ pub fn fetch_asset(params: FetchParams<'_>) -> Result<FetchResult> {
                 // Cache blob failed verification; remove it and also clean the oci-index entry
                 let _ = std::fs::remove_file(&blob_path);
                 let _ = std::fs::remove_file(
-                    oci_index_path_for_uri(cache_dir, &uri).unwrap_or_default(),
+                    oci_index_path_for_uri(cache_dir, &uri, asset).unwrap_or_default(),
                 );
             }
         }
@@ -414,7 +414,7 @@ pub fn fetch_asset(params: FetchParams<'_>) -> Result<FetchResult> {
             None => &ReqwestTransport::default(),
         };
 
-        match download_via_scheme(transport_ref, cache_dir, name, &uri, auth.as_deref()) {
+        match download_via_scheme(transport_ref, cache_dir, name, asset, &uri, auth.as_deref()) {
             Ok(result) => break result,
             Err(e) => {
                 let retryable = e.is_retryable();
@@ -508,6 +508,7 @@ fn download_via_scheme(
     transport: &dyn Transport,
     cache_dir: &Path,
     name: &str,
+    asset: &Asset,
     uri: &str,
     auth: Option<&str>,
 ) -> std::result::Result<DownloadedFile, FetchError> {
@@ -517,7 +518,7 @@ fn download_via_scheme(
     match parsed.scheme() {
         "http" | "https" => try_download(transport, cache_dir, uri, auth, None),
         "github-release" => try_download_github_release(transport, cache_dir, uri, auth),
-        "oci" => try_download_oci(transport, cache_dir, name, uri, auth),
+        "oci" => try_download_oci(transport, cache_dir, name, asset, uri, auth),
         other => Err(FetchError::permanent(anyhow!(
             "unsupported uri scheme '{other}' in asset uri: {uri}"
         ))),
@@ -911,21 +912,24 @@ pub fn oci_manifest_hex_from_uri(uri: &str) -> Option<String> {
 }
 
 /// Path for the oci-index entry mapping a manifest digest to the assembled-tar sha256.
-pub fn oci_index_path(cache_dir: &Path, manifest_hex: &str) -> PathBuf {
-    cache_dir.join("oci-index").join(manifest_hex)
+pub fn oci_index_path(cache_dir: &Path, manifest_hex: &str, platform_slug: &str) -> PathBuf {
+    cache_dir
+        .join("oci-index")
+        .join(format!("{manifest_hex}.{platform_slug}"))
 }
 
 /// Read the assembled-tar sha256 hex from an oci-index entry (if present and valid).
-pub fn oci_index_tar_hex_from_cache(cache_dir: &Path, uri: &str) -> Option<String> {
+pub fn oci_index_tar_hex_from_cache(cache_dir: &Path, uri: &str, asset: &Asset) -> Option<String> {
     let manifest_hex = oci_manifest_hex_from_uri(uri)?;
-    let path = oci_index_path(cache_dir, &manifest_hex);
+    let platform_slug = oci_platform_slug_from_asset(asset).ok()?;
+    let path = oci_index_path(cache_dir, &manifest_hex, &platform_slug);
     std::fs::read_to_string(&path)
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
-/// Enumerate all manifest digest hex values currently in the oci-index dir.
+/// Enumerate valid oci-index entry keys (`<manifest_hex>.<platform_slug>`).
 pub fn oci_index_manifest_hexes_in_cache(cache_dir: &Path) -> Vec<String> {
     let dir = cache_dir.join("oci-index");
     std::fs::read_dir(&dir)
@@ -935,7 +939,11 @@ pub fn oci_index_manifest_hexes_in_cache(cache_dir: &Path) -> Vec<String> {
         .filter_map(|e| e.ok())
         .filter_map(|e| {
             let name = e.file_name().to_string_lossy().to_ascii_lowercase();
-            if name.len() == 64 && name.chars().all(|c| c.is_ascii_hexdigit()) {
+            let (manifest_hex, _platform) = name.split_once('.')?;
+            if manifest_hex.len() == 64
+                && manifest_hex.chars().all(|c| c.is_ascii_hexdigit())
+                && !name.ends_with('.')
+            {
                 Some(name)
             } else {
                 None
@@ -944,8 +952,18 @@ pub fn oci_index_manifest_hexes_in_cache(cache_dir: &Path) -> Vec<String> {
         .collect()
 }
 
-fn oci_index_path_for_uri(cache_dir: &Path, uri: &str) -> Option<PathBuf> {
-    oci_manifest_hex_from_uri(uri).map(|hex| oci_index_path(cache_dir, &hex))
+pub fn oci_platform_slug_from_asset(asset: &Asset) -> Result<String> {
+    let (os, arch, variant) = asset.resolved_platform()?;
+    Ok(match variant {
+        Some(variant) => format!("{os}-{arch}-{variant}"),
+        None => format!("{os}-{arch}"),
+    })
+}
+
+fn oci_index_path_for_uri(cache_dir: &Path, uri: &str, asset: &Asset) -> Option<PathBuf> {
+    let manifest_hex = oci_manifest_hex_from_uri(uri)?;
+    let platform_slug = oci_platform_slug_from_asset(asset).ok()?;
+    Some(oci_index_path(cache_dir, &manifest_hex, &platform_slug))
 }
 
 /// Parse a `WWW-Authenticate: ******"...",service="...",scope="..."` header.
@@ -1140,10 +1158,15 @@ fn try_download_oci(
     transport: &dyn Transport,
     cache_dir: &Path,
     name: &str,
+    asset: &Asset,
     uri: &str,
     auth: Option<&str>,
 ) -> std::result::Result<DownloadedFile, FetchError> {
     let oci_ref = parse_oci_uri(uri)?;
+    let asset_platform = asset.resolved_platform().map_err(|e| {
+        FetchError::permanent(e.context(format!("asset '{name}': cannot resolve platform")))
+    })?;
+    let platform_slug = oci_platform_slug_from_asset(asset).map_err(FetchError::permanent)?;
 
     // 1. Pull manifest by digest
     let manifest_url = format!(
@@ -1160,17 +1183,56 @@ fn try_download_oci(
         FetchError::permanent(anyhow!("failed to parse OCI manifest for '{name}': {e}"))
     })?;
 
-    // Reject image indices (multi-arch)
     let media_type = manifest
         .get("mediaType")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    if media_type.contains("image.index") || media_type.contains("manifest.list") {
-        return Err(FetchError::permanent(anyhow!(
-            "oci asset '{name}' is a multi-arch image index; only single-platform manifest \
-             digests are supported in v1. Pin a platform-specific digest."
-        )));
-    }
+    let (manifest, _manifest_bytes, effective_digest_hex) = if is_image_index(media_type) {
+        let child_digest =
+            select_platform_child(&manifest, &asset_platform).ok_or_else(|| {
+                let platform = match &asset_platform.2 {
+                    Some(variant) => {
+                        format!("{}/{}/{}", asset_platform.0, asset_platform.1, variant)
+                    }
+                    None => format!("{}/{}", asset_platform.0, asset_platform.1),
+                };
+                FetchError::permanent(anyhow!(
+                    "oci asset '{name}': image index does not contain a child for platform '{platform}'"
+                ))
+            })?;
+        let child_hex = child_digest
+            .strip_prefix("sha256:")
+            .ok_or_else(|| {
+                FetchError::permanent(anyhow!(
+                    "oci asset '{name}': index child digest is not sha256-prefixed: {child_digest}"
+                ))
+            })?
+            .to_string();
+        let child_url = format!(
+            "https://{}/v2/{}/manifests/{}",
+            oci_ref.registry, oci_ref.repo, child_digest
+        );
+        let child_bytes = fetch_oci_bytes(transport, &child_url, auth, Some(MANIFEST_ACCEPT))?;
+        verify_digest(&child_bytes, &child_hex)?;
+        let child_manifest: serde_json::Value =
+            serde_json::from_slice(&child_bytes).map_err(|e| {
+                FetchError::permanent(anyhow!(
+                    "failed to parse child OCI manifest for '{name}': {e}"
+                ))
+            })?;
+        let child_media = child_manifest
+            .get("mediaType")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if is_image_index(child_media) {
+            return Err(FetchError::permanent(anyhow!(
+                "oci asset '{name}': nested image index not supported (child {child_digest} is also an index)"
+            )));
+        }
+        (child_manifest, child_bytes, child_hex)
+    } else {
+        (manifest, manifest_bytes, oci_ref.digest_hex.clone())
+    };
 
     // 2. Pull config blob
     let config = manifest.get("config").ok_or_else(|| {
@@ -1272,14 +1334,18 @@ fn try_download_oci(
     std::fs::create_dir_all(&oci_index_dir).map_err(|e| {
         FetchError::permanent(anyhow::Error::new(e).context("cannot create oci-index directory"))
     })?;
-    std::fs::write(oci_index_dir.join(&oci_ref.digest_hex), &tar_hex).map_err(|e| {
+    std::fs::write(
+        oci_index_path(cache_dir, &oci_ref.digest_hex, &platform_slug),
+        &tar_hex,
+    )
+    .map_err(|e| {
         FetchError::permanent(anyhow::Error::new(e).context("cannot write oci-index entry"))
     })?;
 
     // 6. Write assembled tar to quarantine
     let quarantine_path = cache_dir.join("quarantine").join(format!(
         "oci-{}-{}-{}.part",
-        &oci_ref.digest_hex[..16],
+        &effective_digest_hex[..16],
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1300,6 +1366,34 @@ fn try_download_oci(
         bytes_written: tar_len,
         content_length: None,
     })
+}
+
+fn is_image_index(media_type: &str) -> bool {
+    media_type.contains("image.index") || media_type.contains("manifest.list")
+}
+
+fn select_platform_child(
+    index: &serde_json::Value,
+    platform: &(String, String, Option<String>),
+) -> Option<String> {
+    let manifests = index.get("manifests")?.as_array()?;
+    let (wanted_os, wanted_arch, wanted_variant) = platform;
+    for entry in manifests {
+        let plat = entry.get("platform")?;
+        let os = plat.get("os")?.as_str()?;
+        let arch = plat.get("architecture")?.as_str()?;
+        if os != wanted_os || arch != wanted_arch {
+            continue;
+        }
+        if let Some(want_var) = wanted_variant {
+            let variant = plat.get("variant").and_then(|v| v.as_str()).unwrap_or("");
+            if variant != want_var {
+                continue;
+            }
+        }
+        return entry.get("digest")?.as_str().map(str::to_string);
+    }
+    None
 }
 
 /// Assemble a docker-load-compatible image archive tarball.
@@ -1524,6 +1618,7 @@ mod tests {
             checksum: Some(format!("sha256:{hex}")),
             filename: Some("tool.bin".to_string()),
             auth: None,
+            platform: None,
         }
     }
 
@@ -1750,6 +1845,7 @@ mod tests {
             checksum: None,
             filename: Some("tool.bin".to_string()),
             auth: None,
+            platform: None,
         };
         let cache = TempDir::new().unwrap();
         let (transport, calls) = MockTransport::new(data.to_vec());
@@ -1815,6 +1911,7 @@ mod tests {
             checksum: Some(format!("sha256:{hex}")),
             filename: None,
             auth: Some("${SHASSET_TEST_TOKEN}".to_string()),
+            platform: None,
         };
         std::env::set_var("SHASSET_TEST_TOKEN", "token123");
 
@@ -1900,6 +1997,7 @@ mod tests {
             checksum: Some(format!("sha256:{hex}")),
             filename: None,
             auth: Some("${SHASSET_TEST_TOKEN}".to_string()),
+            platform: None,
         };
         std::env::set_var("SHASSET_TEST_TOKEN", "token123");
 
@@ -1967,6 +2065,7 @@ mod tests {
             checksum: Some(format!("sha256:{}", "a".repeat(64))),
             filename: None,
             auth: None,
+            platform: None,
         };
         let out = TempDir::new().unwrap();
         let cache = TempDir::new().unwrap();
@@ -2001,11 +2100,20 @@ mod tests {
     fn unsupported_uri_scheme_is_permanent_error() {
         let cache = TempDir::new().unwrap();
         let (transport, calls) = MockTransport::new(b"ignored".to_vec());
+        let asset = Asset {
+            uri: "ftp://example.com/x".to_string(),
+            version: String::new(),
+            checksum: None,
+            filename: None,
+            auth: None,
+            platform: None,
+        };
 
         let err = download_via_scheme(
             &transport,
             cache.path(),
             "test",
+            &asset,
             "ftp://example.com/x",
             None,
         )
@@ -2229,6 +2337,7 @@ mod tests {
             checksum: None,
             filename: Some("svc.tar".to_string()),
             auth: None,
+            platform: None,
         };
 
         let cache = TempDir::new().unwrap();
@@ -2327,6 +2436,7 @@ mod tests {
             checksum: None,
             filename: Some("svc.tar".to_string()),
             auth: None,
+            platform: None,
         };
 
         let cache = TempDir::new().unwrap();
@@ -2381,6 +2491,7 @@ mod tests {
             checksum: None,
             filename: Some("svc.tar".to_string()),
             auth: None,
+            platform: None,
         };
 
         let cache = TempDir::new().unwrap();
@@ -2421,10 +2532,25 @@ mod tests {
     }
 
     #[test]
-    fn oci_uri_rejects_image_index() {
+    fn oci_uri_image_index_selects_matching_platform() {
+        let (child_manifest_bytes, config_bytes, layer_gz, child_manifest_hex) =
+            make_oci_test_fixtures();
+        let config_hex = sha256_hex(&config_bytes);
+        let layer_gz_hex = sha256_hex(&layer_gz);
+        let child_digest = format!("sha256:{child_manifest_hex}");
+
         let index = serde_json::json!({
             "mediaType": "application/vnd.oci.image.index.v1+json",
-            "manifests": []
+            "manifests": [
+                {
+                    "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "platform": {"os": "linux", "architecture": "arm64"}
+                },
+                {
+                    "digest": child_digest,
+                    "platform": {"os": "linux", "architecture": "amd64"}
+                }
+            ]
         });
         let index_bytes = serde_json::to_vec(&index).unwrap();
         let index_hex = sha256_hex(&index_bytes);
@@ -2435,10 +2561,101 @@ mod tests {
             checksum: None,
             filename: Some("svc.tar".to_string()),
             auth: None,
+            platform: None,
         };
 
         let cache = TempDir::new().unwrap();
-        let (transport, _) = MockTransport::new(index_bytes);
+        let (transport, calls) = MockTransport::with_expectations(
+            vec![
+                MockOutcome::Body {
+                    body: index_bytes,
+                    content_length: None,
+                },
+                MockOutcome::Body {
+                    body: child_manifest_bytes,
+                    content_length: None,
+                },
+                MockOutcome::Body {
+                    body: config_bytes,
+                    content_length: None,
+                },
+                MockOutcome::Body {
+                    body: layer_gz,
+                    content_length: None,
+                },
+            ],
+            vec![
+                (
+                    format!("https://ghcr.io/v2/botworkz/svc/manifests/sha256:{index_hex}"),
+                    Some(MANIFEST_ACCEPT.to_string()),
+                ),
+                (
+                    format!(
+                        "https://ghcr.io/v2/botworkz/svc/manifests/sha256:{child_manifest_hex}"
+                    ),
+                    Some(MANIFEST_ACCEPT.to_string()),
+                ),
+                (
+                    format!("https://ghcr.io/v2/botworkz/svc/blobs/sha256:{config_hex}"),
+                    None,
+                ),
+                (
+                    format!("https://ghcr.io/v2/botworkz/svc/blobs/sha256:{layer_gz_hex}"),
+                    None,
+                ),
+            ],
+        );
+
+        let result = fetch_asset(FetchParams {
+            name: "my-svc",
+            asset: &asset,
+            out_dir: None,
+            cache_dir: cache.path(),
+            retries: 0,
+            backoff: &Backoff::default(),
+            compute_checksum: true,
+            no_reverify: false,
+            materialize_mode: MaterializeMode::Copy,
+            transport: Some(Box::new(transport)),
+        })
+        .unwrap();
+
+        assert_eq!(MockTransport::call_count(&calls), 4);
+        let index_entry = cache
+            .path()
+            .join("oci-index")
+            .join(format!("{index_hex}.linux-amd64"));
+        assert_eq!(
+            std::fs::read_to_string(index_entry).unwrap().trim(),
+            result.computed_sha256
+        );
+    }
+
+    #[test]
+    fn oci_uri_image_index_errors_when_platform_not_found() {
+        let index = serde_json::json!({
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "manifests": [
+                {
+                    "digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                    "platform": {"os": "linux", "architecture": "arm64"}
+                }
+            ]
+        });
+        let index_bytes = serde_json::to_vec(&index).unwrap();
+        let index_hex = sha256_hex(&index_bytes);
+
+        let asset = Asset {
+            uri: format!("oci://ghcr.io/botworkz/svc@sha256:{index_hex}"),
+            version: String::new(),
+            checksum: None,
+            filename: Some("svc.tar".to_string()),
+            auth: None,
+            platform: None,
+        };
+
+        let cache = TempDir::new().unwrap();
+        let (transport, calls) = MockTransport::new(index_bytes);
 
         let err = fetch_asset(FetchParams {
             name: "my-svc",
@@ -2454,8 +2671,85 @@ mod tests {
         })
         .unwrap_err();
 
+        assert_eq!(MockTransport::call_count(&calls), 1);
         assert!(
-            format!("{err:#}").contains("multi-arch image index"),
+            format!("{err:#}")
+                .contains("image index does not contain a child for platform 'linux/amd64'"),
+            "error was: {err:#}"
+        );
+    }
+
+    #[test]
+    fn oci_uri_nested_image_index_is_rejected() {
+        let child_index = serde_json::json!({
+            "mediaType": "application/vnd.docker.distribution.manifest.list.v2+json",
+            "manifests": []
+        });
+        let child_index_bytes = serde_json::to_vec(&child_index).unwrap();
+        let child_hex = sha256_hex(&child_index_bytes);
+
+        let index = serde_json::json!({
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "manifests": [
+                {
+                    "digest": format!("sha256:{child_hex}"),
+                    "platform": {"os": "linux", "architecture": "amd64"}
+                }
+            ]
+        });
+        let index_bytes = serde_json::to_vec(&index).unwrap();
+        let index_hex = sha256_hex(&index_bytes);
+
+        let asset = Asset {
+            uri: format!("oci://ghcr.io/botworkz/svc@sha256:{index_hex}"),
+            version: String::new(),
+            checksum: None,
+            filename: Some("svc.tar".to_string()),
+            auth: None,
+            platform: Some("linux/amd64".to_string()),
+        };
+
+        let cache = TempDir::new().unwrap();
+        let (transport, calls) = MockTransport::with_expectations(
+            vec![
+                MockOutcome::Body {
+                    body: index_bytes,
+                    content_length: None,
+                },
+                MockOutcome::Body {
+                    body: child_index_bytes,
+                    content_length: None,
+                },
+            ],
+            vec![
+                (
+                    format!("https://ghcr.io/v2/botworkz/svc/manifests/sha256:{index_hex}"),
+                    Some(MANIFEST_ACCEPT.to_string()),
+                ),
+                (
+                    format!("https://ghcr.io/v2/botworkz/svc/manifests/sha256:{child_hex}"),
+                    Some(MANIFEST_ACCEPT.to_string()),
+                ),
+            ],
+        );
+
+        let err = fetch_asset(FetchParams {
+            name: "my-svc",
+            asset: &asset,
+            out_dir: None,
+            cache_dir: cache.path(),
+            retries: 0,
+            backoff: &Backoff::default(),
+            compute_checksum: true,
+            no_reverify: false,
+            materialize_mode: MaterializeMode::Copy,
+            transport: Some(Box::new(transport)),
+        })
+        .unwrap_err();
+
+        assert_eq!(MockTransport::call_count(&calls), 2);
+        assert!(
+            format!("{err:#}").contains("nested image index not supported"),
             "error was: {err:#}"
         );
     }
@@ -2490,6 +2784,7 @@ mod tests {
                 checksum: None,
                 filename: Some("svc.tar".to_string()),
                 auth: None,
+                platform: None,
             };
             let cache = TempDir::new().unwrap();
             let (transport, _) = MockTransport::with_outcomes(vec![
@@ -2671,6 +2966,7 @@ mod tests {
             checksum: None,
             filename: Some("svc.tar".to_string()),
             auth: auth_value.map(str::to_string),
+            platform: None,
         };
 
         let cache = TempDir::new().unwrap();

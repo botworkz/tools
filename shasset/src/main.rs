@@ -90,6 +90,7 @@ fn cmd_add(config: &Path, args: cli::AddArgs) -> Result<()> {
         checksum: args.checksum.clone(),
         filename: args.filename.clone(),
         auth: args.auth.clone(),
+        platform: None,
     };
 
     let checksum = if args.compute {
@@ -121,6 +122,7 @@ fn cmd_add(config: &Path, args: cli::AddArgs) -> Result<()> {
         checksum,
         filename: args.filename,
         auth: args.auth,
+        platform: None,
     };
 
     manifest.assets.insert(args.name.clone(), stored);
@@ -302,18 +304,20 @@ fn cmd_prune(config: &Path, args: cli::PruneArgs) -> Result<()> {
 
 fn prune_cache(cache_dir: &Path, manifest: &Manifest, dry_run: bool) -> Result<PruneSummary> {
     let referenced = referenced_blob_hexes(manifest, cache_dir)?;
-    let oci_referenced_manifest_hexes = oci_referenced_manifest_hexes(manifest);
-    let plan = compute_prune_plan(cache_dir, &referenced, &oci_referenced_manifest_hexes)?;
+    let oci_referenced_index_keys = oci_referenced_index_keys(manifest);
+    let plan = compute_prune_plan(cache_dir, &referenced, &oci_referenced_index_keys)?;
     apply_prune_plan(plan, dry_run)
 }
 
-fn oci_referenced_manifest_hexes(manifest: &Manifest) -> HashSet<String> {
+fn oci_referenced_index_keys(manifest: &Manifest) -> HashSet<String> {
     manifest
         .assets
         .values()
         .filter_map(|asset| {
             let uri = asset.expanded_uri();
-            fetch::oci_manifest_hex_from_uri(&uri)
+            let manifest_hex = fetch::oci_manifest_hex_from_uri(&uri)?;
+            let platform_slug = fetch::oci_platform_slug_from_asset(asset).ok()?;
+            Some(format!("{manifest_hex}.{platform_slug}"))
         })
         .collect()
 }
@@ -328,7 +332,7 @@ fn referenced_blob_hexes(manifest: &Manifest, cache_dir: &Path) -> Result<HashSe
         // For OCI assets, look up the assembled-tar sha256 from the oci-index
         let uri = asset.expanded_uri();
         if uri.starts_with("oci://") {
-            if let Some(tar_hex) = fetch::oci_index_tar_hex_from_cache(cache_dir, &uri) {
+            if let Some(tar_hex) = fetch::oci_index_tar_hex_from_cache(cache_dir, &uri, asset) {
                 referenced.insert(tar_hex);
             }
         }
@@ -339,7 +343,7 @@ fn referenced_blob_hexes(manifest: &Manifest, cache_dir: &Path) -> Result<HashSe
 fn compute_prune_plan(
     cache_dir: &Path,
     referenced: &HashSet<String>,
-    oci_manifest_hexes: &HashSet<String>,
+    oci_index_keys: &HashSet<String>,
 ) -> Result<PrunePlan> {
     let mut plan = PrunePlan::default();
     let blobs_dir = cache_dir.join("blobs").join("sha256");
@@ -405,7 +409,7 @@ fn compute_prune_plan(
         {
             let entry = entry?;
             let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
-            if !oci_manifest_hexes.contains(&name) {
+            if !oci_index_keys.contains(&name) {
                 plan.summary.quarantine_entries_cleared += 1; // reuse field for simplicity
                 plan.quarantine_paths.push(entry.path());
             }
@@ -671,6 +675,7 @@ mod tests {
             checksum: Some(format!("sha256:{hex}")),
             filename: Some("tool.bin".to_string()),
             auth: None,
+            platform: None,
         }
     }
 
@@ -780,6 +785,7 @@ mod tests {
                     checksum: None,
                     filename: None,
                     auth: None,
+                    platform: None,
                 },
             )]),
         };
@@ -808,6 +814,7 @@ mod tests {
                 ),
                 filename: None,
                 auth: None,
+                platform: None,
             },
         );
         save(&path, &m).unwrap();
@@ -831,6 +838,7 @@ mod tests {
             checksum: None,
             filename: None,
             auth: None,
+            platform: None,
         };
         assert_eq!(
             a.expanded_uri(),
@@ -846,6 +854,7 @@ mod tests {
             checksum: None,
             filename: Some("tool-${version}.tar.gz".to_string()),
             auth: None,
+            platform: None,
         };
         assert_eq!(a.output_filename().unwrap(), "tool-2.0.0.tar.gz");
     }
@@ -858,6 +867,7 @@ mod tests {
             checksum: None,
             filename: None,
             auth: None,
+            platform: None,
         };
         assert_eq!(a.output_filename().unwrap(), "archive.zip");
     }
@@ -933,6 +943,7 @@ mod tests {
             checksum: Some(format!("sha256:{hex}")),
             filename: Some("tool".to_string()),
             auth: None,
+            platform: None,
         };
 
         let result = fetch_asset(FetchParams {
@@ -968,6 +979,7 @@ mod tests {
             checksum: Some(format!("sha256:{wrong_hex}")),
             filename: Some("tool".to_string()),
             auth: None,
+            platform: None,
         };
 
         let err = fetch_asset(FetchParams {
@@ -999,6 +1011,7 @@ mod tests {
             checksum: None,
             filename: Some("tool".to_string()),
             auth: None,
+            platform: None,
         };
 
         let err = fetch_asset(FetchParams {
@@ -1033,6 +1046,7 @@ mod tests {
             )),
             filename: Some("tool".to_string()),
             auth: None,
+            platform: None,
         };
 
         let err = fetch_asset(FetchParams {
@@ -1064,6 +1078,7 @@ mod tests {
             checksum: Some(format!("sha256:{}", "a".repeat(64))),
             filename: Some("tool".to_string()),
             auth: None,
+            platform: None,
         };
 
         let err = fetch_asset(FetchParams {
@@ -1102,6 +1117,7 @@ mod tests {
             checksum: None,
             filename: None,
             auth: Some("${TEST_SHASSET_TOKEN_ABC}".to_string()),
+            platform: None,
         };
         assert_eq!(a.resolved_auth().unwrap().as_deref(), Some("supersecret"));
     }
@@ -1115,6 +1131,7 @@ mod tests {
             checksum: None,
             filename: None,
             auth: Some("${SHASSET_DEFINITELY_NOT_SET_XYZ123}".to_string()),
+            platform: None,
         };
         assert!(a.resolved_auth().is_err());
     }
@@ -1151,6 +1168,7 @@ mod tests {
             checksum: Some("sha256:".to_string() + &"a".repeat(64)),
             filename: None,
             auth: Some("${SECRET_TOKEN}".to_string()),
+            platform: None,
         };
         let mut map = BTreeMap::new();
         map.insert("tool".to_string(), a);
