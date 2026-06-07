@@ -67,6 +67,13 @@ shapes:
   `x-access-token` placeholder. Everything after the first `:` is the password, so passwords
   containing colons are preserved in full.
 
+shasset always issues the initial OCI request unauthenticated and authenticates
+only via the `WWW-Authenticate: Bearer` challenge that follows. Operator-supplied
+`auth:` credentials are used as HTTP Basic on the token-exchange endpoint, never
+as a bearer token on the manifest/blob URL itself. This matches the
+docker/distribution token-spec flow and is what `skopeo`, `crane`, and the
+docker CLI do.
+
 For non-OCI URIs (`https://`, `github-release://`), the resolved string is sent as
 `Authorization: ****** regardless of whether it contains a colon — colon-splitting only
 applies to the OCI token-exchange leg.
