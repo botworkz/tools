@@ -17,6 +17,10 @@ pub(crate) struct PackArgs {
     /// SSH private key path (default: <repo-root>/build/packer_ssh_key).
     #[arg(long)]
     key: Option<PathBuf>,
+    /// Packer template path (file or directory), relative to --repo-root.
+    /// Defaults to "images/" for backwards compatibility.
+    #[arg(long, default_value = "images/")]
+    template: PathBuf,
 }
 
 /// Run the KVM-only Packer flow natively inside the botforge container.
@@ -121,6 +125,12 @@ pub(crate) fn cmd_pack(args: PackArgs) -> Result<()> {
         .with_context(|| format!("cannot resolve SSH private key: {}", key_path.display()))?;
     let _ = repo_relative_path(&repo_root, &key_real)?;
     let rel_key_path = repo_relative_path(&repo_root, &key_path)?;
+    let template_abs = resolve_under_root(&repo_root, args.template.clone());
+    let template_rel = repo_relative_path(&repo_root, &template_abs)
+        .context("packer template path escapes repo root")?;
+    if !template_abs.exists() {
+        bail!("packer template not found: {}", template_abs.display());
+    }
 
     ensure_command("packer")?;
     ensure_command("qemu-img")?;
@@ -135,7 +145,7 @@ pub(crate) fn cmd_pack(args: PackArgs) -> Result<()> {
     println!("running packer init");
     run_command_in_dir(
         "packer",
-        &packer_init_args(),
+        &packer_init_args(&template_rel),
         &packer_env,
         &repo_root,
         "packer init failed",
@@ -143,7 +153,7 @@ pub(crate) fn cmd_pack(args: PackArgs) -> Result<()> {
     println!("running packer build");
     run_command_in_dir(
         "packer",
-        &packer_build_args(&rel_key_path, &public_key),
+        &packer_build_args(&rel_key_path, &public_key, &template_rel),
         &packer_env,
         &repo_root,
         "packer build failed",
@@ -174,11 +184,11 @@ pub(crate) fn cmd_pack(args: PackArgs) -> Result<()> {
     Ok(())
 }
 
-fn packer_init_args() -> Vec<String> {
-    vec!["init".into(), "images/".into()]
+fn packer_init_args(template: &str) -> Vec<String> {
+    vec!["init".into(), template.into()]
 }
 
-fn packer_build_args(rel_key_path: &str, public_key: &str) -> Vec<String> {
+fn packer_build_args(rel_key_path: &str, public_key: &str, template: &str) -> Vec<String> {
     vec![
         "build".into(),
         "-var".into(),
@@ -187,7 +197,7 @@ fn packer_build_args(rel_key_path: &str, public_key: &str) -> Vec<String> {
         format!("ssh_private_key_file={rel_key_path}"),
         "-var".into(),
         format!("ssh_public_key={public_key}"),
-        "images/".into(),
+        template.into(),
     ]
 }
 
@@ -208,13 +218,17 @@ mod tests {
 
     #[test]
     fn packer_init_args_match_expected_argv() {
-        let args = packer_init_args();
+        let args = packer_init_args("images/");
         assert_eq!(args, vec!["init", "images/"]);
     }
 
     #[test]
     fn packer_build_args_match_expected_argv() {
-        let args = packer_build_args("build/packer_ssh_key", "ssh-ed25519 AAAA example");
+        let args = packer_build_args(
+            "build/packer_ssh_key",
+            "ssh-ed25519 AAAA example",
+            "images/",
+        );
         assert_eq!(
             args,
             vec![
@@ -226,6 +240,31 @@ mod tests {
                 "-var",
                 "ssh_public_key=ssh-ed25519 AAAA example",
                 "images/",
+            ]
+        );
+    }
+
+    #[test]
+    fn packer_args_pass_through_custom_template_path() {
+        assert_eq!(
+            packer_init_args("images/botwork"),
+            vec!["init", "images/botwork"]
+        );
+        assert_eq!(
+            packer_build_args(
+                "build/packer_ssh_key",
+                "ssh-ed25519 AAAA example",
+                "images/botwork",
+            ),
+            vec![
+                "build",
+                "-var",
+                "accelerator=kvm",
+                "-var",
+                "ssh_private_key_file=build/packer_ssh_key",
+                "-var",
+                "ssh_public_key=ssh-ed25519 AAAA example",
+                "images/botwork",
             ]
         );
     }
