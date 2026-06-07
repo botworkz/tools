@@ -160,6 +160,23 @@ pub trait Transport: Send + Sync {
             content_length: resp.content_length,
         })
     }
+
+    /// Fetch `uri` using HTTP Basic auth (`Authorization: Basic <base64(user:password)>`).
+    ///
+    /// Used for OCI token-exchange endpoints, which require Basic auth per the docker token
+    /// spec. The default implementation falls back to `get` with a `user:password` string so
+    /// that mock transports in tests keep compiling without change; `ReqwestTransport` overrides
+    /// this to send a correctly-encoded Basic header.
+    fn get_with_basic_auth(
+        &self,
+        uri: &str,
+        user: &str,
+        password: &str,
+        accept: Option<&str>,
+    ) -> std::result::Result<DownloadResponse, FetchError> {
+        let combined = format!("{user}:{password}");
+        self.get(uri, Some(&combined), accept)
+    }
 }
 
 /// Real reqwest-based transport.
@@ -190,6 +207,38 @@ impl Transport for ReqwestTransport {
             let header_val = ["Bearer ", token].concat();
             req = req.header("Authorization", header_val);
         }
+        if let Some(accept_header) = accept {
+            req = req.header("Accept", accept_header);
+        }
+        let resp = req.send().map_err(|error| {
+            FetchError::retryable(
+                anyhow::Error::new(error).context(format!("HTTP request failed: {uri}")),
+            )
+        })?;
+        let status = resp.status();
+        if !status.is_success() {
+            let code = status.as_u16();
+            return Err(http_status_error(code, uri));
+        }
+        let content_length = resp.content_length();
+        Ok(DownloadResponse {
+            body: Box::new(resp),
+            content_length,
+        })
+    }
+
+    fn get_with_basic_auth(
+        &self,
+        uri: &str,
+        user: &str,
+        password: &str,
+        accept: Option<&str>,
+    ) -> std::result::Result<DownloadResponse, FetchError> {
+        let mut req = self
+            .client
+            .get(uri)
+            .header("User-Agent", "shasset")
+            .basic_auth(user, Some(password));
         if let Some(accept_header) = accept {
             req = req.header("Accept", accept_header);
         }
@@ -977,12 +1026,32 @@ fn fetch_oci_bytes(
                 let token_url = build_oci_token_url(&challenge)
                     .map_err(|e| FetchError::permanent(e.context("invalid OCI token realm URL")))?;
 
-                // auth may be "user:pass" for basic auth on the token endpoint, else anonymous
-                let token_basic_auth = auth.filter(|a| a.contains(':'));
+                // Resolve credentials for the token endpoint:
+                //
+                // - Some(("user", "pass"))      -> auth: "user:pass" in shasset.yaml
+                // - Some(("x-access-token", t)) -> bare-token auth, no colon (GHCR / GitHub PAT)
+                // - None                        -> anonymous (no auth field)
+                //
+                // x-access-token is the GitHub convention for "I only have a token, treat it as a
+                // password". GHCR, Harbor, and generic docker-distribution registries all accept
+                // this shape via HTTP Basic on the token endpoint. For ECR/AWS or other registries
+                // that require a specific username, use auth: "AWS:${TOKEN}" in shasset.yaml.
+                let creds: Option<(String, String)> = auth.map(|a| match a.split_once(':') {
+                    Some((user, pass)) => (user.to_string(), pass.to_string()),
+                    None => ("x-access-token".to_string(), a.to_string()),
+                });
 
-                // Fetch token
-                let mut token_resp =
-                    transport.get(&token_url, token_basic_auth, Some("application/json"))?;
+                // Fetch token using HTTP Basic auth (required by the OCI/docker token spec)
+                let token_resp_result = match &creds {
+                    Some((user, password)) => transport.get_with_basic_auth(
+                        &token_url,
+                        user,
+                        password,
+                        Some("application/json"),
+                    ),
+                    None => transport.get(&token_url, None, Some("application/json")),
+                };
+                let mut token_resp = token_resp_result?;
                 let mut token_body = String::new();
                 token_resp
                     .body
@@ -2544,7 +2613,7 @@ mod tests {
             ])),
             oci_calls: Mutex::new(VecDeque::from(vec![
                 // First manifest call → 401 with challenge
-(401, Some(r#"******"https://ghcr.io/token",service="ghcr.io",scope="repository:botworkz/svc:pull""#.to_string()), vec![]),
+(401, Some(r#"Bearer realm="https://ghcr.io/token",service="ghcr.io",scope="repository:botworkz/svc:pull""#.to_string()), vec![]),
                 // Second manifest call (after token exchange) → 200
                 (200, None, manifest_bytes.clone()),
                 // Config
@@ -2579,5 +2648,227 @@ mod tests {
         .unwrap();
 
         assert!(result.blob_path.exists(), "assembled tar not in cache");
+    }
+
+    // Helper: build a minimal OCI manifest + blobs for mock transport tests.
+    fn make_oci_test_fixtures() -> (Vec<u8>, Vec<u8>, Vec<u8>, String) {
+        let config_bytes: Vec<u8> = b"{\"architecture\":\"amd64\"}".to_vec();
+        let config_hex = sha256_hex(&config_bytes);
+        let layer_tar = make_minimal_layer_tar();
+        let layer_gz = make_gzip(&layer_tar);
+        let layer_gz_hex = sha256_hex(&layer_gz);
+        let manifest = serde_json::json!({
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "digest": format!("sha256:{config_hex}"),
+                "mediaType": "application/vnd.oci.image.config.v1+json"
+            },
+            "layers": [{
+                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                "digest": format!("sha256:{layer_gz_hex}"),
+                "size": layer_gz.len()
+            }]
+        });
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        let manifest_hex = sha256_hex(&manifest_bytes);
+        (manifest_bytes, config_bytes, layer_gz, manifest_hex)
+    }
+
+    const OCI_WWW_AUTH: &str = r#"Bearer realm="https://ghcr.io/token",service="ghcr.io",scope="repository:botworkz/svc:pull""#;
+
+    /// Run `fetch_asset` against an OCI mock that returns 401+challenge on the first manifest
+    /// request, then succeeds after token exchange. Returns (basic_auth_calls, anonymous_get_calls,
+    /// fetch_succeeded).
+    fn run_oci_basic_auth_exchange(
+        auth_value: Option<&str>,
+    ) -> (Vec<(String, String)>, usize, bool) {
+        use std::sync::Arc;
+
+        let (manifest_bytes, config_bytes, layer_gz, manifest_hex) = make_oci_test_fixtures();
+        let token_json = serde_json::json!({"token": "test-bearer-token"}).to_string();
+
+        let basic_auth_calls = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+        let anon_get_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        type OciCallOutcome = (u16, Option<String>, Vec<u8>);
+
+        struct InnerMock {
+            basic_auth_calls: Arc<Mutex<Vec<(String, String)>>>,
+            anon_get_count: Arc<std::sync::atomic::AtomicUsize>,
+            get_calls: Mutex<VecDeque<Vec<u8>>>,
+            basic_auth_responses: Mutex<VecDeque<Vec<u8>>>,
+            oci_calls: Mutex<VecDeque<OciCallOutcome>>,
+        }
+
+        impl Transport for InnerMock {
+            fn get(
+                &self,
+                _uri: &str,
+                auth: Option<&str>,
+                _accept: Option<&str>,
+            ) -> std::result::Result<DownloadResponse, FetchError> {
+                if auth.is_none() {
+                    self.anon_get_count
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                let body = self
+                    .get_calls
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("mock get calls exhausted");
+                Ok(DownloadResponse {
+                    body: Box::new(std::io::Cursor::new(body)),
+                    content_length: None,
+                })
+            }
+
+            fn get_with_basic_auth(
+                &self,
+                _uri: &str,
+                user: &str,
+                password: &str,
+                _accept: Option<&str>,
+            ) -> std::result::Result<DownloadResponse, FetchError> {
+                self.basic_auth_calls
+                    .lock()
+                    .unwrap()
+                    .push((user.to_string(), password.to_string()));
+                let body = self
+                    .basic_auth_responses
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("mock basic_auth calls exhausted");
+                Ok(DownloadResponse {
+                    body: Box::new(std::io::Cursor::new(body)),
+                    content_length: None,
+                })
+            }
+
+            fn get_oci(
+                &self,
+                _uri: &str,
+                _auth: Option<&str>,
+                _accept: Option<&str>,
+            ) -> std::result::Result<OciHttpResponse, FetchError> {
+                let (status, www_auth, body) = self
+                    .oci_calls
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("mock get_oci calls exhausted");
+                Ok(OciHttpResponse {
+                    status,
+                    www_authenticate: www_auth,
+                    body: Box::new(std::io::Cursor::new(body)),
+                    content_length: None,
+                })
+            }
+        }
+
+        let token_bytes = token_json.into_bytes();
+        let transport = InnerMock {
+            basic_auth_calls: Arc::clone(&basic_auth_calls),
+            anon_get_count: Arc::clone(&anon_get_count),
+            get_calls: Mutex::new(VecDeque::from(vec![token_bytes.clone()])),
+            basic_auth_responses: Mutex::new(VecDeque::from(vec![token_bytes])),
+            oci_calls: Mutex::new(VecDeque::from(vec![
+                (401, Some(OCI_WWW_AUTH.to_string()), vec![]),
+                (200, None, manifest_bytes),
+                (200, None, config_bytes),
+                (200, None, layer_gz),
+            ])),
+        };
+
+        let asset = Asset {
+            uri: format!("oci://ghcr.io/botworkz/svc@sha256:{manifest_hex}"),
+            version: String::new(),
+            checksum: None,
+            filename: Some("svc.tar".to_string()),
+            auth: auth_value.map(str::to_string),
+        };
+
+        let cache = TempDir::new().unwrap();
+        let ok = fetch_asset(FetchParams {
+            name: "my-svc",
+            asset: &asset,
+            out_dir: None,
+            cache_dir: cache.path(),
+            retries: 0,
+            backoff: &Backoff::default(),
+            compute_checksum: true,
+            no_reverify: false,
+            materialize_mode: MaterializeMode::Copy,
+            transport: Some(Box::new(transport)),
+        })
+        .is_ok();
+
+        let calls = basic_auth_calls.lock().unwrap().clone();
+        let anon = anon_get_count.load(std::sync::atomic::Ordering::SeqCst);
+        (calls, anon, ok)
+    }
+
+    /// Bug regression: a bare token (no colon) must be sent as Basic auth with
+    /// username "x-access-token", not discarded or sent as an anonymous request.
+    #[test]
+    fn oci_token_exchange_bare_token_uses_x_access_token_basic_auth() {
+        let (calls, _anon, ok) = run_oci_basic_auth_exchange(Some("ghs_test_token_no_colon"));
+        assert!(ok, "fetch should succeed");
+        assert_eq!(
+            calls.len(),
+            1,
+            "expected exactly one basic-auth call to the token endpoint"
+        );
+        assert_eq!(
+            calls[0],
+            (
+                "x-access-token".to_string(),
+                "ghs_test_token_no_colon".to_string()
+            ),
+            "bare token must use x-access-token as the username"
+        );
+    }
+
+    /// A `user:pass` auth value must be split on the first colon and sent as Basic auth.
+    #[test]
+    fn oci_token_exchange_user_colon_pass_splits_correctly() {
+        let (calls, _anon, ok) = run_oci_basic_auth_exchange(Some("alice:s3cret"));
+        assert!(ok, "fetch should succeed");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0],
+            ("alice".to_string(), "s3cret".to_string()),
+            "user:pass must split on the first colon"
+        );
+    }
+
+    /// Passwords that themselves contain colons must not be truncated (split_once, not splitn).
+    #[test]
+    fn oci_token_exchange_password_with_colons_preserved() {
+        let (calls, _anon, ok) = run_oci_basic_auth_exchange(Some("alice:s3:cret"));
+        assert!(ok, "fetch should succeed");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0],
+            ("alice".to_string(), "s3:cret".to_string()),
+            "password portion must include everything after the first colon"
+        );
+    }
+
+    /// When `auth` is None the token endpoint must be hit via `get` (anonymous), not via
+    /// `get_with_basic_auth`.
+    #[test]
+    fn oci_token_exchange_no_auth_falls_back_to_anonymous() {
+        let (calls, anon, ok) = run_oci_basic_auth_exchange(None);
+        assert!(ok, "fetch should succeed");
+        assert!(
+            calls.is_empty(),
+            "no basic-auth call expected for anonymous token exchange"
+        );
+        assert!(
+            anon > 0,
+            "anonymous token exchange should use get() not get_with_basic_auth()"
+        );
     }
 }
