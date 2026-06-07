@@ -2690,12 +2690,14 @@ mod tests {
         let basic_auth_calls = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
         let anon_get_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
+        type OciCallOutcome = (u16, Option<String>, Vec<u8>);
+
         struct InnerMock {
             basic_auth_calls: Arc<Mutex<Vec<(String, String)>>>,
             anon_get_count: Arc<std::sync::atomic::AtomicUsize>,
             get_calls: Mutex<VecDeque<Vec<u8>>>,
             basic_auth_responses: Mutex<VecDeque<Vec<u8>>>,
-            oci_calls: Mutex<VecDeque<(u16, Option<String>, Vec<u8>)>>,
+            oci_calls: Mutex<VecDeque<OciCallOutcome>>,
         }
 
         impl Transport for InnerMock {
