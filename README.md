@@ -2,7 +2,7 @@
 
 `botworkz/tools` is a cargo workspace that builds two container-published CLIs used across the botworkz toolchain:
 
-- **[`shasset/`](./shasset)** — generic, verified-asset downloader and registry manager. Maintains a `shasset.yaml` manifest of named assets (`http(s)://`, `github-release://`, `oci://`) and fetches + verifies them against pinned SHA-256 checksums. Published as `ghcr.io/botworkz/tools/shasset`. The `shasset/` directory also hosts `bin/update-deps` and the shared bash helpers under `shasset/lib/`.
+- **[`shasset/`](./shasset)** — generic, verified-asset downloader and registry manager. Maintains a `shasset.yaml` manifest of named assets (`http(s)://`, `github-release://`, `oci://`) and fetches + verifies them against pinned SHA-256 checksums. Published as `ghcr.io/botworkz/tools/shasset`. The `shasset/` directory also hosts `bin/update-deps`.
 - **[`botforge/`](./botforge)** — build-time CLI for VM artifact workflows: `deps`, `iso`, `payload`, `pack`, `run`, `test`. Wraps the QEMU/KVM, Packer, and ISO toolchains and is distributed as a batteries-included image at `ghcr.io/botworkz/tools/botforge`.
 
 See each app's `README.md` for usage, schema, and container instructions.

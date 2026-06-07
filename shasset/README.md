@@ -78,12 +78,3 @@ Options:
 
 Example:
 *****__CODE_BLOCK_0_0__*****
-
-## Shared bash helpers (`lib/`)
-
-`shasset/lib/` contains bash helper libraries that can be vendored by sibling consumer repos. Source `common.sh` first, then any sibling-locator libraries as needed:
-
-- `lib/common.sh` — logging (`log_info`, `log_warn`, `log_error`, `die`), `ensure_command`, `verify_sha256`, ephemeral SSH keypair helpers, accelerator selection (`pick_accelerator`, `packer_accelerator`), and repo-relative path helpers.
-- `lib/botworkz.sh` — locates a sibling `botworkz/mcp` checkout (`BOTWORKZ_MCP_DIR`, defaults to `${REPO_ROOT}/../mcp`).
-- `lib/tools.sh` — locates a sibling `botworkz/botwork` checkout (`BOTWORK_TOOLS_DIR`, defaults to `${REPO_ROOT}/../botwork`) and provides cargo-build / release-download helpers for `botwork-launcher` and `botwork-tools`.
-- `lib/botwork.sh` — locates a sibling `botworkz/mcp-extra` checkout (`BOTWORK_MCP_EXTRA_DIR`, defaults to `${REPO_ROOT}/../mcp-extra`).*****__CODE_BLOCK_0_1__*****
