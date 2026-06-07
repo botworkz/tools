@@ -215,7 +215,10 @@ fn run_test_flow(
         .with_context(|| format!("iso bootstrap mount failed for label {}", bootstrap.label))?;
 
         let script_path = bootstrap.mount.join(&bootstrap.bootstrap);
-        let run_cmd = format!("sudo bash {}", shell_single_quote(&script_path.display().to_string()));
+        let run_cmd = format!(
+            "sudo bash {}",
+            shell_single_quote(&script_path.display().to_string())
+        );
         ssh_with_retry(
             ssh,
             &run_cmd,
