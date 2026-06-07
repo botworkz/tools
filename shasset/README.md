@@ -98,6 +98,45 @@ Accepted forms: `os/arch` and `os/arch/variant`. `platform:` is ignored for
 non-OCI URIs and for OCI URIs that resolve directly to a single-platform
 manifest (no walk needed).
 
+### Optional `version:` field
+
+`version:` is optional in the manifest schema. When present it is used to expand
+`${version}` placeholders in the `uri:` and `filename:` fields. When omitted (or set
+to an empty string) those fields are used as-is.
+
+For OCI or other digest-pinned assets whose URI does not reference `${version}`,
+you can either omit the field entirely or set it purely for informational purposes
+— for example so that Dependabot or a custom version-bump script can track it:
+
+```yaml
+assets:
+  auth-broker:
+    uri: oci://ghcr.io/botworkz/auth-broker@sha256:abc123…
+    filename: auth-broker.tar
+    version: "0.3.1"   # informational only — URI does not use ${version}
+```
+
+On the CLI, `--version` is now optional on `shasset add`:
+
+```sh
+# OCI asset — no version needed
+shasset add auth-broker \
+  --uri oci://ghcr.io/botworkz/auth-broker@sha256:abc123… \
+  --filename auth-broker.tar
+
+# Non-OCI asset with version interpolation
+shasset add mytool \
+  --uri https://example.com/v${version}/mytool.tar.gz \
+  --version 1.2.3 \
+  --checksum sha256:<64-hex>
+
+# Non-OCI asset with informational version (no interpolation)
+shasset add mytool \
+  --uri https://example.com/mytool.tar.gz \
+  --version 1.2.3 \
+  --checksum sha256:<64-hex>
+```
+
 ## Retry and backoff
 
 Transient errors (HTTP 5xx, 429, connection/DNS/timeout failures, and other transport-level read failures) are retried with exponential backoff up to the configured `retries` count. HTTP 4xx errors (except 429) and checksum mismatches are **not** retried — they fail immediately. Empty/zero-byte downloads are always errors.
