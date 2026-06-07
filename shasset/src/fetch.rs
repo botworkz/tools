@@ -911,6 +911,19 @@ pub fn oci_manifest_hex_from_uri(uri: &str) -> Option<String> {
     }
 }
 
+/// Extract the manifest digest hex for an OCI asset, trying `asset.digest` first
+/// and falling back to the legacy `@sha256:<hex>` URI suffix.
+pub fn oci_manifest_hex_from_asset(asset: &Asset, uri: &str) -> Option<String> {
+    if let Some(ref d) = asset.digest {
+        if let Some(hex) = d.strip_prefix("sha256:") {
+            if hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Some(hex.to_ascii_lowercase());
+            }
+        }
+    }
+    oci_manifest_hex_from_uri(uri)
+}
+
 /// Path for the oci-index entry mapping a manifest digest to the assembled-tar sha256.
 pub fn oci_index_path(cache_dir: &Path, manifest_hex: &str, platform_slug: &str) -> PathBuf {
     cache_dir
@@ -920,7 +933,7 @@ pub fn oci_index_path(cache_dir: &Path, manifest_hex: &str, platform_slug: &str)
 
 /// Read the assembled-tar sha256 hex from an oci-index entry (if present and valid).
 pub fn oci_index_tar_hex_from_cache(cache_dir: &Path, uri: &str, asset: &Asset) -> Option<String> {
-    let manifest_hex = oci_manifest_hex_from_uri(uri)?;
+    let manifest_hex = oci_manifest_hex_from_asset(asset, uri)?;
     let platform_slug = oci_platform_slug_from_asset(asset).ok()?;
     let path = oci_index_path(cache_dir, &manifest_hex, &platform_slug);
     std::fs::read_to_string(&path)
@@ -961,9 +974,70 @@ pub fn oci_platform_slug_from_asset(asset: &Asset) -> Result<String> {
 }
 
 fn oci_index_path_for_uri(cache_dir: &Path, uri: &str, asset: &Asset) -> Option<PathBuf> {
-    let manifest_hex = oci_manifest_hex_from_uri(uri)?;
+    let manifest_hex = oci_manifest_hex_from_asset(asset, uri)?;
     let platform_slug = oci_platform_slug_from_asset(asset).ok()?;
     Some(oci_index_path(cache_dir, &manifest_hex, &platform_slug))
+}
+
+/// Build an [`OciRef`] for `asset` from its URI and resolved digest.
+///
+/// Accepts both the new form (`oci://<registry>/<repo>` + `asset.digest`) and the
+/// legacy form (`oci://<registry>/<repo>@sha256:<hex>`). If both are present they
+/// must agree (validated by [`Asset::oci_digest_hex`]). Fails fast if no digest
+/// can be resolved.
+fn resolve_oci_ref(
+    name: &str,
+    asset: &Asset,
+    uri: &str,
+) -> std::result::Result<OciRef, FetchError> {
+    // Resolve the effective digest hex (prefers `asset.digest`, falls back to URI suffix,
+    // errors if both present and mismatched, errors if neither present).
+    let digest_hex = asset
+        .oci_digest_hex()
+        .map_err(FetchError::permanent)?
+        .ok_or_else(|| {
+            FetchError::permanent(anyhow!(
+                "asset '{name}': OCI asset has no digest pin; add a \
+                 'digest: sha256:<64-hex>' field, or use the legacy \
+                 oci://<registry>/<repo>@sha256:<hex> URI form"
+            ))
+        })?;
+
+    // For the legacy URI form (`oci://…@sha256:…`) delegate full URI parsing to
+    // `parse_oci_uri` so its strict validation still runs.  For the new clean-URI
+    // form we extract registry/repo directly.
+    if uri.contains('@') {
+        let parsed = parse_oci_uri(uri)?;
+        Ok(OciRef {
+            registry: parsed.registry,
+            repo: parsed.repo,
+            digest: format!("sha256:{digest_hex}"),
+            digest_hex,
+        })
+    } else {
+        let rest = uri
+            .strip_prefix("oci://")
+            .ok_or_else(|| FetchError::permanent(anyhow!("URI must use oci:// scheme: {uri}")))?;
+        if rest.is_empty() {
+            return Err(FetchError::permanent(anyhow!("oci:// URI is empty: {uri}")));
+        }
+        let (registry, repo) = rest.split_once('/').ok_or_else(|| {
+            FetchError::permanent(anyhow!(
+                "oci:// URI must have '<registry>/<repo>' after 'oci://': {uri}"
+            ))
+        })?;
+        if registry.is_empty() || repo.is_empty() {
+            return Err(FetchError::permanent(anyhow!(
+                "oci:// URI has empty registry or repo: {uri}"
+            )));
+        }
+        Ok(OciRef {
+            registry: registry.to_string(),
+            repo: repo.to_string(),
+            digest: format!("sha256:{digest_hex}"),
+            digest_hex,
+        })
+    }
 }
 
 /// Parse a `WWW-Authenticate: ******"...",service="...",scope="..."` header.
@@ -1162,7 +1236,7 @@ fn try_download_oci(
     uri: &str,
     auth: Option<&str>,
 ) -> std::result::Result<DownloadedFile, FetchError> {
-    let oci_ref = parse_oci_uri(uri)?;
+    let oci_ref = resolve_oci_ref(name, asset, uri)?;
     let asset_platform = asset.resolved_platform().map_err(|e| {
         FetchError::permanent(e.context(format!("asset '{name}': cannot resolve platform")))
     })?;
@@ -1616,6 +1690,7 @@ mod tests {
             uri: "https://example.com/v1/tool".to_string(),
             version: "1".to_string(),
             checksum: Some(format!("sha256:{hex}")),
+            digest: None,
             filename: Some("tool.bin".to_string()),
             auth: None,
             platform: None,
@@ -1843,6 +1918,7 @@ mod tests {
             uri: "https://example.com/v1/tool".to_string(),
             version: "1".to_string(),
             checksum: None,
+            digest: None,
             filename: Some("tool.bin".to_string()),
             auth: None,
             platform: None,
@@ -1909,6 +1985,7 @@ mod tests {
             uri: "github-release://botworkz/tools/v1.2.3/tool.tar.gz".to_string(),
             version: "1".to_string(),
             checksum: Some(format!("sha256:{hex}")),
+            digest: None,
             filename: None,
             auth: Some("${SHASSET_TEST_TOKEN}".to_string()),
             platform: None,
@@ -1995,6 +2072,7 @@ mod tests {
             uri: "github-release://botworkz/botwork-extra/release/0.0.3/botwork-vault".to_string(),
             version: "1".to_string(),
             checksum: Some(format!("sha256:{hex}")),
+            digest: None,
             filename: None,
             auth: Some("${SHASSET_TEST_TOKEN}".to_string()),
             platform: None,
@@ -2063,6 +2141,7 @@ mod tests {
             uri: "github-release://botworkz/tools/v1.2.3/missing.tar.gz".to_string(),
             version: "1".to_string(),
             checksum: Some(format!("sha256:{}", "a".repeat(64))),
+            digest: None,
             filename: None,
             auth: None,
             platform: None,
@@ -2104,6 +2183,7 @@ mod tests {
             uri: "ftp://example.com/x".to_string(),
             version: String::new(),
             checksum: None,
+            digest: None,
             filename: None,
             auth: None,
             platform: None,
@@ -2335,6 +2415,7 @@ mod tests {
             uri: format!("oci://ghcr.io/botworkz/svc@sha256:{manifest_hex}"),
             version: String::new(),
             checksum: None,
+            digest: None,
             filename: Some("svc.tar".to_string()),
             auth: None,
             platform: None,
@@ -2434,6 +2515,7 @@ mod tests {
             uri: format!("oci://ghcr.io/botworkz/svc@sha256:{real_hex}"),
             version: String::new(),
             checksum: None,
+            digest: None,
             filename: Some("svc.tar".to_string()),
             auth: None,
             platform: None,
@@ -2489,6 +2571,7 @@ mod tests {
             uri: format!("oci://ghcr.io/botworkz/svc@sha256:{manifest_hex}"),
             version: String::new(),
             checksum: None,
+            digest: None,
             filename: Some("svc.tar".to_string()),
             auth: None,
             platform: None,
@@ -2559,6 +2642,7 @@ mod tests {
             uri: format!("oci://ghcr.io/botworkz/svc@sha256:{index_hex}"),
             version: String::new(),
             checksum: None,
+            digest: None,
             filename: Some("svc.tar".to_string()),
             auth: None,
             platform: None,
@@ -2649,6 +2733,7 @@ mod tests {
             uri: format!("oci://ghcr.io/botworkz/svc@sha256:{index_hex}"),
             version: String::new(),
             checksum: None,
+            digest: None,
             filename: Some("svc.tar".to_string()),
             auth: None,
             platform: None,
@@ -2704,6 +2789,7 @@ mod tests {
             uri: format!("oci://ghcr.io/botworkz/svc@sha256:{index_hex}"),
             version: String::new(),
             checksum: None,
+            digest: None,
             filename: Some("svc.tar".to_string()),
             auth: None,
             platform: Some("linux/amd64".to_string()),
@@ -2782,6 +2868,7 @@ mod tests {
                 uri: format!("oci://ghcr.io/botworkz/svc@sha256:{manifest_hex}"),
                 version: String::new(),
                 checksum: None,
+                digest: None,
                 filename: Some("svc.tar".to_string()),
                 auth: None,
                 platform: None,
@@ -2820,6 +2907,244 @@ mod tests {
         let run1 = assemble_fresh();
         let run2 = assemble_fresh();
         assert_eq!(run1, run2, "assembled tar is not deterministic");
+    }
+
+    /// New `digest:` field form produces the same manifest URL as the legacy URI-suffix form.
+    #[test]
+    fn oci_new_form_issues_same_manifest_url_as_legacy_form() {
+        let layer_tar = make_minimal_layer_tar();
+        let layer_gz = make_gzip(&layer_tar);
+        let layer_gz_hex = sha256_hex(&layer_gz);
+        let config_bytes = b"{\"architecture\":\"amd64\"}";
+        let config_hex = sha256_hex(config_bytes);
+
+        let manifest = serde_json::json!({
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": format!("sha256:{config_hex}"),
+                "size": config_bytes.len()
+            },
+            "layers": [{
+                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                "digest": format!("sha256:{layer_gz_hex}"),
+                "size": layer_gz.len()
+            }]
+        });
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        let manifest_hex = sha256_hex(&manifest_bytes);
+
+        // New form: clean URI + structured digest field.
+        let asset = Asset {
+            uri: "oci://ghcr.io/botworkz/svc".to_string(),
+            version: String::new(),
+            checksum: None,
+            digest: Some(format!("sha256:{manifest_hex}")),
+            filename: Some("svc.tar".to_string()),
+            auth: None,
+            platform: None,
+        };
+
+        let cache = TempDir::new().unwrap();
+        let (transport, calls) = MockTransport::with_expectations(
+            vec![
+                MockOutcome::Body {
+                    body: manifest_bytes,
+                    content_length: None,
+                },
+                MockOutcome::Body {
+                    body: config_bytes.to_vec(),
+                    content_length: None,
+                },
+                MockOutcome::Body {
+                    body: layer_gz,
+                    content_length: None,
+                },
+            ],
+            vec![
+                // Expect the SAME manifest URL as the legacy form would produce.
+                (
+                    format!("https://ghcr.io/v2/botworkz/svc/manifests/sha256:{manifest_hex}"),
+                    Some(MANIFEST_ACCEPT.to_string()),
+                ),
+                (
+                    format!("https://ghcr.io/v2/botworkz/svc/blobs/sha256:{config_hex}"),
+                    None,
+                ),
+                (
+                    format!("https://ghcr.io/v2/botworkz/svc/blobs/sha256:{layer_gz_hex}"),
+                    None,
+                ),
+            ],
+        );
+
+        let result = fetch_asset(FetchParams {
+            name: "my-svc",
+            asset: &asset,
+            out_dir: None,
+            cache_dir: cache.path(),
+            retries: 0,
+            backoff: &Backoff::default(),
+            compute_checksum: true,
+            no_reverify: false,
+            materialize_mode: MaterializeMode::Copy,
+            transport: Some(Box::new(transport)),
+        })
+        .unwrap();
+
+        assert_eq!(MockTransport::call_count(&calls), 3);
+        assert!(result.blob_path.exists());
+    }
+
+    /// A cache entry populated by the legacy URI-suffix form must be a hit when
+    /// re-fetching using the new `digest:` field form (same effective hex → same path).
+    #[test]
+    fn oci_cache_compat_new_form_hits_legacy_cache() {
+        let config_bytes = b"{\"architecture\":\"amd64\"}";
+        let config_hex = sha256_hex(config_bytes);
+        let layer_tar = make_minimal_layer_tar();
+        let layer_gz = make_gzip(&layer_tar);
+        let layer_gz_hex = sha256_hex(&layer_gz);
+
+        let manifest = serde_json::json!({
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "digest": format!("sha256:{config_hex}"),
+                "mediaType": "application/vnd.oci.image.config.v1+json"
+            },
+            "layers": [{
+                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                "digest": format!("sha256:{layer_gz_hex}"),
+                "size": layer_gz.len()
+            }]
+        });
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        let manifest_hex = sha256_hex(&manifest_bytes);
+
+        let cache = TempDir::new().unwrap();
+
+        // ── Step 1: populate cache via legacy URI-suffix form ──
+        let legacy_asset = Asset {
+            uri: format!("oci://ghcr.io/botworkz/svc@sha256:{manifest_hex}"),
+            version: String::new(),
+            checksum: None,
+            digest: None,
+            filename: Some("svc.tar".to_string()),
+            auth: None,
+            platform: None,
+        };
+        let (transport1, _) = MockTransport::with_outcomes(vec![
+            MockOutcome::Body {
+                body: manifest_bytes,
+                content_length: None,
+            },
+            MockOutcome::Body {
+                body: config_bytes.to_vec(),
+                content_length: None,
+            },
+            MockOutcome::Body {
+                body: layer_gz,
+                content_length: None,
+            },
+        ]);
+        let r1 = fetch_asset(FetchParams {
+            name: "my-svc",
+            asset: &legacy_asset,
+            out_dir: None,
+            cache_dir: cache.path(),
+            retries: 0,
+            backoff: &Backoff::default(),
+            compute_checksum: true,
+            no_reverify: false,
+            materialize_mode: MaterializeMode::Copy,
+            transport: Some(Box::new(transport1)),
+        })
+        .unwrap();
+        let cached_tar_hex = r1.computed_sha256.clone();
+
+        // ── Step 2: re-fetch using the new `digest:` field form ──
+        let new_asset = Asset {
+            uri: "oci://ghcr.io/botworkz/svc".to_string(),
+            version: String::new(),
+            checksum: None,
+            digest: Some(format!("sha256:{manifest_hex}")),
+            filename: Some("svc.tar".to_string()),
+            auth: None,
+            platform: None,
+        };
+        // Transport with NO outcomes — any real request would panic.
+        let (transport2, calls2) = MockTransport::with_outcomes(vec![]);
+        let r2 = fetch_asset(FetchParams {
+            name: "my-svc",
+            asset: &new_asset,
+            out_dir: None,
+            cache_dir: cache.path(),
+            retries: 0,
+            backoff: &Backoff::default(),
+            compute_checksum: true,
+            no_reverify: false,
+            materialize_mode: MaterializeMode::Copy,
+            transport: Some(Box::new(transport2)),
+        })
+        .unwrap();
+
+        // Cache hit: no network calls and same tar hex.
+        assert_eq!(
+            MockTransport::call_count(&calls2),
+            0,
+            "new-form re-fetch must hit cache without any network call"
+        );
+        assert_eq!(
+            r2.computed_sha256, cached_tar_hex,
+            "cache hit must return the same tar sha256 as the original download"
+        );
+    }
+
+    /// An OCI asset with neither a `@sha256:` URI suffix nor a `digest:` field
+    /// must fail fast with a clear actionable error message.
+    #[test]
+    fn oci_no_digest_fails_fast_with_clear_message() {
+        let asset = Asset {
+            uri: "oci://ghcr.io/botworkz/svc".to_string(),
+            version: String::new(),
+            checksum: None,
+            digest: None,
+            filename: Some("svc.tar".to_string()),
+            auth: None,
+            platform: None,
+        };
+
+        let cache = TempDir::new().unwrap();
+        let (transport, calls) = MockTransport::with_outcomes(vec![]);
+
+        let err = fetch_asset(FetchParams {
+            name: "my-svc",
+            asset: &asset,
+            out_dir: None,
+            cache_dir: cache.path(),
+            retries: 0,
+            backoff: &Backoff::default(),
+            compute_checksum: true,
+            no_reverify: false,
+            materialize_mode: MaterializeMode::Copy,
+            transport: Some(Box::new(transport)),
+        })
+        .unwrap_err();
+
+        assert_eq!(
+            MockTransport::call_count(&calls),
+            0,
+            "no network call expected for missing-digest error"
+        );
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("OCI asset has no digest pin"),
+            "error should mention missing digest pin: {msg}"
+        );
+        assert!(
+            msg.contains("digest: sha256:<64-hex>"),
+            "error should suggest digest field: {msg}"
+        );
     }
 
     // Helper: build a minimal OCI manifest + blobs for mock transport tests.
@@ -2964,6 +3289,7 @@ mod tests {
             uri: format!("oci://ghcr.io/botworkz/svc@sha256:{manifest_hex}"),
             version: String::new(),
             checksum: None,
+            digest: None,
             filename: Some("svc.tar".to_string()),
             auth: auth_value.map(str::to_string),
             platform: None,

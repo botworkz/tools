@@ -84,10 +84,16 @@ fn cmd_add(config: &Path, args: cli::AddArgs) -> Result<()> {
         }
     }
 
+    if let Some(ref d) = args.digest {
+        ParsedChecksum::parse(d)
+            .with_context(|| format!("invalid digest for asset '{}'", args.name))?;
+    }
+
     let asset = Asset {
         uri: args.uri.clone(),
         version: args.version.clone(),
         checksum: args.checksum.clone(),
+        digest: args.digest.clone(),
         filename: args.filename.clone(),
         auth: args.auth.clone(),
         platform: None,
@@ -120,6 +126,7 @@ fn cmd_add(config: &Path, args: cli::AddArgs) -> Result<()> {
         uri: args.uri,
         version: args.version,
         checksum,
+        digest: args.digest,
         filename: args.filename,
         auth: args.auth,
         platform: None,
@@ -172,6 +179,9 @@ fn cmd_get(config: &Path, args: cli::GetArgs) -> Result<()> {
                     "version": a.version,
                     "checksum": a.checksum,
                 });
+                if let Some(d) = &a.digest {
+                    obj["digest"] = json!(d);
+                }
                 if let Some(f) = &a.filename {
                     obj["filename"] = json!(f);
                 }
@@ -188,6 +198,9 @@ fn cmd_get(config: &Path, args: cli::GetArgs) -> Result<()> {
             println!("  uri:      {}", a.uri);
             println!("  version:  {}", a.version);
             println!("  checksum: {}", a.checksum.as_deref().unwrap_or("<none>"));
+            if let Some(d) = &a.digest {
+                println!("  digest:   {d}");
+            }
             if let Some(f) = &a.filename {
                 println!("  filename: {f}");
             }
@@ -315,7 +328,7 @@ fn oci_referenced_index_keys(manifest: &Manifest) -> HashSet<String> {
         .values()
         .filter_map(|asset| {
             let uri = asset.expanded_uri();
-            let manifest_hex = fetch::oci_manifest_hex_from_uri(&uri)?;
+            let manifest_hex = fetch::oci_manifest_hex_from_asset(asset, &uri)?;
             let platform_slug = fetch::oci_platform_slug_from_asset(asset).ok()?;
             Some(format!("{manifest_hex}.{platform_slug}"))
         })
@@ -673,6 +686,7 @@ mod tests {
             uri: "https://example.com/v1/tool".to_string(),
             version: "1".to_string(),
             checksum: Some(format!("sha256:{hex}")),
+            digest: None,
             filename: Some("tool.bin".to_string()),
             auth: None,
             platform: None,
@@ -783,6 +797,7 @@ mod tests {
                     uri: "https://example.com/tool".to_string(),
                     version: "1".to_string(),
                     checksum: None,
+                    digest: None,
                     filename: None,
                     auth: None,
                     platform: None,
@@ -812,6 +827,7 @@ mod tests {
                     "sha256:0000000000000000000000000000000000000000000000000000000000000000"
                         .to_string(),
                 ),
+                digest: None,
                 filename: None,
                 auth: None,
                 platform: None,
@@ -836,6 +852,7 @@ mod tests {
             uri: "https://example.com/releases/v${version}/tool-${version}.tar.gz".to_string(),
             version: "2.0.0".to_string(),
             checksum: None,
+            digest: None,
             filename: None,
             auth: None,
             platform: None,
@@ -852,6 +869,7 @@ mod tests {
             uri: "https://example.com/releases/v${version}/tool-${version}.tar.gz".to_string(),
             version: "2.0.0".to_string(),
             checksum: None,
+            digest: None,
             filename: Some("tool-${version}.tar.gz".to_string()),
             auth: None,
             platform: None,
@@ -865,6 +883,7 @@ mod tests {
             uri: "https://example.com/releases/v1.0/archive.zip".to_string(),
             version: "1.0".to_string(),
             checksum: None,
+            digest: None,
             filename: None,
             auth: None,
             platform: None,
@@ -941,6 +960,7 @@ mod tests {
             uri: "https://example.com/v1/tool".to_string(),
             version: "1".to_string(),
             checksum: Some(format!("sha256:{hex}")),
+            digest: None,
             filename: Some("tool".to_string()),
             auth: None,
             platform: None,
@@ -977,6 +997,7 @@ mod tests {
             uri: "https://example.com/v1/tool".to_string(),
             version: "1".to_string(),
             checksum: Some(format!("sha256:{wrong_hex}")),
+            digest: None,
             filename: Some("tool".to_string()),
             auth: None,
             platform: None,
@@ -1009,6 +1030,7 @@ mod tests {
             uri: "https://example.com/v1/tool".to_string(),
             version: "1".to_string(),
             checksum: None,
+            digest: None,
             filename: Some("tool".to_string()),
             auth: None,
             platform: None,
@@ -1044,6 +1066,7 @@ mod tests {
                 "sha256:{}",
                 sha256_hex(b"") // sha of empty — would match, but we catch empty first
             )),
+            digest: None,
             filename: Some("tool".to_string()),
             auth: None,
             platform: None,
@@ -1076,6 +1099,7 @@ mod tests {
             uri: "https://example.com/v1/tool".to_string(),
             version: "1".to_string(),
             checksum: Some(format!("sha256:{}", "a".repeat(64))),
+            digest: None,
             filename: Some("tool".to_string()),
             auth: None,
             platform: None,
@@ -1115,6 +1139,7 @@ mod tests {
             uri: "https://example.com".to_string(),
             version: "1".to_string(),
             checksum: None,
+            digest: None,
             filename: None,
             auth: Some("${TEST_SHASSET_TOKEN_ABC}".to_string()),
             platform: None,
@@ -1129,6 +1154,7 @@ mod tests {
             uri: "https://example.com".to_string(),
             version: "1".to_string(),
             checksum: None,
+            digest: None,
             filename: None,
             auth: Some("${SHASSET_DEFINITELY_NOT_SET_XYZ123}".to_string()),
             platform: None,
@@ -1166,6 +1192,7 @@ mod tests {
             uri: "https://example.com".to_string(),
             version: "1.0".to_string(),
             checksum: Some("sha256:".to_string() + &"a".repeat(64)),
+            digest: None,
             filename: None,
             auth: Some("${SECRET_TOKEN}".to_string()),
             platform: None,
