@@ -49,6 +49,11 @@ pub struct AddArgs {
     /// Checksum in `sha256:<hex>` format. Mutually exclusive with `--compute`.
     #[arg(long, conflicts_with = "compute")]
     pub checksum: Option<String>,
+    /// OCI manifest digest in `sha256:<hex>` form. Pins the OCI image manifest
+    /// for `oci://` URIs and is the OCI-equivalent of `--checksum` for HTTPS
+    /// / github-release URIs.
+    #[arg(long)]
+    pub digest: Option<String>,
     /// Download the asset, compute its sha256 checksum, and store it.
     #[arg(long, conflicts_with = "checksum")]
     pub compute: bool,
