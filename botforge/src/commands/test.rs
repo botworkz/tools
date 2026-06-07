@@ -53,11 +53,35 @@ pub(crate) struct TestArgs {
 #[derive(Debug, Deserialize, Default)]
 struct TestConfig {
     #[serde(default)]
-    isos: Vec<PathBuf>,
+    isos: Vec<TestIso>,
     #[serde(default)]
     steps: Vec<TestStep>,
     #[serde(default)]
     diagnostics_units: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum TestIso {
+    Attach(PathBuf),
+    Bootstrap {
+        path: PathBuf,
+        label: String,
+        mount: PathBuf,
+        #[serde(default = "default_bootstrap_path")]
+        bootstrap: PathBuf,
+    },
+}
+
+#[derive(Debug)]
+struct TestIsoBootstrap {
+    label: String,
+    mount: PathBuf,
+    bootstrap: PathBuf,
+}
+
+fn default_bootstrap_path() -> PathBuf {
+    PathBuf::from("bootstrap.sh")
 }
 
 #[derive(Debug, Deserialize)]
@@ -112,8 +136,26 @@ pub(crate) fn cmd_test(args: TestArgs) -> Result<()> {
     create_overlay_image(&base_image, &overlay_image)?;
 
     let mut extra_isos = Vec::new();
+    let mut bootstraps = Vec::new();
     for iso in &test_config.isos {
-        extra_isos.push(resolve_under_root(&repo_root, iso.clone()));
+        match iso {
+            TestIso::Attach(path) => {
+                extra_isos.push(resolve_under_root(&repo_root, path.clone()));
+            }
+            TestIso::Bootstrap {
+                path,
+                label,
+                mount,
+                bootstrap,
+            } => {
+                extra_isos.push(resolve_under_root(&repo_root, path.clone()));
+                bootstraps.push(TestIsoBootstrap {
+                    label: label.clone(),
+                    mount: mount.clone(),
+                    bootstrap: bootstrap.clone(),
+                });
+            }
+        }
     }
     let qemu_args = qemu_run_args(&overlay_image, &seed_iso, &extra_isos, args.ssh_port);
 
@@ -125,7 +167,7 @@ pub(crate) fn cmd_test(args: TestArgs) -> Result<()> {
         key: ssh_key.clone(),
     };
 
-    let test_result = run_test_flow(&repo_root, &test_config, &ssh_options);
+    let test_result = run_test_flow(&repo_root, &test_config, &ssh_options, &bootstraps);
     if let Err(err) = test_result {
         eprintln!("test failed: {err:#}");
         collect_test_diagnostics(&ssh_options, &test_config.diagnostics_units);
@@ -143,7 +185,12 @@ pub(crate) fn cmd_test(args: TestArgs) -> Result<()> {
     Ok(())
 }
 
-fn run_test_flow(repo_root: &Path, config: &TestConfig, ssh: &SshOptions) -> Result<()> {
+fn run_test_flow(
+    repo_root: &Path,
+    config: &TestConfig,
+    ssh: &SshOptions,
+    bootstraps: &[TestIsoBootstrap],
+) -> Result<()> {
     wait_for_ssh(ssh, TEST_SSH_READY_TIMEOUT)?;
     ssh_with_retry(
         ssh,
@@ -153,6 +200,31 @@ fn run_test_flow(repo_root: &Path, config: &TestConfig, ssh: &SshOptions) -> Res
         TEST_CLOUD_INIT_TIMEOUT,
     )?;
     require_stable_ssh(ssh, TEST_STABLE_SSH_ATTEMPTS, TEST_STABLE_SSH_REQUIRED)?;
+
+    for bootstrap in bootstraps {
+        let mount = shell_single_quote(&bootstrap.mount.display().to_string());
+        let label = shell_single_quote(&bootstrap.label);
+        let mount_cmd = format!("sudo mkdir -p {mount} && sudo mount -L {label} -o ro {mount}");
+        ssh_with_retry(
+            ssh,
+            &mount_cmd,
+            TEST_TRANSPORT_RETRIES,
+            TEST_TRANSPORT_RETRY_DELAY,
+            TEST_CLOUD_INIT_TIMEOUT,
+        )
+        .with_context(|| format!("iso bootstrap mount failed for label {}", bootstrap.label))?;
+
+        let script_path = bootstrap.mount.join(&bootstrap.bootstrap);
+        let run_cmd = format!("sudo bash {}", shell_single_quote(&script_path.display().to_string()));
+        ssh_with_retry(
+            ssh,
+            &run_cmd,
+            TEST_TRANSPORT_RETRIES,
+            TEST_TRANSPORT_RETRY_DELAY,
+            TEST_CLOUD_INIT_TIMEOUT,
+        )
+        .with_context(|| format!("iso bootstrap script failed for label {}", bootstrap.label))?;
+    }
 
     for step in &config.steps {
         for upload in &step.uploads {
@@ -229,4 +301,75 @@ fn cleanup_test(vm_child: &mut Option<Child>, overlay_image: &Path) {
     }
     *vm_child = None;
     let _ = std::fs::remove_file(overlay_image);
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{default_bootstrap_path, TestConfig, TestIso};
+    use std::path::PathBuf;
+
+    #[test]
+    fn test_config_isos_parses_legacy_and_bootstrap_shapes() {
+        let config: TestConfig = serde_yaml::from_str(
+            r#"
+isos:
+  - some/legacy.iso
+  - path: some/payload.iso
+    label: botwork-payload
+    mount: /mnt/botwork-payload
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.isos.len(), 2);
+        match &config.isos[0] {
+            TestIso::Attach(path) => assert_eq!(path, &PathBuf::from("some/legacy.iso")),
+            TestIso::Bootstrap { .. } => panic!("expected legacy iso entry"),
+        }
+        match &config.isos[1] {
+            TestIso::Bootstrap {
+                path,
+                label,
+                mount,
+                bootstrap,
+            } => {
+                assert_eq!(path, &PathBuf::from("some/payload.iso"));
+                assert_eq!(label, "botwork-payload");
+                assert_eq!(mount, &PathBuf::from("/mnt/botwork-payload"));
+                assert_eq!(bootstrap, &default_bootstrap_path());
+            }
+            TestIso::Attach(_) => panic!("expected bootstrap iso entry"),
+        }
+    }
+
+    #[test]
+    fn test_config_isos_parses_bootstrap_override() {
+        let config: TestConfig = serde_yaml::from_str(
+            r#"
+isos:
+  - path: other.iso
+    label: lbl
+    mount: /mnt/other
+    bootstrap: custom-init.sh
+"#,
+        )
+        .unwrap();
+
+        match &config.isos[0] {
+            TestIso::Bootstrap { bootstrap, .. } => {
+                assert_eq!(bootstrap, &PathBuf::from("custom-init.sh"))
+            }
+            TestIso::Attach(_) => panic!("expected bootstrap iso entry"),
+        }
+    }
+
+    #[test]
+    fn test_config_isos_parses_empty_list() {
+        let config: TestConfig = serde_yaml::from_str("isos: []\n").unwrap();
+        assert!(config.isos.is_empty());
+    }
 }
