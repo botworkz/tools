@@ -78,6 +78,26 @@ For non-OCI URIs (`https://`, `github-release://`), the resolved string is sent 
 `Authorization: ****** regardless of whether it contains a colon — colon-splitting only
 applies to the OCI token-exchange leg.
 
+### Platform selection for OCI image indices
+
+When an `oci://` URI points at a multi-arch image index (`mediaType:
+application/vnd.oci.image.index.v1+json` or the Docker equivalent), shasset
+selects a child manifest using the asset's `platform:` field, defaulting to
+`linux/amd64`. The selected child's tarball is what gets cached and
+materialized.
+
+```yaml
+assets:
+  mcp-exec-bash:
+    uri: oci://ghcr.io/example/mcp-exec-bash@sha256:dfe0edd…
+    filename: mcp-exec-bash.tar
+    platform: linux/amd64  # default; omit for the same effect
+```
+
+Accepted forms: `os/arch` and `os/arch/variant`. `platform:` is ignored for
+non-OCI URIs and for OCI URIs that resolve directly to a single-platform
+manifest (no walk needed).
+
 ## Retry and backoff
 
 Transient errors (HTTP 5xx, 429, connection/DNS/timeout failures, and other transport-level read failures) are retried with exponential backoff up to the configured `retries` count. HTTP 4xx errors (except 429) and checksum mismatches are **not** retried — they fail immediately. Empty/zero-byte downloads are always errors.
