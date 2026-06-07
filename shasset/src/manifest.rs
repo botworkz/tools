@@ -80,6 +80,10 @@ pub struct Asset {
     /// `sha256:<64-hex>` — required for fetch/verify unless being computed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checksum: Option<String>,
+    /// `sha256:<64-hex>` — OCI manifest digest. Required for `oci://` URIs
+    /// (unless using the legacy `oci://<registry>/<repo>@sha256:<hex>` form).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
     /// Forced output filename; when absent the URI basename is used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filename: Option<String>,
@@ -138,6 +142,44 @@ impl Asset {
         Ok(Some(ParsedChecksum::parse(raw)?))
     }
 
+    /// Parse and validate the `digest:` field (OCI manifest digest).
+    pub fn parsed_digest(&self) -> Result<Option<ParsedChecksum>> {
+        let Some(raw) = &self.digest else {
+            return Ok(None);
+        };
+        Ok(Some(ParsedChecksum::parse(raw)?))
+    }
+
+    /// Resolve the OCI manifest digest hex from either the structured `digest:` field
+    /// or the legacy `oci://...@sha256:<hex>` URI suffix.
+    ///
+    /// - Prefers `self.digest` when set.
+    /// - Falls back to the `@sha256:<hex>` suffix in `self.expanded_uri()`.
+    /// - If **both** are present they must match exactly; returns `Err` if they differ.
+    /// - Returns `Ok(None)` when neither is present.
+    pub fn oci_digest_hex(&self) -> Result<Option<String>> {
+        let parsed_d = self.parsed_digest()?;
+        let uri = self.expanded_uri();
+        let uri_hex = oci_uri_manifest_hex(&uri);
+
+        match (parsed_d, uri_hex) {
+            (Some(d), Some(u)) => {
+                let field_hex = d.hex.to_ascii_lowercase();
+                if field_hex != u {
+                    bail!(
+                        "OCI digest mismatch: 'digest' field says sha256:{}, URI suffix says sha256:{}",
+                        field_hex,
+                        u
+                    );
+                }
+                Ok(Some(field_hex))
+            }
+            (Some(d), None) => Ok(Some(d.hex.to_ascii_lowercase())),
+            (None, Some(u)) => Ok(Some(u)),
+            (None, None) => Ok(None),
+        }
+    }
+
     /// Resolve the requested OCI platform, defaulting to "linux/amd64".
     /// Returns (os, arch, variant) where variant is None if not specified.
     pub fn resolved_platform(&self) -> Result<(String, String, Option<String>)> {
@@ -152,6 +194,19 @@ impl Asset {
             }
             _ => bail!("invalid platform '{raw}': expected 'os/arch' or 'os/arch/variant'"),
         }
+    }
+}
+
+/// Extract the manifest digest hex from an `oci://` URI, if valid.
+/// Private helper — avoids a circular dependency with fetch.rs.
+fn oci_uri_manifest_hex(uri: &str) -> Option<String> {
+    let rest = uri.strip_prefix("oci://")?;
+    let (_, digest) = rest.rsplit_once('@')?;
+    let hex = digest.strip_prefix("sha256:")?;
+    if hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some(hex.to_ascii_lowercase())
+    } else {
+        None
     }
 }
 
@@ -279,6 +334,7 @@ mod tests {
                 .to_string(),
             version: String::new(),
             checksum: None,
+            digest: None,
             filename: Some("svc.tar".to_string()),
             auth: None,
             platform: None,
@@ -319,6 +375,7 @@ mod tests {
                     .to_string(),
                 version: String::new(),
                 checksum: None,
+                digest: None,
                 filename: Some("svc.tar".to_string()),
                 auth: None,
                 platform: Some(raw.to_string()),
@@ -329,5 +386,68 @@ mod tests {
                 "unexpected error for '{raw}': {err:#}"
             );
         }
+    }
+
+    // Shared hex used in oci_digest_hex tests — 64 valid hex chars.
+    const HEX_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const HEX_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    fn make_oci_asset(uri: &str, digest: Option<&str>) -> Asset {
+        Asset {
+            uri: uri.to_string(),
+            version: String::new(),
+            checksum: None,
+            digest: digest.map(str::to_string),
+            filename: Some("svc.tar".to_string()),
+            auth: None,
+            platform: None,
+        }
+    }
+
+    #[test]
+    fn oci_digest_hex_from_field_only() {
+        let asset = make_oci_asset(
+            "oci://ghcr.io/botworkz/svc",
+            Some(&format!("sha256:{HEX_A}")),
+        );
+        assert_eq!(asset.oci_digest_hex().unwrap(), Some(HEX_A.to_string()));
+    }
+
+    #[test]
+    fn oci_digest_hex_from_uri_only() {
+        let asset = make_oci_asset(&format!("oci://ghcr.io/botworkz/svc@sha256:{HEX_A}"), None);
+        assert_eq!(asset.oci_digest_hex().unwrap(), Some(HEX_A.to_string()));
+    }
+
+    #[test]
+    fn oci_digest_hex_both_matching() {
+        let asset = make_oci_asset(
+            &format!("oci://ghcr.io/botworkz/svc@sha256:{HEX_A}"),
+            Some(&format!("sha256:{HEX_A}")),
+        );
+        assert_eq!(asset.oci_digest_hex().unwrap(), Some(HEX_A.to_string()));
+    }
+
+    #[test]
+    fn oci_digest_hex_both_mismatching_errors() {
+        let asset = make_oci_asset(
+            &format!("oci://ghcr.io/botworkz/svc@sha256:{HEX_A}"),
+            Some(&format!("sha256:{HEX_B}")),
+        );
+        let err = asset.oci_digest_hex().unwrap_err();
+        assert!(
+            err.to_string().contains("OCI digest mismatch"),
+            "expected mismatch error, got: {err:#}"
+        );
+        assert!(
+            err.to_string().contains(HEX_A) && err.to_string().contains(HEX_B),
+            "error should name both values: {err:#}"
+        );
+    }
+
+    #[test]
+    fn oci_digest_hex_neither_returns_none() {
+        let asset = make_oci_asset("oci://ghcr.io/botworkz/svc", None);
+        assert_eq!(asset.oci_digest_hex().unwrap(), None);
     }
 }

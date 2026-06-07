@@ -89,14 +89,56 @@ materialized.
 ```yaml
 assets:
   mcp-exec-bash:
-    uri: oci://ghcr.io/example/mcp-exec-bash@sha256:dfe0edd…
+    uri: oci://ghcr.io/example/mcp-exec-bash
+    digest: sha256:dfe0edd…           # OCI manifest digest — pins the image
     filename: mcp-exec-bash.tar
-    platform: linux/amd64  # default; omit for the same effect
+    platform: linux/amd64             # default; omit for the same effect
 ```
 
 Accepted forms: `os/arch` and `os/arch/variant`. `platform:` is ignored for
 non-OCI URIs and for OCI URIs that resolve directly to a single-platform
 manifest (no walk needed).
+
+### OCI manifest pinning (`digest:`)
+
+shasset supports two equivalent ways to pin an OCI image manifest:
+
+**New form (recommended):** separate `uri:` and `digest:` fields.
+
+```yaml
+assets:
+  auth-broker:
+    uri: oci://ghcr.io/botworkz/botwork-extra/auth-broker
+    digest: sha256:bd3f67c16197643eb4834596207d1b5b6ed3530aafc29ec81754632c8079164d
+    filename: auth-broker.tar
+    auth: ${GHCR_USER}:${GHCR_TOKEN}
+```
+
+**Legacy form (still accepted, deprecated):** digest appended to the URI.
+
+```yaml
+assets:
+  auth-broker:
+    uri: oci://ghcr.io/botworkz/botwork-extra/auth-broker@sha256:bd3f67c16197643eb4834596207d1b5b6ed3530aafc29ec81754632c8079164d
+    filename: auth-broker.tar
+    auth: ${GHCR_USER}:${GHCR_TOKEN}
+```
+
+Both forms are fully equivalent: the cache key is derived from the manifest
+hex in both cases, so a cache entry populated by either form is reused by the
+other.
+
+**Why the manifest digest is a sufficient integrity anchor:** the OCI manifest
+cryptographically chains to the config blob and every layer blob via their
+`sha256:` descriptors. shasset self-verifies each of these digests during
+fetch, so nothing untrusted ever lands on disk. The `checksum:` field (sha256
+of the assembled `.tar` file) is therefore optional for OCI assets — the
+manifest digest already provides full integrity coverage.
+
+The `digest:` field accepts the same `sha256:<64-hex>` format as `checksum:`.
+It is validated at `shasset add` time and at fetch time. If both `digest:` and
+the legacy URI suffix are present they must agree; shasset errors if they
+differ.
 
 ## Retry and backoff
 
