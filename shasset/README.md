@@ -54,6 +54,23 @@ assets:
 - By default, cache blobs are re-verified before use; `--no-reverify` skips that check.
 - `prune` removes cached blobs not referenced by the current manifest and clears stale `quarantine/*` entries. Use `--dry-run` to report what would be removed without deleting anything; the command prints a human-readable summary of blobs removed, bytes reclaimed, and quarantine entries cleared.
 
+### Authentication
+
+`auth:` resolves `${ENV_VAR}` references at fetch time. The resolved string follows one of two
+shapes:
+
+- `auth: ${TOKEN}` — bare token (no colon). Used as the password with the placeholder username
+  `x-access-token` for OCI token exchange. This matches GHCR / GitHub PAT conventions and works
+  with most docker-distribution registries (Harbor, Gitea, generic distributions).
+- `auth: ${USER}:${TOKEN}` — explicit `username:password`. Use this for ECR
+  (`auth: "AWS:${ECR_TOKEN}"`), Harbor robot accounts, or any registry that rejects the
+  `x-access-token` placeholder. Everything after the first `:` is the password, so passwords
+  containing colons are preserved in full.
+
+For non-OCI URIs (`https://`, `github-release://`), the resolved string is sent as
+`Authorization: ****** regardless of whether it contains a colon — colon-splitting only
+applies to the OCI token-exchange leg.
+
 ## Retry and backoff
 
 Transient errors (HTTP 5xx, 429, connection/DNS/timeout failures, and other transport-level read failures) are retried with exponential backoff up to the configured `retries` count. HTTP 4xx errors (except 429) and checksum mismatches are **not** retried — they fail immediately. Empty/zero-byte downloads are always errors.
