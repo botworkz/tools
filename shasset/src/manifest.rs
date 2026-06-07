@@ -86,6 +86,11 @@ pub struct Asset {
     /// `${ENV_VAR}` template resolved at runtime; NEVER written back resolved.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<String>,
+    /// Platform selector for OCI image indices. Defaults to `linux/amd64`.
+    /// Form: `os/arch` or `os/arch/variant`. Ignored for non-OCI URIs and
+    /// for OCI URIs that resolve to a single-platform manifest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
 }
 
 impl Asset {
@@ -131,6 +136,22 @@ impl Asset {
             return Ok(None);
         };
         Ok(Some(ParsedChecksum::parse(raw)?))
+    }
+
+    /// Resolve the requested OCI platform, defaulting to "linux/amd64".
+    /// Returns (os, arch, variant) where variant is None if not specified.
+    pub fn resolved_platform(&self) -> Result<(String, String, Option<String>)> {
+        let raw = self.platform.as_deref().unwrap_or("linux/amd64");
+        let parts: Vec<&str> = raw.split('/').collect();
+        match parts.as_slice() {
+            [os, arch] if !os.is_empty() && !arch.is_empty() => {
+                Ok((os.to_string(), arch.to_string(), None))
+            }
+            [os, arch, variant] if !os.is_empty() && !arch.is_empty() && !variant.is_empty() => {
+                Ok((os.to_string(), arch.to_string(), Some(variant.to_string())))
+            }
+            _ => bail!("invalid platform '{raw}': expected 'os/arch' or 'os/arch/variant'"),
+        }
     }
 }
 
@@ -233,7 +254,7 @@ pub fn save(path: &Path, manifest: &Manifest) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::Manifest;
+    use super::{Asset, Manifest};
 
     #[test]
     fn version_defaults_empty_for_versionless_asset() {
@@ -249,5 +270,64 @@ mod tests {
             format!("oci://ghcr.io/botworkz/session-broker@sha256:{digest}")
         );
         assert_eq!(asset.output_filename().unwrap(), "session-broker.tar");
+    }
+
+    #[test]
+    fn resolved_platform_parses_and_defaults() {
+        let default_asset = Asset {
+            uri: "oci://ghcr.io/botworkz/svc@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .to_string(),
+            version: String::new(),
+            checksum: None,
+            filename: Some("svc.tar".to_string()),
+            auth: None,
+            platform: None,
+        };
+        assert_eq!(
+            default_asset.resolved_platform().unwrap(),
+            ("linux".to_string(), "amd64".to_string(), None)
+        );
+
+        let explicit = Asset {
+            platform: Some("linux/amd64".to_string()),
+            ..default_asset.clone()
+        };
+        assert_eq!(
+            explicit.resolved_platform().unwrap(),
+            ("linux".to_string(), "amd64".to_string(), None)
+        );
+
+        let with_variant = Asset {
+            platform: Some("linux/arm/v7".to_string()),
+            ..default_asset
+        };
+        assert_eq!(
+            with_variant.resolved_platform().unwrap(),
+            (
+                "linux".to_string(),
+                "arm".to_string(),
+                Some("v7".to_string())
+            )
+        );
+    }
+
+    #[test]
+    fn resolved_platform_rejects_invalid_shapes() {
+        for raw in ["linux", "linux/", "/amd64", ""] {
+            let asset = Asset {
+                uri: "oci://ghcr.io/botworkz/svc@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_string(),
+                version: String::new(),
+                checksum: None,
+                filename: Some("svc.tar".to_string()),
+                auth: None,
+                platform: Some(raw.to_string()),
+            };
+            let err = asset.resolved_platform().unwrap_err();
+            assert!(
+                err.to_string().contains("invalid platform"),
+                "unexpected error for '{raw}': {err:#}"
+            );
+        }
     }
 }

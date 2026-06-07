@@ -233,6 +233,7 @@ mod tests {
             checksum: None,
             filename: None,
             auth: None,
+            platform: None,
         };
         assert_eq!(
             oci_or_default_filename("session-broker", &asset).unwrap(),
@@ -248,6 +249,7 @@ mod tests {
             checksum: None,
             filename: Some("broker.tar".to_string()),
             auth: None,
+            platform: None,
         };
         assert_eq!(
             oci_or_default_filename("session-broker", &asset).unwrap(),
@@ -263,6 +265,7 @@ mod tests {
             checksum: None,
             filename: Some("nested/broker.tar".to_string()),
             auth: None,
+            platform: None,
         };
         assert!(oci_or_default_filename("session-broker", &asset).is_err());
     }
