@@ -86,6 +86,14 @@ selects a child manifest using the asset's `platform:` field, defaulting to
 `linux/amd64`. The selected child's tarball is what gets cached and
 materialized.
 
+For `oci://` assets, shasset materializes tarballs in **OCI image-layout
+archive** format (`oci-layout`, `index.json`, and `blobs/sha256/*` at tar
+root). This preserves the pinned manifest digest in
+`index.json.manifests[0].digest` and intentionally does **not** include a
+top-level `manifest.json` (the docker-archive marker). If you load these tars
+with Docker, use Docker Engine **25.0+** (`docker load -i` supports both
+docker-archive and oci-archive there).
+
 ```yaml
 assets:
   mcp-exec-bash:

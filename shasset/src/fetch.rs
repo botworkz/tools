@@ -1,5 +1,4 @@
 use anyhow::{anyhow, bail, Context, Result};
-use flate2::read::GzDecoder;
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -1225,7 +1224,7 @@ fn verify_digest(data: &[u8], expected_hex: &str) -> std::result::Result<(), Fet
 const MANIFEST_ACCEPT: &str =
     "application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json";
 
-/// Pull an OCI image by digest, assemble a docker-archive tar, and return a DownloadedFile.
+/// Pull an OCI image by digest, assemble an OCI image-layout tar, and return a DownloadedFile.
 ///
 /// The oci-index cache is checked by the caller (`fetch_asset`); this function always pulls.
 fn try_download_oci(
@@ -1261,7 +1260,7 @@ fn try_download_oci(
         .get("mediaType")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let (manifest, _manifest_bytes, effective_digest_hex) = if is_image_index(media_type) {
+    let (manifest, manifest_bytes, effective_digest_hex) = if is_image_index(media_type) {
         let child_digest =
             select_platform_child(&manifest, &asset_platform).ok_or_else(|| {
                 let platform = match &asset_platform.2 {
@@ -1336,7 +1335,7 @@ fn try_download_oci(
     let config_bytes = fetch_oci_bytes(transport, &config_url, auth, None)?;
     verify_digest(&config_bytes, &config_hex)?;
 
-    // 3. Pull each layer blob and decompress
+    // 3. Pull each layer blob
     let layers_json = manifest
         .get("layers")
         .and_then(|v| v.as_array())
@@ -1362,44 +1361,27 @@ fn try_download_oci(
                 ))
             })?
             .to_string();
-        let layer_media_type = layer_desc
-            .get("mediaType")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-
         let layer_url = format!(
             "https://{}/v2/{}/blobs/{}",
             oci_ref.registry, oci_ref.repo, layer_digest
         );
-        let layer_compressed = fetch_oci_bytes(transport, &layer_url, auth, None)?;
-        verify_digest(&layer_compressed, &layer_hex)?;
-
-        let layer_tar =
-            if layer_media_type.contains("+gzip") || layer_media_type.ends_with("tar.gzip") {
-                let mut decoder = GzDecoder::new(layer_compressed.as_slice());
-                let mut decompressed = Vec::new();
-                decoder.read_to_end(&mut decompressed).map_err(|e| {
-                    FetchError::permanent(
-                        anyhow::Error::new(e)
-                            .context(format!("failed to decompress OCI layer for '{name}'")),
-                    )
-                })?;
-                decompressed
-            } else {
-                layer_compressed
-            };
-
-        layers.push((layer_hex, layer_tar));
+        let layer_bytes = fetch_oci_bytes(transport, &layer_url, auth, None)?;
+        verify_digest(&layer_bytes, &layer_hex)?;
+        layers.push((layer_hex, layer_bytes));
     }
 
-    // 4. Assemble docker-archive tar
-    let local_tag = format!("botwork/{name}:local");
-    let tar_bytes = assemble_docker_archive(&local_tag, &config_hex, &config_bytes, &layers)
-        .map_err(|e| {
-            FetchError::permanent(
-                e.context(format!("failed to assemble docker archive for '{name}'")),
-            )
-        })?;
+    // 4. Assemble OCI image-layout tar
+    let tar_bytes = assemble_oci_archive(
+        &effective_digest_hex,
+        &manifest,
+        &manifest_bytes,
+        &config_hex,
+        &config_bytes,
+        &layers,
+    )
+    .map_err(|e| {
+        FetchError::permanent(e.context(format!("failed to assemble OCI archive for '{name}'")))
+    })?;
 
     let tar_hex = hex::encode(sha2::Sha256::digest(&tar_bytes));
 
@@ -1470,19 +1452,20 @@ fn select_platform_child(
     None
 }
 
-/// Assemble a docker-load-compatible image archive tarball.
+/// Assemble an OCI image-layout archive tarball.
 ///
 /// Layout (entries sorted lexicographically for determinism):
 /// ```text
-/// <config-hex>.json               -- OCI config blob bytes
-/// <layer-hex>/json                -- minimal v1 image JSON
-/// <layer-hex>/layer.tar           -- uncompressed layer tar
-/// <layer-hex>/VERSION             -- "1.0"
-/// manifest.json                   -- docker-archive manifest
-/// repositories                    -- legacy tag index
+/// blobs/sha256/<manifest-hex>     -- OCI manifest bytes
+/// blobs/sha256/<config-hex>       -- OCI config blob bytes
+/// blobs/sha256/<layer-hex>        -- OCI layer blob bytes
+/// index.json                      -- OCI image index
+/// oci-layout                      -- {"imageLayoutVersion":"1.0.0"}
 /// ```
-fn assemble_docker_archive(
-    local_tag: &str,
+fn assemble_oci_archive(
+    manifest_hex: &str,
+    manifest: &serde_json::Value,
+    manifest_bytes: &[u8],
     config_hex: &str,
     config_bytes: &[u8],
     layers: &[(String, Vec<u8>)],
@@ -1490,48 +1473,35 @@ fn assemble_docker_archive(
     // Collect (path, data) pairs, then sort and write
     let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
 
-    // manifest.json
-    let layer_paths: Vec<String> = layers
-        .iter()
-        .map(|(hex, _)| format!("{hex}/layer.tar"))
-        .collect();
-    let manifest_json = serde_json::to_vec(&serde_json::json!([{
-        "Config": format!("{config_hex}.json"),
-        "RepoTags": [local_tag],
-        "Layers": layer_paths,
-    }]))
-    .context("failed to serialize docker-archive manifest.json")?;
-    entries.push(("manifest.json".to_string(), manifest_json));
+    let manifest_media_type = manifest
+        .get("mediaType")
+        .and_then(|v| v.as_str())
+        .unwrap_or("application/vnd.oci.image.manifest.v1+json");
 
-    // repositories
-    let (repo_name, tag_name) = local_tag.rsplit_once(':').unwrap_or((local_tag, "latest"));
-    let last_layer_hex = layers
-        .last()
-        .map(|(hex, _)| hex.as_str())
-        .unwrap_or(config_hex);
-    let repositories_json = serde_json::to_vec(&serde_json::json!({
-        repo_name: { tag_name: last_layer_hex }
+    let index_json = serde_json::to_vec(&serde_json::json!({
+        "schemaVersion": 2,
+        "manifests": [{
+            "mediaType": manifest_media_type,
+            "digest": format!("sha256:{manifest_hex}"),
+            "size": manifest_bytes.len(),
+        }]
     }))
-    .context("failed to serialize docker-archive repositories")?;
-    entries.push(("repositories".to_string(), repositories_json));
+    .context("failed to serialize OCI index.json")?;
+    entries.push(("index.json".to_string(), index_json));
 
-    // config blob
-    entries.push((format!("{config_hex}.json"), config_bytes.to_vec()));
+    let oci_layout = serde_json::to_vec(&serde_json::json!({
+        "imageLayoutVersion": "1.0.0",
+    }))
+    .context("failed to serialize OCI layout file")?;
+    entries.push(("oci-layout".to_string(), oci_layout));
 
-    // layers
-    for (i, (layer_hex, layer_tar)) in layers.iter().enumerate() {
-        entries.push((format!("{layer_hex}/VERSION"), b"1.0".to_vec()));
-
-        let parent = if i > 0 {
-            Some(layers[i - 1].0.as_str())
-        } else {
-            None
-        };
-        let v1_json =
-            build_layer_v1_json(layer_hex, parent).context("failed to build layer v1 JSON")?;
-        entries.push((format!("{layer_hex}/json"), v1_json));
-
-        entries.push((format!("{layer_hex}/layer.tar"), layer_tar.clone()));
+    entries.push((
+        format!("blobs/sha256/{manifest_hex}"),
+        manifest_bytes.to_vec(),
+    ));
+    entries.push((format!("blobs/sha256/{config_hex}"), config_bytes.to_vec()));
+    for (layer_hex, layer_bytes) in layers {
+        entries.push((format!("blobs/sha256/{layer_hex}"), layer_bytes.clone()));
     }
 
     // Deterministic order
@@ -1551,30 +1521,16 @@ fn assemble_docker_archive(
             ar.append_data(&mut hdr, path.as_str(), data.as_slice())
                 .with_context(|| format!("failed to write tar entry '{path}'"))?;
         }
-        ar.finish()
-            .context("failed to finalize docker-archive tar")?;
+        ar.finish().context("failed to finalize OCI archive tar")?;
     }
 
     Ok(out)
 }
 
-fn build_layer_v1_json(layer_hex: &str, parent_hex: Option<&str>) -> Result<Vec<u8>> {
-    let mut obj = serde_json::json!({
-        "id": layer_hex,
-        "created": "0001-01-01T00:00:00Z",
-        "container_config": {"Cmd": ["/bin/sh"]},
-        "config": {}
-    });
-    if let Some(p) = parent_hex {
-        obj["parent"] = serde_json::Value::String(p.to_string());
-    }
-    serde_json::to_vec(&obj).context("failed to serialize layer v1 json")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::VecDeque;
+    use std::collections::{HashSet, VecDeque};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -2470,28 +2426,42 @@ mod tests {
         assert_eq!(MockTransport::call_count(&calls), 3);
         assert!(result.blob_path.exists());
 
-        // Parse the resulting tar and verify manifest.json
+        // Parse the resulting tar and verify OCI image-layout structure.
         let blob_bytes = std::fs::read(&result.blob_path).unwrap();
         let mut ar = tar::Archive::new(blob_bytes.as_slice());
-        let mut found_manifest = false;
+        let mut seen_paths = HashSet::new();
+        let mut index_digest: Option<String> = None;
+        let mut image_layout_version: Option<String> = None;
         for entry in ar.entries().unwrap() {
             let mut entry = entry.unwrap();
             let path = entry.path().unwrap().to_string_lossy().to_string();
-            if path == "manifest.json" {
-                let mut content = String::new();
-                entry.read_to_string(&mut content).unwrap();
-                let json: serde_json::Value = serde_json::from_str(&content).unwrap();
-                let arr = json.as_array().unwrap();
-                assert_eq!(arr.len(), 1);
-                let first = &arr[0];
-                assert_eq!(
-                    first["RepoTags"].as_array().unwrap()[0].as_str().unwrap(),
-                    "botwork/my-svc:local"
-                );
-                found_manifest = true;
+            seen_paths.insert(path.clone());
+            if path == "index.json" {
+                let index_json: serde_json::Value = serde_json::from_reader(&mut entry).unwrap();
+                index_digest = index_json["manifests"][0]["digest"]
+                    .as_str()
+                    .map(ToString::to_string);
+            } else if path == "oci-layout" {
+                let layout_json: serde_json::Value = serde_json::from_reader(&mut entry).unwrap();
+                image_layout_version = layout_json["imageLayoutVersion"]
+                    .as_str()
+                    .map(ToString::to_string);
             }
         }
-        assert!(found_manifest, "manifest.json not found in assembled tar");
+        let expected_index_digest = format!("sha256:{manifest_hex}");
+        assert_eq!(
+            index_digest.as_deref(),
+            Some(expected_index_digest.as_str())
+        );
+        assert_eq!(image_layout_version.as_deref(), Some("1.0.0"));
+        assert!(
+            seen_paths.iter().any(|p| p.starts_with("blobs/sha256/")),
+            "no blobs/sha256/* entries found in assembled tar"
+        );
+        assert!(
+            !seen_paths.contains("manifest.json"),
+            "assembled tar should not contain top-level manifest.json"
+        );
     }
 
     #[test]
