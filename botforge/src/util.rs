@@ -25,32 +25,9 @@ pub(crate) fn run_command(
     envs: &[(&str, &str)],
     failure_context: &str,
 ) -> Result<()> {
-    run_command_internal(program, args, envs, None, failure_context)
-}
-
-pub(crate) fn run_command_in_dir(
-    program: &str,
-    args: &[String],
-    envs: &[(&str, &str)],
-    current_dir: &Path,
-    failure_context: &str,
-) -> Result<()> {
-    run_command_internal(program, args, envs, Some(current_dir), failure_context)
-}
-
-fn run_command_internal(
-    program: &str,
-    args: &[String],
-    envs: &[(&str, &str)],
-    current_dir: Option<&Path>,
-    failure_context: &str,
-) -> Result<()> {
-    let mut command = Command::new(program);
-    command.args(args).envs(envs.iter().copied());
-    if let Some(dir) = current_dir {
-        command.current_dir(dir);
-    }
-    let status = command
+    let status = Command::new(program)
+        .args(args)
+        .envs(envs.iter().copied())
         .status()
         .with_context(|| format!("failed to execute {program}"))?;
     if !status.success() {
@@ -81,24 +58,6 @@ pub(crate) fn normalize_path(path: &Path) -> PathBuf {
         }
     }
     normalized
-}
-
-pub(crate) fn repo_relative_path(repo_root: &Path, path: &Path) -> Result<String> {
-    let repo_root = normalize_path(repo_root);
-    let path = normalize_path(path);
-    let relative = path.strip_prefix(&repo_root).with_context(|| {
-        format!(
-            "path '{}' is outside repo root '{}'",
-            path.display(),
-            repo_root.display()
-        )
-    })?;
-    let rendered = if relative.as_os_str().is_empty() {
-        ".".to_string()
-    } else {
-        relative.to_string_lossy().replace('\\', "/")
-    };
-    Ok(rendered)
 }
 
 pub(crate) fn resolve_cache_dir(
@@ -214,7 +173,7 @@ pub(crate) fn unique_suffix() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{materialize_flat, repo_relative_path};
+    use super::materialize_flat;
     use std::path::Path;
     use tempfile::TempDir;
 
@@ -267,32 +226,5 @@ mod tests {
         let path = materialize_flat(&blob, &out, "tool", true).unwrap();
         let mode = std::fs::metadata(path).unwrap().permissions().mode();
         assert_eq!(mode & 0o111, 0o111);
-    }
-
-    #[test]
-    fn repo_relative_path_returns_relative_path_for_inside_path() {
-        let relative = repo_relative_path(
-            Path::new("/repo/root"),
-            Path::new("/repo/root/build/packer_ssh_key"),
-        )
-        .unwrap();
-        assert_eq!(relative, "build/packer_ssh_key");
-    }
-
-    #[test]
-    fn repo_relative_path_normalizes_dots_and_parents() {
-        let relative = repo_relative_path(
-            Path::new("/repo/root"),
-            Path::new("/repo/root/build/./nested/../packer_ssh_key"),
-        )
-        .unwrap();
-        assert_eq!(relative, "build/packer_ssh_key");
-    }
-
-    #[test]
-    fn repo_relative_path_rejects_outside_path() {
-        let err =
-            repo_relative_path(Path::new("/repo/root"), Path::new("/repo/other/key")).unwrap_err();
-        assert!(err.to_string().contains("outside repo root"));
     }
 }

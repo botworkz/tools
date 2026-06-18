@@ -120,7 +120,7 @@ jobs:
           docker run --rm --entrypoint qemu-img "botwork/botforge:ci" --version
           docker run --rm --entrypoint xorriso "botwork/botforge:ci" -version
           docker run --rm --entrypoint ssh "botwork/botforge:ci" -V
-          docker run --rm --entrypoint packer "botwork/botforge:ci" version
+          docker run --rm --entrypoint virt-customize "botwork/botforge:ci" --version
 
           rm -rf .ci-deps-smoke
           mkdir -p .ci-deps-smoke/out
