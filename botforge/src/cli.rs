@@ -20,6 +20,8 @@ pub(crate) struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum Commands {
+    /// Build a qcow2 image by running a virt-customize spec against a source qcow2.
+    Build(commands::build::BuildArgs),
     /// Fetch and stage one or all assets from shasset.yaml into a flat output directory.
     Deps(commands::deps::DepsArgs),
     /// Build an ISO image from a source directory.
