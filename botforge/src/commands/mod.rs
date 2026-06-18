@@ -1,3 +1,4 @@
+pub(crate) mod build;
 pub(crate) mod deps;
 pub(crate) mod iso;
 pub(crate) mod payload;

@@ -122,6 +122,28 @@ jobs:
           docker run --rm --entrypoint ssh "botwork/botforge:ci" -V
           docker run --rm --entrypoint virt-customize "botwork/botforge:ci" --version
 
+          # botforge build: verify the CLI parses a minimal spec and reports
+          # a sensible error when --source does not exist. We can't run
+          # virt-customize for real in this job (it needs /dev/kvm and a
+          # multi-GB qcow2), but we *can* exercise the YAML parser + CLI
+          # plumbing end-to-end here, which catches regressions like
+          # required-args being silently dropped from the wrapper.
+          rm -rf .ci-build-smoke
+          mkdir -p .ci-build-smoke
+          printf 'disk_size: 1G\nsteps:\n  - run_command: "true"\n' \
+            > .ci-build-smoke/spec.yaml
+          if docker run --rm \
+            -v "$PWD/.ci-build-smoke:/work" \
+            -w /work \
+            "botwork/botforge:ci" \
+            build --spec spec.yaml --source missing.qcow2 --output out.qcow2 \
+            2>&1 | tee /tmp/build-smoke.log
+          then
+            echo "expected botforge build to fail on missing source" >&2
+            exit 1
+          fi
+          grep -q "source qcow2 not found" /tmp/build-smoke.log
+
           rm -rf .ci-deps-smoke
           mkdir -p .ci-deps-smoke/out
           printf 'botforge deps smoke fixture\n' > .ci-deps-smoke/fixture.bin
