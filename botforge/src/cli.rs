@@ -26,8 +26,6 @@ pub(crate) enum Commands {
     Iso(commands::iso::IsoArgs),
     /// Build a payload ISO from a config-driven staging plan.
     Payload(commands::payload::PayloadArgs),
-    /// Run the KVM-only Packer build flow natively inside the botforge image.
-    Pack(commands::pack::PackArgs),
     /// Launch a VM with qemu (KVM-only).
     Run(commands::run::RunArgs),
     /// Boot and validate a packed VM from a test config.
