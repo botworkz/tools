@@ -1,0 +1,7 @@
+name: minimal-static
+description: Smoke test that the static walker emits everything 1:1.
+
+vars:
+  greeting:
+    type: string
+    default: hello

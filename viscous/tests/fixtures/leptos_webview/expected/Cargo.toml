@@ -1,0 +1,12 @@
+[package]
+name = "bells_whistles"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+leptos = { version = "0.6", features = ["csr"] }
+leptos_router = { version = "0.6", features = ["csr"] }
+console_error_panic_hook = "0.1"

@@ -1,0 +1,27 @@
+name: overrides-and-appends
+description: Exercise on_conflict overwrite / append / skip / upsert semantics.
+
+vars:
+  app_name:
+    type: string
+    default: demo
+
+generate:
+  - template: __templates__/base.liquid
+    dest: notes.txt
+
+  - template: __templates__/extra.liquid
+    dest: notes.txt
+    on_conflict: append
+
+  - template: __templates__/special.liquid
+    dest: greet.txt
+    on_conflict: upsert
+
+  - template: __templates__/replace.liquid
+    dest: greet.txt
+    on_conflict: overwrite
+
+  - template: __templates__/skipped.liquid
+    dest: greet.txt
+    on_conflict: skip

@@ -1,0 +1,9 @@
+project_name: Bells-Whistles
+routes:
+  - "/"
+  - "/whistle"
+components:
+  - name: Button
+    props: ["label", "kind"]
+  - name: InputBox
+use_tailwind: true

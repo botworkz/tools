@@ -2,6 +2,7 @@
 .github
 target
 shasset/target
+viscous/target
 *.tar
 *.tar.gz
 *.zip
