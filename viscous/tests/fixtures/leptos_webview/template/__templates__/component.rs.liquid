@@ -1,0 +1,10 @@
+use leptos::*;
+
+#[component]
+pub fn {{ component.name | pascal_case }}(
+    {%- for prop in component.props %}
+    #[prop(into)] {{ prop }}: String,
+    {%- endfor %}
+) -> impl IntoView {
+    view! { <div class="{{ component.name | kebab_case }}">"{{ component.name }}"</div> }
+}

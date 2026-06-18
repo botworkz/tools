@@ -1,3 +1,4 @@
 [workspace]
-members = ["shasset", "botforge"]
+members = ["shasset", "botforge", "viscous"]
+exclude = ["viscous/tests/fixtures"]
 resolver = "2"

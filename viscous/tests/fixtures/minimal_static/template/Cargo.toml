@@ -1,0 +1,3 @@
+[package]
+name = "stub"
+edition = "2021"

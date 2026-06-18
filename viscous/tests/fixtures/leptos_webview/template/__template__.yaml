@@ -1,0 +1,44 @@
+name: leptos-webview
+description: Minimal CSR Leptos app for webview embedding.
+version: 0.1.0
+
+vars:
+  project_name:
+    type: string
+    required: true
+    description: cargo crate name (will be snake_cased into crate_name)
+
+  routes:
+    type: array
+    items: { type: string }
+    default: ["/"]
+
+  components:
+    type: array
+    items:
+      type: object
+      schema:
+        name:  { type: string, required: true }
+        props: { type: array, items: { type: string }, default: [] }
+    default: []
+
+  use_tailwind:
+    type: bool
+    default: false
+
+derived:
+  crate_name: "{{ project_name | snake_case }}"
+
+generate:
+  - template: __templates__/component.rs.liquid
+    for_each: components
+    as: component
+    dest: "src/components/{{ component.name | snake_case }}.rs"
+
+  - template: __templates__/route.rs.liquid
+    for_each: routes
+    dest: "src/routes/route{{ item | replace: '/', '_' }}.rs"
+
+  - template: __templates__/tailwind.config.js.liquid
+    when: use_tailwind
+    dest: tailwind.config.js
