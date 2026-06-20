@@ -79,7 +79,7 @@ all guest paths must be absolute.
 
 ```yaml
 # Optional disk knobs (defaults shown).
-disk_size: 10G        # passed to `qemu-img resize`
+disk_size: 10G        # rewrites the qcow2 header's virtual size field
 memsize: 4096         # MB given to the libguestfs appliance
 smp: 4                # vCPUs given to the libguestfs appliance
 
@@ -124,7 +124,9 @@ steps:
 
 - Copies `--source` to `<output>.partial` with `cp --reflink=auto` (instant
   CoW on btrfs/xfs, falls back to a plain copy otherwise).
-- Runs `qemu-img resize` to the spec's `disk_size`.
+- Rewrites the qcow2 header's `size` field in place so the declared
+  virtual size matches the spec's `disk_size` (grow-only; no clusters
+  are allocated, no `qemu-img` invocation).
 - Invokes `virt-customize` once, in argument order: context staging first
   (when present) followed by each declared step.
 - Renames `<output>.partial` to `<output>` on success. On failure the
