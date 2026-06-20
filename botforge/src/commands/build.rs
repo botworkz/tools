@@ -34,6 +34,29 @@ pub(crate) struct BuildArgs {
 struct BuildSpec {
     #[serde(default)]
     disk_size: Option<String>,
+    /// Optional libguestfs partition device (`/dev/sda1`, `/dev/vda2`, …)
+    /// to expand into the new free space after the qcow2 is grown.
+    ///
+    /// Unset (default): header-only grow. The qcow2's declared virtual
+    /// size moves; the partition table and the filesystem inside don't.
+    /// Correct when the guest plans to grow the rootfs itself (cloud-init
+    /// `growpart`/`growfs` on boot) or when the extra space is consumed
+    /// by an unpartitioned data area.
+    ///
+    /// Set: after the header grow, `virt-resize` runs source → fresh
+    /// empty target with `--expand <partition>`, then the expanded copy
+    /// replaces the original. The named partition's filesystem grows to
+    /// fill the new disk. Required when virt-customize will write more
+    /// data into the rootfs than the source image's partition can hold
+    /// — which is what "No space left on device" inside the libguestfs
+    /// appliance looks like.
+    ///
+    /// The partition path is interpreted by libguestfs against the
+    /// source image's view, not the host's. Find it with
+    /// `virt-filesystems --long --parts -a <source>` against the same
+    /// qcow2 that's used as `--source`.
+    #[serde(default)]
+    expand_partition: Option<String>,
     #[serde(default)]
     memsize: Option<u32>,
     #[serde(default)]
@@ -185,6 +208,16 @@ pub(crate) fn cmd_build(args: BuildArgs) -> Result<()> {
         spec.disk_size.as_deref().unwrap_or(DEFAULT_DISK_SIZE),
     )?;
 
+    // Header-only grow leaves the partition table and filesystem at the
+    // source image's original size. When the spec opts in, run virt-resize
+    // to expand a named partition into the new free space before any of
+    // the spec's steps execute — otherwise virt-customize would happily
+    // write into the new virtual range and hit ENOSPC inside the guest
+    // filesystem (the rootfs ext4 still thinks it's the original size).
+    if let Some(partition) = spec.expand_partition.as_deref() {
+        expand_partition_into_free_space(&partial, partition)?;
+    }
+
     let staging_dir = create_temp_dir("botforge-build")?;
     let result = (|| -> Result<()> {
         let mut virt_args = Vec::<String>::new();
@@ -277,6 +310,116 @@ fn resize_qcow2(disk: &Path, size: &str) -> Result<()> {
     let new_size =
         crate::qcow2::parse_size(size).with_context(|| format!("invalid disk_size '{}'", size))?;
     crate::qcow2::grow_qcow2_virtual_size(disk, new_size)
+}
+
+/// Expand `partition` (a libguestfs-style device path like `/dev/sda1`) on
+/// `disk` to fill the disk's newly-grown free space.
+///
+/// `virt-resize` cannot operate in place: it is fundamentally source →
+/// target. We materialise a fresh empty qcow2 of the same virtual size
+/// as `disk`, `virt-resize --expand <partition>` into it, then atomically
+/// swap the expanded copy back into `disk`. The intermediate file lives
+/// in the same directory as `disk` so the rename is intra-filesystem and
+/// stays atomic on every filesystem we care about.
+///
+/// We deliberately leave fallbacks off: if `virt-resize` reports an
+/// error, the caller's spec is asking for something the tool can't do,
+/// and silently continuing would just shift the failure into the next
+/// step (where it would look like an inscrutable ENOSPC). Fail loud,
+/// here.
+fn expand_partition_into_free_space(disk: &Path, partition: &str) -> Result<()> {
+    ensure_command("virt-resize")?;
+    ensure_command("qemu-img")?;
+
+    let parent = disk.parent().unwrap_or_else(|| Path::new("."));
+    let expanded = {
+        let mut name = disk
+            .file_name()
+            .map(|n| n.to_os_string())
+            .unwrap_or_default();
+        name.push(".expanded");
+        parent.join(name)
+    };
+    // Stale .expanded from a previous failed run would confuse the swap;
+    // clear it up front (same posture as the .partial guard above).
+    if expanded.exists() {
+        std::fs::remove_file(&expanded).with_context(|| {
+            format!("cannot remove stale expanded qcow2: {}", expanded.display())
+        })?;
+    }
+
+    // virt-resize requires the output disk to already exist at the new
+    // virtual size; it copies-with-expansion into a pre-created image.
+    // The output qcow2 has no backing file: virt-resize writes a fresh
+    // partition table + filesystem layout into it from scratch.
+    let virtual_size = read_qcow2_virtual_size(disk)
+        .with_context(|| format!("cannot read virtual size of {}", disk.display()))?;
+    create_empty_qcow2(&expanded, virtual_size)?;
+
+    let virt_resize_status = Command::new("virt-resize")
+        .arg("--expand")
+        .arg(partition)
+        .arg(disk)
+        .arg(&expanded)
+        .status()
+        .context("failed to execute virt-resize")?;
+    if !virt_resize_status.success() {
+        // Leave .expanded behind for post-mortem; clear it on the next
+        // run via the guard above. Match resize_qcow2's failure shape.
+        bail!("virt-resize failed (exit status: {virt_resize_status})");
+    }
+
+    std::fs::rename(&expanded, disk).with_context(|| {
+        format!(
+            "cannot replace {} with expanded image {}",
+            disk.display(),
+            expanded.display()
+        )
+    })?;
+    Ok(())
+}
+
+/// Read the qcow2 virtual size from the header. Mirrors the in-process
+/// reader path the grow helper uses, kept narrow because virt-resize's
+/// pre-created output disk has to exactly match.
+fn read_qcow2_virtual_size(disk: &Path) -> Result<u64> {
+    use std::fs::File;
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut f = File::open(disk).with_context(|| format!("cannot open {}", disk.display()))?;
+    let mut magic = [0u8; 4];
+    f.read_exact(&mut magic)?;
+    if &magic != b"QFI\xfb" {
+        bail!("not a qcow2 image: {}", disk.display());
+    }
+    f.seek(SeekFrom::Start(0x18))?;
+    let mut buf = [0u8; 8];
+    f.read_exact(&mut buf)?;
+    Ok(u64::from_be_bytes(buf))
+}
+
+/// Materialise a fresh, empty qcow2 of `size_bytes` at `path`. virt-resize
+/// requires the destination to pre-exist; `qemu-img create` is the only
+/// tool in our toolchain that knows how to lay down a valid empty qcow2
+/// header + L1/L2/refcount scaffolding. (`grow_qcow2_virtual_size`
+/// rewrites an existing header — it does not synthesize one from scratch.)
+fn create_empty_qcow2(path: &Path, size_bytes: u64) -> Result<()> {
+    let status = Command::new("qemu-img")
+        .arg("create")
+        .arg("-q")
+        .arg("-f")
+        .arg("qcow2")
+        .arg(path)
+        .arg(size_bytes.to_string())
+        .status()
+        .context("failed to execute qemu-img create")?;
+    if !status.success() {
+        bail!(
+            "qemu-img create failed for {} (exit status: {status})",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 fn run_virt_customize(args: &[String]) -> Result<()> {
@@ -472,6 +615,7 @@ mod tests {
     fn spec_round_trips_full_example() {
         let yaml = r#"
 disk_size: 12G
+expand_partition: /dev/sda1
 memsize: 2048
 smp: 2
 context:
@@ -491,6 +635,7 @@ steps:
 "#;
         let spec: BuildSpec = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(spec.disk_size.as_deref(), Some("12G"));
+        assert_eq!(spec.expand_partition.as_deref(), Some("/dev/sda1"));
         assert_eq!(spec.memsize, Some(2048));
         assert_eq!(spec.smp, Some(2));
         let ctx = spec.context.as_ref().unwrap();
@@ -675,6 +820,13 @@ steps:
     #[test]
     fn shell_single_quote_escapes_embedded_quotes() {
         assert_eq!(shell_single_quote("a'b"), "'a'\"'\"'b'");
+    }
+
+    #[test]
+    fn spec_expand_partition_defaults_to_none() {
+        let yaml = "steps: []\n";
+        let spec: BuildSpec = serde_yaml::from_str(yaml).unwrap();
+        assert!(spec.expand_partition.is_none());
     }
 
     #[test]
