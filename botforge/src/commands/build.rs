@@ -149,7 +149,6 @@ struct WriteSpec {
 
 pub(crate) fn cmd_build(args: BuildArgs) -> Result<()> {
     ensure_command("virt-customize")?;
-    ensure_command("qemu-img")?;
     ensure_command("tar")?;
 
     let repo_root = std::fs::canonicalize(
@@ -275,16 +274,9 @@ fn copy_qcow2(source: &Path, partial: &Path) -> Result<()> {
 }
 
 fn resize_qcow2(disk: &Path, size: &str) -> Result<()> {
-    let status = Command::new("qemu-img")
-        .arg("resize")
-        .arg(disk)
-        .arg(size)
-        .status()
-        .context("failed to execute qemu-img resize")?;
-    if !status.success() {
-        bail!("qemu-img resize failed (exit status: {status})");
-    }
-    Ok(())
+    let new_size =
+        crate::qcow2::parse_size(size).with_context(|| format!("invalid disk_size '{}'", size))?;
+    crate::qcow2::grow_qcow2_virtual_size(disk, new_size)
 }
 
 fn run_virt_customize(args: &[String]) -> Result<()> {
