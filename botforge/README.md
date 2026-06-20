@@ -83,6 +83,18 @@ disk_size: 10G        # rewrites the qcow2 header's virtual size field
 memsize: 4096         # MB given to the libguestfs appliance
 smp: 4                # vCPUs given to the libguestfs appliance
 
+# Optional: after growing the qcow2 header, expand a specific partition
+# (and the filesystem inside it) to fill the new free space. Without
+# this, `disk_size` only moves the qcow2 envelope — the partition
+# table and rootfs stay the source image's original size. Set this
+# when virt-customize steps need to write more data into the rootfs
+# than the source partition can hold.
+#
+# Find the right device path with `virt-filesystems --long --parts
+# -a <source-qcow2>`; common values are `/dev/sda1` (Debian generic
+# cloud) or `/dev/vda1`.
+expand_partition: /dev/sda1
+
 # Optional context: a host tarball that gets unpacked into the guest
 # before any step runs. The host paths under `paths:` are packed into a
 # tarball, uploaded once, then extracted under `dest:` in the guest.
@@ -127,6 +139,12 @@ steps:
 - Rewrites the qcow2 header's `size` field in place so the declared
   virtual size matches the spec's `disk_size` (grow-only; no clusters
   are allocated, no `qemu-img` invocation).
+- When `expand_partition` is set, runs `virt-resize --expand <part>`
+  source → fresh empty qcow2 of the new size, then atomically replaces
+  the partial with the expanded copy. The named partition's filesystem
+  grows to fill the new disk. (`qemu-img create` is invoked once here
+  to materialise the empty target — virt-resize requires it to
+  pre-exist.)
 - Invokes `virt-customize` once, in argument order: context staging first
   (when present) followed by each declared step.
 - Renames `<output>.partial` to `<output>` on success. On failure the
