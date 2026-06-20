@@ -1,0 +1,47 @@
+name: yamllint
+
+# Lint every YAML in the repo against the committed `.yamllint` config.
+# Cheap (seconds), self-contained, no secrets — runs on every PR + push
+# to main so the indent-sequences style stays clean over time.
+
+on:
+  push:
+    branches:
+    - main
+    paths:
+    - '**/*.yaml'
+    - '**/*.yml'
+    - '.yamllint'
+    - '.github/workflows/yamllint.yml'
+  pull_request:
+    branches:
+    - main
+    paths:
+    - '**/*.yaml'
+    - '**/*.yml'
+    - '.yamllint'
+    - '.github/workflows/yamllint.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    # Pinned for reproducibility; matches the version we used while
+    # generating the .yamllint config (1.38.x is the current stable line).
+    - name: Install yamllint
+      run: pip install 'yamllint==1.38.*'
+
+    - name: Run yamllint
+      run: yamllint --strict -f github .
