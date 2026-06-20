@@ -1,0 +1,44 @@
+# yamllint config for botworkz/tools.
+#
+# House style: list items sit flush with their parent key, not indented
+# one extra level (Kubernetes/Ansible style):
+#
+#     updates:
+#     - package-ecosystem: docker
+#
+# rather than the more common:
+#
+#     updates:
+#       - package-ecosystem: docker
+#
+# Enforced by `indentation.indent-sequences: false`.
+#
+# Quirks:
+#  * `truthy.check-keys: false` -- otherwise yamllint flags GitHub
+#    Actions' `on:` trigger key as a YAML 1.1 truthy literal (`on`
+#    is one of the 22 ways to spell `true` in 1.1).
+#  * `document-start: disable` -- a few files lead with comments and
+#    no `---`; not worth churning every YAML in the tree over.
+#  * `line-length.max: 120` -- some CI lines and asset URLs don't
+#    usefully wrap. Keeps the bar above most of them while still
+#    catching genuinely runaway lines.
+
+extends: default
+
+# Viscous template fixtures are deliberately small/dense examples used by
+# the template-rendering unit tests; reformatting them changes the test
+# inputs. The template's runtime correctness is covered by viscous's own
+# Rust tests, so it's safe to skip them from the project-wide lint.
+ignore: |
+  /viscous/tests/fixtures/
+
+rules:
+  indentation:
+    spaces: 2
+    indent-sequences: false
+    check-multi-line-strings: false
+  truthy:
+    check-keys: false
+  document-start: disable
+  line-length:
+    max: 120

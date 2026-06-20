@@ -160,7 +160,16 @@ jobs:
             sleep 0.1
           done
           curl -fsS "$ASSET_URL" -o /dev/null
-          printf 'settings:\n  retries: 0\nassets:\n  fixture:\n    uri: %s\n    version: "1"\n    checksum: sha256:%s\n    filename: fixture.bin\n' "$ASSET_URL" "$ASSET_SHA" > .ci-deps-smoke/shasset.yaml
+          {
+            printf '%s\n' 'settings:'
+            printf '%s\n' '  retries: 0'
+            printf '%s\n' 'assets:'
+            printf '%s\n' '  fixture:'
+            printf '%s\n' "    uri: ${ASSET_URL}"
+            printf '%s\n' '    version: "1"'
+            printf '%s\n' "    checksum: sha256:${ASSET_SHA}"
+            printf '%s\n' '    filename: fixture.bin'
+          } > .ci-deps-smoke/shasset.yaml
 
           docker run --rm \
             --network host \
@@ -172,7 +181,16 @@ jobs:
           cmp -s .ci-deps-smoke/fixture.bin .ci-deps-smoke/out/fixture.bin
           test -x .ci-deps-smoke/out/fixture.bin
 
-          printf 'settings:\n  retries: 0\nassets:\n  fixture:\n    uri: %s\n    version: "1"\n    checksum: sha256:0000000000000000000000000000000000000000000000000000000000000000\n    filename: fixture.bin\n' "$ASSET_URL" > .ci-deps-smoke/shasset-bad.yaml
+          {
+            printf '%s\n' 'settings:'
+            printf '%s\n' '  retries: 0'
+            printf '%s\n' 'assets:'
+            printf '%s\n' '  fixture:'
+            printf '%s\n' "    uri: ${ASSET_URL}"
+            printf '%s\n' '    version: "1"'
+            printf '%s\n' '    checksum: sha256:0000000000000000000000000000000000000000000000000000000000000000'
+            printf '%s\n' '    filename: fixture.bin'
+          } > .ci-deps-smoke/shasset-bad.yaml
 
           if docker run --rm \
             --network host \
