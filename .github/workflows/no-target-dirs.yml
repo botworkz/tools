@@ -1,0 +1,57 @@
+name: no-target-dirs
+
+# Hard guard against committing build output. Specifically: any tracked
+# file beneath a directory called `target` at any depth in the tree.
+#
+# The trailing slash in the regex matters — `target.toml` and other
+# leaf-named files containing the word are deliberately ignored.
+#
+# Opt-out: drop a `.gitignore-target-allow` at the repo root with one
+# extended-regex pattern per line. Each pattern is matched against the
+# full repo-relative path of every hit; matching paths are excused.
+# Blank lines and `#` comments are ignored.
+
+on:
+  push:
+    branches:
+    - main
+  pull_request:
+    branches:
+    - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  no-target:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Reject tracked files under any target/ directory
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        hits=$(git ls-files | grep -E '(^|/)target/' || true)
+
+        allow=.gitignore-target-allow
+        if [ -f "$allow" ] && [ -n "$hits" ]; then
+          patterns=$(grep -vE '^\s*(#|$)' "$allow" || true)
+          if [ -n "$patterns" ]; then
+            alt=$(printf '%s\n' "$patterns" | paste -sd'|' -)
+            hits=$(printf '%s\n' "$hits" | grep -vE "$alt" || true)
+          fi
+        fi
+
+        if [ -n "$hits" ]; then
+          echo "::error::Tracked files inside a target/ directory are not allowed."
+          echo "::error::Add an extended-regex line to .gitignore-target-allow to opt out."
+          echo "Offending tracked files:"
+          echo "$hits" | sed 's/^/  /'
+          exit 1
+        fi
+        echo "OK: no tracked target/ files"
