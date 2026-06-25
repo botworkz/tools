@@ -2,3 +2,25 @@
 members = ["shasset", "botforge", "viscous"]
 exclude = ["viscous/tests/fixtures"]
 resolver = "2"
+
+# Workspace-wide lint policy. Inherited by every member crate via
+# `[lints] workspace = true` in their `Cargo.toml`. The set is
+# intentionally tiny:
+#
+# * `unsafe_code = "forbid"` — we don't write `unsafe` outside of
+#   tests, full stop. `forbid` (vs `deny`) means a downstream
+#   `#![allow(unsafe_code)]` in a child module cannot re-enable it;
+#   a future PR that needs an `unsafe` block has to first change
+#   the policy here in a stand-alone commit, which gets reviewed on
+#   its own merits.
+#
+# At time of writing none of `shasset`, `botforge`, or `viscous`
+# contains a single `unsafe` block — this codifies that as the
+# policy going forward. Mirrors the same workspace gate on
+# `botworkz/botwork`, `botworkz/botwork-extra`, `botworkz/mcp`,
+# `botworkz/mcp-extra`, `botworkz/gander`, and `botworkz/geese`.
+#
+# Any expansion of this block belongs in a separate PR with its
+# own justification — this is a policy gate, not a style sheet.
+[workspace.lints.rust]
+unsafe_code = "forbid"
