@@ -1,3 +1,18 @@
+# CI orchestrator for botworkz/tools.
+#
+# Release flow:
+# - Keep VERSION at a pre-release value during development (e.g. 0.4.15-dev).
+# - To cut a release, update VERSION to MAJOR.MINOR.PATCH (no suffix) and merge to main.
+# - publish builds and pushes ghcr.io/botworkz/tools/<crate>:${VERSION} for
+#   each crate in the matrix (shasset, botforge, viscous), and creates a
+#   GitHub Release for v${VERSION} with the per-crate binaries attached.
+# - On release: [published], bump advances VERSION to the next minor -dev
+#   and pushes back to main.
+# - If a clean VERSION sits on main for more than one push (e.g. a chore
+#   commit lands before the next -dev bump), the publish job's Read VERSION
+#   step probes the GitHub Releases API for v${VERSION} and warn-and-bails
+#   on collision rather than silently overwriting GHCR tags or re-uploading
+#   release assets.
 name: CI
 
 on:
@@ -65,6 +80,8 @@ jobs:
 
     - name: Read VERSION
       id: version
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         set -euo pipefail
         raw="$(tr -d '[:space:]' < VERSION)"
@@ -72,9 +89,24 @@ jobs:
         if [[ "${raw}" == *-* ]]; then
           echo "is_release=false" >> "$GITHUB_OUTPUT"
           echo "VERSION=${raw} contains a pre-release suffix — skipping publish."
+          exit 0
+        fi
+        tag="v${raw}"
+        # `gh release view` exits 0 if the release exists, non-zero otherwise.
+        # When VERSION is non-dev but a release for the tag already exists, the
+        # publish path would silently overwrite ghcr.io/botworkz/tools/{shasset,
+        # botforge,viscous}:${raw} container tags and re-upload binary assets
+        # to the existing GitHub Release — all built from a different commit.
+        # Refuse to do that: warn loudly and treat this run as a no-op.
+        # Recovery is to bump VERSION (either to the next -dev for ongoing
+        # development, or to the next MAJOR.MINOR.PATCH if you actually meant
+        # to cut a new release).
+        if gh release view "${tag}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+          echo "is_release=false" >> "$GITHUB_OUTPUT"
+          echo "::warning::VERSION=${raw} is non-dev but release ${tag} already exists — refusing to republish (would overwrite ghcr.io/botworkz/tools/{shasset,botforge,viscous}:${raw} and re-upload release assets from a different commit). Bump VERSION and re-run."
         else
           echo "is_release=true" >> "$GITHUB_OUTPUT"
-          echo "VERSION=${raw} is a clean semver — proceeding with publish."
+          echo "VERSION=${raw} is a clean semver and ${tag} does not exist — proceeding with publish."
         fi
 
     - name: Log in to GHCR
