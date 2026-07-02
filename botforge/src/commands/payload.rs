@@ -170,18 +170,17 @@ fn write_payload_bootstrap_script(payload: &PayloadConfig, staging_dir: &Path) -
 
 fn render_payload_bootstrap(payload: &PayloadConfig) -> Result<String> {
     let mut script = String::from(
-        "#!/usr/bin/env bash\nset -euo pipefail\n\nPAYLOAD_MOUNT=/mnt/botwork-payload\n\nshopt -s nullglob\nfor image_tar in \"$PAYLOAD_MOUNT\"/images/*.tar; do\n  docker load -i \"$image_tar\"\ndone\nshopt -u nullglob\n",
+        "#!/usr/bin/env bash\nset -euo pipefail\n\nPAYLOAD_MOUNT=\"$(cd \"$(dirname \"${BASH_SOURCE[0]}\")\" && pwd)\"\n\nshopt -s nullglob\nfor image_tar in \"$PAYLOAD_MOUNT\"/images/*.tar; do\n  docker load -i \"$image_tar\"\ndone\nshopt -u nullglob\n",
     );
 
     for file in &payload.files {
         validate_mode_string(&file.mode)?;
         let relative_stage_path = validate_relative_staging_path(&file.staging_path)?;
         validate_payload_install_path(&file.install_path)?;
-        let payload_source = Path::new("/mnt/botwork-payload").join(relative_stage_path);
         script.push_str(&format!(
-            "install -D -m {} {} {}\n",
+            "install -D -m {} \"${{PAYLOAD_MOUNT}}\"/{} {}\n",
             file.mode,
-            shell_single_quote(&payload_source.display().to_string()),
+            shell_single_quote(&relative_stage_path.display().to_string()),
             shell_single_quote(&file.install_path.display().to_string())
         ));
     }
@@ -332,13 +331,38 @@ mod tests {
         };
 
         let script = render_payload_bootstrap(&payload).unwrap();
+        assert!(script.contains("BASH_SOURCE[0]"));
+        assert!(
+            script.contains("PAYLOAD_MOUNT=\"$(cd \"$(dirname \"${BASH_SOURCE[0]}\")\" && pwd)\"")
+        );
         assert!(script.contains("docker load -i \"$image_tar\""));
+        assert!(script.contains("\"$PAYLOAD_MOUNT\"/images/*.tar"));
         assert!(script.contains(
-            "install -D -m 0644 '/mnt/botwork-payload/envoy/lds/listener.yaml' '/etc/botwork/envoy/lds/listener.yaml'"
+            "install -D -m 0644 \"${PAYLOAD_MOUNT}\"/'envoy/lds/listener.yaml' '/etc/botwork/envoy/lds/listener.yaml'"
         ));
         assert!(script.contains("systemctl daemon-reload"));
         assert!(script.contains("systemctl enable 'botwork-auth-broker'"));
         assert!(script.contains("systemctl restart 'botwork-envoy'"));
+    }
+
+    #[test]
+    fn render_payload_bootstrap_is_mount_agnostic() {
+        let payload = PayloadConfig {
+            images: vec![],
+            files: vec![PayloadFile {
+                source: Path::new("/tmp/listener.yaml").to_path_buf(),
+                staging_path: Path::new("envoy/lds/listener.yaml").to_path_buf(),
+                install_path: Path::new("/etc/botwork/envoy/lds/listener.yaml").to_path_buf(),
+                mode: "0644".to_string(),
+            }],
+            services: PayloadServices::default(),
+        };
+
+        let script = render_payload_bootstrap(&payload).unwrap();
+        assert!(
+            !script.contains("/mnt/botwork-payload"),
+            "bootstrap script must not hard-code /mnt/botwork-payload: {script}"
+        );
     }
 
     #[test]
