@@ -278,6 +278,23 @@ steps:
 - Renames `<output>.partial` to `<output>` on success. On failure the
   `.partial` is left in place for post-mortem and cleared by the next run.
 
+## SSH verbosity
+
+By default, `botforge test` (and any subcommand that SSHes into a VM) runs
+`ssh`/`scp` with `-o LogLevel=ERROR`.  This suppresses the
+`Warning: Permanently added … to the list of known hosts.` message that would
+otherwise appear on every connection (because botforge always uses a fresh
+per-run `UserKnownHostsFile=/dev/null`).
+
+To restore full OpenSSH verbosity for debugging, set either of:
+
+```sh
+BOTFORGE_SSH_VERBOSE=1   # ssh/scp-specific toggle
+BOTFORGE_DEBUG=1         # broader debug flag; implies verbose ssh
+```
+
+Accepted truthy values are `1`, `true`, and `yes` (case-insensitive).
+
 ## What is **not** here
 
 There is no `botforge pack` subcommand. Image builds used to drive Packer +
