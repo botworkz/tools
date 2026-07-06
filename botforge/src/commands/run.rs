@@ -42,7 +42,7 @@ pub(crate) fn cmd_run(args: RunArgs) -> Result<()> {
         .unwrap_or_default();
 
     create_overlay_image(&base_image, &overlay_image)?;
-    let mut qemu_args = qemu_run_args(&overlay_image, &seed_iso, &payload_isos, args.ssh_port);
+    let mut qemu_args = qemu_run_args(&overlay_image, &seed_iso, &payload_isos, args.ssh_port, &[]);
     if !args.foreground {
         qemu_args.push("-daemonize".into());
     }
