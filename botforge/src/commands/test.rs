@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use clap::Args;
 use serde::Deserialize;
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -54,6 +55,8 @@ pub(crate) struct TestArgs {
 struct TestConfig {
     #[serde(default)]
     isos: Vec<TestIso>,
+    #[serde(default)]
+    ports: Vec<u16>,
     #[serde(default)]
     steps: Vec<TestStep>,
     #[serde(default)]
@@ -157,7 +160,14 @@ pub(crate) fn cmd_test(args: TestArgs) -> Result<()> {
             }
         }
     }
-    let qemu_args = qemu_run_args(&overlay_image, &seed_iso, &extra_isos, args.ssh_port);
+    validate_test_ports(&test_config.ports, args.ssh_port)?;
+    let qemu_args = qemu_run_args(
+        &overlay_image,
+        &seed_iso,
+        &extra_isos,
+        args.ssh_port,
+        &test_config.ports,
+    );
 
     let mut vm_child = Some(spawn_qemu_with_log(&qemu_args, &vm_log)?);
     let ssh_options = SshOptions {
@@ -259,6 +269,27 @@ fn load_test_config(path: &Path) -> Result<TestConfig> {
     serde_yaml::from_str(&yaml).with_context(|| format!("invalid test config: {}", path.display()))
 }
 
+fn validate_test_ports(ports: &[u16], ssh_port: u16) -> Result<()> {
+    let mut seen = HashSet::new();
+    for port in ports {
+        if *port == 0 {
+            anyhow::bail!("invalid test config port 0: ports must be in 1..=65535");
+        }
+        if *port == ssh_port {
+            anyhow::bail!("invalid test config port {port}: duplicates configured ssh port");
+        }
+        if *port == 22 {
+            anyhow::bail!("invalid test config port 22: guest ssh is forwarded automatically");
+        }
+        if !seen.insert(*port) {
+            anyhow::bail!(
+                "invalid test config port {port}: duplicate ports are not allowed in `ports`"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn collect_test_diagnostics(ssh: &SshOptions, units: &[String]) {
     let _ = ssh_with_retry(
         ssh,
@@ -312,7 +343,7 @@ fn shell_single_quote(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{default_bootstrap_path, TestConfig, TestIso};
+    use super::{default_bootstrap_path, validate_test_ports, TestConfig, TestIso};
     use std::path::PathBuf;
 
     #[test]
@@ -374,5 +405,28 @@ isos:
     fn test_config_isos_parses_empty_list() {
         let config: TestConfig = serde_yaml::from_str("isos: []\n").unwrap();
         assert!(config.isos.is_empty());
+    }
+
+    #[test]
+    fn test_config_ports_parse_and_default() {
+        let with_ports: TestConfig = serde_yaml::from_str(
+            r#"
+ports:
+  - 80
+"#,
+        )
+        .unwrap();
+        assert_eq!(with_ports.ports, vec![80]);
+
+        let without_ports: TestConfig = serde_yaml::from_str("steps: []\n").unwrap();
+        assert!(without_ports.ports.is_empty());
+    }
+
+    #[test]
+    fn test_config_ports_validation_rejects_invalid_and_duplicate_values() {
+        assert!(validate_test_ports(&[0], 2222).is_err());
+        assert!(validate_test_ports(&[2222], 2222).is_err());
+        assert!(validate_test_ports(&[22], 2222).is_err());
+        assert!(validate_test_ports(&[80, 80], 2222).is_err());
     }
 }

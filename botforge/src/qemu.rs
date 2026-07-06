@@ -42,6 +42,7 @@ pub(crate) fn qemu_run_args(
     seed_iso: &Path,
     extra_isos: &[PathBuf],
     ssh_port: u16,
+    extra_ports: &[u16],
 ) -> Vec<String> {
     let mut args = vec![
         "-accel".into(),
@@ -61,9 +62,14 @@ pub(crate) fn qemu_run_args(
         args.push("-drive".into());
         args.push(format!("file={},media=cdrom,readonly=on", iso.display()));
     }
+    let mut netdev = format!("user,id=net0,hostfwd=tcp:127.0.0.1:{ssh_port}-:22");
+    for port in extra_ports {
+        netdev.push_str(&format!(",hostfwd=tcp:127.0.0.1:{port}-:{port}"));
+    }
+
     args.extend([
         "-netdev".into(),
-        format!("user,id=net0,hostfwd=tcp:127.0.0.1:{ssh_port}-:22"),
+        netdev,
         "-device".into(),
         "virtio-net-pci,netdev=net0".into(),
         "-nographic".into(),
@@ -114,6 +120,7 @@ mod tests {
             Path::new("/seed.iso"),
             &[PathBuf::from("/payload.iso")],
             2222,
+            &[],
         );
         assert!(
             !args.iter().any(|a| a.contains("/base.qcow2")),
@@ -142,6 +149,22 @@ mod tests {
                 "virtio-net-pci,netdev=net0",
                 "-nographic"
             ]
+        );
+    }
+
+    #[test]
+    fn qemu_run_args_includes_extra_host_forwards() {
+        let args = qemu_run_args(
+            Path::new("/overlay.qcow2"),
+            Path::new("/seed.iso"),
+            &[PathBuf::from("/payload.iso")],
+            2222,
+            &[80],
+        );
+        let netdev_index = args.iter().position(|arg| arg == "-netdev").unwrap() + 1;
+        assert_eq!(
+            args[netdev_index],
+            "user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22,hostfwd=tcp:127.0.0.1:80-:80"
         );
     }
 }
