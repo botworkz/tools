@@ -14,7 +14,7 @@ use crate::ssh::{
     journalctl_command, require_stable_ssh, scp_with_retry, ssh_with_retry, wait_for_ssh,
     SshOptions,
 };
-use crate::util::{create_temp_dir, ensure_command, resolve_under_root};
+use crate::util::{create_temp_dir, ensure_command, resolve_under_root, unique_suffix};
 
 const TEST_SSH_READY_TIMEOUT: Duration = Duration::from_secs(300);
 const TEST_CLOUD_INIT_TIMEOUT: Duration = Duration::from_secs(300);
@@ -109,6 +109,14 @@ struct TestStep {
     #[serde(default)]
     uploads: Vec<TestUpload>,
     run: String,
+    /// Interpreter used to execute `run:`. Mirrors GitHub Actions `shell:` semantics.
+    ///
+    /// Named shells: `bash` (default), `sh`, `python`.
+    /// Custom template: any string containing `{0}`, e.g. `python3 -u {0}`.
+    /// When absent, defaults to `bash --noprofile --norc -e -o pipefail {0}` with
+    /// automatic `sh -e {0}` fallback if bash is not available.
+    #[serde(default)]
+    shell: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -256,7 +264,7 @@ fn run_test_flow(
         .with_context(|| format!("iso bootstrap script failed for label {}", bootstrap.label))?;
     }
 
-    for step in &config.steps {
+    for (step_idx, step) in config.steps.iter().enumerate() {
         match step.target {
             StepTarget::Guest => {
                 for upload in &step.uploads {
@@ -270,18 +278,77 @@ fn run_test_flow(
                     )
                     .with_context(|| format!("test step '{}' upload failed", step.name))?;
                 }
-                ssh_with_retry(
+
+                let suffix = unique_suffix();
+                let local_script = std::env::temp_dir()
+                    .join(format!("botforge-step-{step_idx}-{suffix}.sh"));
+                std::fs::write(&local_script, step.run.as_bytes()).with_context(|| {
+                    format!("test step '{}': failed to write script file", step.name)
+                })?;
+                let remote_script =
+                    format!("/tmp/botforge-step-{step_idx}-{suffix}.sh");
+
+                let template = resolve_shell(step.shell.as_deref())
+                    .expect("shell already validated at config load");
+
+                let scp_result = scp_with_retry(
                     ssh,
-                    &step.run,
+                    &local_script,
+                    &remote_script,
                     TEST_TRANSPORT_RETRIES,
                     TEST_TRANSPORT_RETRY_DELAY,
-                    Duration::from_secs(300),
                 )
-                .with_context(|| format!("test step '{}' command failed", step.name))?;
+                .with_context(|| {
+                    format!("test step '{}' script upload failed", step.name)
+                });
+
+                let step_result = if scp_result.is_ok() {
+                    let ssh_cmd = template
+                        .iter()
+                        .map(|a| {
+                            if a == "{0}" {
+                                shell_single_quote(&remote_script)
+                            } else {
+                                a.clone()
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    ssh_with_retry(
+                        ssh,
+                        &ssh_cmd,
+                        TEST_TRANSPORT_RETRIES,
+                        TEST_TRANSPORT_RETRY_DELAY,
+                        Duration::from_secs(300),
+                    )
+                    .with_context(|| format!("test step '{}' command failed", step.name))
+                } else {
+                    scp_result
+                };
+
+                // Best-effort cleanup: remote script, then local temp file.
+                let _ = ssh_with_retry(
+                    ssh,
+                    &format!("rm -f {}", shell_single_quote(&remote_script)),
+                    1,
+                    Duration::from_secs(0),
+                    Duration::from_secs(10),
+                );
+                let _ = std::fs::remove_file(&local_script);
+
+                step_result?;
             }
             StepTarget::Host => {
-                run_host_step(&step.name, &step.run, repo_root, Duration::from_secs(300))
-                    .with_context(|| format!("test step '{}' command failed", step.name))?;
+                let template = resolve_shell(step.shell.as_deref())
+                    .expect("shell already validated at config load");
+                run_host_step(
+                    &step.name,
+                    &step.run,
+                    repo_root,
+                    Duration::from_secs(300),
+                    &template,
+                )
+                .with_context(|| format!("test step '{}' command failed", step.name))?;
             }
         }
     }
@@ -296,6 +363,8 @@ fn load_test_config(path: &Path) -> Result<TestConfig> {
 
 fn validate_test_steps(steps: &[TestStep], ports: &[u16]) -> Result<()> {
     for step in steps {
+        resolve_shell(step.shell.as_deref())
+            .with_context(|| format!("test step '{}': invalid `shell:` value", step.name))?;
         if step.target == StepTarget::Host && !step.uploads.is_empty() {
             anyhow::bail!(
                 "test step '{}': `uploads` is not valid on an `on: host` step; \
@@ -314,40 +383,111 @@ fn validate_test_steps(steps: &[TestStep], ports: &[u16]) -> Result<()> {
     Ok(())
 }
 
-/// Run a shell command locally in the botforge container (harness) with a plain execution timeout.
+/// Run a step locally in the botforge container (harness) with a plain execution timeout.
+/// `run` is written to a temp file and executed via `template` (argv with `{0}` slot).
 /// The working directory is `repo_root`. Inherits the current process environment.
-fn run_host_step(name: &str, run: &str, repo_root: &Path, timeout: Duration) -> Result<()> {
-    let mut child = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(run)
+fn run_host_step(
+    name: &str,
+    run: &str,
+    repo_root: &Path,
+    timeout: Duration,
+    template: &[String],
+) -> Result<()> {
+    let script =
+        std::env::temp_dir().join(format!("botforge-host-step-{}.sh", unique_suffix()));
+    std::fs::write(&script, run.as_bytes())
+        .with_context(|| format!("failed to write script file for host step '{name}'"))?;
+
+    let argv: Vec<String> = template
+        .iter()
+        .map(|a| {
+            if a == "{0}" {
+                script.to_string_lossy().into_owned()
+            } else {
+                a.clone()
+            }
+        })
+        .collect();
+
+    let mut child = std::process::Command::new(&argv[0])
+        .args(&argv[1..])
         .current_dir(repo_root)
         .spawn()
         .with_context(|| format!("failed to spawn host step '{name}'"))?;
 
     let deadline = Instant::now() + timeout;
-    loop {
+    let step_result = loop {
         match child
             .try_wait()
             .with_context(|| format!("failed to wait for host step '{name}'"))?
         {
             Some(status) => {
                 if status.success() {
-                    return Ok(());
+                    break Ok(());
                 }
-                anyhow::bail!(
+                break Err(anyhow::anyhow!(
                     "host step '{name}' exited with status: {status}"
-                );
+                ));
             }
             None => {
                 if Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
-                    anyhow::bail!(
+                    break Err(anyhow::anyhow!(
                         "host step '{name}' timed out after {}s",
                         timeout.as_secs()
-                    );
+                    ));
                 }
                 std::thread::sleep(Duration::from_millis(200));
+            }
+        }
+    };
+
+    // Best-effort cleanup of temp script.
+    let _ = std::fs::remove_file(&script);
+
+    step_result
+}
+
+/// Resolve a step's `shell:` value into an argv template with a `{0}` slot.
+///
+/// Named shells (`bash`, `sh`, `python`) map to fixed GHA-compatible templates.
+/// Custom templates must contain `{0}` as a placeholder for the script file path.
+/// `None` (absent) returns the default `bash` template.
+///
+/// Returns `Err` for: unknown single-token named shell, or a custom multi-token
+/// shell string that does not contain `{0}`.
+fn resolve_shell(shell: Option<&str>) -> Result<Vec<String>> {
+    match shell {
+        None | Some("bash") => Ok(vec![
+            "bash".to_string(),
+            "--noprofile".to_string(),
+            "--norc".to_string(),
+            "-e".to_string(),
+            "-o".to_string(),
+            "pipefail".to_string(),
+            "{0}".to_string(),
+        ]),
+        Some("sh") => Ok(vec!["sh".to_string(), "-e".to_string(), "{0}".to_string()]),
+        Some("python") => Ok(vec!["python3".to_string(), "{0}".to_string()]),
+        Some(custom) => {
+            if custom.contains("{0}") {
+                Ok(custom.split_whitespace().map(str::to_string).collect())
+            } else if custom.split_whitespace().count() <= 1 {
+                anyhow::bail!(
+                    "unknown named shell '{}'; supported named shells: bash, sh, python. \
+                     For a custom interpreter use the '{{0}}' placeholder form, \
+                     e.g. '{} {{0}}'",
+                    custom,
+                    custom
+                )
+            } else {
+                anyhow::bail!(
+                    "custom shell '{}' does not contain the '{{0}}' placeholder; \
+                     '{{0}}' must appear in the shell template to indicate where \
+                     the script file path is substituted",
+                    custom
+                )
             }
         }
     }
@@ -428,10 +568,11 @@ fn shell_single_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        default_bootstrap_path, validate_test_ports, validate_test_steps, StepTarget, TestConfig,
-        TestIso, TestStep, TestUpload,
+        default_bootstrap_path, resolve_shell, run_host_step, validate_test_ports,
+        validate_test_steps, StepTarget, TestConfig, TestIso, TestStep, TestUpload,
     };
     use std::path::PathBuf;
+    use std::time::Duration;
 
     #[test]
     fn test_config_isos_parses_legacy_and_bootstrap_shapes() {
@@ -640,6 +781,7 @@ steps:
             target,
             name: name.to_string(),
             run: "echo ok".to_string(),
+            shell: None,
             uploads: if with_uploads {
                 vec![TestUpload {
                     src: PathBuf::from("src/file"),
@@ -696,5 +838,206 @@ steps:
     fn test_validate_steps_accepts_guest_only_without_ports() {
         let steps = vec![make_step(StepTarget::Guest, "s", false)];
         assert!(validate_test_steps(&steps, &[]).is_ok());
+    }
+
+    // --- shell resolver ---
+
+    #[test]
+    fn test_resolve_shell_absent_returns_bash_template() {
+        let tmpl = resolve_shell(None).unwrap();
+        assert_eq!(
+            tmpl,
+            vec!["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "{0}"]
+        );
+    }
+
+    #[test]
+    fn test_resolve_shell_bash_returns_bash_template() {
+        let tmpl = resolve_shell(Some("bash")).unwrap();
+        assert_eq!(
+            tmpl,
+            vec!["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "{0}"]
+        );
+    }
+
+    #[test]
+    fn test_resolve_shell_sh_returns_sh_template() {
+        let tmpl = resolve_shell(Some("sh")).unwrap();
+        assert_eq!(tmpl, vec!["sh", "-e", "{0}"]);
+    }
+
+    #[test]
+    fn test_resolve_shell_python_returns_python3_template() {
+        let tmpl = resolve_shell(Some("python")).unwrap();
+        assert_eq!(tmpl, vec!["python3", "{0}"]);
+    }
+
+    #[test]
+    fn test_resolve_shell_custom_with_placeholder_is_split() {
+        let tmpl = resolve_shell(Some("python3 -u {0}")).unwrap();
+        assert_eq!(tmpl, vec!["python3", "-u", "{0}"]);
+    }
+
+    #[test]
+    fn test_resolve_shell_custom_without_placeholder_is_error() {
+        let err = resolve_shell(Some("python3 -u")).unwrap_err();
+        assert!(
+            err.to_string().contains("{0}"),
+            "error should mention '{{0}}': {err}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_shell_unknown_named_shell_is_error() {
+        let err = resolve_shell(Some("fish")).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("fish"),
+            "error should mention the shell name: {msg}"
+        );
+        assert!(
+            msg.contains("bash") && msg.contains("sh") && msg.contains("python"),
+            "error should list supported shells: {msg}"
+        );
+    }
+
+    // --- shell deserialization ---
+
+    #[test]
+    fn test_step_parses_shell_python() {
+        let config: TestConfig = serde_yaml::from_str(
+            r#"
+steps:
+  - on: guest
+    name: py-step
+    shell: python
+    run: print("hello")
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.steps[0].shell.as_deref(), Some("python"));
+    }
+
+    #[test]
+    fn test_step_parses_without_shell_defaults_to_none() {
+        let config: TestConfig = serde_yaml::from_str(
+            r#"
+steps:
+  - on: guest
+    name: no-shell
+    run: echo hello
+"#,
+        )
+        .unwrap();
+        assert!(config.steps[0].shell.is_none());
+    }
+
+    // --- {0} substitution ---
+
+    #[test]
+    fn test_apply_shell_template_substitutes_placeholder() {
+        let tmpl = resolve_shell(None).unwrap();
+        let argv: Vec<String> = tmpl
+            .iter()
+            .map(|a| {
+                if a == "{0}" {
+                    "/tmp/my-script.sh".to_string()
+                } else {
+                    a.clone()
+                }
+            })
+            .collect();
+        assert_eq!(
+            argv,
+            vec![
+                "bash",
+                "--noprofile",
+                "--norc",
+                "-e",
+                "-o",
+                "pipefail",
+                "/tmp/my-script.sh"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_apply_sh_template_substitutes_placeholder() {
+        let tmpl = resolve_shell(Some("sh")).unwrap();
+        let argv: Vec<String> = tmpl
+            .iter()
+            .map(|a| {
+                if a == "{0}" {
+                    "/tmp/step.sh".to_string()
+                } else {
+                    a.clone()
+                }
+            })
+            .collect();
+        assert_eq!(argv, vec!["sh", "-e", "/tmp/step.sh"]);
+    }
+
+    // --- host step execution ---
+
+    #[test]
+    fn test_host_step_sh_false_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmpl = resolve_shell(Some("sh")).unwrap();
+        let err =
+            run_host_step("fail-step", "false", dir.path(), Duration::from_secs(10), &tmpl)
+                .unwrap_err();
+        assert!(
+            err.to_string().contains("fail-step"),
+            "error should mention step name: {err}"
+        );
+    }
+
+    #[test]
+    fn test_host_step_exit_nonzero_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmpl = resolve_shell(Some("sh")).unwrap();
+        let err =
+            run_host_step("bad", "exit 3", dir.path(), Duration::from_secs(10), &tmpl)
+                .unwrap_err();
+        assert!(err.to_string().contains("bad"), "error should mention step name: {err}");
+    }
+
+    #[test]
+    fn test_host_step_default_set_e_fails_on_mid_script_error() {
+        // Under the default bash template (-e -o pipefail), a non-final failing
+        // command must fail the step even though the last command would succeed.
+        let dir = tempfile::tempdir().unwrap();
+        let tmpl = resolve_shell(None).unwrap();
+        let err = run_host_step(
+            "mid-fail",
+            "false\necho ok\n",
+            dir.path(),
+            Duration::from_secs(10),
+            &tmpl,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("mid-fail"),
+            "error should mention step name: {err}"
+        );
+    }
+
+    #[test]
+    fn test_host_step_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmpl = resolve_shell(None).unwrap();
+        assert!(run_host_step("ok", "true", dir.path(), Duration::from_secs(10), &tmpl).is_ok());
+    }
+
+    #[test]
+    fn test_validate_steps_rejects_bad_shell() {
+        let mut step = make_step(StepTarget::Guest, "bad-shell", false);
+        step.shell = Some("fish".to_string());
+        let err = validate_test_steps(&[step], &[]).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("fish"),
+            "error should mention shell name: {msg}"
+        );
     }
 }
