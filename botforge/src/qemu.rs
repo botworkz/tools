@@ -110,7 +110,7 @@ pub(crate) fn qemu_run_args(
         args.push("-drive".into());
         args.push(format!("file={},media=cdrom,readonly=on", iso.display()));
     }
-    let mut netdev = format!("user,id=net0,hostfwd=tcp:127.0.0.1:{ssh_port}-:22");
+    let mut netdev = format!("user,id=net0,hostfwd=tcp:0.0.0.0:{ssh_port}-:22");
     for spec in extra_ports {
         netdev.push_str(&format!(
             ",hostfwd=tcp:{}:{}-:{}",
@@ -209,11 +209,27 @@ mod tests {
                 "-drive",
                 "file=/payload.iso,media=cdrom,readonly=on",
                 "-netdev",
-                "user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22",
+                "user,id=net0,hostfwd=tcp:0.0.0.0:2222-:22",
                 "-device",
                 "virtio-net-pci,netdev=net0",
                 "-nographic"
             ]
+        );
+    }
+
+    #[test]
+    fn qemu_run_args_default_ssh_forward_binds_all_interfaces() {
+        let args = qemu_run_args(
+            Path::new("/overlay.qcow2"),
+            Path::new("/seed.iso"),
+            &[],
+            2222,
+            &[],
+        );
+        let netdev_index = args.iter().position(|arg| arg == "-netdev").unwrap() + 1;
+        assert!(
+            args[netdev_index].starts_with("user,id=net0,hostfwd=tcp:0.0.0.0:2222-:22"),
+            "netdev should begin with built-in SSH forward bound to all interfaces"
         );
     }
 
@@ -229,7 +245,7 @@ mod tests {
         let netdev_index = args.iter().position(|arg| arg == "-netdev").unwrap() + 1;
         assert_eq!(
             args[netdev_index],
-            "user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22,hostfwd=tcp:127.0.0.1:80-:80"
+            "user,id=net0,hostfwd=tcp:0.0.0.0:2222-:22,hostfwd=tcp:127.0.0.1:80-:80"
         );
     }
 
@@ -245,7 +261,7 @@ mod tests {
         let netdev_index = args.iter().position(|arg| arg == "-netdev").unwrap() + 1;
         assert_eq!(
             args[netdev_index],
-            "user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22,hostfwd=tcp:0.0.0.0:9901-:9901"
+            "user,id=net0,hostfwd=tcp:0.0.0.0:2222-:22,hostfwd=tcp:0.0.0.0:9901-:9901"
         );
     }
 
@@ -261,7 +277,7 @@ mod tests {
         let netdev_index = args.iter().position(|arg| arg == "-netdev").unwrap() + 1;
         assert_eq!(
             args[netdev_index],
-            "user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22,hostfwd=tcp:127.0.0.1:80-:80,hostfwd=tcp:0.0.0.0:9901-:9901"
+            "user,id=net0,hostfwd=tcp:0.0.0.0:2222-:22,hostfwd=tcp:127.0.0.1:80-:80,hostfwd=tcp:0.0.0.0:9901-:9901"
         );
     }
 }
