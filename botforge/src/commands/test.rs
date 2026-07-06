@@ -6,7 +6,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::Child;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::iso::{build_iso, detect_iso_tool, render_user_data, write_seed_files};
 use crate::qemu::{create_overlay_image, qemu_run_args, require_kvm, spawn_qemu_with_log};
@@ -87,9 +87,25 @@ fn default_bootstrap_path() -> PathBuf {
     PathBuf::from("bootstrap.sh")
 }
 
+/// Where a test step executes: inside the guest (SSH) or on the harness host (local).
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum StepTarget {
+    /// Run via SSH inside the guest VM.
+    Guest,
+    /// Run locally in the botforge container (harness), reaching the guest only via forwarded
+    /// `ports:`. This is the botforge container / harness where botforge itself runs — not the
+    /// CI runner host.
+    Host,
+}
+
 #[derive(Debug, Deserialize)]
 struct TestStep {
+    /// Where this step executes. Required; must be `guest` or `host`.
+    #[serde(rename = "on")]
+    target: StepTarget,
     name: String,
+    /// Files to scp into the guest before running. Only valid on `on: guest` steps.
     #[serde(default)]
     uploads: Vec<TestUpload>,
     run: String,
@@ -120,6 +136,7 @@ pub(crate) fn cmd_test(args: TestArgs) -> Result<()> {
     let ssh_pub = PathBuf::from(format!("{}.pub", ssh_key.display()));
 
     let test_config = load_test_config(&test_config_path)?;
+    validate_test_steps(&test_config.steps, &test_config.ports)?;
     let build_dir = repo_root.join("build");
     std::fs::create_dir_all(&build_dir)
         .with_context(|| format!("cannot create build dir: {}", build_dir.display()))?;
@@ -240,25 +257,33 @@ fn run_test_flow(
     }
 
     for step in &config.steps {
-        for upload in &step.uploads {
-            let src = resolve_under_root(repo_root, upload.src.clone());
-            scp_with_retry(
-                ssh,
-                &src,
-                &upload.dest,
-                TEST_TRANSPORT_RETRIES,
-                TEST_TRANSPORT_RETRY_DELAY,
-            )
-            .with_context(|| format!("test step '{}' upload failed", step.name))?;
+        match step.target {
+            StepTarget::Guest => {
+                for upload in &step.uploads {
+                    let src = resolve_under_root(repo_root, upload.src.clone());
+                    scp_with_retry(
+                        ssh,
+                        &src,
+                        &upload.dest,
+                        TEST_TRANSPORT_RETRIES,
+                        TEST_TRANSPORT_RETRY_DELAY,
+                    )
+                    .with_context(|| format!("test step '{}' upload failed", step.name))?;
+                }
+                ssh_with_retry(
+                    ssh,
+                    &step.run,
+                    TEST_TRANSPORT_RETRIES,
+                    TEST_TRANSPORT_RETRY_DELAY,
+                    Duration::from_secs(300),
+                )
+                .with_context(|| format!("test step '{}' command failed", step.name))?;
+            }
+            StepTarget::Host => {
+                run_host_step(&step.name, &step.run, repo_root, Duration::from_secs(300))
+                    .with_context(|| format!("test step '{}' command failed", step.name))?;
+            }
         }
-        ssh_with_retry(
-            ssh,
-            &step.run,
-            TEST_TRANSPORT_RETRIES,
-            TEST_TRANSPORT_RETRY_DELAY,
-            Duration::from_secs(300),
-        )
-        .with_context(|| format!("test step '{}' command failed", step.name))?;
     }
     Ok(())
 }
@@ -267,6 +292,65 @@ fn load_test_config(path: &Path) -> Result<TestConfig> {
     let yaml = std::fs::read_to_string(path)
         .with_context(|| format!("cannot read test config: {}", path.display()))?;
     serde_yaml::from_str(&yaml).with_context(|| format!("invalid test config: {}", path.display()))
+}
+
+fn validate_test_steps(steps: &[TestStep], ports: &[u16]) -> Result<()> {
+    for step in steps {
+        if step.target == StepTarget::Host && !step.uploads.is_empty() {
+            anyhow::bail!(
+                "test step '{}': `uploads` is not valid on an `on: host` step; \
+                 files are already local in the harness",
+                step.name
+            );
+        }
+    }
+    let has_host_step = steps.iter().any(|s| s.target == StepTarget::Host);
+    if has_host_step && ports.is_empty() {
+        anyhow::bail!(
+            "test config has `on: host` steps but no `ports:` are declared; \
+             a host step reaches the guest only via forwarded ports"
+        );
+    }
+    Ok(())
+}
+
+/// Run a shell command locally in the botforge container (harness) with a plain execution timeout.
+/// The working directory is `repo_root`. Inherits the current process environment.
+fn run_host_step(name: &str, run: &str, repo_root: &Path, timeout: Duration) -> Result<()> {
+    let mut child = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(run)
+        .current_dir(repo_root)
+        .spawn()
+        .with_context(|| format!("failed to spawn host step '{name}'"))?;
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child
+            .try_wait()
+            .with_context(|| format!("failed to wait for host step '{name}'"))?
+        {
+            Some(status) => {
+                if status.success() {
+                    return Ok(());
+                }
+                anyhow::bail!(
+                    "host step '{name}' exited with status: {status}"
+                );
+            }
+            None => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    anyhow::bail!(
+                        "host step '{name}' timed out after {}s",
+                        timeout.as_secs()
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
+    }
 }
 
 fn validate_test_ports(ports: &[u16], ssh_port: u16) -> Result<()> {
@@ -343,7 +427,10 @@ fn shell_single_quote(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{default_bootstrap_path, validate_test_ports, TestConfig, TestIso};
+    use super::{
+        default_bootstrap_path, validate_test_ports, validate_test_steps, StepTarget, TestConfig,
+        TestIso, TestStep, TestUpload,
+    };
     use std::path::PathBuf;
 
     #[test]
@@ -428,5 +515,186 @@ ports:
         assert!(validate_test_ports(&[2222], 2222).is_err());
         assert!(validate_test_ports(&[22], 2222).is_err());
         assert!(validate_test_ports(&[80, 80], 2222).is_err());
+    }
+
+    // --- step deserialization ---
+
+    #[test]
+    fn test_step_parses_guest_step() {
+        let config: TestConfig = serde_yaml::from_str(
+            r#"
+steps:
+  - on: guest
+    name: goss
+    run: goss -g /path/goss.yaml validate
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.steps.len(), 1);
+        assert_eq!(config.steps[0].target, StepTarget::Guest);
+        assert_eq!(config.steps[0].name, "goss");
+        assert_eq!(config.steps[0].run, "goss -g /path/goss.yaml validate");
+        assert!(config.steps[0].uploads.is_empty());
+    }
+
+    #[test]
+    fn test_step_parses_host_step() {
+        let config: TestConfig = serde_yaml::from_str(
+            r#"
+ports:
+  - 80
+steps:
+  - on: host
+    name: vm-narrative
+    run: bash smoke/vm-narrative.sh 127.0.0.1
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.steps.len(), 1);
+        assert_eq!(config.steps[0].target, StepTarget::Host);
+        assert_eq!(config.steps[0].name, "vm-narrative");
+        assert_eq!(config.steps[0].run, "bash smoke/vm-narrative.sh 127.0.0.1");
+    }
+
+    #[test]
+    fn test_step_parses_guest_step_with_uploads() {
+        let config: TestConfig = serde_yaml::from_str(
+            r#"
+steps:
+  - on: guest
+    name: upload-and-run
+    uploads:
+      - src: local/file.sh
+        dest: /tmp/file.sh
+    run: bash /tmp/file.sh
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.steps[0].uploads.len(), 1);
+        assert_eq!(config.steps[0].uploads[0].src, PathBuf::from("local/file.sh"));
+        assert_eq!(config.steps[0].uploads[0].dest, "/tmp/file.sh");
+    }
+
+    #[test]
+    fn test_step_parses_interleaved_guest_and_host_steps_in_order() {
+        let config: TestConfig = serde_yaml::from_str(
+            r#"
+ports:
+  - 80
+steps:
+  - on: guest
+    name: goss
+    run: goss -g /path/goss.yaml validate
+  - on: guest
+    name: flip-spigot
+    run: sudo cp /etc/envoy/rds/active.ingress.yaml /etc/envoy/rds/active.yaml
+  - on: host
+    name: vm-narrative
+    run: bash smoke/vm-narrative.sh 127.0.0.1
+  - on: guest
+    name: flip-spigot-back
+    run: sudo cp /etc/envoy/rds/active.holding.yaml /etc/envoy/rds/active.yaml
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.steps.len(), 4);
+        assert_eq!(config.steps[0].target, StepTarget::Guest);
+        assert_eq!(config.steps[1].target, StepTarget::Guest);
+        assert_eq!(config.steps[2].target, StepTarget::Host);
+        assert_eq!(config.steps[3].target, StepTarget::Guest);
+    }
+
+    #[test]
+    fn test_step_rejects_missing_on_field() {
+        let result: Result<TestConfig, _> = serde_yaml::from_str(
+            r#"
+steps:
+  - name: no-on-field
+    run: echo hello
+"#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_step_rejects_invalid_on_value() {
+        let result: Result<TestConfig, _> = serde_yaml::from_str(
+            r#"
+steps:
+  - on: invalid
+    name: bad-step
+    run: echo hello
+"#,
+        );
+        assert!(result.is_err());
+    }
+
+    // --- step validation ---
+
+    fn make_step(target: StepTarget, name: &str, with_uploads: bool) -> TestStep {
+        TestStep {
+            target,
+            name: name.to_string(),
+            run: "echo ok".to_string(),
+            uploads: if with_uploads {
+                vec![TestUpload {
+                    src: PathBuf::from("src/file"),
+                    dest: "/tmp/file".to_string(),
+                }]
+            } else {
+                vec![]
+            },
+        }
+    }
+
+    #[test]
+    fn test_validate_steps_accepts_guest_with_uploads() {
+        let steps = vec![make_step(StepTarget::Guest, "s", true)];
+        assert!(validate_test_steps(&steps, &[80]).is_ok());
+    }
+
+    #[test]
+    fn test_validate_steps_accepts_host_without_uploads() {
+        let steps = vec![make_step(StepTarget::Host, "s", false)];
+        assert!(validate_test_steps(&steps, &[80]).is_ok());
+    }
+
+    #[test]
+    fn test_validate_steps_rejects_uploads_on_host_step() {
+        let steps = vec![make_step(StepTarget::Host, "bad", true)];
+        let err = validate_test_steps(&steps, &[80]).unwrap_err();
+        assert!(
+            err.to_string().contains("uploads"),
+            "error should mention 'uploads': {err}"
+        );
+        assert!(
+            err.to_string().contains("bad"),
+            "error should mention step name: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_steps_rejects_host_step_without_ports() {
+        let steps = vec![make_step(StepTarget::Host, "edge", false)];
+        let err = validate_test_steps(&steps, &[]).unwrap_err();
+        assert!(
+            err.to_string().contains("ports"),
+            "error should mention 'ports': {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_steps_accepts_empty_steps_without_ports() {
+        assert!(validate_test_steps(&[], &[]).is_ok());
+    }
+
+    #[test]
+    fn test_validate_steps_accepts_guest_only_without_ports() {
+        let steps = vec![make_step(StepTarget::Guest, "s", false)];
+        assert!(validate_test_steps(&steps, &[]).is_ok());
     }
 }
