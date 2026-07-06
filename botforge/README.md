@@ -70,6 +70,19 @@ For `botforge test`, the `isos:` list in test config supports two forms:
   (default `bootstrap.sh`) to attach the ISO, mount it by label in the guest,
   and run the bootstrap script with `sudo` before configured `steps:`.
 
+`botforge test` also supports an optional `ports:` list for additional guest
+TCP forwards to the harness. Each guest port `N` is forwarded 1:1 to
+`127.0.0.1:N` where botforge runs (no host:guest remapping). Guest SSH on
+`:22` is always forwarded automatically via `--ssh-port`.
+
+```yaml
+ports:
+  - 80
+steps:
+  - name: check-edge
+    run: curl -fsS http://127.0.0.1/
+```
+
 ### `botforge build` spec format
 
 A build spec is a YAML document with three top-level concerns: disk knobs,
