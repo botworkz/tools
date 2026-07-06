@@ -88,6 +88,118 @@ steps:
     run: curl -fsS http://127.0.0.1/
 ```
 
+### `botforge test` step model
+
+Each entry in `steps:` has a required `on:` field that selects where it runs:
+
+- **`on: guest`** — runs inside the VM via SSH. `uploads:` scp files into the
+  guest first, then `run:` executes there. This is the traditional test step.
+- **`on: host`** — runs locally in the **botforge container / harness** (where
+  botforge itself executes), _not_ inside the guest. Reaches the guest only
+  via ports declared in `ports:`. Inherits the harness environment (so CI
+  variables such as `GH_TOKEN` are visible). Has a plain execution timeout
+  with no SSH transport retries. `uploads:` is not valid on host steps.
+
+Steps execute in the exact order written; guest and host steps may interleave
+freely. This lets you flip guest state, hit the guest from outside, then
+restore — all in a single ordered sequence.
+
+Config errors are reported at load time for: missing or invalid `on:`; `uploads:`
+on an `on: host` step; any `on: host` step present when `ports:` is empty;
+invalid `shell:` value.
+
+On **any** step failure (guest or host) the usual guest diagnostics are
+collected (`systemctl --failed`, `journalctl`, `cloud-init status`, VM log
+tail) — a harness-side failure typically implicates a guest service.
+
+#### `shell:` field (optional)
+
+Every step has an optional `shell:` field that selects the interpreter used to
+execute `run:`, mirroring GitHub Actions `shell:` semantics. `run:` is always
+written to a temporary script file and executed by the interpreter — never
+passed as a raw string to a shell.
+
+**Named shells** (exact match):
+
+| `shell:` value | Invocation template |
+|---|---|
+| _(absent)_ or `bash` | `bash --noprofile --norc -e -o pipefail {0}` |
+| `sh` | `sh -e {0}` |
+| `python` | `python3 {0}` |
+
+`{0}` is replaced at runtime with the path to the temp script file.
+
+**Custom template**: any string containing `{0}`, e.g. `python3 -u {0}` or
+`perl {0}`. The string is split on whitespace; `{0}` may appear anywhere.
+
+```yaml
+steps:
+  - on: guest
+    name: py-check
+    shell: python
+    run: |
+      import sys
+      assert sys.version_info >= (3, 9)
+  - on: host
+    name: custom-interp
+    shell: python3 -u {0}
+    run: |
+      import os, sys
+      print("token present:", bool(os.environ.get("GH_TOKEN")))
+```
+
+**Default (`bash`) applies `-e -o pipefail` everywhere.**
+When `shell:` is absent the default bash template is used on both `on: guest`
+and `on: host` steps. This means a failing command anywhere in a multi-line
+`run:` block fails the step immediately — including the left-hand side of a
+pipe. Bash must be present in the guest image and the botforge container (both
+currently are). If bash is unavailable the explicit `shell: sh` fallback
+(`sh -e {0}`) can be set.
+
+> **Behaviour change (guest steps):** prior to this change, guest `run:` strings
+> were executed as raw SSH commands with no `set -e` or `pipefail`. They now run
+> under `bash --noprofile --norc -e -o pipefail` by default. A mid-script
+> non-zero exit or a failing left side of a pipe now fails the step. If you need
+> the old lenient behaviour, set `shell: sh` and write your script accordingly.
+
+**Execution model (both targets):**
+
+- **host step** — `run:` is written to a temp file in the botforge container
+  and executed via the resolved interpreter template using
+  `std::process::Command`. Working directory is `repo_root`; the harness
+  environment is inherited. The 300 s timeout and kill behaviour are unchanged.
+- **guest step** — `run:` is written to a temp file in the container, scp'd to
+  a unique path under `/tmp` on the guest (e.g.
+  `/tmp/botforge-step-<n>-<id>.sh`), then executed there via `ssh_with_retry`
+  with the same 10-retry / 300 s timeout as today. The guest `uploads:` still
+  happen first, exactly as before.
+
+Temp script files (both the local container copy and the guest `/tmp` copy for
+guest steps) are removed best-effort after each step, on both success and
+failure paths. A cleanup failure never masks the step result.
+
+```yaml
+ports:
+  - 80
+steps:
+  - on: guest
+    name: goss
+    run: goss -g /path/goss.yaml validate
+  - on: guest
+    name: flip-spigot-to-ingress
+    run: |
+      sudo cp /etc/envoy/rds/active.ingress.yaml /etc/envoy/rds/active.yaml
+      sudo systemctl reload botwork-envoy
+  - on: host
+    name: vm-narrative
+    run: bash smoke/vm-narrative.sh 127.0.0.1
+  - on: guest
+    name: flip-spigot-back
+    run: |
+      sudo cp /etc/envoy/rds/active.holding.yaml /etc/envoy/rds/active.yaml
+      sudo systemctl reload botwork-envoy
+```
+
 ### `botforge build` spec format
 
 A build spec is a YAML document with three top-level concerns: disk knobs,
