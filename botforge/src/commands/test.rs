@@ -9,7 +9,9 @@ use std::process::Child;
 use std::time::Duration;
 
 use crate::iso::{build_iso, detect_iso_tool, render_user_data, write_seed_files};
-use crate::qemu::{create_overlay_image, qemu_run_args, require_kvm, spawn_qemu_with_log};
+use crate::qemu::{
+    create_overlay_image, qemu_run_args, require_kvm, spawn_qemu_with_log, PortSpec,
+};
 use crate::ssh::{
     journalctl_command, require_stable_ssh, scp_with_retry, ssh_with_retry, wait_for_ssh,
     SshOptions,
@@ -56,7 +58,7 @@ struct TestConfig {
     #[serde(default)]
     isos: Vec<TestIso>,
     #[serde(default)]
-    ports: Vec<u16>,
+    ports: Vec<PortSpec>,
     #[serde(default)]
     steps: Vec<TestStep>,
     #[serde(default)]
@@ -269,21 +271,26 @@ fn load_test_config(path: &Path) -> Result<TestConfig> {
     serde_yaml::from_str(&yaml).with_context(|| format!("invalid test config: {}", path.display()))
 }
 
-fn validate_test_ports(ports: &[u16], ssh_port: u16) -> Result<()> {
+fn validate_test_ports(ports: &[PortSpec], ssh_port: u16) -> Result<()> {
     let mut seen = HashSet::new();
-    for port in ports {
-        if *port == 0 {
+    for spec in ports {
+        if spec.port == 0 {
             anyhow::bail!("invalid test config port 0: ports must be in 1..=65535");
         }
-        if *port == ssh_port {
-            anyhow::bail!("invalid test config port {port}: duplicates configured ssh port");
+        if spec.port == ssh_port {
+            anyhow::bail!(
+                "invalid test config port {}: duplicates configured ssh port",
+                spec.port
+            );
         }
-        if *port == 22 {
+        if spec.port == 22 {
             anyhow::bail!("invalid test config port 22: guest ssh is forwarded automatically");
         }
-        if !seen.insert(*port) {
+        if !seen.insert(spec.port) {
             anyhow::bail!(
-                "invalid test config port {port}: duplicate ports are not allowed in `ports`"
+                "invalid test config port {}: duplicate port numbers are not allowed in `ports` \
+                 (binds on different addresses may still conflict at QEMU startup)",
+                spec.port
             );
         }
     }
@@ -344,7 +351,15 @@ fn shell_single_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{default_bootstrap_path, validate_test_ports, TestConfig, TestIso};
+    use crate::qemu::PortSpec;
     use std::path::PathBuf;
+
+    fn loopback(port: u16) -> PortSpec {
+        PortSpec {
+            addr: "127.0.0.1".into(),
+            port,
+        }
+    }
 
     #[test]
     fn test_config_isos_parses_legacy_and_bootstrap_shapes() {
@@ -408,25 +423,118 @@ isos:
     }
 
     #[test]
-    fn test_config_ports_parse_and_default() {
-        let with_ports: TestConfig = serde_yaml::from_str(
+    fn test_config_ports_integer_parses_to_loopback() {
+        let config: TestConfig = serde_yaml::from_str(
             r#"
 ports:
   - 80
 "#,
         )
         .unwrap();
-        assert_eq!(with_ports.ports, vec![80]);
+        assert_eq!(config.ports.len(), 1);
+        assert_eq!(config.ports[0], loopback(80));
+    }
 
-        let without_ports: TestConfig = serde_yaml::from_str("steps: []\n").unwrap();
-        assert!(without_ports.ports.is_empty());
+    #[test]
+    fn test_config_ports_string_parses_to_custom_addr() {
+        let config: TestConfig = serde_yaml::from_str(
+            r#"
+ports:
+  - "0.0.0.0:9901"
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.ports.len(), 1);
+        assert_eq!(
+            config.ports[0],
+            PortSpec {
+                addr: "0.0.0.0".into(),
+                port: 9901
+            }
+        );
+    }
+
+    #[test]
+    fn test_config_ports_explicit_loopback_string() {
+        let config: TestConfig = serde_yaml::from_str(
+            r#"
+ports:
+  - "127.0.0.1:80"
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.ports[0], loopback(80));
+    }
+
+    #[test]
+    fn test_config_ports_mixed_int_and_string() {
+        let config: TestConfig = serde_yaml::from_str(
+            r#"
+ports:
+  - 80
+  - "0.0.0.0:9901"
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.ports.len(), 2);
+        assert_eq!(config.ports[0], loopback(80));
+        assert_eq!(
+            config.ports[1],
+            PortSpec {
+                addr: "0.0.0.0".into(),
+                port: 9901
+            }
+        );
+    }
+
+    #[test]
+    fn test_config_ports_default_is_empty() {
+        let config: TestConfig = serde_yaml::from_str("steps: []\n").unwrap();
+        assert!(config.ports.is_empty());
+    }
+
+    #[test]
+    fn test_config_ports_malformed_string_rejected() {
+        assert!(serde_yaml::from_str::<TestConfig>("ports:\n  - \"noport\"\n").is_err());
+        assert!(serde_yaml::from_str::<TestConfig>("ports:\n  - \":80\"\n").is_err());
+        assert!(
+            serde_yaml::from_str::<TestConfig>("ports:\n  - \"0.0.0.0:notanumber\"\n").is_err()
+        );
+        assert!(serde_yaml::from_str::<TestConfig>("ports:\n  - \"0.0.0.0:99999\"\n").is_err());
     }
 
     #[test]
     fn test_config_ports_validation_rejects_invalid_and_duplicate_values() {
-        assert!(validate_test_ports(&[0], 2222).is_err());
-        assert!(validate_test_ports(&[2222], 2222).is_err());
-        assert!(validate_test_ports(&[22], 2222).is_err());
-        assert!(validate_test_ports(&[80, 80], 2222).is_err());
+        assert!(validate_test_ports(&[loopback(0)], 2222).is_err());
+        assert!(validate_test_ports(&[loopback(2222)], 2222).is_err());
+        assert!(validate_test_ports(&[loopback(22)], 2222).is_err());
+        assert!(validate_test_ports(&[loopback(80), loopback(80)], 2222).is_err());
+        // duplicate port number regardless of address
+        assert!(validate_test_ports(
+            &[
+                loopback(80),
+                PortSpec {
+                    addr: "0.0.0.0".into(),
+                    port: 80
+                }
+            ],
+            2222
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn test_config_ports_validation_accepts_distinct_ports() {
+        assert!(validate_test_ports(
+            &[
+                loopback(80),
+                PortSpec {
+                    addr: "0.0.0.0".into(),
+                    port: 9901
+                }
+            ],
+            2222
+        )
+        .is_ok());
     }
 }

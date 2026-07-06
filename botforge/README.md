@@ -71,13 +71,18 @@ For `botforge test`, the `isos:` list in test config supports two forms:
   and run the bootstrap script with `sudo` before configured `steps:`.
 
 `botforge test` also supports an optional `ports:` list for additional guest
-TCP forwards to the harness. Each guest port `N` is forwarded 1:1 to
-`127.0.0.1:N` where botforge runs (no host:guest remapping). Guest SSH on
+TCP forwards to the harness. Each entry is either a bare integer guest port
+(bound on `127.0.0.1`, reachable only inside the botforge container) or an
+`"<addr>:<port>"` string that sets the bind address explicitly (e.g.
+`"0.0.0.0:80"` to make the port reachable by sibling containers on the same
+compose network). The guest port always equals the host port — no host:guest
+remapping. External port remapping is a compose-layer concern. Guest SSH on
 `:22` is always forwarded automatically via `--ssh-port`.
 
 ```yaml
 ports:
-  - 80
+  - 80              # bind 127.0.0.1:80 -> guest :80  (loopback only)
+  - "0.0.0.0:9901"  # bind 0.0.0.0:9901 -> guest :9901 (all interfaces)
 steps:
   - name: check-edge
     run: curl -fsS http://127.0.0.1/

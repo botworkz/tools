@@ -1,9 +1,57 @@
 use anyhow::{bail, Context, Result};
+use serde::de::{self, Deserializer};
+use serde::Deserialize;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
 use crate::util::run_command;
+
+/// A forwarded port specification: a bind address and a port number.
+///
+/// Deserializes from either a bare integer (loopback bind) or a `"<addr>:<port>"` string.
+#[derive(Debug, PartialEq)]
+pub(crate) struct PortSpec {
+    pub(crate) addr: String,
+    pub(crate) port: u16,
+}
+
+impl<'de> Deserialize<'de> for PortSpec {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Int(u16),
+            Str(String),
+        }
+        match Raw::deserialize(deserializer)? {
+            Raw::Int(port) => Ok(PortSpec {
+                addr: "127.0.0.1".into(),
+                port,
+            }),
+            Raw::Str(s) => {
+                let colon = s.rfind(':').ok_or_else(|| {
+                    de::Error::custom(format!(
+                        "invalid port spec {s:?}: expected \"<addr>:<port>\" or a bare integer"
+                    ))
+                })?;
+                let addr = s[..colon].to_string();
+                let port_str = &s[colon + 1..];
+                if addr.is_empty() {
+                    return Err(de::Error::custom(format!(
+                        "invalid port spec {s:?}: address must not be empty"
+                    )));
+                }
+                let port = port_str.parse::<u16>().map_err(|_| {
+                    de::Error::custom(format!(
+                        "invalid port spec {s:?}: port {port_str:?} is not a valid port number (1-65535)"
+                    ))
+                })?;
+                Ok(PortSpec { addr, port })
+            }
+        }
+    }
+}
 
 pub(crate) fn require_kvm() -> Result<()> {
     if !Path::new("/dev/kvm").exists() {
@@ -42,7 +90,7 @@ pub(crate) fn qemu_run_args(
     seed_iso: &Path,
     extra_isos: &[PathBuf],
     ssh_port: u16,
-    extra_ports: &[u16],
+    extra_ports: &[PortSpec],
 ) -> Vec<String> {
     let mut args = vec![
         "-accel".into(),
@@ -63,8 +111,11 @@ pub(crate) fn qemu_run_args(
         args.push(format!("file={},media=cdrom,readonly=on", iso.display()));
     }
     let mut netdev = format!("user,id=net0,hostfwd=tcp:127.0.0.1:{ssh_port}-:22");
-    for port in extra_ports {
-        netdev.push_str(&format!(",hostfwd=tcp:127.0.0.1:{port}-:{port}"));
+    for spec in extra_ports {
+        netdev.push_str(&format!(
+            ",hostfwd=tcp:{}:{}-:{}",
+            spec.addr, spec.port, spec.port
+        ));
     }
 
     args.extend([
@@ -93,8 +144,22 @@ pub(crate) fn spawn_qemu_with_log(args: &[String], log_path: &Path) -> Result<Ch
 
 #[cfg(test)]
 mod tests {
-    use super::{qemu_img_create_args, qemu_run_args};
+    use super::{qemu_img_create_args, qemu_run_args, PortSpec};
     use std::path::{Path, PathBuf};
+
+    fn loopback(port: u16) -> PortSpec {
+        PortSpec {
+            addr: "127.0.0.1".into(),
+            port,
+        }
+    }
+
+    fn allif(port: u16) -> PortSpec {
+        PortSpec {
+            addr: "0.0.0.0".into(),
+            port,
+        }
+    }
 
     #[test]
     fn qemu_img_create_args_match_expected_argv() {
@@ -159,12 +224,44 @@ mod tests {
             Path::new("/seed.iso"),
             &[PathBuf::from("/payload.iso")],
             2222,
-            &[80],
+            &[loopback(80)],
         );
         let netdev_index = args.iter().position(|arg| arg == "-netdev").unwrap() + 1;
         assert_eq!(
             args[netdev_index],
             "user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22,hostfwd=tcp:127.0.0.1:80-:80"
+        );
+    }
+
+    #[test]
+    fn qemu_run_args_extra_host_forward_with_custom_addr() {
+        let args = qemu_run_args(
+            Path::new("/overlay.qcow2"),
+            Path::new("/seed.iso"),
+            &[],
+            2222,
+            &[allif(9901)],
+        );
+        let netdev_index = args.iter().position(|arg| arg == "-netdev").unwrap() + 1;
+        assert_eq!(
+            args[netdev_index],
+            "user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22,hostfwd=tcp:0.0.0.0:9901-:9901"
+        );
+    }
+
+    #[test]
+    fn qemu_run_args_extra_host_forwards_mixed() {
+        let args = qemu_run_args(
+            Path::new("/overlay.qcow2"),
+            Path::new("/seed.iso"),
+            &[],
+            2222,
+            &[loopback(80), allif(9901)],
+        );
+        let netdev_index = args.iter().position(|arg| arg == "-netdev").unwrap() + 1;
+        assert_eq!(
+            args[netdev_index],
+            "user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22,hostfwd=tcp:127.0.0.1:80-:80,hostfwd=tcp:0.0.0.0:9901-:9901"
         );
     }
 }
