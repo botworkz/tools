@@ -77,7 +77,9 @@ TCP forwards to the harness. Each entry is either a bare integer guest port
 `"0.0.0.0:80"` to make the port reachable by sibling containers on the same
 compose network). The guest port always equals the host port — no host:guest
 remapping. External port remapping is a compose-layer concern. Guest SSH on
-`:22` is always forwarded automatically via `--ssh-port`.
+`:22` is always forwarded automatically via `--ssh-port`, bound to `0.0.0.0`
+on the botforge container so it is reachable from the host and sibling
+containers on the compose network.
 
 ```yaml
 ports:
