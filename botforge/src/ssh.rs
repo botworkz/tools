@@ -205,13 +205,54 @@ pub(crate) fn retry_transport_cmd(
     }
 }
 
+/// Like [`retry_transport_cmd`] but captures and returns stdout on success.
+fn retry_transport_cmd_capture(
+    program: &str,
+    args: &[String],
+    retries: usize,
+    retry_delay: Duration,
+    failure_context: &str,
+) -> Result<String> {
+    let mut attempts = 0usize;
+    loop {
+        let output = Command::new(program)
+            .args(args)
+            .output()
+            .with_context(|| format!("failed to execute {program}"))?;
+        if output.status.success() {
+            return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
+        }
+        attempts += 1;
+        if output.status.code() != Some(255) || attempts >= retries {
+            bail!("{failure_context} (exit status: {})", output.status);
+        }
+        std::thread::sleep(retry_delay);
+    }
+}
+
+/// Run a remote SSH command and return its stdout as a `String`.
+///
+/// Uses the same retry/timeout semantics as [`ssh_with_retry`] but captures
+/// stdout instead of inheriting it.
+pub(crate) fn ssh_capture_stdout(
+    ssh: &SshOptions,
+    remote_command: &str,
+    retries: usize,
+    retry_delay: Duration,
+    connect_timeout: Duration,
+) -> Result<String> {
+    let args = ssh_command_args(ssh, remote_command, connect_timeout.as_secs());
+    retry_transport_cmd_capture("ssh", &args, retries, retry_delay, "ssh command failed")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        journalctl_command, scp_command_args_with_verbose, ssh_command_args_with_verbose,
-        SshOptions,
+        journalctl_command, retry_transport_cmd_capture, scp_command_args_with_verbose,
+        ssh_command_args_with_verbose, SshOptions,
     };
     use std::path::Path;
+    use std::time::Duration;
 
     fn test_ssh_opts() -> SshOptions {
         SshOptions {
@@ -327,5 +368,21 @@ mod tests {
             cmd,
             "sudo journalctl -u ssh -u botwork-launcher --no-pager -n 200"
         );
+    }
+
+    #[test]
+    fn retry_transport_cmd_capture_returns_stdout_on_success() {
+        let args: Vec<String> = vec!["hello from capture".to_string()];
+        let result =
+            retry_transport_cmd_capture("echo", &args, 1, Duration::from_secs(0), "echo failed");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().trim(), "hello from capture");
+    }
+
+    #[test]
+    fn retry_transport_cmd_capture_fails_on_nonzero_exit() {
+        let result =
+            retry_transport_cmd_capture("false", &[], 1, Duration::from_secs(0), "expected fail");
+        assert!(result.is_err());
     }
 }
