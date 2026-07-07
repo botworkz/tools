@@ -13,8 +13,8 @@ use crate::qemu::{
     create_overlay_image, qemu_run_args, require_kvm, spawn_qemu_with_log, PortSpec,
 };
 use crate::ssh::{
-    journalctl_command, require_stable_ssh, scp_with_retry, ssh_with_retry, wait_for_ssh,
-    SshOptions,
+    journalctl_command, require_stable_ssh, scp_with_retry, ssh_capture_stdout, ssh_with_retry,
+    wait_for_ssh, SshOptions,
 };
 use crate::util::{create_temp_dir, ensure_command, resolve_under_root, unique_suffix};
 
@@ -266,6 +266,9 @@ fn run_test_flow(
         .with_context(|| format!("iso bootstrap script failed for label {}", bootstrap.label))?;
     }
 
+    // Shared ordered env map threaded across all steps (both guest and host).
+    let mut accumulated_env: Vec<(String, String)> = Vec::new();
+
     for (step_idx, step) in config.steps.iter().enumerate() {
         match step.target {
             StepTarget::Guest => {
@@ -284,10 +287,15 @@ fn run_test_flow(
                 let suffix = unique_suffix();
                 let local_script =
                     std::env::temp_dir().join(format!("botforge-step-{step_idx}-{suffix}.sh"));
-                std::fs::write(&local_script, step.run.as_bytes()).with_context(|| {
+                let remote_script = format!("/tmp/botforge-step-{step_idx}-{suffix}.sh");
+                let remote_env_path = format!("/tmp/botforge-env-{step_idx}-{suffix}");
+
+                // Prepend env preamble (exports + BOTFORGE_ENV setup) to the script body.
+                let preamble = build_guest_env_preamble(&accumulated_env, &remote_env_path);
+                let script_content = format!("{preamble}{}", step.run);
+                std::fs::write(&local_script, script_content.as_bytes()).with_context(|| {
                     format!("test step '{}': failed to write script file", step.name)
                 })?;
-                let remote_script = format!("/tmp/botforge-step-{step_idx}-{suffix}.sh");
 
                 let template = resolve_shell(step.shell.as_deref())
                     .expect("shell already validated at config load");
@@ -325,10 +333,29 @@ fn run_test_flow(
                     scp_result
                 };
 
-                // Best-effort cleanup: remote script, then local temp file.
+                // On success, read back the remote env file and merge into accumulated env.
+                if step_result.is_ok() {
+                    if let Ok(env_contents) = ssh_capture_stdout(
+                        ssh,
+                        &format!("cat {}", shell_single_quote(&remote_env_path)),
+                        1,
+                        Duration::from_secs(0),
+                        Duration::from_secs(10),
+                    ) {
+                        if let Ok(new_entries) = parse_env_file(&env_contents) {
+                            env_merge(&mut accumulated_env, new_entries);
+                        }
+                    }
+                }
+
+                // Best-effort cleanup: remote env file, remote script, then local temp file.
                 let _ = ssh_with_retry(
                     ssh,
-                    &format!("rm -f {}", shell_single_quote(&remote_script)),
+                    &format!(
+                        "rm -f {} {}",
+                        shell_single_quote(&remote_env_path),
+                        shell_single_quote(&remote_script)
+                    ),
                     1,
                     Duration::from_secs(0),
                     Duration::from_secs(10),
@@ -340,14 +367,32 @@ fn run_test_flow(
             StepTarget::Host => {
                 let template = resolve_shell(step.shell.as_deref())
                     .expect("shell already validated at config load");
-                run_host_step(
+                let suffix = unique_suffix();
+                let env_file = std::env::temp_dir().join(format!("botforge-host-env-{suffix}"));
+                let step_result = run_host_step(
                     &step.name,
                     &step.run,
                     repo_root,
                     Duration::from_secs(300),
                     &template,
+                    &accumulated_env,
+                    &env_file,
                 )
-                .with_context(|| format!("test step '{}' command failed", step.name))?;
+                .with_context(|| format!("test step '{}' command failed", step.name));
+
+                // On success, parse the local env file and merge into accumulated env.
+                if step_result.is_ok() {
+                    if let Ok(contents) = std::fs::read_to_string(&env_file) {
+                        if let Ok(new_entries) = parse_env_file(&contents) {
+                            env_merge(&mut accumulated_env, new_entries);
+                        }
+                    }
+                }
+
+                // Best-effort cleanup of the local env file.
+                let _ = std::fs::remove_file(&env_file);
+
+                step_result?;
             }
         }
     }
@@ -410,14 +455,22 @@ fn validate_test_steps(steps: &[TestStep], ports: &[PortSpec]) -> Result<()> {
 
 /// Run a step locally in the botforge container (harness) with a plain execution timeout.
 /// `run` is written to a temp file and executed via `template` (argv with `{0}` slot).
-/// The working directory is `repo_root`. Inherits the current process environment.
+/// The working directory is `repo_root`. Inherits the current process environment, with
+/// `accumulated_env` injected (overriding inherited values) and `BOTFORGE_ENV` pointing at
+/// `env_file` so the step can write new key-value pairs for later steps to consume.
 fn run_host_step(
     name: &str,
     run: &str,
     repo_root: &Path,
     timeout: Duration,
     template: &[String],
+    accumulated_env: &[(String, String)],
+    env_file: &Path,
 ) -> Result<()> {
+    // Create/truncate the env file so `>>` always works inside the step.
+    std::fs::write(env_file, b"")
+        .with_context(|| format!("failed to create env file for host step '{name}'"))?;
+
     let script = std::env::temp_dir().join(format!("botforge-host-step-{}.sh", unique_suffix()));
     std::fs::write(&script, run.as_bytes())
         .with_context(|| format!("failed to write script file for host step '{name}'"))?;
@@ -436,6 +489,12 @@ fn run_host_step(
     let mut child = std::process::Command::new(&argv[0])
         .args(&argv[1..])
         .current_dir(repo_root)
+        .env("BOTFORGE_ENV", env_file)
+        .envs(
+            accumulated_env
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str())),
+        )
         .spawn()
         .with_context(|| format!("failed to spawn host step '{name}'"))?;
 
@@ -568,13 +627,104 @@ fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
+/// Parse a `$GITHUB_ENV`-style env file, returning key-value pairs in insertion order.
+///
+/// Supported formats:
+/// - **Single-line:** `KEY=value` — key is everything before the first `=`; value is
+///   everything after (may contain `=`; no trimming).
+/// - **Heredoc / multiline:** `KEY<<DELIMITER` followed by lines of value text ending
+///   at a line equal to `DELIMITER`. The value is the lines joined with `\n` (no
+///   trailing newline added). The delimiter line itself is consumed and not included.
+///
+/// Blank lines and lines that match neither format are skipped.
+pub(crate) fn parse_env_file(contents: &str) -> Result<Vec<(String, String)>> {
+    let mut result: Vec<(String, String)> = Vec::new();
+    let lines: Vec<&str> = contents.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        if line.is_empty() {
+            i += 1;
+            continue;
+        }
+        // Check for heredoc: KEY<<DELIMITER (no '=' before '<<')
+        let eq_pos = line.find('=');
+        let heredoc_pos = line.find("<<");
+        if let Some(hpos) = heredoc_pos {
+            let before_heredoc = &line[..hpos];
+            if !before_heredoc.is_empty()
+                && eq_pos.is_none_or(|ep| ep > hpos)
+                && !before_heredoc.contains('=')
+            {
+                let key = before_heredoc;
+                let delimiter = &line[hpos + 2..];
+                if !delimiter.is_empty() {
+                    i += 1;
+                    let mut value_lines: Vec<&str> = Vec::new();
+                    while i < lines.len() && lines[i] != delimiter {
+                        value_lines.push(lines[i]);
+                        i += 1;
+                    }
+                    if i >= lines.len() {
+                        anyhow::bail!("unterminated heredoc for key '{key}'");
+                    }
+                    i += 1; // consume the delimiter line
+                    result.push((key.to_string(), value_lines.join("\n")));
+                    continue;
+                }
+            }
+        }
+        // Single-line: KEY=value
+        if let Some(eq) = eq_pos {
+            let key = &line[..eq];
+            let value = &line[eq + 1..];
+            if !key.is_empty() {
+                result.push((key.to_string(), value.to_string()));
+            }
+        }
+        i += 1;
+    }
+    Ok(result)
+}
+
+/// Merge `new_entries` into `accumulated`, updating existing keys in-place and
+/// appending new keys at the end (insertion-ordered, last-write-wins).
+fn env_merge(accumulated: &mut Vec<(String, String)>, new_entries: Vec<(String, String)>) {
+    for (key, value) in new_entries {
+        if let Some(entry) = accumulated.iter_mut().find(|(k, _)| k == &key) {
+            entry.1 = value;
+        } else {
+            accumulated.push((key, value));
+        }
+    }
+}
+
+/// Build the shell preamble that exports all accumulated env vars and sets up
+/// `BOTFORGE_ENV` pointing at `remote_env_path` for a guest step script.
+fn build_guest_env_preamble(accumulated_env: &[(String, String)], remote_env_path: &str) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    for (key, value) in accumulated_env {
+        lines.push(format!("export {}={}", key, shell_single_quote(value)));
+    }
+    lines.push(format!(
+        "export BOTFORGE_ENV={}",
+        shell_single_quote(remote_env_path)
+    ));
+    lines.push(": > \"$BOTFORGE_ENV\"".to_string());
+    let mut preamble = lines.join("\n");
+    preamble.push('\n');
+    preamble
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        default_bootstrap_path, resolve_shell, run_host_step, validate_test_ports,
-        validate_test_steps, StepTarget, TestConfig, TestIso, TestStep, TestUpload,
+        build_guest_env_preamble, default_bootstrap_path, env_merge, parse_env_file, resolve_shell,
+        run_host_step, shell_single_quote, validate_test_ports, validate_test_steps, StepTarget,
+        TestConfig, TestIso, TestStep, TestUpload,
     };
     use crate::qemu::PortSpec;
+    use crate::util::unique_suffix;
     use std::path::PathBuf;
     use std::time::Duration;
 
@@ -1102,18 +1252,26 @@ steps:
 
     // --- host step execution ---
 
+    fn tmp_env_file() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("botforge-test-env-{}.env", unique_suffix()))
+    }
+
     #[test]
     fn test_host_step_sh_false_fails() {
         let dir = tempfile::tempdir().unwrap();
         let tmpl = resolve_shell(Some("sh")).unwrap();
+        let env_file = tmp_env_file();
         let err = run_host_step(
             "fail-step",
             "false",
             dir.path(),
             Duration::from_secs(10),
             &tmpl,
+            &[],
+            &env_file,
         )
         .unwrap_err();
+        let _ = std::fs::remove_file(&env_file);
         assert!(
             err.to_string().contains("fail-step"),
             "error should mention step name: {err}"
@@ -1124,8 +1282,18 @@ steps:
     fn test_host_step_exit_nonzero_fails() {
         let dir = tempfile::tempdir().unwrap();
         let tmpl = resolve_shell(Some("sh")).unwrap();
-        let err =
-            run_host_step("bad", "exit 3", dir.path(), Duration::from_secs(10), &tmpl).unwrap_err();
+        let env_file = tmp_env_file();
+        let err = run_host_step(
+            "bad",
+            "exit 3",
+            dir.path(),
+            Duration::from_secs(10),
+            &tmpl,
+            &[],
+            &env_file,
+        )
+        .unwrap_err();
+        let _ = std::fs::remove_file(&env_file);
         assert!(
             err.to_string().contains("bad"),
             "error should mention step name: {err}"
@@ -1138,14 +1306,18 @@ steps:
         // command must fail the step even though the last command would succeed.
         let dir = tempfile::tempdir().unwrap();
         let tmpl = resolve_shell(None).unwrap();
+        let env_file = tmp_env_file();
         let err = run_host_step(
             "mid-fail",
             "false\necho ok\n",
             dir.path(),
             Duration::from_secs(10),
             &tmpl,
+            &[],
+            &env_file,
         )
         .unwrap_err();
+        let _ = std::fs::remove_file(&env_file);
         assert!(
             err.to_string().contains("mid-fail"),
             "error should mention step name: {err}"
@@ -1156,7 +1328,66 @@ steps:
     fn test_host_step_success() {
         let dir = tempfile::tempdir().unwrap();
         let tmpl = resolve_shell(None).unwrap();
-        assert!(run_host_step("ok", "true", dir.path(), Duration::from_secs(10), &tmpl).is_ok());
+        let env_file = tmp_env_file();
+        let result = run_host_step(
+            "ok",
+            "true",
+            dir.path(),
+            Duration::from_secs(10),
+            &tmpl,
+            &[],
+            &env_file,
+        );
+        let _ = std::fs::remove_file(&env_file);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_host_step_injects_accumulated_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmpl = resolve_shell(None).unwrap();
+        let env_file = tmp_env_file();
+        let accumulated = vec![
+            ("MY_VAR".to_string(), "hello world".to_string()),
+            ("ANOTHER".to_string(), "42".to_string()),
+        ];
+        let result = run_host_step(
+            "env-check",
+            r#"test "$MY_VAR" = "hello world" && test "$ANOTHER" = "42""#,
+            dir.path(),
+            Duration::from_secs(10),
+            &tmpl,
+            &accumulated,
+            &env_file,
+        );
+        let _ = std::fs::remove_file(&env_file);
+        assert!(
+            result.is_ok(),
+            "accumulated env vars should be visible in host step: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_host_step_botforge_env_is_set_and_writable() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmpl = resolve_shell(None).unwrap();
+        let env_file = tmp_env_file();
+        let result = run_host_step(
+            "write-env",
+            r#"echo "WRITTEN=yes" >> "$BOTFORGE_ENV""#,
+            dir.path(),
+            Duration::from_secs(10),
+            &tmpl,
+            &[],
+            &env_file,
+        );
+        let contents = std::fs::read_to_string(&env_file).unwrap_or_default();
+        let _ = std::fs::remove_file(&env_file);
+        assert!(result.is_ok(), "step should succeed: {result:?}");
+        assert!(
+            contents.contains("WRITTEN=yes"),
+            "env file should contain written value, got: {contents:?}"
+        );
     }
 
     #[test]
@@ -1169,5 +1400,220 @@ steps:
             msg.contains("fish"),
             "error should mention shell name: {msg}"
         );
+    }
+
+    // --- parse_env_file ---
+
+    #[test]
+    fn test_parse_env_file_empty() {
+        let result = parse_env_file("").unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_parse_env_file_single_line() {
+        let result = parse_env_file("FOO=bar\n").unwrap();
+        assert_eq!(result, vec![("FOO".to_string(), "bar".to_string())]);
+    }
+
+    #[test]
+    fn test_parse_env_file_value_contains_equals() {
+        let result = parse_env_file("URL=https://example.com/a=1&b=2\n").unwrap();
+        assert_eq!(
+            result,
+            vec![("URL".to_string(), "https://example.com/a=1&b=2".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_parse_env_file_value_preserves_interior_spaces() {
+        let result = parse_env_file("MSG=  hello world  \n").unwrap();
+        assert_eq!(
+            result,
+            vec![("MSG".to_string(), "  hello world  ".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_parse_env_file_multiple_single_line() {
+        let result = parse_env_file("A=1\nB=2\nC=3\n").unwrap();
+        assert_eq!(
+            result,
+            vec![
+                ("A".to_string(), "1".to_string()),
+                ("B".to_string(), "2".to_string()),
+                ("C".to_string(), "3".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_env_file_skips_blank_lines() {
+        let result = parse_env_file("\nA=1\n\nB=2\n\n").unwrap();
+        assert_eq!(
+            result,
+            vec![
+                ("A".to_string(), "1".to_string()),
+                ("B".to_string(), "2".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_env_file_heredoc_basic() {
+        let input = "BODY<<EOF\nline1\nline2\nEOF\n";
+        let result = parse_env_file(input).unwrap();
+        assert_eq!(
+            result,
+            vec![("BODY".to_string(), "line1\nline2".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_parse_env_file_heredoc_custom_delimiter() {
+        let input = "MSG<<ENDOFMSG\nhello\nworld\nENDOFMSG\n";
+        let result = parse_env_file(input).unwrap();
+        assert_eq!(
+            result,
+            vec![("MSG".to_string(), "hello\nworld".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_parse_env_file_heredoc_single_line_value() {
+        let input = "KEY<<DELIM\nonly line\nDELIM\n";
+        let result = parse_env_file(input).unwrap();
+        assert_eq!(result, vec![("KEY".to_string(), "only line".to_string())]);
+    }
+
+    #[test]
+    fn test_parse_env_file_heredoc_empty_value() {
+        let input = "KEY<<DELIM\nDELIM\n";
+        let result = parse_env_file(input).unwrap();
+        assert_eq!(result, vec![("KEY".to_string(), "".to_string())]);
+    }
+
+    #[test]
+    fn test_parse_env_file_mixed_single_and_heredoc() {
+        let input = "A=1\nBODY<<EOF\nline1\nline2\nEOF\nZ=last\n";
+        let result = parse_env_file(input).unwrap();
+        assert_eq!(
+            result,
+            vec![
+                ("A".to_string(), "1".to_string()),
+                ("BODY".to_string(), "line1\nline2".to_string()),
+                ("Z".to_string(), "last".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_env_file_unterminated_heredoc_is_error() {
+        let input = "KEY<<DELIM\nsome line\n";
+        assert!(parse_env_file(input).is_err());
+    }
+
+    #[test]
+    fn test_parse_env_file_value_with_heredoc_markers_in_single_line() {
+        // Single-line value that contains "<<" should be treated as single-line
+        // because there's an "=" before the "<<".
+        let input = "KEY=value<<not-heredoc\n";
+        let result = parse_env_file(input).unwrap();
+        assert_eq!(
+            result,
+            vec![("KEY".to_string(), "value<<not-heredoc".to_string())]
+        );
+    }
+
+    // --- env_merge ---
+
+    #[test]
+    fn test_env_merge_appends_new_keys() {
+        let mut acc: Vec<(String, String)> = vec![("A".to_string(), "1".to_string())];
+        env_merge(&mut acc, vec![("B".to_string(), "2".to_string())]);
+        assert_eq!(
+            acc,
+            vec![
+                ("A".to_string(), "1".to_string()),
+                ("B".to_string(), "2".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_env_merge_updates_existing_key_in_place() {
+        let mut acc: Vec<(String, String)> = vec![
+            ("A".to_string(), "old".to_string()),
+            ("B".to_string(), "keep".to_string()),
+        ];
+        env_merge(&mut acc, vec![("A".to_string(), "new".to_string())]);
+        // A's value updated; B preserved; order unchanged
+        assert_eq!(
+            acc,
+            vec![
+                ("A".to_string(), "new".to_string()),
+                ("B".to_string(), "keep".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_env_merge_empty_new_entries_is_noop() {
+        let mut acc: Vec<(String, String)> = vec![("A".to_string(), "1".to_string())];
+        env_merge(&mut acc, vec![]);
+        assert_eq!(acc, vec![("A".to_string(), "1".to_string())]);
+    }
+
+    #[test]
+    fn test_env_merge_last_write_wins_for_duplicate_new_keys() {
+        let mut acc: Vec<(String, String)> = vec![];
+        env_merge(
+            &mut acc,
+            vec![
+                ("X".to_string(), "first".to_string()),
+                ("X".to_string(), "second".to_string()),
+            ],
+        );
+        // Second write overwrites first; X appears once
+        assert_eq!(acc, vec![("X".to_string(), "second".to_string())]);
+    }
+
+    // --- build_guest_env_preamble ---
+
+    #[test]
+    fn test_build_guest_env_preamble_empty_env() {
+        let preamble = build_guest_env_preamble(&[], "/tmp/botforge-env-1");
+        assert!(preamble.contains("export BOTFORGE_ENV='/tmp/botforge-env-1'"));
+        assert!(preamble.contains(": > \"$BOTFORGE_ENV\""));
+        // No extra export lines when accumulated env is empty
+        assert!(!preamble.contains("export A="));
+    }
+
+    #[test]
+    fn test_build_guest_env_preamble_exports_accumulated_vars() {
+        let acc = vec![
+            ("FOO".to_string(), "bar".to_string()),
+            ("MSG".to_string(), "hello world".to_string()),
+        ];
+        let preamble = build_guest_env_preamble(&acc, "/tmp/env");
+        assert!(
+            preamble.contains("export FOO='bar'"),
+            "preamble: {preamble}"
+        );
+        assert!(
+            preamble.contains("export MSG='hello world'"),
+            "preamble: {preamble}"
+        );
+        assert!(preamble.contains("export BOTFORGE_ENV="));
+        assert!(preamble.contains(": > \"$BOTFORGE_ENV\""));
+    }
+
+    #[test]
+    fn test_build_guest_env_preamble_quotes_special_chars() {
+        let acc = vec![("VAL".to_string(), "it's a value".to_string())];
+        let preamble = build_guest_env_preamble(&acc, "/tmp/env");
+        // shell_single_quote escapes embedded single quotes
+        let expected = format!("export VAL={}", shell_single_quote("it's a value"));
+        assert!(preamble.contains(&expected), "preamble: {preamble}");
     }
 }
