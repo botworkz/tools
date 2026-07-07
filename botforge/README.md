@@ -106,9 +106,44 @@ Steps execute in the exact order written; guest and host steps may interleave
 freely. This lets you flip guest state, hit the guest from outside, then
 restore — all in a single ordered sequence.
 
+#### Reusable step fragments with `uses:`
+
+`botforge test` can splice a reusable list of steps from another YAML file in
+the same repository:
+
+- `uses: "@://path/within/repo.yaml"` resolves from the explicit
+  `--repo-root` passed to `botforge test`.
+- The referenced file must itself be a YAML **list of steps**.
+- `inputs:` provides string substitutions for `${{ inputs.NAME }}` placeholders
+  inside the included fragment before validation.
+- Runtime `${VAR}` expansion is unchanged; only `${{ ... }}` is handled at load
+  time.
+
+```yaml
+# test.yaml
+steps:
+  - uses: "@://smoke/vm-narrative.steps.yaml"
+    inputs:
+      target: ingress
+      shell: bash
+```
+
+```yaml
+# smoke/vm-narrative.steps.yaml
+- on: guest
+  name: "narrative-${{ inputs.target }}"
+  shell: ${{ inputs.shell }}
+  run: |
+    echo "${USER}"   # runtime env expansion, unchanged
+    ./smoke-${{ inputs.target }}.sh
+```
+
+For this first iteration, `@://` is the only supported `uses:` scheme. Plain
+filesystem paths, `../` traversal, and other schemes are rejected.
+
 Config errors are reported at load time for: missing or invalid `on:`; `uploads:`
 on an `on: host` step; any `on: host` step present when `ports:` is empty;
-invalid `shell:` value.
+invalid `shell:` value; invalid `uses:` scheme/path; missing include inputs.
 
 On **any** step failure (guest or host) the usual guest diagnostics are
 collected (`systemctl --failed`, `journalctl`, `cloud-init status`, VM log
