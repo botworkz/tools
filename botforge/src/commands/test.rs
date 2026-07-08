@@ -305,13 +305,8 @@ fn run_test_flow(
 
     for (step_idx, step) in config.steps.iter().enumerate() {
         let step_log_path = step_log_path(&step_log_dir, step_idx, &step.name);
-        File::create(&step_log_path).with_context(|| {
-            format!(
-                "failed to create step log file for test step '{}': {}",
-                step.name,
-                step_log_path.display()
-            )
-        })?;
+        // The file is created by StepLogWriter::create inside each step runner;
+        // no pre-creation needed here (the directory was already created above).
         let step_result = match step.target {
             StepTarget::Guest => (|| -> Result<()> {
                 for upload in &step.uploads {
@@ -680,6 +675,10 @@ impl StepLogWriter {
     }
 
     fn log_line(&self, stream: StepOutputStream, line: &[u8]) -> Result<()> {
+        // Compute the timestamp and lossy-convert the line *before* acquiring
+        // the lock so formatting latency is not serialised across both threads.
+        let ts = step_log_timestamp()?;
+        let line_str = String::from_utf8_lossy(line).into_owned();
         let mut inner = self
             .inner
             .lock()
@@ -687,15 +686,17 @@ impl StepLogWriter {
         serde_json::to_writer(
             &mut *inner,
             &StepLogRecord {
-                ts: step_log_timestamp()?,
+                ts,
                 stream: stream.as_str(),
-                line: String::from_utf8_lossy(line).into_owned(),
+                line: line_str,
             },
         )
         .context("failed to serialize step log record")?;
         inner
             .write_all(b"\n")
             .context("failed to write step log newline")?;
+        // Flush after each line for crash-safety: if the step is killed, all
+        // prior lines are still visible in the JSONL file.
         inner.flush().context("failed to flush step log")?;
         Ok(())
     }
@@ -749,6 +750,48 @@ fn spawn_output_forwarder<R: Read + Send + 'static>(
     })
 }
 
+/// Write all bytes of `buf` to `writer`, retrying on non-blocking back-pressure.
+///
+/// Unlike the stdlib `write_all`, this handles:
+/// - Partial writes (advances past the written bytes and continues).
+/// - `WouldBlock` / `EAGAIN` (fd not ready): sleeps a short backoff and retries
+///   the **same remaining bytes** — no data is dropped or reordered.
+/// - `Interrupted` / `EINTR`: retries immediately.
+/// - Any other error: returned to the caller.
+///
+/// This is used for the live-console tee path, where botforge's own inherited
+/// stdout/stderr fd may be in non-blocking mode (common under PTYs, process
+/// supervisors, and some container runtimes).
+fn write_all_resilient<W: Write>(writer: &mut W, mut buf: &[u8]) -> std::io::Result<()> {
+    use std::io::ErrorKind;
+    let mut backoff = Duration::from_millis(1);
+    while !buf.is_empty() {
+        match writer.write(buf) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    ErrorKind::WriteZero,
+                    "write returned zero bytes",
+                ));
+            }
+            Ok(n) => {
+                buf = &buf[n..];
+                // Reset backoff after making forward progress.
+                backoff = Duration::from_millis(1);
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => {
+                // EINTR: retry immediately with the same slice.
+            }
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                // EAGAIN: fd not ready. Sleep briefly and retry the same bytes.
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(Duration::from_millis(10));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 fn stream_child_output<R: Read, W: Write>(
     mut reader: R,
     mut writer: W,
@@ -765,10 +808,13 @@ fn stream_child_output<R: Read, W: Write>(
             break;
         }
         let slice = &chunk[..bytes_read];
-        writer
-            .write_all(slice)
+        // Use the resilient writer so a non-blocking console fd (EAGAIN / os
+        // error 11) causes a brief back-off retry instead of a fatal error.
+        write_all_resilient(&mut writer, slice)
             .context("failed to forward child process output")?;
-        writer.flush().context("failed to flush forwarded output")?;
+        // No per-chunk flush on the console side: the terminal/pipe receives
+        // bytes as written; flushing every chunk adds syscall pressure without
+        // correctness benefit. The JSONL log is flushed per-line below.
         pending.extend_from_slice(slice);
         while let Some(pos) = pending.iter().position(|&b| b == b'\n') {
             let mut line = pending.drain(..=pos).collect::<Vec<_>>();
@@ -821,6 +867,8 @@ fn run_ssh_step_with_step_log(
     retries: usize,
     retry_delay: Duration,
 ) -> Result<()> {
+    // 300s execution timeout per attempt, matching the host-step ceiling.
+    const SSH_STEP_TIMEOUT: Duration = Duration::from_secs(300);
     let logger = Arc::new(StepLogWriter::create(log_path)?);
     let mut attempts = 0usize;
     loop {
@@ -828,12 +876,51 @@ fn run_ssh_step_with_step_log(
         command.args(&args);
         let (mut child, forwarders) =
             spawn_logged_child(&mut command, Arc::clone(&logger), "failed to execute ssh")?;
-        let status = child.wait().context("failed to wait for ssh")?;
-        join_output_forwarders(forwarders)?;
+
+        // Poll with a bounded deadline; kill and surface a timeout error if
+        // the step does not exit within SSH_STEP_TIMEOUT.
+        let deadline = Instant::now() + SSH_STEP_TIMEOUT;
+        let wait_result: Result<Option<std::process::ExitStatus>> = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Ok(Some(status)),
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break Ok(None); // None signals timeout
+                    }
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+                Err(e) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    // Convert to anyhow and break; forwarders joined below.
+                    break Err(anyhow::Error::new(e).context("failed to wait for ssh"));
+                }
+            }
+        };
+
+        // Always join forwarders so threads and pipes are cleaned up on every
+        // exit path. Forwarder errors are suppressed — the step result wins
+        // (see Bug 3 fix; WouldBlock is no longer an error after Bug 1 fix).
+        let _ = join_output_forwarders(forwarders);
+
+        let status = match wait_result? {
+            None => {
+                anyhow::bail!(
+                    "ssh step timed out after {}s",
+                    SSH_STEP_TIMEOUT.as_secs()
+                );
+            }
+            Some(s) => s,
+        };
+
         if status.success() {
             return Ok(());
         }
         attempts += 1;
+        // Non-255 exit or retries exhausted → hard failure. Retry only on 255
+        // (SSH transport error) to match retry_transport_cmd semantics.
         if status.code() != Some(255) || attempts >= retries {
             anyhow::bail!("ssh command failed (exit status: {status})");
         }
@@ -925,9 +1012,15 @@ fn run_host_step(
         }
     };
 
-    join_output_forwarders(forwarders)?;
+    // Join forwarders unconditionally — threads and pipes must be cleaned up
+    // on every exit path (success, failure, timeout). Forwarder errors are
+    // suppressed here: step_result is the source of truth for the step outcome.
+    // A forwarder/tee error must NOT override a real step failure, and must not
+    // by itself fail an otherwise-successful step (WouldBlock is no longer an
+    // error after Bug 1 fix).
+    let _ = join_output_forwarders(forwarders);
 
-    // Best-effort cleanup of temp script.
+    // Best-effort cleanup of temp script — always runs regardless of outcome.
     let _ = std::fs::remove_file(&script);
 
     step_result
@@ -1122,8 +1215,8 @@ mod tests {
     use super::{
         build_guest_env_preamble, default_bootstrap_path, env_merge, load_test_config,
         parse_env_file, resolve_shell, run_host_step, shell_single_quote, step_log_path,
-        step_status_marker, validate_test_ports, validate_test_steps, HostStepFiles, StepTarget,
-        TestConfig, TestIso, TestStep, TestUpload,
+        step_status_marker, validate_test_ports, validate_test_steps, write_all_resilient,
+        HostStepFiles, StepTarget, TestConfig, TestIso, TestStep, TestUpload,
     };
     use crate::cli::Cli;
     use crate::qemu::PortSpec;
@@ -2247,5 +2340,96 @@ steps:
         // shell_single_quote escapes embedded single quotes
         let expected = format!("export VAL={}", shell_single_quote("it's a value"));
         assert!(preamble.contains(&expected), "preamble: {preamble}");
+    }
+
+    // --- write_all_resilient ---
+
+    /// Verify that write_all_resilient successfully forwards all bytes to a
+    /// non-blocking Unix-domain socket, handling EAGAIN (WouldBlock) without
+    /// dropping or reordering data.
+    #[cfg(unix)]
+    #[test]
+    fn test_write_all_resilient_nonblocking_fd() {
+        use std::io::Read;
+        use std::os::unix::net::UnixStream;
+
+        let (mut writer_end, mut reader_end) = UnixStream::pair().unwrap();
+        // Make the write end non-blocking so writes may return WouldBlock.
+        writer_end.set_nonblocking(true).unwrap();
+
+        // 512 KiB — well above the socket buffer (typically 128–212 KiB).
+        let data: Vec<u8> = (0u8..=255u8).cycle().take(512 * 1024).collect();
+        let data_for_check = data.clone();
+
+        // Drain slowly in a background thread to force repeated WouldBlock.
+        let reader_handle = std::thread::spawn(move || {
+            let mut received = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                match reader_end.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => received.extend_from_slice(&buf[..n]),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(e) => panic!("reader error: {e}"),
+                }
+            }
+            received
+        });
+
+        // Must not error; must not drop or reorder bytes.
+        write_all_resilient(&mut writer_end, &data_for_check).unwrap();
+        // Drop the write end so the reader sees EOF and terminates.
+        drop(writer_end);
+
+        let received = reader_handle.join().unwrap();
+        assert_eq!(
+            received, data_for_check,
+            "write_all_resilient must forward all bytes without loss or reordering"
+        );
+    }
+
+    // --- host step timeout ---
+
+    #[test]
+    fn test_host_step_timeout_kills_and_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmpl = resolve_shell(Some("sh")).unwrap();
+        let env_file = tmp_env_file();
+        let log_file = tmp_step_log(dir.path());
+        let start = std::time::Instant::now();
+        // Use `exec` so the shell replaces itself with sleep; the child we hold
+        // is then the sleep process itself, so child.kill() kills it directly
+        // and the pipes close immediately without a lingering grandchild.
+        let err = run_host_step(
+            "slow-step",
+            "exec sleep 5",
+            dir.path(),
+            Duration::from_millis(400),
+            &tmpl,
+            &[],
+            HostStepFiles {
+                env_file: &env_file,
+                log_path: &log_file,
+            },
+        )
+        .unwrap_err();
+        let elapsed = start.elapsed();
+        let _ = std::fs::remove_file(&env_file);
+        // Should have killed quickly — well under the 5-second sleep.
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "host step timeout should kill quickly; took {elapsed:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("slow-step"),
+            "timeout error should mention the step name: {msg}"
+        );
+        assert!(
+            msg.contains("timed out"),
+            "timeout error should mention 'timed out': {msg}"
+        );
     }
 }
