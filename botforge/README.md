@@ -115,8 +115,10 @@ the same repository:
   `--repo-root` passed to `botforge test`.
 - The referenced file must be a mapping with a top-level `steps:` key whose
   value is a list of steps, consistent with the top-level config shape.
-- `inputs:` provides string substitutions for `${{ inputs.NAME }}` placeholders
-  inside the included fragment before validation.
+- The fragment declares its **input contract** in a top-level `inputs:` block
+  (see below). The caller passes values via `with:` at the call site.
+- `${{ inputs.NAME }}` placeholders in the fragment body are substituted with
+  resolved input values before validation.
 - Runtime `${VAR}` expansion is unchanged; only `${{ ... }}` is handled at load
   time.
 
@@ -124,13 +126,20 @@ the same repository:
 # test.yaml
 steps:
   - uses: "@://smoke/vm-narrative.steps.yaml"
-    inputs:
+    with:
       target: ingress
       shell: bash
 ```
 
 ```yaml
 # smoke/vm-narrative.steps.yaml
+inputs:
+  target:
+    type: string
+    required: true
+  shell:
+    type: string
+    default: bash
 steps:
   - on: guest
     name: "narrative-${{ inputs.target }}"
@@ -140,13 +149,44 @@ steps:
       ./smoke-${{ inputs.target }}.sh
 ```
 
+##### Fragment `inputs:` declaration
+
+Each declared input supports:
+
+- **`type`** — `string`, `number`, or `boolean`. Required.
+- **`required`** — boolean, default `false`. When `true`, the resolved value
+  must not be absent. An empty string `""` satisfies `required`.
+- **`default`** — the value used when the caller omits the input or passes the
+  `__default__` sentinel. May not be combined with `required: true`.
+
+Every undeclared input has an implicit absent default (`unset`). `required:
+true` means the resolved value must not be `unset`.
+
+**`__default__` sentinel:** a caller's `with:` value of `__default__` resolves
+to the declared default (or absent if none is declared), the same as omitting
+the key entirely. This lets a computed expression fall back to the declared
+default:
+
+```yaml
+with:
+  target: ${{ steps.cond.outputs.value == 'go' && 'CUSTOM' || '__default__' }}
+```
+
+A computed expression cannot omit a key; `__default__` is the way to express
+"custom OR the declared default." To opt out of the default and force an empty
+string instead, emit `""` from the expression.
+
 For this first iteration, `@://` is the only supported `uses:` scheme. Plain
 filesystem paths, `../` traversal, and other schemes are rejected.
 
 Config errors are reported at load time for: missing or invalid `on:`; `uploads:`
 on an `on: host` step; any `on: host` step present when `ports:` is empty;
-invalid `shell:` value; invalid `uses:` scheme/path; missing include inputs;
-fragment missing a `steps:` list.
+invalid `shell:` value; invalid `uses:` scheme/path; `with:` key not declared
+by the fragment (`unexpected input '<name>' not declared by fragment <path>`);
+missing required input (`missing required input '<name>'`); type mismatch
+(`input '<name>' must be a <type>`); `required: true` combined with `default`
+in a declaration (`input '<name>' cannot set both 'required: true' and
+'default'`); fragment missing a `steps:` list.
 
 On **any** step failure (guest or host) the usual guest diagnostics are
 collected (`systemctl --failed`, `journalctl`, `cloud-init status`, VM log
