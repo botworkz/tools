@@ -17,7 +17,7 @@ use super::log::{
     join_output_forwarders, print_step_status, print_step_title, spawn_output_forwarder,
     step_log_path, StepLogWriter, StepOutputStream,
 };
-use super::step::{resolve_shell, StepTarget};
+use super::step::{resolve_shell, StepTarget, TestStep};
 
 const TEST_SSH_READY_TIMEOUT: Duration = Duration::from_secs(300);
 const TEST_CLOUD_INIT_TIMEOUT: Duration = Duration::from_secs(300);
@@ -33,6 +33,17 @@ const TEST_STABLE_SSH_REQUIRED: usize = 2;
 pub(crate) fn run_test_flow(
     repo_root: &Path,
     config: &TestConfig,
+    ssh: &SshOptions,
+    bootstraps: &[TestIsoBootstrap],
+) -> Result<()> {
+    run_step_flow(repo_root, &config.steps, ssh, bootstraps)
+}
+
+/// Shared boot→wait-for-SSH→wait-for-cloud-init→run-steps spine used by both
+/// `botforge test` and `botforge build`.  `bootstraps` is empty for build runs.
+pub(crate) fn run_step_flow(
+    repo_root: &Path,
+    steps: &[TestStep],
     ssh: &SshOptions,
     bootstraps: &[TestIsoBootstrap],
 ) -> Result<()> {
@@ -84,7 +95,7 @@ pub(crate) fn run_test_flow(
     // Shared ordered env map threaded across all steps (both guest and host).
     let mut accumulated_env: Vec<(String, String)> = Vec::new();
 
-    for (step_idx, step) in config.steps.iter().enumerate() {
+    for (step_idx, step) in steps.iter().enumerate() {
         let step_log_path = step_log_path(&step_log_dir, step_idx, &step.name);
         // The file is created by StepLogWriter::create inside each step runner;
         // no pre-creation needed here (the directory was already created above).
@@ -546,6 +557,90 @@ pub(crate) fn cleanup_test(vm_child: &mut Option<Child>, overlay_image: &Path) {
     }
     *vm_child = None;
     let _ = std::fs::remove_file(overlay_image);
+}
+
+pub(crate) fn preserve_failed_build_disk(partial: &Path, failed_partial: &Path) -> Result<()> {
+    if failed_partial.exists() {
+        std::fs::remove_file(failed_partial).with_context(|| {
+            format!(
+                "cannot replace previous failed build disk: {}",
+                failed_partial.display()
+            )
+        })?;
+    }
+    std::fs::rename(partial, failed_partial).with_context(|| {
+        format!(
+            "cannot preserve failed build disk from {} to {}",
+            partial.display(),
+            failed_partial.display()
+        )
+    })?;
+    Ok(())
+}
+
+const BUILD_POWEROFF_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Issue a graceful poweroff over SSH, then poll for the qemu process to exit cleanly.
+///
+/// On a clean shutdown (`Ok(())`), the caller should atomically rename the partial disk
+/// to the final output path. On failure (`Err(...)`), this preserves the tainted disk at
+/// `<output>.partial.failed` for post-mortem; the caller must NOT rename it to the output path.
+///
+/// Only calls `child.kill()` if the 120 s timeout fires — killing a live-write qcow2
+/// yields a non-fsck-clean image.
+pub(crate) fn shutdown_build_vm(
+    vm_child: &mut Option<Child>,
+    partial: &Path,
+    failed_partial: &Path,
+    ssh: &SshOptions,
+) -> Result<()> {
+    // Best-effort graceful poweroff; ignore SSH errors (VM may be unresponsive).
+    let _ = ssh_with_retry(
+        ssh,
+        "sudo systemctl poweroff",
+        1,
+        Duration::from_secs(0),
+        Duration::from_secs(10),
+    );
+
+    let clean_exit = if let Some(child) = vm_child.as_mut() {
+        let deadline = Instant::now() + BUILD_POWEROFF_TIMEOUT;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    break status.success();
+                }
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break false; // timeout
+                    }
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+                Err(e) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    eprintln!("warning: failed to poll build VM status: {e}");
+                    break false;
+                }
+            }
+        }
+    } else {
+        false
+    };
+    *vm_child = None;
+
+    if clean_exit {
+        Ok(())
+    } else {
+        preserve_failed_build_disk(partial, failed_partial)?;
+        anyhow::bail!(
+            "build VM did not shut down cleanly; \
+             partial disk left at {} for post-mortem",
+            failed_partial.display()
+        )
+    }
 }
 
 #[cfg(test)]

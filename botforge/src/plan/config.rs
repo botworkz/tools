@@ -20,15 +20,17 @@ pub(super) const MAX_INCLUDE_DEPTH: usize = 32;
 ///
 /// Every document must carry exactly one `type:` discriminator.  The loader
 /// dispatches on it to enforce command-boundary separation and per-kind presence
-/// rules.  Future entrypoint kinds (e.g. `build`) are registered here without
-/// changing the loader logic.
+/// rules.
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 enum DocumentType {
     /// An entrypoint document consumed directly by `botforge test`.
     Test,
+    /// An entrypoint document consumed directly by `botforge build`.
+    Build,
     /// A reusable document spliced in via `uses:`.  May not carry
-    /// entrypoint-only sections (`ports:`, `isos:`, `diagnostics_units:`).
+    /// entrypoint-only sections (`ports:`, `isos:`, `diagnostics_units:`,
+    /// `disk_size:`, `memsize:`, `smp:`).
     Fragment,
 }
 
@@ -36,6 +38,7 @@ impl DocumentType {
     fn as_str(self) -> &'static str {
         match self {
             DocumentType::Test => "test",
+            DocumentType::Build => "build",
             DocumentType::Fragment => "fragment",
         }
     }
@@ -43,6 +46,11 @@ impl DocumentType {
     /// Returns `true` if this kind is the expected entrypoint for `botforge test`.
     fn is_test_entrypoint(self) -> bool {
         matches!(self, DocumentType::Test)
+    }
+
+    /// Returns `true` if this kind is the expected entrypoint for `botforge build`.
+    fn is_build_entrypoint(self) -> bool {
+        matches!(self, DocumentType::Build)
     }
 
     /// Returns `true` if this kind can be consumed via a `uses:` reference.
@@ -97,6 +105,43 @@ struct RawTestDocument {
     diagnostics_units: Vec<String>,
 }
 
+fn default_disk_size() -> String {
+    "10G".to_string()
+}
+
+fn default_memsize() -> u32 {
+    4096
+}
+
+fn default_smp() -> u32 {
+    4
+}
+
+/// Resolved configuration for a `botforge build` run.
+#[derive(Debug)]
+pub(crate) struct BuildConfig {
+    pub(crate) disk_size: String,
+    pub(crate) memsize: u32,
+    pub(crate) smp: u32,
+    pub(crate) steps: Vec<TestStep>,
+}
+
+/// Raw deserialization target for a top-level `botforge build` document.
+/// The `type:` field is required and must be `build`.
+#[derive(Debug, Deserialize)]
+struct RawBuildDocument {
+    #[serde(rename = "type")]
+    doc_type: DocumentType,
+    #[serde(default = "default_disk_size")]
+    disk_size: String,
+    #[serde(default = "default_memsize")]
+    memsize: u32,
+    #[serde(default = "default_smp")]
+    smp: u32,
+    #[serde(default)]
+    steps: Vec<RawTestStep>,
+}
+
 #[derive(Debug, Deserialize)]
 struct RawTestStepFragment {
     #[serde(default)]
@@ -144,7 +189,10 @@ pub(super) fn default_bootstrap_path() -> PathBuf {
 pub(crate) fn load_test_config(repo_root: &Path, path: &Path) -> Result<TestConfig> {
     let yaml = std::fs::read_to_string(path)
         .with_context(|| format!("cannot read test config: {}", path.display()))?;
-    let raw: RawTestDocument = serde_yaml::from_str(&yaml)
+    let value: Value = serde_yaml::from_str(&yaml)
+        .with_context(|| format!("invalid test config: {}", path.display()))?;
+    check_no_build_sections_in_test_doc(path, &value)?;
+    let raw: RawTestDocument = serde_yaml::from_value(value)
         .with_context(|| format!("invalid test config: {}", path.display()))?;
     if !raw.doc_type.is_test_entrypoint() {
         anyhow::bail!(
@@ -160,6 +208,29 @@ pub(crate) fn load_test_config(repo_root: &Path, path: &Path) -> Result<TestConf
         ports: raw.ports,
         steps: expand_test_steps(repo_root, path, raw.steps, &mut include_stack)?,
         diagnostics_units: raw.diagnostics_units,
+    })
+}
+
+pub(crate) fn load_build_config(repo_root: &Path, path: &Path) -> Result<BuildConfig> {
+    let yaml = std::fs::read_to_string(path)
+        .with_context(|| format!("cannot read build config: {}", path.display()))?;
+    let value: Value = serde_yaml::from_str(&yaml)
+        .with_context(|| format!("invalid build config: {}", path.display()))?;
+    check_no_test_entrypoint_sections_in_build_doc(path, &value)?;
+    let raw: RawBuildDocument = serde_yaml::from_value(value)
+        .with_context(|| format!("invalid build config: {}", path.display()))?;
+    if !raw.doc_type.is_build_entrypoint() {
+        anyhow::bail!(
+            "botforge build requires a 'type: build' document, got 'type: {}'",
+            raw.doc_type.as_str()
+        );
+    }
+    let mut include_stack = vec![path.to_path_buf()];
+    Ok(BuildConfig {
+        disk_size: raw.disk_size,
+        memsize: raw.memsize,
+        smp: raw.smp,
+        steps: expand_test_steps(repo_root, path, raw.steps, &mut include_stack)?,
     })
 }
 
@@ -272,10 +343,58 @@ fn check_fragment_document_type(uses: &str, value: &Value) -> Result<()> {
     }
 }
 
-/// Reject entrypoint-only sections (`ports:`, `isos:`, `diagnostics_units:`) inside
-/// a `type: fragment` document.  Serde would silently ignore them; this turns a
-/// misplaced key into an explicit load-time error.
+/// Reject entrypoint-only sections (`ports:`, `isos:`, `diagnostics_units:`,
+/// `disk_size:`, `memsize:`, `smp:`) inside a `type: fragment` document.
+/// Serde would silently ignore them; this turns a misplaced key into an explicit
+/// load-time error.
 fn check_no_entrypoint_sections_in_fragment(path: &Path, value: &Value) -> Result<()> {
+    let mapping = match value {
+        Value::Mapping(m) => m,
+        _ => return Ok(()),
+    };
+    for section in &[
+        "ports",
+        "isos",
+        "diagnostics_units",
+        "disk_size",
+        "memsize",
+        "smp",
+    ] {
+        if mapping.contains_key(Value::String(section.to_string())) {
+            anyhow::bail!(
+                "{}: is not valid in a 'type: fragment' document ({})",
+                section,
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Reject build-only sections (`disk_size:`, `memsize:`, `smp:`) inside a
+/// `type: test` document.  Serde would silently ignore them; this turns a
+/// misplaced key into an explicit load-time error.
+fn check_no_build_sections_in_test_doc(path: &Path, value: &Value) -> Result<()> {
+    let mapping = match value {
+        Value::Mapping(m) => m,
+        _ => return Ok(()),
+    };
+    for section in &["disk_size", "memsize", "smp"] {
+        if mapping.contains_key(Value::String(section.to_string())) {
+            anyhow::bail!(
+                "{}: is not valid in a 'type: test' document ({})",
+                section,
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Reject test-entrypoint-only sections (`ports:`, `isos:`, `diagnostics_units:`)
+/// inside a `type: build` document.  Serde would silently ignore them; this turns a
+/// misplaced key into an explicit load-time error.
+fn check_no_test_entrypoint_sections_in_build_doc(path: &Path, value: &Value) -> Result<()> {
     let mapping = match value {
         Value::Mapping(m) => m,
         _ => return Ok(()),
@@ -283,7 +402,7 @@ fn check_no_entrypoint_sections_in_fragment(path: &Path, value: &Value) -> Resul
     for section in &["ports", "isos", "diagnostics_units"] {
         if mapping.contains_key(Value::String(section.to_string())) {
             anyhow::bail!(
-                "{}: is not valid in a 'type: fragment' document ({})",
+                "{}: is not valid in a 'type: build' document ({})",
                 section,
                 path.display()
             );
@@ -517,11 +636,27 @@ pub(crate) fn validate_test_steps(steps: &[TestStep], ports: &[PortSpec]) -> Res
     Ok(())
 }
 
+pub(crate) fn validate_build_steps(steps: &[TestStep]) -> Result<()> {
+    for step in steps {
+        resolve_shell(step.shell.as_deref())
+            .with_context(|| format!("build step '{}': invalid `shell:` value", step.name))?;
+        if step.target == StepTarget::Host && !step.uploads.is_empty() {
+            anyhow::bail!(
+                "build step '{}': `uploads` is not valid on an `on: host` step; \
+                 files are already local in the harness",
+                step.name
+            );
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        default_bootstrap_path, load_test_config, resolve_fragment_inputs, validate_test_ports,
-        validate_test_steps, InputDeclaration, InputType, TestConfig, TestIso, MAX_INCLUDE_DEPTH,
+        default_bootstrap_path, load_build_config, load_test_config, resolve_fragment_inputs,
+        validate_build_steps, validate_test_ports, validate_test_steps, InputDeclaration,
+        InputType, TestConfig, TestIso, MAX_INCLUDE_DEPTH,
     };
     use crate::plan::step::{StepTarget, TestStep, TestUpload};
     use crate::qemu::PortSpec;
@@ -1806,5 +1941,290 @@ steps:
             msg.contains("depth limit") && msg.contains(&depth.to_string()),
             "error must mention the depth limit: {msg}"
         );
+    }
+
+    // --- BuildConfig loading ---
+
+    fn write_build_config(repo: &TempDir, name: &str, content: &str) {
+        std::fs::write(repo.path().join(name), content).unwrap();
+    }
+
+    #[test]
+    fn test_load_build_config_minimal() {
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            r#"
+type: build
+steps:
+  - on: guest
+    name: provision
+    run: echo hello
+"#,
+        );
+        let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
+        assert_eq!(config.disk_size, "10G");
+        assert_eq!(config.memsize, 4096);
+        assert_eq!(config.smp, 4);
+        assert_eq!(config.steps.len(), 1);
+        assert_eq!(config.steps[0].name, "provision");
+    }
+
+    #[test]
+    fn test_load_build_config_overrides_defaults() {
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            r#"
+type: build
+disk_size: "20G"
+memsize: 8192
+smp: 8
+steps: []
+"#,
+        );
+        let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
+        assert_eq!(config.disk_size, "20G");
+        assert_eq!(config.memsize, 8192);
+        assert_eq!(config.smp, 8);
+        assert!(config.steps.is_empty());
+    }
+
+    #[test]
+    fn test_load_build_config_rejects_wrong_type() {
+        let repo = TempDir::new().unwrap();
+        write_build_config(&repo, "build.yaml", "type: test\nsteps: []\n");
+        let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("type: test"),
+            "error should mention the actual type: {err:#}"
+        );
+    }
+
+    #[test]
+    fn test_load_build_config_rejects_fragment_type() {
+        let repo = TempDir::new().unwrap();
+        write_build_config(&repo, "build.yaml", "type: fragment\nsteps: []\n");
+        let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
+        assert!(format!("{err:#}").contains("type: fragment"));
+    }
+
+    #[test]
+    fn test_load_build_config_rejects_ports_section() {
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            "type: build\nports:\n  - 80\nsteps: []\n",
+        );
+        let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("ports") && msg.contains("type: build"),
+            "error should mention the offending key and document type: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_load_build_config_rejects_isos_section() {
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            "type: build\nisos:\n  - some.iso\nsteps: []\n",
+        );
+        let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
+        assert!(format!("{err:#}").contains("isos"));
+    }
+
+    #[test]
+    fn test_load_build_config_rejects_diagnostics_units_section() {
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            "type: build\ndiagnostics_units:\n  - foo\nsteps: []\n",
+        );
+        let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
+        assert!(format!("{err:#}").contains("diagnostics_units"));
+    }
+
+    #[test]
+    fn test_load_test_config_rejects_disk_size_section() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            "type: test\ndisk_size: \"20G\"\nsteps: []\n",
+        )
+        .unwrap();
+        let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("disk_size") && msg.contains("type: test"),
+            "error should mention the offending key and document type: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_load_test_config_rejects_memsize_section() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            "type: test\nmemsize: 8192\nsteps: []\n",
+        )
+        .unwrap();
+        let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+        assert!(format!("{err:#}").contains("memsize"));
+    }
+
+    #[test]
+    fn test_load_test_config_rejects_smp_section() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            "type: test\nsmp: 8\nsteps: []\n",
+        )
+        .unwrap();
+        let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+        assert!(format!("{err:#}").contains("smp"));
+    }
+
+    #[test]
+    fn test_fragment_rejects_disk_size() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("frag.yaml"),
+            "type: fragment\ndisk_size: \"20G\"\nsteps: []\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            "type: test\nsteps:\n  - uses: \"@://frag.yaml\"\n",
+        )
+        .unwrap();
+        let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+        assert!(format!("{err:#}").contains("disk_size"));
+    }
+
+    #[test]
+    fn test_fragment_rejects_memsize() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("frag.yaml"),
+            "type: fragment\nmemsize: 8192\nsteps: []\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            "type: test\nsteps:\n  - uses: \"@://frag.yaml\"\n",
+        )
+        .unwrap();
+        let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+        assert!(format!("{err:#}").contains("memsize"));
+    }
+
+    #[test]
+    fn test_fragment_rejects_smp() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("frag.yaml"),
+            "type: fragment\nsmp: 8\nsteps: []\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            "type: test\nsteps:\n  - uses: \"@://frag.yaml\"\n",
+        )
+        .unwrap();
+        let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+        assert!(format!("{err:#}").contains("smp"));
+    }
+
+    #[test]
+    fn test_build_config_accepts_fragment_via_uses() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("frag.yaml"),
+            r#"
+type: fragment
+steps:
+  - on: guest
+    name: frag-step
+    run: echo from-fragment
+"#,
+        )
+        .unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            r#"
+type: build
+steps:
+  - uses: "@://frag.yaml"
+"#,
+        );
+        let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
+        assert_eq!(config.steps.len(), 1);
+        assert_eq!(config.steps[0].name, "frag-step");
+    }
+
+    #[test]
+    fn test_build_config_cannot_be_used_as_fragment() {
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build-base.yaml",
+            "type: build\nsteps:\n  - on: guest\n    name: s\n    run: echo ok\n",
+        );
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            "type: test\nsteps:\n  - uses: \"@://build-base.yaml\"\n",
+        )
+        .unwrap();
+        let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("not a consumable fragment"),
+            "error should reject build doc as fragment: {msg}"
+        );
+    }
+
+    // --- validate_build_steps ---
+
+    #[test]
+    fn test_validate_build_steps_accepts_guest_with_uploads() {
+        let steps = vec![make_step(StepTarget::Guest, "s", true)];
+        assert!(validate_build_steps(&steps).is_ok());
+    }
+
+    #[test]
+    fn test_validate_build_steps_accepts_guest_without_uploads() {
+        let steps = vec![make_step(StepTarget::Guest, "s", false)];
+        assert!(validate_build_steps(&steps).is_ok());
+    }
+
+    #[test]
+    fn test_validate_build_steps_rejects_uploads_on_host_step() {
+        let steps = vec![make_step(StepTarget::Host, "bad", true)];
+        let err = validate_build_steps(&steps).unwrap_err();
+        assert!(err.to_string().contains("uploads"));
+        assert!(err.to_string().contains("bad"));
+    }
+
+    #[test]
+    fn test_validate_build_steps_accepts_host_step_without_ports() {
+        // Unlike test, build does not require ports for host steps.
+        let steps = vec![make_step(StepTarget::Host, "h", false)];
+        assert!(validate_build_steps(&steps).is_ok());
+    }
+
+    #[test]
+    fn test_validate_build_steps_rejects_bad_shell() {
+        let mut step = make_step(StepTarget::Guest, "bad-shell", false);
+        step.shell = Some("fish".to_string());
+        let err = validate_build_steps(&[step]).unwrap_err();
+        assert!(format!("{err:#}").contains("fish"));
     }
 }

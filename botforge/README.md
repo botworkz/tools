@@ -56,6 +56,7 @@ at the shasset manifest and `payload` at the payload config.
 
 | Command | Summary |
 |---|---|
+| `botforge build --spec <file> --source <qcow2> --output <qcow2> [--repo-root <dir>]` | Boot a source qcow2 under qemu, inject an ephemeral in-harness SSH keypair via cloud-init, run `type: build` plan steps, and commit the result on clean shutdown. |
 | `botforge build-legacy --spec <file> --source <qcow2> --output <qcow2>` | [legacy] Run a virt-customize spec against a source qcow2 to produce an output qcow2. |
 | `botforge deps --out <dir> [name ...]` | Fetch + stage shasset assets into a flat output directory. |
 | `botforge iso --src <dir> --out <file> [--volume-id <id>]` | Build an ISO image from a source tree. Also supports generating a cidata seed ISO with an injected SSH key. |
@@ -72,14 +73,13 @@ For `botforge test`, the test config is a YAML document with a required
 - **`type: fragment`** — a reusable document spliced in via `uses:`.  May
   carry `steps:` (and an `inputs:` contract) only; declaring `isos:`, `ports:`,
   or `diagnostics_units:` on a fragment is a load-time error.  The same
-  fragment file is reusable from any entrypoint kind.  `type: build` is a
-  planned future entrypoint kind and is not implemented yet.
+  fragment file is reusable from any entrypoint kind, including `type: build`.
 
 `botforge test` requires a `type: test` document as its top-level plan; passing
 any other `type:` value (including `type: fragment`) is a hard load-time error.
 A `uses:` reference must point at a `type: fragment` document; pointing it at
-any entrypoint document (`type: test`, or a future `type: build`) is also a
-load-time error.
+any entrypoint document (`type: test` or `type: build`) is also a load-time
+error.
 
 The `isos:` list in test config supports two forms:
 
@@ -132,9 +132,9 @@ the same repository:
 
 - `uses: "@://path/within/repo.yaml"` resolves from the explicit
   `--repo-root` passed to `botforge test`.
-- The referenced file must be a `type: fragment` document (see below).  Any
-  other `type:` value — including future entrypoint kinds such as `type: build`
-  — is rejected as a non-consumable include target.
+- The referenced file must be a `type: fragment` document (see below). Any
+  other entrypoint `type:` value — including `type: build` — is rejected as a
+  non-consumable include target.
 - The fragment declares its **input contract** in a top-level `inputs:` block
   (see below). The caller passes values via `with:` at the call site.
 - `${{ inputs.NAME }}` placeholders in the fragment body are substituted with
