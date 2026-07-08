@@ -166,6 +166,8 @@ fn default_build_cloud_init_timeout() -> u64 {
 /// Resolved configuration for a `botforge build` run.
 #[derive(Debug)]
 pub(crate) struct BuildConfig {
+    /// Shasset asset key naming the base image qcow2 to boot from.
+    pub(crate) base_image: String,
     pub(crate) disk_size: String,
     pub(crate) memsize: u32,
     pub(crate) smp: u32,
@@ -181,6 +183,9 @@ pub(crate) struct BuildConfig {
 struct RawBuildDocument {
     #[serde(rename = "type")]
     doc_type: DocumentType,
+    /// Shasset asset key naming the base image qcow2 to boot from. Required.
+    #[serde(rename = "base-image", default)]
+    base_image: Option<String>,
     #[serde(default = "default_disk_size")]
     disk_size: String,
     #[serde(default = "default_memsize")]
@@ -313,8 +318,22 @@ pub(crate) fn load_build_config(repo_root: &Path, path: &Path) -> Result<BuildCo
             raw.doc_type.as_str()
         );
     }
+    let base_image = match raw.base_image {
+        None => anyhow::bail!(
+            "'base-image' is required in a 'type: build' document ({}): \
+             set it to the shasset asset key of the base qcow2",
+            path.display()
+        ),
+        Some(s) if s.trim().is_empty() => anyhow::bail!(
+            "'base-image' is required in a 'type: build' document ({}): \
+             set it to the shasset asset key of the base qcow2",
+            path.display()
+        ),
+        Some(s) => s,
+    };
     let mut include_stack = vec![path.to_path_buf()];
     Ok(BuildConfig {
+        base_image,
         disk_size: raw.disk_size,
         memsize: raw.memsize,
         smp: raw.smp,
@@ -453,6 +472,7 @@ fn check_no_entrypoint_sections_in_fragment(path: &Path, value: &Value) -> Resul
         "smp",
         "step_timeout",
         "timeout",
+        "base-image",
     ] {
         if mapping.contains_key(Value::String(section.to_string())) {
             anyhow::bail!(
@@ -465,7 +485,7 @@ fn check_no_entrypoint_sections_in_fragment(path: &Path, value: &Value) -> Resul
     Ok(())
 }
 
-/// Reject build-only sections (`disk_size:`, `memsize:`, `smp:`) inside a
+/// Reject build-only sections (`disk_size:`, `memsize:`, `smp:`, `base-image:`) inside a
 /// `type: test` document.  Serde would silently ignore them; this turns a
 /// misplaced key into an explicit load-time error.
 fn check_no_build_sections_in_test_doc(path: &Path, value: &Value) -> Result<()> {
@@ -473,7 +493,7 @@ fn check_no_build_sections_in_test_doc(path: &Path, value: &Value) -> Result<()>
         Value::Mapping(m) => m,
         _ => return Ok(()),
     };
-    for section in &["disk_size", "memsize", "smp"] {
+    for section in &["disk_size", "memsize", "smp", "base-image"] {
         if mapping.contains_key(Value::String(section.to_string())) {
             anyhow::bail!(
                 "{}: is not valid in a 'type: test' document ({})",
@@ -2068,6 +2088,7 @@ steps:
             "build.yaml",
             r#"
 type: build
+base-image: debian-base
 steps:
   - on: guest
     name: provision
@@ -2075,6 +2096,7 @@ steps:
 "#,
         );
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
+        assert_eq!(config.base_image, "debian-base");
         assert_eq!(config.disk_size, "10G");
         assert_eq!(config.memsize, 4096);
         assert_eq!(config.smp, 4);
@@ -2093,6 +2115,7 @@ steps:
             "build.yaml",
             r#"
 type: build
+base-image: my-base
 disk_size: "20G"
 memsize: 8192
 smp: 8
@@ -2102,6 +2125,7 @@ steps: []
 "#,
         );
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
+        assert_eq!(config.base_image, "my-base");
         assert_eq!(config.disk_size, "20G");
         assert_eq!(config.memsize, 8192);
         assert_eq!(config.smp, 8);
@@ -2191,6 +2215,71 @@ steps: []
         );
         let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
         assert!(format!("{err:#}").contains("diagnostics_units"));
+    }
+
+    #[test]
+    fn test_load_build_config_requires_base_image() {
+        let repo = TempDir::new().unwrap();
+        write_build_config(&repo, "build.yaml", "type: build\nsteps: []\n");
+        let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("base-image") && msg.contains("required"),
+            "error should mention missing base-image: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_load_build_config_rejects_empty_base_image() {
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            "type: build\nbase-image: \"\"\nsteps: []\n",
+        );
+        let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("base-image") && msg.contains("required"),
+            "error should mention empty base-image: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_fragment_rejects_base_image() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("frag.yaml"),
+            "type: fragment\nbase-image: debian-base\nsteps: []\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            "type: test\nsteps:\n  - uses: \"@://frag.yaml\"\n",
+        )
+        .unwrap();
+        let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("base-image"),
+            "error should mention base-image: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_load_test_config_rejects_base_image_section() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            "type: test\nbase-image: debian-base\nsteps: []\n",
+        )
+        .unwrap();
+        let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("base-image"),
+            "error should mention base-image: {msg}"
+        );
     }
 
     #[test]
@@ -2338,6 +2427,7 @@ steps:
             "build.yaml",
             r#"
 type: build
+base-image: debian-base
 steps:
   - uses: "@://frag.yaml"
 "#,
@@ -2372,6 +2462,7 @@ steps:
             "build.yaml",
             r#"
 type: build
+base-image: debian-base
 steps:
   - uses: "@://frag.yaml"
     with:
