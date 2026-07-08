@@ -149,6 +149,11 @@ On **any** step failure (guest or host) the usual guest diagnostics are
 collected (`systemctl --failed`, `journalctl`, `cloud-init status`, VM log
 tail) — a harness-side failure typically implicates a guest service.
 
+Each step also writes a JSONL transcript to
+`build/logs/step-<index>-<name>.log`, with one record per stdout/stderr line.
+Console output still streams live unchanged while the log captures the stream
+(`stdout` or `stderr`) and timestamp for each recorded line.
+
 #### `shell:` field (optional)
 
 Every step has an optional `shell:` field that selects the interpreter used to
