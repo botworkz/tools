@@ -83,6 +83,12 @@ struct RawTestConfig {
 }
 
 #[derive(Debug, Deserialize)]
+struct RawTestStepFragment {
+    #[serde(default)]
+    steps: Vec<RawTestStep>,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum RawTestStep {
     Step(TestStep),
@@ -499,10 +505,17 @@ fn load_test_steps_fragment(
         .with_context(|| format!("cannot read test step include: {}", path.display()))?;
     let mut value: Value = serde_yaml::from_str(&yaml)
         .with_context(|| format!("invalid test step include: {}", path.display()))?;
+    if value.is_sequence() {
+        return Err(anyhow::anyhow!(
+            "test step include must be a mapping with a 'steps:' key"
+        ))
+        .with_context(|| format!("invalid test step include: {}", path.display()));
+    }
     substitute_inputs_in_value(&mut value, inputs)
         .with_context(|| format!("invalid test step include: {}", path.display()))?;
-    serde_yaml::from_value(value)
-        .with_context(|| format!("invalid test step include: {}", path.display()))
+    let fragment: RawTestStepFragment = serde_yaml::from_value(value)
+        .with_context(|| format!("invalid test step include: {}", path.display()))?;
+    Ok(fragment.steps)
 }
 
 fn resolve_uses_path(repo_root: &Path, uses: &str) -> Result<PathBuf> {
@@ -1565,15 +1578,16 @@ steps:
         std::fs::write(
             repo.path().join("shared/narrative.yaml"),
             r#"
-- on: guest
-  name: "narrative-${{ inputs.target }}"
-  shell: ${{ inputs.shell }}
-  uploads:
-    - src: scripts/${{ inputs.target }}.sh
-      dest: /tmp/${{ inputs.target }}.sh
-  run: |
-    echo "${USER}"
-    bash /tmp/${{ inputs.target }}.sh
+steps:
+  - on: guest
+    name: "narrative-${{ inputs.target }}"
+    shell: ${{ inputs.shell }}
+    uploads:
+      - src: scripts/${{ inputs.target }}.sh
+        dest: /tmp/${{ inputs.target }}.sh
+    run: |
+      echo "${USER}"
+      bash /tmp/${{ inputs.target }}.sh
 "#,
         )
         .unwrap();
@@ -1626,9 +1640,10 @@ steps:
         std::fs::write(
             repo.path().join("shared/narrative.yaml"),
             r#"
-- on: guest
-  name: "${{ inputs.target }}"
-  run: "echo ok"
+steps:
+  - on: guest
+    name: "${{ inputs.target }}"
+    run: "echo ok"
 "#,
         )
         .unwrap();
@@ -1643,6 +1658,35 @@ steps:
 
         let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
         assert!(format!("{err:#}").contains("missing required input 'target'"));
+    }
+
+    #[test]
+    fn test_load_test_config_rejects_bare_list_fragment() {
+        let repo = TempDir::new().unwrap();
+        std::fs::create_dir_all(repo.path().join("shared")).unwrap();
+        std::fs::write(
+            repo.path().join("shared/narrative.yaml"),
+            r#"
+- on: guest
+  name: bare
+  run: "echo ok"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            r#"
+steps:
+  - uses: "@://shared/narrative.yaml"
+"#,
+        )
+        .unwrap();
+
+        let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("must be a mapping with a 'steps:' key"),
+            "unexpected error: {err:#}"
+        );
     }
 
     #[test]
