@@ -318,7 +318,10 @@ mod tests {
         let err = Cli::try_parse_from(["botforge", "build"]).unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
         let err_text = err.to_string();
-        assert!(err_text.contains("--spec"), "expected --spec in error: {err_text}");
+        assert!(
+            err_text.contains("--spec"),
+            "expected --spec in error: {err_text}"
+        );
         assert!(
             err_text.contains("--source"),
             "expected --source in error: {err_text}"
