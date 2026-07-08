@@ -17,13 +17,14 @@ use super::log::{
     join_output_forwarders, print_step_status, print_step_title, spawn_output_forwarder,
     step_log_path, StepLogWriter, StepOutputStream,
 };
-use super::step::{resolve_shell, StepTarget, TestStep};
+use super::step::{resolve_shell, ArchiveStep, RunStep, StepTarget, TestStep};
 
 const TEST_SSH_READY_TIMEOUT: Duration = Duration::from_secs(300);
 const TEST_TRANSPORT_RETRIES: usize = 10;
 const TEST_TRANSPORT_RETRY_DELAY: Duration = Duration::from_secs(2);
 const TEST_STABLE_SSH_ATTEMPTS: usize = 5;
 const TEST_STABLE_SSH_REQUIRED: usize = 2;
+type ArchiveExecutor<'a> = dyn FnMut(usize, &ArchiveStep) -> Result<()> + 'a;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct StepTimeoutPolicy {
@@ -37,6 +38,15 @@ struct StepExecutionBudget {
     step_timeout: Duration,
     overall_deadline: Instant,
     overall_timeout: Duration,
+}
+
+struct RunStepContext<'a> {
+    repo_root: &'a Path,
+    ssh: &'a SshOptions,
+    step_log_dir: &'a Path,
+    overall_deadline: Instant,
+    overall_timeout: Duration,
+    default_step_timeout: Duration,
 }
 
 // ---------------------------------------------------------------------------
@@ -59,6 +69,7 @@ pub(crate) fn run_test_flow(
             default_step_timeout: Duration::from_secs(config.step_timeout),
             cloud_init_timeout: Duration::from_secs(config.cloud_init_timeout),
         },
+        None,
     )
     .map(|_| ())
 }
@@ -71,6 +82,7 @@ pub(crate) fn run_step_flow(
     ssh: &SshOptions,
     bootstraps: &[TestIsoBootstrap],
     timeouts: StepTimeoutPolicy,
+    mut archive_executor: Option<&mut ArchiveExecutor<'_>>,
 ) -> Result<Instant> {
     let overall_deadline = Instant::now() + timeouts.overall_timeout;
     let step_log_dir = repo_root.join("build").join("logs");
@@ -132,156 +144,193 @@ pub(crate) fn run_step_flow(
 
     // Shared ordered env map threaded across all steps (both guest and host).
     let mut accumulated_env: Vec<(String, String)> = Vec::new();
+    let run_context = RunStepContext {
+        repo_root,
+        ssh,
+        step_log_dir: &step_log_dir,
+        overall_deadline,
+        overall_timeout: timeouts.overall_timeout,
+        default_step_timeout: timeouts.default_step_timeout,
+    };
 
     for (step_idx, step) in steps.iter().enumerate() {
         ensure_overall_budget(overall_deadline, timeouts.overall_timeout)?;
-        let step_log_path = step_log_path(&step_log_dir, step_idx, &step.name);
-        let step_timeout = resolve_step_timeout(step, timeouts.default_step_timeout);
-        let step_budget = StepExecutionBudget {
-            step_timeout,
-            overall_deadline,
-            overall_timeout: timeouts.overall_timeout,
-        };
         // The file is created by StepLogWriter::create inside each step runner;
         // no pre-creation needed here (the directory was already created above).
-        print_step_title(step_idx, &step.name);
-        let step_result = match step.target {
-            StepTarget::Guest => (|| -> Result<()> {
-                for upload in &step.uploads {
-                    let src = resolve_under_root(repo_root, upload.src.clone());
-                    scp_with_retry(
-                        ssh,
-                        &src,
-                        &upload.dest,
-                        TEST_TRANSPORT_RETRIES,
-                        TEST_TRANSPORT_RETRY_DELAY,
-                    )
-                    .with_context(|| format!("test step '{}' upload failed", step.name))?;
-                }
-
-                let suffix = unique_suffix();
-                let local_script =
-                    std::env::temp_dir().join(format!("botforge-step-{step_idx}-{suffix}.sh"));
-                let remote_script = format!("/tmp/botforge-step-{step_idx}-{suffix}.sh");
-                let remote_env_path = format!("/tmp/botforge-env-{step_idx}-{suffix}");
-
-                // Prepend env preamble (exports + BOTFORGE_ENV setup) to the script body.
-                let preamble = build_guest_env_preamble(&accumulated_env, &remote_env_path);
-                let script_content = format!("{preamble}{}", step.run);
-                std::fs::write(&local_script, script_content.as_bytes()).with_context(|| {
-                    format!("test step '{}': failed to write script file", step.name)
-                })?;
-
-                let template = resolve_shell(step.shell.as_deref())
-                    .expect("shell already validated at config load");
-
-                let scp_result = scp_with_retry(
-                    ssh,
-                    &local_script,
-                    &remote_script,
-                    TEST_TRANSPORT_RETRIES,
-                    TEST_TRANSPORT_RETRY_DELAY,
-                )
-                .with_context(|| format!("test step '{}' script upload failed", step.name));
-
-                let step_result = if scp_result.is_ok() {
-                    let ssh_cmd = template
-                        .iter()
-                        .map(|a| {
-                            if a == "{0}" {
-                                shell_single_quote(&remote_script)
-                            } else {
-                                a.clone()
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    run_ssh_step_with_step_log(
-                        &step.name,
-                        ssh_command_args(ssh, &ssh_cmd, Duration::from_secs(300).as_secs()),
-                        &step_log_path,
-                        step_budget,
-                        TEST_TRANSPORT_RETRIES,
-                        TEST_TRANSPORT_RETRY_DELAY,
-                    )
-                    .with_context(|| format!("test step '{}' command failed", step.name))
+        print_step_title(step_idx, step.display_name());
+        let step_result = match step {
+            TestStep::Run(step) => run_run_step(&run_context, step_idx, step, &mut accumulated_env),
+            TestStep::Archive(step) => {
+                if let Some(executor) = archive_executor.as_mut() {
+                    executor(step_idx, step)
                 } else {
-                    scp_result
-                };
-
-                // On success, read back the remote env file and merge into accumulated env.
-                if step_result.is_ok() {
-                    if let Ok(env_contents) = ssh_capture_stdout(
-                        ssh,
-                        &format!("cat {}", shell_single_quote(&remote_env_path)),
-                        1,
-                        Duration::from_secs(0),
-                        Duration::from_secs(10),
-                    ) {
-                        if let Ok(new_entries) = parse_env_file(&env_contents) {
-                            env_merge(&mut accumulated_env, new_entries);
-                        }
-                    }
+                    let archive_name = step
+                        .archive
+                        .name
+                        .as_deref()
+                        .unwrap_or(step.archive.src.as_str());
+                    anyhow::bail!(
+                        "step {} ('{}') is an `archive` step, but archive execution is not enabled for this command",
+                        step_idx + 1,
+                        archive_name
+                    );
                 }
-
-                // Best-effort cleanup: remote env file, remote script, then local temp file.
-                let _ = ssh_with_retry(
-                    ssh,
-                    &format!(
-                        "rm -f {} {}",
-                        shell_single_quote(&remote_env_path),
-                        shell_single_quote(&remote_script)
-                    ),
-                    1,
-                    Duration::from_secs(0),
-                    Duration::from_secs(10),
-                );
-                let _ = std::fs::remove_file(&local_script);
-
-                step_result
-            })(),
-            StepTarget::Host => {
-                let template = resolve_shell(step.shell.as_deref())
-                    .expect("shell already validated at config load");
-                let suffix = unique_suffix();
-                let env_file = std::env::temp_dir().join(format!("botforge-host-env-{suffix}"));
-                let step_result = run_host_step(
-                    &step.name,
-                    &step.run,
-                    repo_root,
-                    step_budget,
-                    &template,
-                    &accumulated_env,
-                    HostStepFiles {
-                        env_file: &env_file,
-                        log_path: &step_log_path,
-                    },
-                )
-                .with_context(|| format!("test step '{}' command failed", step.name));
-
-                // On success, parse the local env file and merge into accumulated env.
-                if step_result.is_ok() {
-                    if let Ok(contents) = std::fs::read_to_string(&env_file) {
-                        if let Ok(new_entries) = parse_env_file(&contents) {
-                            env_merge(&mut accumulated_env, new_entries);
-                        }
-                    }
-                }
-
-                // Best-effort cleanup of the local env file.
-                let _ = std::fs::remove_file(&env_file);
-
-                step_result
             }
         };
-        print_step_status(step_idx, &step.name, step_result.is_ok());
+        print_step_status(step_idx, step.display_name(), step_result.is_ok());
         step_result?;
     }
     Ok(overall_deadline)
 }
 
-fn resolve_step_timeout(step: &TestStep, default_step_timeout: Duration) -> Duration {
-    Duration::from_secs(step.timeout.unwrap_or(default_step_timeout.as_secs()))
+fn run_run_step(
+    context: &RunStepContext<'_>,
+    step_idx: usize,
+    step: &RunStep,
+    accumulated_env: &mut Vec<(String, String)>,
+) -> Result<()> {
+    let step_log_path = step_log_path(context.step_log_dir, step_idx, &step.name);
+    let step_timeout = resolve_step_timeout(step.timeout, context.default_step_timeout);
+    let step_budget = StepExecutionBudget {
+        step_timeout,
+        overall_deadline: context.overall_deadline,
+        overall_timeout: context.overall_timeout,
+    };
+
+    match step.target {
+        StepTarget::Guest => (|| -> Result<()> {
+            for upload in &step.uploads {
+                let src = resolve_under_root(context.repo_root, upload.src.clone());
+                scp_with_retry(
+                    context.ssh,
+                    &src,
+                    &upload.dest,
+                    TEST_TRANSPORT_RETRIES,
+                    TEST_TRANSPORT_RETRY_DELAY,
+                )
+                .with_context(|| format!("test step '{}' upload failed", step.name))?;
+            }
+
+            let suffix = unique_suffix();
+            let local_script =
+                std::env::temp_dir().join(format!("botforge-step-{step_idx}-{suffix}.sh"));
+            let remote_script = format!("/tmp/botforge-step-{step_idx}-{suffix}.sh");
+            let remote_env_path = format!("/tmp/botforge-env-{step_idx}-{suffix}");
+
+            // Prepend env preamble (exports + BOTFORGE_ENV setup) to the script body.
+            let preamble = build_guest_env_preamble(accumulated_env, &remote_env_path);
+            let script_content = format!("{preamble}{}", step.run);
+            std::fs::write(&local_script, script_content.as_bytes()).with_context(|| {
+                format!("test step '{}': failed to write script file", step.name)
+            })?;
+
+            let template = resolve_shell(step.shell.as_deref())
+                .expect("shell already validated at config load");
+
+            let scp_result = scp_with_retry(
+                context.ssh,
+                &local_script,
+                &remote_script,
+                TEST_TRANSPORT_RETRIES,
+                TEST_TRANSPORT_RETRY_DELAY,
+            )
+            .with_context(|| format!("test step '{}' script upload failed", step.name));
+
+            let step_result = if scp_result.is_ok() {
+                let ssh_cmd = template
+                    .iter()
+                    .map(|a| {
+                        if a == "{0}" {
+                            shell_single_quote(&remote_script)
+                        } else {
+                            a.clone()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                run_ssh_step_with_step_log(
+                    &step.name,
+                    ssh_command_args(context.ssh, &ssh_cmd, Duration::from_secs(300).as_secs()),
+                    &step_log_path,
+                    step_budget,
+                    TEST_TRANSPORT_RETRIES,
+                    TEST_TRANSPORT_RETRY_DELAY,
+                )
+                .with_context(|| format!("test step '{}' command failed", step.name))
+            } else {
+                scp_result
+            };
+
+            // On success, read back the remote env file and merge into accumulated env.
+            if step_result.is_ok() {
+                if let Ok(env_contents) = ssh_capture_stdout(
+                    context.ssh,
+                    &format!("cat {}", shell_single_quote(&remote_env_path)),
+                    1,
+                    Duration::from_secs(0),
+                    Duration::from_secs(10),
+                ) {
+                    if let Ok(new_entries) = parse_env_file(&env_contents) {
+                        env_merge(accumulated_env, new_entries);
+                    }
+                }
+            }
+
+            // Best-effort cleanup: remote env file, remote script, then local temp file.
+            let _ = ssh_with_retry(
+                context.ssh,
+                &format!(
+                    "rm -f {} {}",
+                    shell_single_quote(&remote_env_path),
+                    shell_single_quote(&remote_script)
+                ),
+                1,
+                Duration::from_secs(0),
+                Duration::from_secs(10),
+            );
+            let _ = std::fs::remove_file(&local_script);
+
+            step_result
+        })(),
+        StepTarget::Host => {
+            let template = resolve_shell(step.shell.as_deref())
+                .expect("shell already validated at config load");
+            let suffix = unique_suffix();
+            let env_file = std::env::temp_dir().join(format!("botforge-host-env-{suffix}"));
+            let step_result = run_host_step(
+                &step.name,
+                &step.run,
+                context.repo_root,
+                step_budget,
+                &template,
+                accumulated_env,
+                HostStepFiles {
+                    env_file: &env_file,
+                    log_path: &step_log_path,
+                },
+            )
+            .with_context(|| format!("test step '{}' command failed", step.name));
+
+            // On success, parse the local env file and merge into accumulated env.
+            if step_result.is_ok() {
+                if let Ok(contents) = std::fs::read_to_string(&env_file) {
+                    if let Ok(new_entries) = parse_env_file(&contents) {
+                        env_merge(accumulated_env, new_entries);
+                    }
+                }
+            }
+
+            // Best-effort cleanup of the local env file.
+            let _ = std::fs::remove_file(&env_file);
+
+            step_result
+        }
+    }?;
+    Ok(())
+}
+
+fn resolve_step_timeout(step_timeout: Option<u64>, default_step_timeout: Duration) -> Duration {
+    Duration::from_secs(step_timeout.unwrap_or(default_step_timeout.as_secs()))
 }
 
 fn overall_timeout_error(overall_timeout: Duration) -> anyhow::Error {
@@ -821,7 +870,7 @@ mod tests {
         build_guest_env_preamble, env_merge, parse_env_file, resolve_step_timeout, run_host_step,
         shell_single_quote, HostStepFiles, StepExecutionBudget,
     };
-    use crate::plan::step::{resolve_shell, StepTarget, TestStep};
+    use crate::plan::step::{resolve_shell, RunStep, StepTarget};
     use crate::util::unique_suffix;
     use serde::Deserialize;
     use std::path::{Path, PathBuf};
@@ -1363,7 +1412,7 @@ mod tests {
 
     #[test]
     fn test_resolve_step_timeout_prefers_per_step_override() {
-        let step = TestStep {
+        let step = RunStep {
             target: StepTarget::Host,
             name: "timeout-step".to_string(),
             uploads: vec![],
@@ -1372,14 +1421,14 @@ mod tests {
             shell: None,
         };
         assert_eq!(
-            resolve_step_timeout(&step, Duration::from_secs(300)),
+            resolve_step_timeout(step.timeout, Duration::from_secs(300)),
             Duration::from_secs(45)
         );
     }
 
     #[test]
     fn test_resolve_step_timeout_falls_back_to_document_default() {
-        let step = TestStep {
+        let step = RunStep {
             target: StepTarget::Host,
             name: "timeout-step".to_string(),
             uploads: vec![],
@@ -1388,7 +1437,7 @@ mod tests {
             shell: None,
         };
         assert_eq!(
-            resolve_step_timeout(&step, Duration::from_secs(1800)),
+            resolve_step_timeout(step.timeout, Duration::from_secs(1800)),
             Duration::from_secs(1800)
         );
     }

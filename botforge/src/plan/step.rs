@@ -1,6 +1,7 @@
 use anyhow::Result;
 use serde::de::{self, Deserializer};
 use serde::Deserialize;
+use serde_yaml::Value;
 use std::path::PathBuf;
 
 /// Where a test step executes: inside the guest (SSH) or on the harness host (local).
@@ -16,7 +17,8 @@ pub(crate) enum StepTarget {
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct TestStep {
+#[serde(deny_unknown_fields)]
+pub(crate) struct RunStep {
     /// Where this step executes. Required; must be `guest` or `host`.
     #[serde(rename = "on")]
     pub(crate) target: StepTarget,
@@ -35,6 +37,70 @@ pub(crate) struct TestStep {
     /// automatic `sh -e {0}` fallback if bash is not available.
     #[serde(default)]
     pub(crate) shell: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ArchiveStepSpec {
+    pub(crate) src: String,
+    #[serde(default)]
+    pub(crate) into: Option<String>,
+    #[serde(default)]
+    pub(crate) name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ArchiveStep {
+    pub(crate) archive: ArchiveStepSpec,
+    #[serde(rename = "on", default)]
+    pub(crate) target: Option<StepTarget>,
+    #[serde(default)]
+    pub(crate) uploads: Vec<TestUpload>,
+    #[serde(default)]
+    pub(crate) run: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_positive_seconds")]
+    pub(crate) timeout: Option<u64>,
+    #[serde(default)]
+    pub(crate) shell: Option<String>,
+}
+
+#[derive(Debug)]
+pub(crate) enum TestStep {
+    Run(RunStep),
+    Archive(ArchiveStep),
+}
+
+impl TestStep {
+    pub(crate) fn display_name(&self) -> &str {
+        match self {
+            Self::Run(step) => &step.name,
+            Self::Archive(step) => step
+                .archive
+                .name
+                .as_deref()
+                .unwrap_or(step.archive.src.as_str()),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for TestStep {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        if let Value::Mapping(mapping) = &value {
+            if mapping.contains_key(Value::String("archive".to_string())) {
+                return serde_yaml::from_value::<ArchiveStep>(value)
+                    .map(Self::Archive)
+                    .map_err(de::Error::custom);
+            }
+        }
+        serde_yaml::from_value::<RunStep>(value)
+            .map(Self::Run)
+            .map_err(de::Error::custom)
+    }
 }
 
 #[derive(Debug, Deserialize)]

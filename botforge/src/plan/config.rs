@@ -730,17 +730,33 @@ pub(crate) fn validate_test_ports(ports: &[PortSpec], ssh_port: u16) -> Result<(
 
 pub(crate) fn validate_test_steps(steps: &[TestStep], ports: &[PortSpec]) -> Result<()> {
     for step in steps {
-        resolve_shell(step.shell.as_deref())
-            .with_context(|| format!("test step '{}': invalid `shell:` value", step.name))?;
-        if step.target == StepTarget::Host && !step.uploads.is_empty() {
-            anyhow::bail!(
-                "test step '{}': `uploads` is not valid on an `on: host` step; \
-                 files are already local in the harness",
-                step.name
-            );
+        match step {
+            TestStep::Run(step) => {
+                resolve_shell(step.shell.as_deref()).with_context(|| {
+                    format!("test step '{}': invalid `shell:` value", step.name)
+                })?;
+                if step.target == StepTarget::Host && !step.uploads.is_empty() {
+                    anyhow::bail!(
+                        "test step '{}': `uploads` is not valid on an `on: host` step; \
+                         files are already local in the harness",
+                        step.name
+                    );
+                }
+            }
+            TestStep::Archive(step) => {
+                anyhow::bail!(
+                    "test step '{}': `archive` steps are only supported in `type: build` documents",
+                    step.archive
+                        .name
+                        .as_deref()
+                        .unwrap_or(step.archive.src.as_str())
+                );
+            }
         }
     }
-    let has_host_step = steps.iter().any(|s| s.target == StepTarget::Host);
+    let has_host_step = steps
+        .iter()
+        .any(|step| matches!(step, TestStep::Run(run) if run.target == StepTarget::Host));
     if has_host_step && ports.is_empty() {
         anyhow::bail!(
             "test config has `on: host` steps but no `ports:` are declared; \
@@ -752,15 +768,54 @@ pub(crate) fn validate_test_steps(steps: &[TestStep], ports: &[PortSpec]) -> Res
 
 pub(crate) fn validate_build_steps(steps: &[TestStep]) -> Result<()> {
     for step in steps {
-        resolve_shell(step.shell.as_deref())
-            .with_context(|| format!("build step '{}': invalid `shell:` value", step.name))?;
-        if step.target == StepTarget::Host && !step.uploads.is_empty() {
-            anyhow::bail!(
-                "build step '{}': `uploads` is not valid on an `on: host` step; \
-                 files are already local in the harness",
-                step.name
-            );
+        match step {
+            TestStep::Run(step) => {
+                resolve_shell(step.shell.as_deref()).with_context(|| {
+                    format!("build step '{}': invalid `shell:` value", step.name)
+                })?;
+                if step.target == StepTarget::Host && !step.uploads.is_empty() {
+                    anyhow::bail!(
+                        "build step '{}': `uploads` is not valid on an `on: host` step; \
+                         files are already local in the harness",
+                        step.name
+                    );
+                }
+            }
+            TestStep::Archive(step) => validate_archive_build_step(step)?,
         }
+    }
+    Ok(())
+}
+
+fn validate_archive_build_step(step: &crate::plan::step::ArchiveStep) -> Result<()> {
+    let name = step
+        .archive
+        .name
+        .as_deref()
+        .unwrap_or(step.archive.src.as_str());
+    if step.archive.src.trim().is_empty() {
+        anyhow::bail!("build step '{name}': archive `src` is required and must be non-empty");
+    }
+    if !step.archive.src.starts_with('@') {
+        anyhow::bail!("build step '{name}': archive `src` must start with '@'");
+    }
+    if step.archive.src.starts_with("@://") {
+        anyhow::bail!("build step '{name}': archive `src` does not support '@://' traversal");
+    }
+    if step.target.is_some() {
+        anyhow::bail!("build step '{name}': `on` is not valid on an `archive` step");
+    }
+    if step.run.is_some() {
+        anyhow::bail!("build step '{name}': `run` is not valid on an `archive` step");
+    }
+    if !step.uploads.is_empty() {
+        anyhow::bail!("build step '{name}': `uploads` is not valid on an `archive` step");
+    }
+    if step.shell.is_some() {
+        anyhow::bail!("build step '{name}': `shell` is not valid on an `archive` step");
+    }
+    if step.timeout.is_some() {
+        anyhow::bail!("build step '{name}': `timeout` is not valid on an `archive` step");
     }
     Ok(())
 }
@@ -772,7 +827,9 @@ mod tests {
         validate_build_steps, validate_test_ports, validate_test_steps, InputDeclaration,
         InputType, TestConfig, TestIso, MAX_INCLUDE_DEPTH,
     };
-    use crate::plan::step::{StepTarget, TestStep, TestUpload};
+    use crate::plan::step::{
+        ArchiveStep, ArchiveStepSpec, RunStep, StepTarget, TestStep, TestUpload,
+    };
     use crate::qemu::PortSpec;
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
@@ -783,6 +840,13 @@ mod tests {
             addr: "127.0.0.1".into(),
             port,
         }
+    }
+
+    fn run_ref(step: &TestStep) -> &RunStep {
+        let TestStep::Run(step) = step else {
+            panic!("expected run step");
+        };
+        step
     }
 
     #[test]
@@ -977,10 +1041,13 @@ steps:
         .unwrap();
 
         assert_eq!(config.steps.len(), 1);
-        assert_eq!(config.steps[0].target, StepTarget::Guest);
-        assert_eq!(config.steps[0].name, "goss");
-        assert_eq!(config.steps[0].run, "goss -g /path/goss.yaml validate");
-        assert!(config.steps[0].uploads.is_empty());
+        assert_eq!(run_ref(&config.steps[0]).target, StepTarget::Guest);
+        assert_eq!(run_ref(&config.steps[0]).name, "goss");
+        assert_eq!(
+            run_ref(&config.steps[0]).run,
+            "goss -g /path/goss.yaml validate"
+        );
+        assert!(run_ref(&config.steps[0]).uploads.is_empty());
     }
 
     #[test]
@@ -998,9 +1065,12 @@ steps:
         .unwrap();
 
         assert_eq!(config.steps.len(), 1);
-        assert_eq!(config.steps[0].target, StepTarget::Host);
-        assert_eq!(config.steps[0].name, "vm-narrative");
-        assert_eq!(config.steps[0].run, "bash smoke/vm-narrative.sh 127.0.0.1");
+        assert_eq!(run_ref(&config.steps[0]).target, StepTarget::Host);
+        assert_eq!(run_ref(&config.steps[0]).name, "vm-narrative");
+        assert_eq!(
+            run_ref(&config.steps[0]).run,
+            "bash smoke/vm-narrative.sh 127.0.0.1"
+        );
     }
 
     #[test]
@@ -1018,12 +1088,12 @@ steps:
         )
         .unwrap();
 
-        assert_eq!(config.steps[0].uploads.len(), 1);
+        assert_eq!(run_ref(&config.steps[0]).uploads.len(), 1);
         assert_eq!(
-            config.steps[0].uploads[0].src,
+            run_ref(&config.steps[0]).uploads[0].src,
             PathBuf::from("local/file.sh")
         );
-        assert_eq!(config.steps[0].uploads[0].dest, "/tmp/file.sh");
+        assert_eq!(run_ref(&config.steps[0]).uploads[0].dest, "/tmp/file.sh");
     }
 
     #[test]
@@ -1039,7 +1109,7 @@ steps:
         )
         .unwrap();
 
-        assert_eq!(config.steps[0].timeout, Some(900));
+        assert_eq!(run_ref(&config.steps[0]).timeout, Some(900));
     }
 
     #[test]
@@ -1066,10 +1136,10 @@ steps:
         .unwrap();
 
         assert_eq!(config.steps.len(), 4);
-        assert_eq!(config.steps[0].target, StepTarget::Guest);
-        assert_eq!(config.steps[1].target, StepTarget::Guest);
-        assert_eq!(config.steps[2].target, StepTarget::Host);
-        assert_eq!(config.steps[3].target, StepTarget::Guest);
+        assert_eq!(run_ref(&config.steps[0]).target, StepTarget::Guest);
+        assert_eq!(run_ref(&config.steps[1]).target, StepTarget::Guest);
+        assert_eq!(run_ref(&config.steps[2]).target, StepTarget::Host);
+        assert_eq!(run_ref(&config.steps[3]).target, StepTarget::Guest);
     }
 
     #[test]
@@ -1141,15 +1211,15 @@ steps:
         let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
 
         assert_eq!(config.steps.len(), 1);
-        assert_eq!(config.steps[0].name, "narrative-edge");
-        assert_eq!(config.steps[0].shell.as_deref(), Some("bash"));
+        assert_eq!(run_ref(&config.steps[0]).name, "narrative-edge");
+        assert_eq!(run_ref(&config.steps[0]).shell.as_deref(), Some("bash"));
         assert_eq!(
-            config.steps[0].uploads[0].src,
+            run_ref(&config.steps[0]).uploads[0].src,
             PathBuf::from("scripts/edge.sh")
         );
-        assert_eq!(config.steps[0].uploads[0].dest, "/tmp/edge.sh");
-        assert!(config.steps[0].run.contains(r#"echo "${USER}""#));
-        assert!(config.steps[0].run.contains("bash /tmp/edge.sh"));
+        assert_eq!(run_ref(&config.steps[0]).uploads[0].dest, "/tmp/edge.sh");
+        assert!(run_ref(&config.steps[0]).run.contains(r#"echo "${USER}""#));
+        assert!(run_ref(&config.steps[0]).run.contains("bash /tmp/edge.sh"));
     }
 
     #[test]
@@ -1252,7 +1322,7 @@ steps:
     // --- step validation ---
 
     fn make_step(target: StepTarget, name: &str, with_uploads: bool) -> TestStep {
-        TestStep {
+        TestStep::Run(RunStep {
             target,
             name: name.to_string(),
             run: "echo ok".to_string(),
@@ -1266,7 +1336,7 @@ steps:
             } else {
                 vec![]
             },
-        }
+        })
     }
 
     #[test]
@@ -1330,7 +1400,7 @@ steps:
 "#,
         )
         .unwrap();
-        assert_eq!(config.steps[0].shell.as_deref(), Some("python"));
+        assert_eq!(run_ref(&config.steps[0]).shell.as_deref(), Some("python"));
     }
 
     #[test]
@@ -1344,13 +1414,16 @@ steps:
 "#,
         )
         .unwrap();
-        assert!(config.steps[0].shell.is_none());
+        assert!(run_ref(&config.steps[0]).shell.is_none());
     }
 
     #[test]
     fn test_validate_steps_rejects_bad_shell() {
         let mut step = make_step(StepTarget::Guest, "bad-shell", false);
-        step.shell = Some("fish".to_string());
+        let TestStep::Run(run) = &mut step else {
+            panic!("expected run step");
+        };
+        run.shell = Some("fish".to_string());
         let err = validate_test_steps(&[step], &[]).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
@@ -1578,7 +1651,7 @@ steps:
 
         let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
         assert_eq!(config.steps.len(), 1);
-        assert_eq!(config.steps[0].name, "hello");
+        assert_eq!(run_ref(&config.steps[0]).name, "hello");
     }
 
     #[test]
@@ -1650,7 +1723,7 @@ steps:
         .unwrap();
 
         let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
-        assert_eq!(config.steps[0].shell.as_deref(), Some("bash"));
+        assert_eq!(run_ref(&config.steps[0]).shell.as_deref(), Some("bash"));
     }
 
     #[test]
@@ -2030,8 +2103,8 @@ steps:
             2,
             "same fragment included twice must expand to two steps"
         );
-        assert_eq!(config.steps[0].name, "reused-step");
-        assert_eq!(config.steps[1].name, "reused-step");
+        assert_eq!(run_ref(&config.steps[0]).name, "reused-step");
+        assert_eq!(run_ref(&config.steps[1]).name, "reused-step");
     }
 
     #[test]
@@ -2104,7 +2177,7 @@ steps:
         assert_eq!(config.timeout, 7200);
         assert_eq!(config.cloud_init_timeout, 600);
         assert_eq!(config.steps.len(), 1);
-        assert_eq!(config.steps[0].name, "provision");
+        assert_eq!(run_ref(&config.steps[0]).name, "provision");
     }
 
     #[test]
@@ -2434,8 +2507,8 @@ steps:
         );
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
         assert_eq!(config.steps.len(), 1);
-        assert_eq!(config.steps[0].name, "frag-step");
-        assert_eq!(config.steps[0].timeout, Some(42));
+        assert_eq!(run_ref(&config.steps[0]).name, "frag-step");
+        assert_eq!(run_ref(&config.steps[0]).timeout, Some(42));
     }
 
     #[test]
@@ -2470,7 +2543,7 @@ steps:
 "#,
         );
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
-        assert_eq!(config.steps[0].timeout, Some(75));
+        assert_eq!(run_ref(&config.steps[0]).timeout, Some(75));
     }
 
     #[test]
@@ -2574,8 +2647,173 @@ steps:
     #[test]
     fn test_validate_build_steps_rejects_bad_shell() {
         let mut step = make_step(StepTarget::Guest, "bad-shell", false);
-        step.shell = Some("fish".to_string());
+        let TestStep::Run(run) = &mut step else {
+            panic!("expected run step");
+        };
+        run.shell = Some("fish".to_string());
         let err = validate_build_steps(&[step]).unwrap_err();
         assert!(format!("{err:#}").contains("fish"));
+    }
+
+    #[test]
+    fn test_build_step_deserialize_archive_shape() {
+        let step: TestStep = serde_yaml::from_str(
+            r#"
+archive:
+  src: "@some-tool"
+  into: some-tool
+  name: unpack-some-tool
+"#,
+        )
+        .unwrap();
+        let TestStep::Archive(archive) = step else {
+            panic!("expected archive step");
+        };
+        assert_eq!(archive.archive.src, "@some-tool");
+        assert_eq!(archive.archive.into.as_deref(), Some("some-tool"));
+        assert_eq!(archive.archive.name.as_deref(), Some("unpack-some-tool"));
+    }
+
+    #[test]
+    fn test_build_step_deserialize_run_shape_still_works() {
+        let step: TestStep = serde_yaml::from_str(
+            r#"
+on: guest
+name: run-it
+run: echo ok
+"#,
+        )
+        .unwrap();
+        let TestStep::Run(step) = step else {
+            panic!("expected run step");
+        };
+        assert_eq!(step.name, "run-it");
+        assert_eq!(step.run, "echo ok");
+    }
+
+    #[test]
+    fn test_validate_build_steps_accepts_archive_step() {
+        let steps = vec![TestStep::Archive(ArchiveStep {
+            archive: ArchiveStepSpec {
+                src: "@some-tool".to_string(),
+                into: Some("some-tool".to_string()),
+                name: Some("unpack".to_string()),
+            },
+            target: None,
+            uploads: vec![],
+            run: None,
+            timeout: None,
+            shell: None,
+        })];
+        assert!(validate_build_steps(&steps).is_ok());
+    }
+
+    #[test]
+    fn test_validate_build_steps_rejects_archive_empty_src() {
+        let steps = vec![TestStep::Archive(ArchiveStep {
+            archive: ArchiveStepSpec {
+                src: "   ".to_string(),
+                into: None,
+                name: Some("bad-archive".to_string()),
+            },
+            target: None,
+            uploads: vec![],
+            run: None,
+            timeout: None,
+            shell: None,
+        })];
+        let err = validate_build_steps(&steps).unwrap_err();
+        assert!(format!("{err:#}").contains("src"));
+        assert!(format!("{err:#}").contains("bad-archive"));
+    }
+
+    #[test]
+    fn test_validate_build_steps_rejects_archive_without_at_prefix() {
+        let steps = vec![TestStep::Archive(ArchiveStep {
+            archive: ArchiveStepSpec {
+                src: "some-tool".to_string(),
+                into: None,
+                name: Some("bad-archive".to_string()),
+            },
+            target: None,
+            uploads: vec![],
+            run: None,
+            timeout: None,
+            shell: None,
+        })];
+        let err = validate_build_steps(&steps).unwrap_err();
+        assert!(format!("{err:#}").contains("must start with '@'"));
+    }
+
+    #[test]
+    fn test_validate_build_steps_rejects_archive_with_forbidden_fields() {
+        let steps = vec![TestStep::Archive(ArchiveStep {
+            archive: ArchiveStepSpec {
+                src: "@some-tool".to_string(),
+                into: None,
+                name: Some("bad-archive".to_string()),
+            },
+            target: Some(StepTarget::Host),
+            uploads: vec![TestUpload {
+                src: PathBuf::from("src/file"),
+                dest: "/tmp/file".to_string(),
+            }],
+            run: Some("echo hi".to_string()),
+            timeout: Some(30),
+            shell: Some("bash".to_string()),
+        })];
+        let err = validate_build_steps(&steps).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("on"),
+            "error should mention first offending field: {err:#}"
+        );
+    }
+
+    #[test]
+    fn test_validate_build_steps_rejects_archive_src_traversal_scheme() {
+        let steps = vec![TestStep::Archive(ArchiveStep {
+            archive: ArchiveStepSpec {
+                src: "@://provider/asset".to_string(),
+                into: None,
+                name: Some("bad-archive".to_string()),
+            },
+            target: None,
+            uploads: vec![],
+            run: None,
+            timeout: None,
+            shell: None,
+        })];
+        let err = validate_build_steps(&steps).unwrap_err();
+        assert!(format!("{err:#}").contains("@://"));
+    }
+
+    #[test]
+    fn test_load_build_config_rejects_archive_step_mixed_with_run_fields() {
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            r#"
+type: build
+base-image: debian-base
+steps:
+  - archive:
+      src: "@some-tool"
+      name: bad-mixed
+    on: host
+    run: echo nope
+"#,
+        );
+        let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
+        let err = validate_build_steps(&config.steps).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("bad-mixed"),
+            "error should mention step name: {msg}"
+        );
+        assert!(
+            msg.contains("on"),
+            "error should mention offending field: {msg}"
+        );
     }
 }
