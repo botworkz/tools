@@ -31,7 +31,7 @@ pub(crate) struct BuildArgs {
     #[arg(long, required = true)]
     spec: PathBuf,
     /// Source qcow2 image path (optional local override). When provided, overrides the
-    /// `base-image:` shasset resolution and boots this file directly. Read-only; copied
+    /// `image:` shasset resolution and boots this file directly. Read-only; copied
     /// to <output>.partial before any modification.
     #[arg(long)]
     source: Option<PathBuf>,
@@ -88,11 +88,12 @@ pub(crate) fn cmd_build(config: &Path, args: BuildArgs) -> Result<()> {
         ensure_command("tar")?;
     }
 
-    // Resolve the source qcow2: --source wins; otherwise fetch base-image via shasset.
+    // Resolve the source qcow2: --source wins; otherwise fetch image via shasset.
     let source = if let Some(src) = args.source {
         resolve_under_root(&repo_root, src)
     } else {
-        resolve_base_image(config, &build_config.base_image, args.cache_dir.as_deref())?
+        let crate::plan::config::ImageRef::ShassetDefault(ref shasset_name) = build_config.image;
+        resolve_base_image(config, shasset_name, args.cache_dir.as_deref())?
     };
 
     if !source.is_file() {
@@ -304,7 +305,7 @@ pub(crate) fn cmd_build(config: &Path, args: BuildArgs) -> Result<()> {
     Ok(())
 }
 
-/// Resolve the `base-image:` shasset asset key to a local qcow2 path.
+/// Resolve the `image:` shasset asset key to a local qcow2 path.
 ///
 /// Mirrors `deps.rs`'s `fetch_asset` pattern: loads the manifest, looks up the
 /// asset, fetches + verifies + caches it via the shasset library, then materializes
@@ -342,13 +343,13 @@ where
     let uri = asset.expanded_uri();
     if uri.starts_with("oci://") {
         bail!(
-            "base-image asset '{asset_key}' is an oci:// image; \
-             base-image must resolve to a qcow2 file asset"
+            "image asset '{asset_key}' is an oci:// image; \
+             image must resolve to a qcow2 file asset"
         );
     }
     if asset.checksum.is_none() {
         eprintln!(
-            "warning: base-image asset '{asset_key}' has no checksum; \
+            "warning: image asset '{asset_key}' has no checksum; \
              integrity will not be verified"
         );
     }
@@ -365,16 +366,16 @@ where
         materialize_mode: MaterializeMode::Copy,
         transport: transport_factory(),
     })
-    .with_context(|| format!("failed to fetch base-image asset '{asset_key}'"))?;
+    .with_context(|| format!("failed to fetch image asset '{asset_key}'"))?;
 
     // Materialize a copy into the cache dir so qemu boots a mutable copy
     // without polluting the shasset blob cache.
-    let filename = asset.output_filename().with_context(|| {
-        format!("base-image asset '{asset_key}': cannot determine output filename")
-    })?;
+    let filename = asset
+        .output_filename()
+        .with_context(|| format!("image asset '{asset_key}': cannot determine output filename"))?;
     let out_dir = cache_dir.join("base-images");
     let qcow2_path = materialize_flat(&fetched.blob_path, &out_dir, &filename, false)
-        .with_context(|| format!("failed to stage base-image asset '{asset_key}'"))?;
+        .with_context(|| format!("failed to stage image asset '{asset_key}'"))?;
 
     Ok(qcow2_path)
 }
@@ -859,7 +860,7 @@ mod tests {
             err_text.contains("--output"),
             "expected --output in error: {err_text}"
         );
-        // --source is now optional (overrides base-image resolution); not required.
+        // --source is now optional (overrides image: resolution); not required.
         assert!(
             !err_text.contains("--source"),
             "--source should not be required: {err_text}"

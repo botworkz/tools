@@ -53,11 +53,11 @@ This produces the stable local tag `botwork/botforge:local`.
 
 The `--config / -c` flag (default `shasset.yaml`) is global; it points `deps`
 at the shasset manifest, `payload` at the payload config, and `build` at the
-shasset manifest used to resolve `base-image:` assets.
+shasset manifest used to resolve `image:` assets.
 
 | Command | Summary |
 |---|---|
-| `botforge build --spec <file> --output <qcow2> [--source <qcow2>] [--cache-dir <dir>] [--repo-root <dir>]` | Resolve `base-image:` from the shasset manifest (`--config`), fetch + verify + cache the qcow2, boot it under qemu, inject an ephemeral in-harness SSH keypair via cloud-init, run `type: build` plan steps, and commit the result on clean shutdown. `--source` is an optional local override that bypasses shasset resolution. |
+| `botforge build --spec <file> --output <qcow2> [--source <qcow2>] [--cache-dir <dir>] [--repo-root <dir>]` | Resolve `image:` from the shasset manifest (`--config`), fetch + verify + cache the qcow2, boot it under qemu, inject an ephemeral in-harness SSH keypair via cloud-init, run `type: build` plan steps, and commit the result on clean shutdown. `--source` is an optional local override that bypasses shasset resolution. |
 | `botforge build-legacy --spec <file> --source <qcow2> --output <qcow2>` | [legacy] Run a virt-customize spec against a source qcow2 to produce an output qcow2. |
 | `botforge deps --out <dir> [name ...]` | Fetch + stage shasset assets into a flat output directory. |
 | `botforge iso --src <dir> --out <file> [--volume-id <id>]` | Build an ISO image from a source tree. Also supports generating a cidata seed ISO with an injected SSH key. |
@@ -422,7 +422,7 @@ directory); all guest paths must be absolute.
 
 ```yaml
 type: build
-base-image: debian-base          # required: shasset asset key of the boot qcow2
+image: "@debian-base"           # required: @<shasset-name> resolves to the provider's default artifact
 disk_size: "10G"                 # optional, default 10G
 memsize: 4096                    # optional, default 4096 MiB
 smp: 4                           # optional, default 4 vCPUs
@@ -439,37 +439,52 @@ steps:
     run: echo "build host check"
 ```
 
-#### `base-image:` (required)
+#### `image:` (required)
 
-`base-image:` is the only required field besides `type: build`. Its value is a
-**shasset asset key** — a name that exists in the `assets:` map of the shasset
-manifest pointed to by the global `--config` flag (default `shasset.yaml`).
+`image:` is the only required field besides `type: build`. Its value is a
+**`@`-scheme reference** identifying the source qcow2 to boot from.
+
+**Supported form (current):** `@<shasset-name>` — resolves the named shasset
+dep-provider's **default artifact** (the single qcow2 it pulls).
+
+Example: `image: "@debian-base"` looks up the `debian-base` asset in the
+shasset manifest pointed to by the global `--config` flag (default
+`shasset.yaml`) and fetches its default file.
+
+**Reserved (not yet supported):** `@://…` — the URI traversal form (walking
+into repos/tarballs/paths within a provider).  The parser recognises this
+form and hard-errors with a clear message so the scheme stays intact for
+when traversal is implemented.  Do not use `://` in `image:` values today.
+
+**Bare names are rejected.** `image: debian-base` (no `@`) is a parse-time
+hard error.  The `@` prefix is mandatory.
 
 When `botforge build` runs:
 1. The manifest is loaded from `--config`.
-2. The named asset is looked up. An unknown key is a hard error naming the key
+2. `image:` is parsed; an `@`-prefixed name is required (hard error otherwise).
+3. The named asset is looked up. An unknown key is a hard error naming the key
    and the manifest path.
-3. `fetch_asset` downloads, verifies the checksum, and caches the blob (same
+4. `fetch_asset` downloads, verifies the checksum, and caches the blob (same
    mechanics as `botforge deps`).
-4. A copy is materialized from the cache into `~/.cache/shasset/base-images/`
+5. A copy is materialized from the cache into `~/.cache/shasset/base-images/`
    (or the `--cache-dir` path) so qemu boots the copy without ever mutating the
    cached blob.
-5. The provisioning flow (resize → boot → SSH → cloud-init → steps → shutdown)
+6. The provisioning flow (resize → boot → SSH → cloud-init → steps → shutdown)
    continues as before, using the materialized copy as the boot disk.
 
-**`--source <qcow2>` overrides `base-image:` resolution.** When `--source` is
+**`--source <qcow2>` overrides `image:` resolution.** When `--source` is
 passed, `botforge build` boots that local file directly and skips shasset
 entirely. This is useful for local iteration, building on a just-produced parent
-qcow2, or arch experiments. Neither `--source` nor a resolvable `base-image:`
+qcow2, or arch experiments. Neither `--source` nor a resolvable `image:`
 → hard error.
 
 **`--cache-dir <dir>` controls the shasset cache.** Defaults to
 `~/.cache/shasset` (respecting `SHASSET_CACHE` / `XDG_CACHE_HOME` / `HOME`).
 The cache is independent of the build/output dir by design — it can be mounted
-as a persistent volume or CI cache to avoid re-downloading the base image on
+as a persistent volume or CI cache to avoid re-downloading the image on
 every build.
 
-`base-image:` is a `type: build`-only field; it is rejected in `type: test` and
+`image:` is a `type: build`-only field; it is rejected in `type: test` and
 `type: fragment` documents at load time.
 
 #### Steps in `type: build`
