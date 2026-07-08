@@ -177,34 +177,6 @@ pub(crate) fn wait_for_ssh(ssh: &SshOptions, timeout: Duration) -> Result<()> {
     }
 }
 
-pub(crate) fn require_stable_ssh(
-    ssh: &SshOptions,
-    attempts: usize,
-    required_consecutive: usize,
-) -> Result<()> {
-    let mut consecutive = 0usize;
-    for _ in 0..attempts {
-        if ssh_with_retry(
-            ssh,
-            "true",
-            1,
-            Duration::from_secs(0),
-            Duration::from_secs(10),
-        )
-        .is_ok()
-        {
-            consecutive += 1;
-            if consecutive >= required_consecutive {
-                return Ok(());
-            }
-        } else {
-            consecutive = 0;
-        }
-        std::thread::sleep(Duration::from_secs(2));
-    }
-    bail!("SSH was not stable enough after {attempts} probes")
-}
-
 pub(crate) fn ssh_with_retry(
     ssh: &SshOptions,
     remote_command: &str,

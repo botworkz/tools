@@ -1,4 +1,5 @@
 use anyhow::Result;
+use serde::de::{self, Deserializer};
 use serde::Deserialize;
 use std::path::PathBuf;
 
@@ -24,6 +25,8 @@ pub(crate) struct TestStep {
     #[serde(default)]
     pub(crate) uploads: Vec<TestUpload>,
     pub(crate) run: String,
+    #[serde(default, deserialize_with = "deserialize_optional_positive_seconds")]
+    pub(crate) timeout: Option<u64>,
     /// Interpreter used to execute `run:`. Mirrors GitHub Actions `shell:` semantics.
     ///
     /// Named shells: `bash` (default), `sh`, `python`.
@@ -38,6 +41,42 @@ pub(crate) struct TestStep {
 pub(crate) struct TestUpload {
     pub(crate) src: PathBuf,
     pub(crate) dest: String,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum SecondsValue {
+    Integer(i64),
+    String(String),
+}
+
+fn parse_positive_seconds(value: SecondsValue) -> std::result::Result<u64, String> {
+    let parsed = match value {
+        SecondsValue::Integer(value) => value,
+        SecondsValue::String(value) => value
+            .trim()
+            .parse::<i64>()
+            .map_err(|_| format!("expected a positive integer number of seconds, got '{value}'"))?,
+    };
+    if parsed <= 0 {
+        return Err(format!(
+            "expected a positive integer number of seconds, got {parsed}"
+        ));
+    }
+    Ok(parsed as u64)
+}
+
+pub(crate) fn deserialize_optional_positive_seconds<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<u64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<SecondsValue>::deserialize(deserializer)?;
+    value
+        .map(parse_positive_seconds)
+        .transpose()
+        .map_err(de::Error::custom)
 }
 
 /// Resolve a step's `shell:` value into an argv template with a `{0}` slot.

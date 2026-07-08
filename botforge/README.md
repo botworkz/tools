@@ -118,12 +118,34 @@ Each entry in `steps:` has a required `on:` field that selects where it runs:
 - **`on: host`** — runs locally in the **botforge container / harness** (where
   botforge itself executes), _not_ inside the guest. Reaches the guest only
   via ports declared in `ports:`. Inherits the harness environment (so CI
-  variables such as `GH_TOKEN` are visible). Has a plain execution timeout
-  with no SSH transport retries. `uploads:` is not valid on host steps.
+  variables such as `GH_TOKEN` are visible). `uploads:` is not valid on host
+  steps.
 
 Steps execute in the exact order written; guest and host steps may interleave
 freely. This lets you flip guest state, hit the guest from outside, then
 restore — all in a single ordered sequence.
+
+#### Timeout tiers
+
+The shared VM runtime now has three timeout layers:
+
+| Tier | Field | `type: test` default | `type: build` default |
+|---|---|---:|---:|
+| per-step | `steps[].timeout` | unset | unset |
+| document step default | `step_timeout` | 300 s | 1800 s |
+| overall wall-clock budget | `timeout` | 1800 s | 7200 s |
+| cloud-init wait | per-kind default | 300 s | 600 s |
+
+- `steps[].timeout` is optional on both `on: guest` and `on: host` steps and
+  wins when set.
+- `step_timeout` applies to any step that does not set its own `timeout`.
+- `timeout` is a wall-clock budget for the full flow: boot/SSH waits,
+  `cloud-init status --wait`, stable-SSH checks, all steps, and graceful
+  shutdown for `botforge build`.
+- Fragment documents may set per-step `timeout:` values inside `steps:`, but
+  top-level `step_timeout:` and `timeout:` remain entrypoint-only.
+- All timeout values are integer seconds; `0` and negative values are rejected
+  at config load.
 
 #### Reusable step fragments with `uses:`
 
@@ -292,12 +314,15 @@ currently are). If bash is unavailable the explicit `shell: sh` fallback
 - **host step** — `run:` is written to a temp file in the botforge container
   and executed via the resolved interpreter template using
   `std::process::Command`. Working directory is `repo_root`; the harness
-  environment is inherited. The 300 s timeout and kill behaviour are unchanged.
+  environment is inherited. The effective timeout is `steps[].timeout` or the
+  document `step_timeout`, and the process is also bounded by the overall
+  document `timeout`.
 - **guest step** — `run:` is written to a temp file in the container, scp'd to
   a unique path under `/tmp` on the guest (e.g.
   `/tmp/botforge-step-<n>-<id>.sh`), then executed there via `ssh_with_retry`
-  with the same 10-retry / 300 s timeout as today. The guest `uploads:` still
-  happen first, exactly as before.
+  with the same 10-retry transport semantics as today. Each SSH attempt uses
+  the effective step timeout and is also bounded by the overall document
+  `timeout`. The guest `uploads:` still happen first, exactly as before.
 
 Temp script files (both the local container copy and the guest `/tmp` copy for
 guest steps) are removed best-effort after each step, on both success and
