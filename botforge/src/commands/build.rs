@@ -19,6 +19,7 @@ use crate::util::{
     create_temp_dir, default_cache_dir, ensure_command, materialize_flat, resolve_under_root,
 };
 
+use crate::plan::step::{ArchiveStep, TestStep};
 use crate::plan::{
     load_build_config, preserve_failed_build_disk, print_log_tail, run_step_flow,
     shutdown_build_vm, validate_build_steps, vm::StepTimeoutPolicy,
@@ -79,6 +80,13 @@ pub(crate) fn cmd_build(config: &Path, args: BuildArgs) -> Result<()> {
 
     let build_config = load_build_config(&repo_root, &spec_path)?;
     validate_build_steps(&build_config.steps)?;
+    if build_config
+        .steps
+        .iter()
+        .any(|step| matches!(step, TestStep::Archive(_)))
+    {
+        ensure_command("tar")?;
+    }
 
     // Resolve the source qcow2: --source wins; otherwise fetch base-image via shasset.
     let source = if let Some(src) = args.source {
@@ -178,6 +186,15 @@ pub(crate) fn cmd_build(config: &Path, args: BuildArgs) -> Result<()> {
     // ---------------------------------------------------------------------------
     // Disk lifecycle step 4: run build steps via shared flow
     // ---------------------------------------------------------------------------
+    let mut archive_executor = |step_idx: usize, step: &ArchiveStep| -> Result<()> {
+        run_archive_step(
+            config,
+            &build_dir,
+            args.cache_dir.as_deref(),
+            step_idx,
+            step,
+        )
+    };
     let step_result = run_step_flow(
         &repo_root,
         &build_config.steps,
@@ -188,6 +205,7 @@ pub(crate) fn cmd_build(config: &Path, args: BuildArgs) -> Result<()> {
             default_step_timeout: std::time::Duration::from_secs(build_config.step_timeout),
             cloud_init_timeout: std::time::Duration::from_secs(build_config.cloud_init_timeout),
         },
+        Some(&mut archive_executor),
     );
     let overall_deadline = match step_result {
         Ok(overall_deadline) => overall_deadline,
@@ -361,6 +379,168 @@ where
     Ok(qcow2_path)
 }
 
+fn run_archive_step(
+    manifest_path: &Path,
+    build_dir: &Path,
+    cache_dir_override: Option<&Path>,
+    step_idx: usize,
+    step: &ArchiveStep,
+) -> Result<()> {
+    let src = step.archive.src.trim();
+    let asset_key = parse_archive_asset_key(src)?;
+
+    let manifest = load(manifest_path)
+        .with_context(|| format!("cannot load shasset manifest: {}", manifest_path.display()))?;
+    let cache_dir = cache_dir_override
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(default_cache_dir);
+    let asset = manifest.assets.get(asset_key).with_context(|| {
+        format!(
+            "archive step '{}': asset '{}' not found in manifest {}",
+            step.archive.name.as_deref().unwrap_or(src),
+            asset_key,
+            manifest_path.display()
+        )
+    })?;
+
+    let fetched = fetch_asset(FetchParams {
+        name: asset_key,
+        asset,
+        out_dir: None,
+        cache_dir: &cache_dir,
+        retries: manifest.settings.retries,
+        backoff: &manifest.settings.backoff,
+        compute_checksum: true,
+        no_reverify: false,
+        materialize_mode: MaterializeMode::Copy,
+        transport: None,
+    })
+    .with_context(|| format!("failed to fetch archive asset '{asset_key}'"))?;
+
+    let relative_unpacked = archive_unpack_relative_path(
+        asset_key,
+        step.archive.into.as_deref(),
+        asset.checksum.as_deref(),
+    );
+    let relative_within_build = relative_unpacked
+        .strip_prefix(Path::new("build"))
+        .unwrap_or(&relative_unpacked);
+    let unpack_dir = build_dir.join(relative_within_build);
+    unpack_archive_to_dir(&fetched.blob_path, &unpack_dir).with_context(|| {
+        format!(
+            "archive step '{}': failed to unpack {} into {}",
+            step.archive.name.as_deref().unwrap_or(src),
+            fetched.blob_path.display(),
+            unpack_dir.display()
+        )
+    })?;
+
+    // TODO: Thread archive outputs into step-input resolution so future steps can consume
+    // them directly via @://build/<path> without manual path wiring.
+    println!(
+        "archive step {} ('{}') unpacked to {}",
+        step_idx + 1,
+        step.archive.name.as_deref().unwrap_or(src),
+        relative_unpacked.display()
+    );
+
+    Ok(())
+}
+
+fn parse_archive_asset_key(src: &str) -> Result<&str> {
+    if src.is_empty() {
+        bail!("archive `src` is required");
+    }
+    if src.starts_with("@://") {
+        bail!("archive `src` does not support '@://' traversal");
+    }
+    let Some(asset_key) = src.strip_prefix('@') else {
+        bail!("archive `src` must start with '@'");
+    };
+    if asset_key.trim().is_empty() {
+        bail!("archive `src` must include a shasset name after '@'");
+    }
+    Ok(asset_key)
+}
+
+fn archive_unpack_relative_path(
+    asset_key: &str,
+    into_hint: Option<&str>,
+    checksum: Option<&str>,
+) -> PathBuf {
+    let hint = into_hint
+        .map(str::trim)
+        .filter(|hint| !hint.is_empty())
+        .unwrap_or(asset_key);
+    let slug = sanitize_archive_hint(hint);
+    // Deterministic, reasonably collision-resistant id from archive identity inputs.
+    let hash = archive_identity_hash_hex(asset_key, into_hint, checksum);
+    PathBuf::from("build")
+        .join("archives")
+        .join(format!("{slug}-{hash}"))
+}
+
+fn sanitize_archive_hint(hint: &str) -> String {
+    let mut out = String::with_capacity(hint.len());
+    for ch in hint.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            out.push(ch);
+        } else {
+            out.push('-');
+        }
+    }
+    let trimmed = out.trim_matches('-');
+    if trimmed.is_empty() {
+        "archive".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn archive_identity_hash_hex(
+    asset_key: &str,
+    into_hint: Option<&str>,
+    checksum: Option<&str>,
+) -> String {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in asset_key
+        .as_bytes()
+        .iter()
+        .chain([0xff].iter())
+        .chain(into_hint.unwrap_or("").as_bytes().iter())
+        .chain([0xfe].iter())
+        .chain(checksum.unwrap_or("").as_bytes().iter())
+    {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    format!("{hash:016x}")
+}
+
+fn unpack_archive_to_dir(archive_path: &Path, destination_dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(destination_dir).with_context(|| {
+        format!(
+            "cannot create archive unpack directory: {}",
+            destination_dir.display()
+        )
+    })?;
+    let status = Command::new("tar")
+        .arg("-xf")
+        .arg(archive_path)
+        .arg("-C")
+        .arg(destination_dir)
+        .arg("--no-same-owner")
+        .arg("--no-same-permissions")
+        .status()
+        .context("failed to execute tar")?;
+    if !status.success() {
+        bail!("tar extraction failed (exit status: {status})");
+    }
+    Ok(())
+}
+
 /// Build the remote command that removes the botforge-owned installer and powers off.
 ///
 /// The command launches a detached transient system service as root. That service
@@ -478,14 +658,16 @@ fn resize_qcow2(disk: &Path, size: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        failed_partial_path, installer_teardown_command, output_stem, partial_path,
-        resolve_base_image_with_transport,
+        archive_unpack_relative_path, failed_partial_path, installer_teardown_command, output_stem,
+        parse_archive_asset_key, partial_path, resolve_base_image_with_transport,
+        unpack_archive_to_dir,
     };
     use crate::cli::Cli;
     use clap::Parser;
     use shasset::fetch::{DownloadResponse, FetchError, Transport};
     use std::io::Cursor;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
     use tempfile::TempDir;
 
     struct MockTransport {
@@ -547,6 +729,80 @@ mod tests {
     #[test]
     fn output_stem_uses_output_file_stem() {
         assert_eq!(output_stem(Path::new("/build/out.qcow2")), "out");
+    }
+
+    #[test]
+    fn archive_asset_key_requires_at_prefix() {
+        let err = parse_archive_asset_key("tool").unwrap_err();
+        assert!(format!("{err:#}").contains("must start with '@'"));
+    }
+
+    #[test]
+    fn archive_asset_key_rejects_traversal_scheme() {
+        let err = parse_archive_asset_key("@://build/tool").unwrap_err();
+        assert!(format!("{err:#}").contains("@://"));
+    }
+
+    #[test]
+    fn archive_asset_key_strips_prefix() {
+        let key = parse_archive_asset_key("@some-tool").unwrap();
+        assert_eq!(key, "some-tool");
+    }
+
+    #[test]
+    fn archive_unpack_relative_path_is_deterministic_and_under_build_archives() {
+        let first =
+            archive_unpack_relative_path("some-tool", Some("tool"), Some("sha256:deadbeef"));
+        let second =
+            archive_unpack_relative_path("some-tool", Some("tool"), Some("sha256:deadbeef"));
+        let different =
+            archive_unpack_relative_path("some-tool", Some("different"), Some("sha256:deadbeef"));
+        assert_eq!(first, second, "same input should produce same path");
+        assert_ne!(
+            first, different,
+            "different inputs should produce distinct output paths"
+        );
+        assert!(
+            first.starts_with(Path::new("build").join("archives")),
+            "archive path should live under build/archives: {}",
+            first.display()
+        );
+    }
+
+    #[test]
+    fn unpack_archive_to_dir_extracts_tar_contents() {
+        let tar_available = Command::new("tar")
+            .arg("--version")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false);
+        if !tar_available {
+            return;
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let src_dir = tmp.path().join("src");
+        let payload_dir = src_dir.join("payload");
+        std::fs::create_dir_all(&payload_dir).unwrap();
+        std::fs::write(payload_dir.join("hello.txt"), "hello archive\n").unwrap();
+
+        let archive_path = tmp.path().join("payload.tar");
+        let status = Command::new("tar")
+            .arg("-cf")
+            .arg(&archive_path)
+            .arg("-C")
+            .arg(&src_dir)
+            .arg("payload")
+            .status()
+            .unwrap();
+        assert!(status.success(), "failed to create test tar archive");
+
+        let dest = tmp.path().join("dest");
+        unpack_archive_to_dir(&archive_path, &dest).unwrap();
+
+        let unpacked = dest.join(PathBuf::from("payload").join("hello.txt"));
+        let body = std::fs::read_to_string(&unpacked).unwrap();
+        assert_eq!(body, "hello archive\n");
     }
 
     #[test]
