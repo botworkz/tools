@@ -1,6 +1,7 @@
 mod cli;
 mod commands;
 mod iso;
+mod plan;
 mod qemu;
 mod ssh;
 mod util;

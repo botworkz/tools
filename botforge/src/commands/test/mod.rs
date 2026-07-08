@@ -7,14 +7,10 @@ use crate::qemu::{create_overlay_image, qemu_run_args, require_kvm, spawn_qemu_w
 use crate::ssh::SshOptions;
 use crate::util::{create_temp_dir, ensure_command, resolve_under_root};
 
-use config::{
-    load_test_config, validate_test_ports, validate_test_steps, TestIso, TestIsoBootstrap,
+use crate::plan::{
+    cleanup_test, collect_test_diagnostics, load_test_config, print_log_tail, run_test_flow,
+    validate_test_ports, validate_test_steps, TestIso, TestIsoBootstrap,
 };
-use run::{cleanup_test, collect_test_diagnostics, print_log_tail, run_test_flow};
-
-pub(crate) mod config;
-pub(crate) mod log;
-pub(crate) mod run;
 
 #[derive(Args, Debug)]
 pub(crate) struct TestArgs {

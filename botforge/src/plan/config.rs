@@ -7,12 +7,14 @@ use std::path::{Component, Path, PathBuf};
 use crate::qemu::PortSpec;
 use crate::util::resolve_under_root;
 
+use super::step::{resolve_shell, StepTarget, TestStep};
+
 const DEFAULT_SENTINEL: &str = "__default__";
 
 /// Maximum number of active `uses:` includes on the call stack at any one time.
 /// Includes the root document, which is always on the stack; so this limits nesting
 /// to `MAX_INCLUDE_DEPTH - 1` fragment levels below the root.
-const MAX_INCLUDE_DEPTH: usize = 32;
+pub(super) const MAX_INCLUDE_DEPTH: usize = 32;
 
 /// The kind of a botforge YAML document, specified by the required `type:` field.
 ///
@@ -51,31 +53,31 @@ impl DocumentType {
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
-enum InputType {
+pub(super) enum InputType {
     String,
     Number,
     Boolean,
 }
 
 #[derive(Debug, Deserialize)]
-struct InputDeclaration {
+pub(super) struct InputDeclaration {
     #[serde(rename = "type")]
-    input_type: InputType,
+    pub(super) input_type: InputType,
     #[serde(default)]
-    required: bool,
-    default: Option<String>,
+    pub(super) required: bool,
+    pub(super) default: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
-pub(in crate::commands::test) struct TestConfig {
+pub(crate) struct TestConfig {
     #[serde(default)]
-    pub(in crate::commands::test) isos: Vec<TestIso>,
+    pub(crate) isos: Vec<TestIso>,
     #[serde(default)]
-    pub(in crate::commands::test) ports: Vec<PortSpec>,
+    pub(crate) ports: Vec<PortSpec>,
     #[serde(default)]
-    pub(in crate::commands::test) steps: Vec<TestStep>,
+    pub(crate) steps: Vec<TestStep>,
     #[serde(default)]
-    pub(in crate::commands::test) diagnostics_units: Vec<String>,
+    pub(crate) diagnostics_units: Vec<String>,
 }
 
 /// Raw deserialization target for a top-level `botforge test` document.
@@ -118,7 +120,7 @@ struct TestStepInclude {
 
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
-pub(in crate::commands::test) enum TestIso {
+pub(crate) enum TestIso {
     Attach(PathBuf),
     Bootstrap {
         path: PathBuf,
@@ -129,55 +131,17 @@ pub(in crate::commands::test) enum TestIso {
     },
 }
 
-pub(in crate::commands::test) struct TestIsoBootstrap {
-    pub(in crate::commands::test) label: String,
-    pub(in crate::commands::test) mount: PathBuf,
-    pub(in crate::commands::test) bootstrap: PathBuf,
+pub(crate) struct TestIsoBootstrap {
+    pub(crate) label: String,
+    pub(crate) mount: PathBuf,
+    pub(crate) bootstrap: PathBuf,
 }
 
-fn default_bootstrap_path() -> PathBuf {
+pub(super) fn default_bootstrap_path() -> PathBuf {
     PathBuf::from("bootstrap.sh")
 }
 
-/// Where a test step executes: inside the guest (SSH) or on the harness host (local).
-#[derive(Debug, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub(in crate::commands::test) enum StepTarget {
-    /// Run via SSH inside the guest VM.
-    Guest,
-    /// Run locally in the botforge container (harness), reaching the guest only via forwarded
-    /// `ports:`. This is the botforge container / harness where botforge itself runs — not the
-    /// CI runner host.
-    Host,
-}
-
-#[derive(Debug, Deserialize)]
-pub(in crate::commands::test) struct TestStep {
-    /// Where this step executes. Required; must be `guest` or `host`.
-    #[serde(rename = "on")]
-    pub(in crate::commands::test) target: StepTarget,
-    pub(in crate::commands::test) name: String,
-    /// Files to scp into the guest before running. Only valid on `on: guest` steps.
-    #[serde(default)]
-    pub(in crate::commands::test) uploads: Vec<TestUpload>,
-    pub(in crate::commands::test) run: String,
-    /// Interpreter used to execute `run:`. Mirrors GitHub Actions `shell:` semantics.
-    ///
-    /// Named shells: `bash` (default), `sh`, `python`.
-    /// Custom template: any string containing `{0}`, e.g. `python3 -u {0}`.
-    /// When absent, defaults to `bash --noprofile --norc -e -o pipefail {0}` with
-    /// automatic `sh -e {0}` fallback if bash is not available.
-    #[serde(default)]
-    pub(in crate::commands::test) shell: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub(in crate::commands::test) struct TestUpload {
-    pub(in crate::commands::test) src: PathBuf,
-    pub(in crate::commands::test) dest: String,
-}
-
-pub(super) fn load_test_config(repo_root: &Path, path: &Path) -> Result<TestConfig> {
+pub(crate) fn load_test_config(repo_root: &Path, path: &Path) -> Result<TestConfig> {
     let yaml = std::fs::read_to_string(path)
         .with_context(|| format!("cannot read test config: {}", path.display()))?;
     let raw: RawTestDocument = serde_yaml::from_str(&yaml)
@@ -347,7 +311,7 @@ fn extract_fragment_input_declarations(
     }
 }
 
-fn resolve_fragment_inputs(
+pub(super) fn resolve_fragment_inputs(
     path: &Path,
     declarations: &BTreeMap<String, InputDeclaration>,
     with: &BTreeMap<String, String>,
@@ -505,7 +469,7 @@ fn substitute_inputs_in_string(text: &str, inputs: &BTreeMap<String, String>) ->
     Ok(rendered)
 }
 
-pub(super) fn validate_test_ports(ports: &[PortSpec], ssh_port: u16) -> Result<()> {
+pub(crate) fn validate_test_ports(ports: &[PortSpec], ssh_port: u16) -> Result<()> {
     let mut seen = HashSet::new();
     for spec in ports {
         if spec.port == 0 {
@@ -531,7 +495,7 @@ pub(super) fn validate_test_ports(ports: &[PortSpec], ssh_port: u16) -> Result<(
     Ok(())
 }
 
-pub(super) fn validate_test_steps(steps: &[TestStep], ports: &[PortSpec]) -> Result<()> {
+pub(crate) fn validate_test_steps(steps: &[TestStep], ports: &[PortSpec]) -> Result<()> {
     for step in steps {
         resolve_shell(step.shell.as_deref())
             .with_context(|| format!("test step '{}': invalid `shell:` value", step.name))?;
@@ -553,57 +517,13 @@ pub(super) fn validate_test_steps(steps: &[TestStep], ports: &[PortSpec]) -> Res
     Ok(())
 }
 
-/// Resolve a step's `shell:` value into an argv template with a `{0}` slot.
-///
-/// Named shells (`bash`, `sh`, `python`) map to fixed GHA-compatible templates.
-/// Custom templates must contain `{0}` as a placeholder for the script file path.
-/// `None` (absent) returns the default `bash` template.
-///
-/// Returns `Err` for: unknown single-token named shell, or a custom multi-token
-/// shell string that does not contain `{0}`.
-pub(in crate::commands::test) fn resolve_shell(shell: Option<&str>) -> Result<Vec<String>> {
-    match shell {
-        None | Some("bash") => Ok(vec![
-            "bash".to_string(),
-            "--noprofile".to_string(),
-            "--norc".to_string(),
-            "-e".to_string(),
-            "-o".to_string(),
-            "pipefail".to_string(),
-            "{0}".to_string(),
-        ]),
-        Some("sh") => Ok(vec!["sh".to_string(), "-e".to_string(), "{0}".to_string()]),
-        Some("python") => Ok(vec!["python3".to_string(), "{0}".to_string()]),
-        Some(custom) => {
-            if custom.contains("{0}") {
-                Ok(custom.split_whitespace().map(str::to_string).collect())
-            } else if custom.split_whitespace().count() <= 1 {
-                anyhow::bail!(
-                    "unknown named shell '{}'; supported named shells: bash, sh, python. \
-                     For a custom interpreter use the '{{0}}' placeholder form, \
-                     e.g. '{} {{0}}'",
-                    custom,
-                    custom
-                )
-            } else {
-                anyhow::bail!(
-                    "custom shell '{}' does not contain the '{{0}}' placeholder; \
-                     '{{0}}' must appear in the shell template to indicate where \
-                     the script file path is substituted",
-                    custom
-                )
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        default_bootstrap_path, load_test_config, resolve_fragment_inputs, resolve_shell,
-        validate_test_ports, validate_test_steps, InputDeclaration, InputType, StepTarget,
-        TestConfig, TestIso, TestStep, TestUpload,
+        default_bootstrap_path, load_test_config, resolve_fragment_inputs, validate_test_ports,
+        validate_test_steps, InputDeclaration, InputType, TestConfig, TestIso, MAX_INCLUDE_DEPTH,
     };
+    use crate::plan::step::{StepTarget, TestStep, TestUpload};
     use crate::qemu::PortSpec;
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
@@ -1130,83 +1050,6 @@ steps:
         assert!(validate_test_steps(&steps, &[]).is_ok());
     }
 
-    // --- shell resolver ---
-
-    #[test]
-    fn test_resolve_shell_absent_returns_bash_template() {
-        let tmpl = resolve_shell(None).unwrap();
-        assert_eq!(
-            tmpl,
-            vec![
-                "bash",
-                "--noprofile",
-                "--norc",
-                "-e",
-                "-o",
-                "pipefail",
-                "{0}"
-            ]
-        );
-    }
-
-    #[test]
-    fn test_resolve_shell_bash_returns_bash_template() {
-        let tmpl = resolve_shell(Some("bash")).unwrap();
-        assert_eq!(
-            tmpl,
-            vec![
-                "bash",
-                "--noprofile",
-                "--norc",
-                "-e",
-                "-o",
-                "pipefail",
-                "{0}"
-            ]
-        );
-    }
-
-    #[test]
-    fn test_resolve_shell_sh_returns_sh_template() {
-        let tmpl = resolve_shell(Some("sh")).unwrap();
-        assert_eq!(tmpl, vec!["sh", "-e", "{0}"]);
-    }
-
-    #[test]
-    fn test_resolve_shell_python_returns_python3_template() {
-        let tmpl = resolve_shell(Some("python")).unwrap();
-        assert_eq!(tmpl, vec!["python3", "{0}"]);
-    }
-
-    #[test]
-    fn test_resolve_shell_custom_with_placeholder_is_split() {
-        let tmpl = resolve_shell(Some("python3 -u {0}")).unwrap();
-        assert_eq!(tmpl, vec!["python3", "-u", "{0}"]);
-    }
-
-    #[test]
-    fn test_resolve_shell_custom_without_placeholder_is_error() {
-        let err = resolve_shell(Some("python3 -u")).unwrap_err();
-        assert!(
-            err.to_string().contains("{0}"),
-            "error should mention '{{0}}': {err}"
-        );
-    }
-
-    #[test]
-    fn test_resolve_shell_unknown_named_shell_is_error() {
-        let err = resolve_shell(Some("fish")).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("fish"),
-            "error should mention the shell name: {msg}"
-        );
-        assert!(
-            msg.contains("bash") && msg.contains("sh") && msg.contains("python"),
-            "error should list supported shells: {msg}"
-        );
-    }
-
     // --- shell deserialization ---
 
     #[test]
@@ -1236,51 +1079,6 @@ steps:
         )
         .unwrap();
         assert!(config.steps[0].shell.is_none());
-    }
-
-    // --- {0} substitution ---
-
-    #[test]
-    fn test_apply_shell_template_substitutes_placeholder() {
-        let tmpl = resolve_shell(None).unwrap();
-        let argv: Vec<String> = tmpl
-            .iter()
-            .map(|a| {
-                if a == "{0}" {
-                    "/tmp/my-script.sh".to_string()
-                } else {
-                    a.clone()
-                }
-            })
-            .collect();
-        assert_eq!(
-            argv,
-            vec![
-                "bash",
-                "--noprofile",
-                "--norc",
-                "-e",
-                "-o",
-                "pipefail",
-                "/tmp/my-script.sh"
-            ]
-        );
-    }
-
-    #[test]
-    fn test_apply_sh_template_substitutes_placeholder() {
-        let tmpl = resolve_shell(Some("sh")).unwrap();
-        let argv: Vec<String> = tmpl
-            .iter()
-            .map(|a| {
-                if a == "{0}" {
-                    "/tmp/step.sh".to_string()
-                } else {
-                    a.clone()
-                }
-            })
-            .collect();
-        assert_eq!(argv, vec!["sh", "-e", "/tmp/step.sh"]);
     }
 
     #[test]
@@ -1978,9 +1776,9 @@ steps:
         // below the root.  We create exactly that many chain links plus one extra to
         // ensure the limit fires.
         let repo = TempDir::new().unwrap();
-        let depth = super::MAX_INCLUDE_DEPTH; // 32
-                                              // Each fragment 0..depth-2 includes the next one.
-                                              // Fragment depth-1 is the one we try to include when the stack is full.
+        let depth = MAX_INCLUDE_DEPTH; // 32
+                                       // Each fragment 0..depth-2 includes the next one.
+                                       // Fragment depth-1 is the one we try to include when the stack is full.
         for i in 0..(depth - 1) {
             let name = format!("frag{i:02}.yaml");
             let next = format!("frag{:02}.yaml", i + 1);
