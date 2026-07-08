@@ -1,21 +1,25 @@
 use anyhow::{Context, Result};
 use clap::Args;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
 use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::process::Child;
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
 
 use crate::iso::{build_iso, detect_iso_tool, render_user_data, write_seed_files};
 use crate::qemu::{
     create_overlay_image, qemu_run_args, require_kvm, spawn_qemu_with_log, PortSpec,
 };
 use crate::ssh::{
-    journalctl_command, require_stable_ssh, scp_with_retry, ssh_capture_stdout, ssh_with_retry,
-    wait_for_ssh, SshOptions,
+    journalctl_command, require_stable_ssh, scp_with_retry, ssh_capture_stdout, ssh_command_args,
+    ssh_with_retry, wait_for_ssh, SshOptions,
 };
 use crate::util::{create_temp_dir, ensure_command, resolve_under_root, unique_suffix};
 
@@ -251,6 +255,13 @@ fn run_test_flow(
     ssh: &SshOptions,
     bootstraps: &[TestIsoBootstrap],
 ) -> Result<()> {
+    let step_log_dir = repo_root.join("build").join("logs");
+    std::fs::create_dir_all(&step_log_dir).with_context(|| {
+        format!(
+            "cannot create test step log dir: {}",
+            step_log_dir.display()
+        )
+    })?;
     wait_for_ssh(ssh, TEST_SSH_READY_TIMEOUT)?;
     ssh_with_retry(
         ssh,
@@ -293,8 +304,16 @@ fn run_test_flow(
     let mut accumulated_env: Vec<(String, String)> = Vec::new();
 
     for (step_idx, step) in config.steps.iter().enumerate() {
-        match step.target {
-            StepTarget::Guest => {
+        let step_log_path = step_log_path(&step_log_dir, step_idx, &step.name);
+        File::create(&step_log_path).with_context(|| {
+            format!(
+                "failed to create step log file for test step '{}': {}",
+                step.name,
+                step_log_path.display()
+            )
+        })?;
+        let step_result = match step.target {
+            StepTarget::Guest => (|| -> Result<()> {
                 for upload in &step.uploads {
                     let src = resolve_under_root(repo_root, upload.src.clone());
                     scp_with_retry(
@@ -344,12 +363,11 @@ fn run_test_flow(
                         })
                         .collect::<Vec<_>>()
                         .join(" ");
-                    ssh_with_retry(
-                        ssh,
-                        &ssh_cmd,
+                    run_ssh_step_with_step_log(
+                        ssh_command_args(ssh, &ssh_cmd, Duration::from_secs(300).as_secs()),
+                        &step_log_path,
                         TEST_TRANSPORT_RETRIES,
                         TEST_TRANSPORT_RETRY_DELAY,
-                        Duration::from_secs(300),
                     )
                     .with_context(|| format!("test step '{}' command failed", step.name))
                 } else {
@@ -385,9 +403,9 @@ fn run_test_flow(
                 );
                 let _ = std::fs::remove_file(&local_script);
 
-                step_result?;
-            }
-            StepTarget::Host => {
+                step_result
+            })(),
+            StepTarget::Host => (|| -> Result<()> {
                 let template = resolve_shell(step.shell.as_deref())
                     .expect("shell already validated at config load");
                 let suffix = unique_suffix();
@@ -400,6 +418,7 @@ fn run_test_flow(
                     &template,
                     &accumulated_env,
                     &env_file,
+                    &step_log_path,
                 )
                 .with_context(|| format!("test step '{}' command failed", step.name));
 
@@ -415,9 +434,11 @@ fn run_test_flow(
                 // Best-effort cleanup of the local env file.
                 let _ = std::fs::remove_file(&env_file);
 
-                step_result?;
-            }
-        }
+                step_result
+            })(),
+        };
+        print_step_status(step_idx, &step.name, step_result.is_ok());
+        step_result?;
     }
     Ok(())
 }
@@ -621,6 +642,203 @@ fn validate_test_steps(steps: &[TestStep], ports: &[PortSpec]) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+enum StepOutputStream {
+    Stdout,
+    Stderr,
+}
+
+impl StepOutputStream {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Stdout => "stdout",
+            Self::Stderr => "stderr",
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct StepLogRecord<'a> {
+    ts: String,
+    stream: &'a str,
+    line: String,
+}
+
+struct StepLogWriter {
+    inner: Mutex<BufWriter<File>>,
+}
+
+impl StepLogWriter {
+    fn create(path: &Path) -> Result<Self> {
+        let file = File::create(path)
+            .with_context(|| format!("failed to create step log file: {}", path.display()))?;
+        Ok(Self {
+            inner: Mutex::new(BufWriter::new(file)),
+        })
+    }
+
+    fn log_line(&self, stream: StepOutputStream, line: &[u8]) -> Result<()> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("step log writer mutex poisoned"))?;
+        serde_json::to_writer(
+            &mut *inner,
+            &StepLogRecord {
+                ts: step_log_timestamp()?,
+                stream: stream.as_str(),
+                line: String::from_utf8_lossy(line).into_owned(),
+            },
+        )
+        .context("failed to serialize step log record")?;
+        inner
+            .write_all(b"\n")
+            .context("failed to write step log newline")?;
+        inner.flush().context("failed to flush step log")?;
+        Ok(())
+    }
+}
+
+fn step_log_timestamp() -> Result<String> {
+    OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .context("failed to format step log timestamp")
+}
+
+fn sanitize_step_log_name(name: &str) -> String {
+    name.chars()
+        .map(|c| match c {
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '.' | '_' | '-' => c,
+            _ => '_',
+        })
+        .collect()
+}
+
+fn step_log_path(log_dir: &Path, step_idx: usize, step_name: &str) -> PathBuf {
+    log_dir.join(format!(
+        "step-{step_idx}-{}.log",
+        sanitize_step_log_name(step_name)
+    ))
+}
+
+fn step_status_marker(step_idx: usize, step_name: &str, success: bool) -> String {
+    let status = if success { "ok" } else { "failed" };
+    format!("step {step_idx} {status}: {step_name}")
+}
+
+fn print_step_status(step_idx: usize, step_name: &str, success: bool) {
+    eprintln!("{}", step_status_marker(step_idx, step_name, success));
+}
+
+fn spawn_output_forwarder<R: Read + Send + 'static>(
+    reader: R,
+    stream: StepOutputStream,
+    logger: Arc<StepLogWriter>,
+) -> JoinHandle<Result<()>> {
+    std::thread::spawn(move || match stream {
+        StepOutputStream::Stdout => {
+            let stdout = std::io::stdout();
+            stream_child_output(reader, stdout.lock(), stream, &logger)
+        }
+        StepOutputStream::Stderr => {
+            let stderr = std::io::stderr();
+            stream_child_output(reader, stderr.lock(), stream, &logger)
+        }
+    })
+}
+
+fn stream_child_output<R: Read, W: Write>(
+    mut reader: R,
+    mut writer: W,
+    stream: StepOutputStream,
+    logger: &StepLogWriter,
+) -> Result<()> {
+    let mut chunk = [0u8; 8192];
+    let mut pending = Vec::new();
+    loop {
+        let bytes_read = reader
+            .read(&mut chunk)
+            .context("failed to read child process output")?;
+        if bytes_read == 0 {
+            break;
+        }
+        let slice = &chunk[..bytes_read];
+        writer
+            .write_all(slice)
+            .context("failed to forward child process output")?;
+        writer.flush().context("failed to flush forwarded output")?;
+        pending.extend_from_slice(slice);
+        while let Some(pos) = pending.iter().position(|&b| b == b'\n') {
+            let mut line = pending.drain(..=pos).collect::<Vec<_>>();
+            line.pop();
+            logger.log_line(stream, &line)?;
+        }
+    }
+    if !pending.is_empty() {
+        logger.log_line(stream, &pending)?;
+    }
+    Ok(())
+}
+
+fn join_output_forwarders(handles: Vec<JoinHandle<Result<()>>>) -> Result<()> {
+    for handle in handles {
+        handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("step output forwarder panicked"))??;
+    }
+    Ok(())
+}
+
+fn spawn_logged_child(
+    command: &mut Command,
+    logger: Arc<StepLogWriter>,
+    spawn_context: &str,
+) -> Result<(Child, Vec<JoinHandle<Result<()>>>)> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn().with_context(|| spawn_context.to_string())?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("failed to capture child stdout for step logging")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("failed to capture child stderr for step logging")?;
+    Ok((
+        child,
+        vec![
+            spawn_output_forwarder(stdout, StepOutputStream::Stdout, Arc::clone(&logger)),
+            spawn_output_forwarder(stderr, StepOutputStream::Stderr, logger),
+        ],
+    ))
+}
+
+fn run_ssh_step_with_step_log(
+    args: Vec<String>,
+    log_path: &Path,
+    retries: usize,
+    retry_delay: Duration,
+) -> Result<()> {
+    let logger = Arc::new(StepLogWriter::create(log_path)?);
+    let mut attempts = 0usize;
+    loop {
+        let mut command = Command::new("ssh");
+        command.args(&args);
+        let (mut child, forwarders) =
+            spawn_logged_child(&mut command, Arc::clone(&logger), "failed to execute ssh")?;
+        let status = child.wait().context("failed to wait for ssh")?;
+        join_output_forwarders(forwarders)?;
+        if status.success() {
+            return Ok(());
+        }
+        attempts += 1;
+        if status.code() != Some(255) || attempts >= retries {
+            anyhow::bail!("ssh command failed (exit status: {status})");
+        }
+        std::thread::sleep(retry_delay);
+    }
+}
+
 /// Run a step locally in the botforge container (harness) with a plain execution timeout.
 /// `run` is written to a temp file and executed via `template` (argv with `{0}` slot).
 /// The working directory is `repo_root`. Inherits the current process environment, with
@@ -634,6 +852,7 @@ fn run_host_step(
     template: &[String],
     accumulated_env: &[(String, String)],
     env_file: &Path,
+    log_path: &Path,
 ) -> Result<()> {
     // Create/truncate the env file so `>>` always works inside the step.
     std::fs::write(env_file, b"")
@@ -654,7 +873,9 @@ fn run_host_step(
         })
         .collect();
 
-    let mut child = std::process::Command::new(&argv[0])
+    let logger = Arc::new(StepLogWriter::create(log_path)?);
+    let mut command = Command::new(&argv[0]);
+    command
         .args(&argv[1..])
         .current_dir(repo_root)
         .env("BOTFORGE_ENV", env_file)
@@ -662,9 +883,12 @@ fn run_host_step(
             accumulated_env
                 .iter()
                 .map(|(k, v)| (k.as_str(), v.as_str())),
-        )
-        .spawn()
-        .with_context(|| format!("failed to spawn host step '{name}'"))?;
+        );
+    let (mut child, forwarders) = spawn_logged_child(
+        &mut command,
+        logger,
+        &format!("failed to spawn host step '{name}'"),
+    )?;
 
     let deadline = Instant::now() + timeout;
     let step_result = loop {
@@ -693,6 +917,8 @@ fn run_host_step(
             }
         }
     };
+
+    join_output_forwarders(forwarders)?;
 
     // Best-effort cleanup of temp script.
     let _ = std::fs::remove_file(&script);
@@ -888,14 +1114,16 @@ fn build_guest_env_preamble(accumulated_env: &[(String, String)], remote_env_pat
 mod tests {
     use super::{
         build_guest_env_preamble, default_bootstrap_path, env_merge, load_test_config,
-        parse_env_file, resolve_shell, run_host_step, shell_single_quote, validate_test_ports,
-        validate_test_steps, StepTarget, TestConfig, TestIso, TestStep, TestUpload,
+        parse_env_file, resolve_shell, run_host_step, shell_single_quote, step_log_path,
+        step_status_marker, validate_test_ports, validate_test_steps, StepTarget, TestConfig,
+        TestIso, TestStep, TestUpload,
     };
     use crate::cli::Cli;
     use crate::qemu::PortSpec;
     use crate::util::unique_suffix;
     use clap::Parser;
-    use std::path::PathBuf;
+    use serde::Deserialize;
+    use std::path::{Path, PathBuf};
     use std::time::Duration;
     use tempfile::TempDir;
 
@@ -1547,11 +1775,31 @@ steps:
         std::env::temp_dir().join(format!("botforge-test-env-{}.env", unique_suffix()))
     }
 
+    fn tmp_step_log(dir: &Path) -> PathBuf {
+        dir.join(format!("step-{}.log", unique_suffix()))
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct LoggedStepLine {
+        ts: String,
+        stream: String,
+        line: String,
+    }
+
+    fn read_step_log(path: &Path) -> Vec<LoggedStepLine> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
     #[test]
     fn test_host_step_sh_false_fails() {
         let dir = tempfile::tempdir().unwrap();
         let tmpl = resolve_shell(Some("sh")).unwrap();
         let env_file = tmp_env_file();
+        let log_file = tmp_step_log(dir.path());
         let err = run_host_step(
             "fail-step",
             "false",
@@ -1560,6 +1808,7 @@ steps:
             &tmpl,
             &[],
             &env_file,
+            &log_file,
         )
         .unwrap_err();
         let _ = std::fs::remove_file(&env_file);
@@ -1574,6 +1823,7 @@ steps:
         let dir = tempfile::tempdir().unwrap();
         let tmpl = resolve_shell(Some("sh")).unwrap();
         let env_file = tmp_env_file();
+        let log_file = tmp_step_log(dir.path());
         let err = run_host_step(
             "bad",
             "exit 3",
@@ -1582,6 +1832,7 @@ steps:
             &tmpl,
             &[],
             &env_file,
+            &log_file,
         )
         .unwrap_err();
         let _ = std::fs::remove_file(&env_file);
@@ -1598,6 +1849,7 @@ steps:
         let dir = tempfile::tempdir().unwrap();
         let tmpl = resolve_shell(None).unwrap();
         let env_file = tmp_env_file();
+        let log_file = tmp_step_log(dir.path());
         let err = run_host_step(
             "mid-fail",
             "false\necho ok\n",
@@ -1606,6 +1858,7 @@ steps:
             &tmpl,
             &[],
             &env_file,
+            &log_file,
         )
         .unwrap_err();
         let _ = std::fs::remove_file(&env_file);
@@ -1620,6 +1873,7 @@ steps:
         let dir = tempfile::tempdir().unwrap();
         let tmpl = resolve_shell(None).unwrap();
         let env_file = tmp_env_file();
+        let log_file = tmp_step_log(dir.path());
         let result = run_host_step(
             "ok",
             "true",
@@ -1628,6 +1882,7 @@ steps:
             &tmpl,
             &[],
             &env_file,
+            &log_file,
         );
         let _ = std::fs::remove_file(&env_file);
         assert!(result.is_ok());
@@ -1638,6 +1893,7 @@ steps:
         let dir = tempfile::tempdir().unwrap();
         let tmpl = resolve_shell(None).unwrap();
         let env_file = tmp_env_file();
+        let log_file = tmp_step_log(dir.path());
         let accumulated = vec![
             ("MY_VAR".to_string(), "hello world".to_string()),
             ("ANOTHER".to_string(), "42".to_string()),
@@ -1650,6 +1906,7 @@ steps:
             &tmpl,
             &accumulated,
             &env_file,
+            &log_file,
         );
         let _ = std::fs::remove_file(&env_file);
         assert!(
@@ -1663,6 +1920,7 @@ steps:
         let dir = tempfile::tempdir().unwrap();
         let tmpl = resolve_shell(None).unwrap();
         let env_file = tmp_env_file();
+        let log_file = tmp_step_log(dir.path());
         let result = run_host_step(
             "write-env",
             r#"echo "WRITTEN=yes" >> "$BOTFORGE_ENV""#,
@@ -1671,6 +1929,7 @@ steps:
             &tmpl,
             &[],
             &env_file,
+            &log_file,
         );
         let contents = std::fs::read_to_string(&env_file).unwrap_or_default();
         let _ = std::fs::remove_file(&env_file);
@@ -1678,6 +1937,67 @@ steps:
         assert!(
             contents.contains("WRITTEN=yes"),
             "env file should contain written value, got: {contents:?}"
+        );
+    }
+
+    #[test]
+    fn test_host_step_writes_jsonl_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmpl = resolve_shell(Some("sh")).unwrap();
+        let env_file = tmp_env_file();
+        let log_file = tmp_step_log(dir.path());
+        let result = run_host_step(
+            "log-lines",
+            "printf 'alpha\\n'; printf 'beta\\n' >&2; printf 'omega'",
+            dir.path(),
+            Duration::from_secs(10),
+            &tmpl,
+            &[],
+            &env_file,
+            &log_file,
+        );
+        let _ = std::fs::remove_file(&env_file);
+        assert!(result.is_ok(), "step should succeed: {result:?}");
+
+        let logged = read_step_log(&log_file);
+        assert_eq!(logged.len(), 3, "expected stdout/stderr lines in log");
+        assert!(
+            logged.iter().all(|entry| !entry.ts.is_empty()),
+            "all log entries should have timestamps: {logged:?}"
+        );
+        assert!(
+            logged
+                .iter()
+                .any(|entry| entry.stream == "stdout" && entry.line == "alpha"),
+            "stdout line should be captured: {logged:?}"
+        );
+        assert!(
+            logged
+                .iter()
+                .any(|entry| entry.stream == "stderr" && entry.line == "beta"),
+            "stderr line should be captured: {logged:?}"
+        );
+        assert!(
+            logged
+                .iter()
+                .any(|entry| entry.stream == "stdout" && entry.line == "omega"),
+            "trailing partial line should be captured: {logged:?}"
+        );
+    }
+
+    #[test]
+    fn test_step_log_path_sanitizes_name() {
+        let log_dir = PathBuf::from("/tmp/botforge-step-logs");
+        let path = step_log_path(&log_dir, 7, "name with/slash\tand*chars");
+        assert_eq!(path, log_dir.join("step-7-name_with_slash_and_chars.log"));
+    }
+
+    #[test]
+    fn test_step_status_marker_formats_result() {
+        assert_eq!(step_status_marker(2, "deploy", true), "step 2 ok: deploy");
+        assert_eq!(
+            step_status_marker(3, "verify", false),
+            "step 3 failed: verify"
         );
     }
 
