@@ -87,19 +87,25 @@ particular user exists in the base image.
      user).
 3. All provisioning steps (`sudo cloud-init status --wait`, `sudo bash
    <provisioner>`, etc.) run as this installer.
-4. **On the success path** (build only), botforge issues a final teardown over
-   the same SSH connection immediately before power-off:
+4. **On the success path** (build only), botforge queues a final root-owned
+   transient systemd service over the same SSH connection immediately before
+   power-off:
    ```
-   sudo bash -c 'userdel -f <installer> &&
-                  rm -rf /home/<installer> &&
-                  rm -f /etc/sudoers.d/90-cloud-init-users &&
-                  systemctl poweroff'
+   sudo systemd-run --quiet --unit botforge-installer-teardown-<installer> --collect \
+     /bin/bash -lc 'set -euo pipefail;
+       sleep 2;
+       loginctl terminate-user <installer> >/dev/null 2>&1 || true;
+       while pgrep -u <installer> >/dev/null 2>&1; do sleep 0.2; done;
+       userdel -f <installer>;
+       rm -rf /home/<installer>;
+       rm -f /etc/sudoers.d/90-cloud-init-users;
+       systemctl poweroff'
    ```
-   This runs as root inside a single sudo bash so user deletion does not
-   affect the calling SSH session. A failure to remove the installer is
-   surfaced as a hard error (the committed image must not contain the
-   installer). The test overlay is discarded on exit, so teardown is not
-   required there.
+   The detached service waits for the SSH caller to return, terminates any
+   remaining installer processes, removes the installer, and only then powers
+   off. If that cleanup cannot complete, the build is treated as a hard error
+   so no committed image can ship with the installer account present. The test
+   overlay is discarded on exit, so teardown is not required there.
 5. Any **shipped runner account** (e.g. a `bot` runner created by a
    provisioner such as `10-bot-user.sh`) is entirely the consuming repo's
    responsibility — botforge neither assumes nor names such accounts.

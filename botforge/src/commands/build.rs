@@ -218,12 +218,10 @@ pub(crate) fn cmd_build(config: &Path, args: BuildArgs) -> Result<()> {
     // Disk lifecycle step 5: installer teardown (botforge-owned identity only)
     //
     // Remove the ephemeral installer account from the guest before committing the
-    // image, so it never ships. This is botforge's last guest action and runs as
-    // a single sudo bash invocation so the entire sequence (userdel, sudoers
-    // cleanup, poweroff) executes as root — user deletion does not affect the
-    // still-running SSH session, and systemctl poweroff is issued while root
-    // context is still active. A failure here is a hard error: a shipped image
-    // must not contain the installer account.
+    // image, so it never ships. This is botforge's last guest action: it queues a
+    // detached root-owned systemd service that waits for the SSH caller to return,
+    // deletes the installer, and only then powers off. A failure here is a hard
+    // error: a shipped image must not contain the installer account.
     //
     // On the failure path (step 4 or teardown error), the VM is killed and the
     // tainted disk is preserved at <output>.partial.failed for post-mortem;
@@ -251,7 +249,8 @@ pub(crate) fn cmd_build(config: &Path, args: BuildArgs) -> Result<()> {
             );
             return Err(err);
         }
-        // Teardown issued poweroff; shutdown_build_vm waits for the VM to exit.
+        // Teardown queued the final cleanup/poweroff service; shutdown_build_vm
+        // only needs to wait for the VM to exit.
     }
 
     // ---------------------------------------------------------------------------
@@ -262,6 +261,7 @@ pub(crate) fn cmd_build(config: &Path, args: BuildArgs) -> Result<()> {
         &partial,
         &failed_partial,
         &ssh_options,
+        !botforge_owned,
         overall_deadline,
         std::time::Duration::from_secs(build_config.timeout),
     );
@@ -361,13 +361,32 @@ where
     Ok(qcow2_path)
 }
 
+/// Build the remote command that removes the botforge-owned installer and powers off.
+///
+/// The command launches a detached transient system service as root. That service
+/// waits briefly for the calling SSH command to return, terminates any remaining
+/// installer processes, deletes the installer account + home, removes the
+/// cloud-init sudoers drop-in, and only then powers off the guest.
+fn installer_teardown_command(installer: &str) -> String {
+    format!(
+        "sudo systemd-run --quiet --unit botforge-installer-teardown-{installer} --collect \
+         /bin/bash -lc 'set -euo pipefail; \
+         sleep 2; \
+         loginctl terminate-user {installer} >/dev/null 2>&1 || true; \
+         while pgrep -u {installer} >/dev/null 2>&1; do sleep 0.2; done; \
+         userdel -f {installer}; \
+         rm -rf /home/{installer}; \
+         rm -f /etc/sudoers.d/90-cloud-init-users; \
+         systemctl poweroff'"
+    )
+}
+
 /// Remove the botforge-owned ephemeral installer user from the guest and power off.
 ///
-/// Runs as a single `sudo bash -c '...'` so all commands execute as root: user
-/// deletion does not affect the calling SSH session, and `systemctl poweroff` is
-/// issued while root context is still active (i.e. before the sudoers drop-in is
-/// removed). `systemctl poweroff` returns immediately (exit 0); the shutdown
-/// happens asynchronously so the SSH command exits cleanly.
+/// The deletion cannot run directly inside the installer's own live SSH session:
+/// `userdel` will refuse while the session's sshd/logind processes still exist.
+/// Instead botforge queues a detached root-owned systemd service that performs the
+/// deletion after the SSH caller has returned, then powers off the guest.
 ///
 /// Returns `Err` if any step fails so the caller can surface it as a hard error
 /// (the image must not ship with the installer present).
@@ -380,16 +399,7 @@ fn run_installer_teardown(
         .saturating_duration_since(Instant::now())
         .min(Duration::from_secs(60));
 
-    // Single root shell: delete the installer user, wipe its home explicitly
-    // (tolerates missing home with rm -rf), remove any cloud-init sudoers drop-in
-    // that names it, then power off. All commands are chained with && so a failure
-    // aborts early and surfaces a non-zero exit to the SSH caller.
-    let cmd = format!(
-        "sudo bash -c 'userdel -f {installer} && \
-         rm -rf /home/{installer} && \
-         rm -f /etc/sudoers.d/90-cloud-init-users && \
-         systemctl poweroff'"
-    );
+    let cmd = installer_teardown_command(installer);
 
     ssh_with_retry(ssh, &cmd, 1, Duration::from_secs(0), timeout).with_context(|| {
         format!(
@@ -468,7 +478,8 @@ fn resize_qcow2(disk: &Path, size: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        failed_partial_path, output_stem, partial_path, resolve_base_image_with_transport,
+        failed_partial_path, installer_teardown_command, output_stem, partial_path,
+        resolve_base_image_with_transport,
     };
     use crate::cli::Cli;
     use clap::Parser;
@@ -514,6 +525,23 @@ mod tests {
     fn failed_partial_path_appends_failed_suffix() {
         let out = failed_partial_path(Path::new("/build/out.qcow2"));
         assert_eq!(out, Path::new("/build/out.qcow2.partial.failed"));
+    }
+
+    #[test]
+    fn installer_teardown_command_queues_detached_cleanup_service() {
+        let cmd = installer_teardown_command("botforge-deadbeefdeadbeefdead");
+        assert_eq!(
+            cmd,
+            "sudo systemd-run --quiet --unit botforge-installer-teardown-botforge-deadbeefdeadbeefdead --collect \
+             /bin/bash -lc 'set -euo pipefail; \
+             sleep 2; \
+             loginctl terminate-user botforge-deadbeefdeadbeefdead >/dev/null 2>&1 || true; \
+             while pgrep -u botforge-deadbeefdeadbeefdead >/dev/null 2>&1; do sleep 0.2; done; \
+             userdel -f botforge-deadbeefdeadbeefdead; \
+             rm -rf /home/botforge-deadbeefdeadbeefdead; \
+             rm -f /etc/sudoers.d/90-cloud-init-users; \
+             systemctl poweroff'"
+        );
     }
 
     #[test]

@@ -740,6 +740,7 @@ pub(crate) fn shutdown_build_vm(
     partial: &Path,
     failed_partial: &Path,
     ssh: &SshOptions,
+    request_poweroff: bool,
     overall_deadline: Instant,
     overall_timeout: Duration,
 ) -> Result<()> {
@@ -753,14 +754,16 @@ pub(crate) fn shutdown_build_vm(
         return Err(overall_timeout_error(overall_timeout));
     }
 
-    // Best-effort graceful poweroff; ignore SSH errors (VM may be unresponsive).
-    let _ = ssh_with_retry(
-        ssh,
-        "sudo systemctl poweroff",
-        1,
-        Duration::from_secs(0),
-        Duration::from_secs(10),
-    );
+    if request_poweroff {
+        // Best-effort graceful poweroff; ignore SSH errors (VM may be unresponsive).
+        let _ = ssh_with_retry(
+            ssh,
+            "sudo systemctl poweroff",
+            1,
+            Duration::from_secs(0),
+            Duration::from_secs(10),
+        );
+    }
 
     let mut timed_out_overall = false;
     let clean_exit = if let Some(child) = vm_child.as_mut() {
