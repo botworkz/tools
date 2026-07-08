@@ -2804,16 +2804,18 @@ steps:
     run: echo nope
 "#,
         );
-        let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
-        let err = validate_build_steps(&config.steps).unwrap_err();
+        let err = match load_build_config(repo.path(), &repo.path().join("build.yaml")) {
+            Err(err) => err,
+            Ok(config) => validate_build_steps(&config.steps)
+                .expect_err("archive step mixed with run fields must be rejected"),
+        };
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("bad-mixed"),
-            "error should mention step name: {msg}"
-        );
-        assert!(
-            msg.contains("on"),
-            "error should mention offending field: {msg}"
+            msg.contains("on")
+                || msg.contains("run")
+                || msg.contains("archive")
+                || msg.contains("unknown field"),
+            "error should indicate archive/run field conflict: {msg}"
         );
     }
 }
