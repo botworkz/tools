@@ -405,7 +405,7 @@ fn run_test_flow(
 
                 step_result
             })(),
-            StepTarget::Host => (|| -> Result<()> {
+            StepTarget::Host => {
                 let template = resolve_shell(step.shell.as_deref())
                     .expect("shell already validated at config load");
                 let suffix = unique_suffix();
@@ -417,8 +417,10 @@ fn run_test_flow(
                     Duration::from_secs(300),
                     &template,
                     &accumulated_env,
-                    &env_file,
-                    &step_log_path,
+                    HostStepFiles {
+                        env_file: &env_file,
+                        log_path: &step_log_path,
+                    },
                 )
                 .with_context(|| format!("test step '{}' command failed", step.name));
 
@@ -435,7 +437,7 @@ fn run_test_flow(
                 let _ = std::fs::remove_file(&env_file);
 
                 step_result
-            })(),
+            }
         };
         print_step_status(step_idx, &step.name, step_result.is_ok());
         step_result?;
@@ -839,6 +841,12 @@ fn run_ssh_step_with_step_log(
     }
 }
 
+#[derive(Clone, Copy)]
+struct HostStepFiles<'a> {
+    env_file: &'a Path,
+    log_path: &'a Path,
+}
+
 /// Run a step locally in the botforge container (harness) with a plain execution timeout.
 /// `run` is written to a temp file and executed via `template` (argv with `{0}` slot).
 /// The working directory is `repo_root`. Inherits the current process environment, with
@@ -851,11 +859,10 @@ fn run_host_step(
     timeout: Duration,
     template: &[String],
     accumulated_env: &[(String, String)],
-    env_file: &Path,
-    log_path: &Path,
+    files: HostStepFiles<'_>,
 ) -> Result<()> {
     // Create/truncate the env file so `>>` always works inside the step.
-    std::fs::write(env_file, b"")
+    std::fs::write(files.env_file, b"")
         .with_context(|| format!("failed to create env file for host step '{name}'"))?;
 
     let script = std::env::temp_dir().join(format!("botforge-host-step-{}.sh", unique_suffix()));
@@ -873,12 +880,12 @@ fn run_host_step(
         })
         .collect();
 
-    let logger = Arc::new(StepLogWriter::create(log_path)?);
+    let logger = Arc::new(StepLogWriter::create(files.log_path)?);
     let mut command = Command::new(&argv[0]);
     command
         .args(&argv[1..])
         .current_dir(repo_root)
-        .env("BOTFORGE_ENV", env_file)
+        .env("BOTFORGE_ENV", files.env_file)
         .envs(
             accumulated_env
                 .iter()
@@ -1115,8 +1122,8 @@ mod tests {
     use super::{
         build_guest_env_preamble, default_bootstrap_path, env_merge, load_test_config,
         parse_env_file, resolve_shell, run_host_step, shell_single_quote, step_log_path,
-        step_status_marker, validate_test_ports, validate_test_steps, StepTarget, TestConfig,
-        TestIso, TestStep, TestUpload,
+        step_status_marker, validate_test_ports, validate_test_steps, HostStepFiles, StepTarget,
+        TestConfig, TestIso, TestStep, TestUpload,
     };
     use crate::cli::Cli;
     use crate::qemu::PortSpec;
@@ -1807,8 +1814,10 @@ steps:
             Duration::from_secs(10),
             &tmpl,
             &[],
-            &env_file,
-            &log_file,
+            HostStepFiles {
+                env_file: &env_file,
+                log_path: &log_file,
+            },
         )
         .unwrap_err();
         let _ = std::fs::remove_file(&env_file);
@@ -1831,8 +1840,10 @@ steps:
             Duration::from_secs(10),
             &tmpl,
             &[],
-            &env_file,
-            &log_file,
+            HostStepFiles {
+                env_file: &env_file,
+                log_path: &log_file,
+            },
         )
         .unwrap_err();
         let _ = std::fs::remove_file(&env_file);
@@ -1857,8 +1868,10 @@ steps:
             Duration::from_secs(10),
             &tmpl,
             &[],
-            &env_file,
-            &log_file,
+            HostStepFiles {
+                env_file: &env_file,
+                log_path: &log_file,
+            },
         )
         .unwrap_err();
         let _ = std::fs::remove_file(&env_file);
@@ -1881,8 +1894,10 @@ steps:
             Duration::from_secs(10),
             &tmpl,
             &[],
-            &env_file,
-            &log_file,
+            HostStepFiles {
+                env_file: &env_file,
+                log_path: &log_file,
+            },
         );
         let _ = std::fs::remove_file(&env_file);
         assert!(result.is_ok());
@@ -1905,8 +1920,10 @@ steps:
             Duration::from_secs(10),
             &tmpl,
             &accumulated,
-            &env_file,
-            &log_file,
+            HostStepFiles {
+                env_file: &env_file,
+                log_path: &log_file,
+            },
         );
         let _ = std::fs::remove_file(&env_file);
         assert!(
@@ -1928,8 +1945,10 @@ steps:
             Duration::from_secs(10),
             &tmpl,
             &[],
-            &env_file,
-            &log_file,
+            HostStepFiles {
+                env_file: &env_file,
+                log_path: &log_file,
+            },
         );
         let contents = std::fs::read_to_string(&env_file).unwrap_or_default();
         let _ = std::fs::remove_file(&env_file);
@@ -1953,8 +1972,10 @@ steps:
             Duration::from_secs(10),
             &tmpl,
             &[],
-            &env_file,
-            &log_file,
+            HostStepFiles {
+                env_file: &env_file,
+                log_path: &log_file,
+            },
         );
         let _ = std::fs::remove_file(&env_file);
         assert!(result.is_ok(), "step should succeed: {result:?}");
