@@ -128,6 +128,40 @@ pub(crate) fn qemu_run_args(
     args
 }
 
+/// Build qemu arguments for a `botforge build` run.
+///
+/// The primary drive is `partial_image` opened **read-write directly** — no
+/// CoW overlay is created.  VM writes land in the partial image, which becomes
+/// the output artifact after a clean shutdown.
+pub(crate) fn qemu_build_args(
+    partial_image: &Path,
+    seed_iso: &Path,
+    ssh_port: u16,
+    memsize: u32,
+    smp: u32,
+) -> Vec<String> {
+    let netdev = format!("user,id=net0,hostfwd=tcp:0.0.0.0:{ssh_port}-:22");
+    vec![
+        "-accel".into(),
+        "kvm".into(),
+        "-m".into(),
+        memsize.to_string(),
+        "-smp".into(),
+        smp.to_string(),
+        "-cpu".into(),
+        "host".into(),
+        "-drive".into(),
+        format!("file={},if=virtio,format=qcow2", partial_image.display()),
+        "-drive".into(),
+        format!("file={},media=cdrom,readonly=on", seed_iso.display()),
+        "-netdev".into(),
+        netdev,
+        "-device".into(),
+        "virtio-net-pci,netdev=net0".into(),
+        "-nographic".into(),
+    ]
+}
+
 pub(crate) fn spawn_qemu_with_log(args: &[String], log_path: &Path) -> Result<Child> {
     let log = File::create(log_path)
         .with_context(|| format!("cannot create VM log file: {}", log_path.display()))?;
@@ -278,6 +312,64 @@ mod tests {
         assert_eq!(
             args[netdev_index],
             "user,id=net0,hostfwd=tcp:0.0.0.0:2222-:22,hostfwd=tcp:127.0.0.1:80-:80,hostfwd=tcp:0.0.0.0:9901-:9901"
+        );
+    }
+
+    #[test]
+    fn qemu_build_args_match_expected_argv() {
+        use super::qemu_build_args;
+        let args = qemu_build_args(
+            Path::new("/partial.qcow2"),
+            Path::new("/seed.iso"),
+            2222,
+            4096,
+            4,
+        );
+        assert_eq!(
+            args,
+            vec![
+                "-accel",
+                "kvm",
+                "-m",
+                "4096",
+                "-smp",
+                "4",
+                "-cpu",
+                "host",
+                "-drive",
+                "file=/partial.qcow2,if=virtio,format=qcow2",
+                "-drive",
+                "file=/seed.iso,media=cdrom,readonly=on",
+                "-netdev",
+                "user,id=net0,hostfwd=tcp:0.0.0.0:2222-:22",
+                "-device",
+                "virtio-net-pci,netdev=net0",
+                "-nographic"
+            ]
+        );
+    }
+
+    #[test]
+    fn qemu_build_args_partial_image_no_overlay() {
+        use super::qemu_build_args;
+        // The partial image path must appear directly in the drive argument,
+        // not behind a qcow2 backing-file overlay.
+        let args = qemu_build_args(
+            Path::new("/build/out.qcow2.partial"),
+            Path::new("/seed.iso"),
+            2222,
+            4096,
+            4,
+        );
+        let drive_arg = args.iter().skip_while(|a| *a != "-drive").nth(1).unwrap();
+        assert!(
+            drive_arg.contains("/build/out.qcow2.partial"),
+            "partial image must appear in first drive arg: {drive_arg}"
+        );
+        // No backing-file= present — this is a direct read-write drive.
+        assert!(
+            !drive_arg.contains("backing-file"),
+            "build drive must not use a backing file: {drive_arg}"
         );
     }
 }

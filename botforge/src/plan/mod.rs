@@ -4,6 +4,10 @@ pub(crate) mod step;
 pub(crate) mod vm;
 
 pub(crate) use config::{
-    load_test_config, validate_test_ports, validate_test_steps, TestIso, TestIsoBootstrap,
+    load_build_config, load_test_config, validate_build_steps, validate_test_ports,
+    validate_test_steps, TestIso, TestIsoBootstrap,
 };
-pub(crate) use vm::{cleanup_test, collect_test_diagnostics, print_log_tail, run_test_flow};
+pub(crate) use vm::{
+    cleanup_test, collect_test_diagnostics, print_log_tail, run_step_flow, run_test_flow,
+    shutdown_build_vm,
+};
