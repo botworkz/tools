@@ -69,6 +69,7 @@ fn scp_command_args_with_verbose(
     if !verbose {
         args.push("-o".into());
         args.push("LogLevel=ERROR".into());
+        args.push("-q".into());
     }
     args.extend([
         "-i".into(),
@@ -325,6 +326,7 @@ mod tests {
                 "UserKnownHostsFile=/dev/null",
                 "-o",
                 "LogLevel=ERROR",
+                "-q",
                 "-i",
                 "/tmp/key",
                 "-P",
@@ -344,6 +346,7 @@ mod tests {
             true,
         );
         assert!(!args.contains(&"LogLevel=ERROR".to_string()));
+        assert!(!args.contains(&"-q".to_string()));
         assert_eq!(
             args,
             vec![

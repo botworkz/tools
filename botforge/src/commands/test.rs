@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
 use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, IsTerminal, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -307,6 +307,7 @@ fn run_test_flow(
         let step_log_path = step_log_path(&step_log_dir, step_idx, &step.name);
         // The file is created by StepLogWriter::create inside each step runner;
         // no pre-creation needed here (the directory was already created above).
+        print_step_title(step_idx, &step.name);
         let step_result = match step.target {
             StepTarget::Guest => (|| -> Result<()> {
                 for upload in &step.uploads {
@@ -724,13 +725,43 @@ fn step_log_path(log_dir: &Path, step_idx: usize, step_name: &str) -> PathBuf {
     ))
 }
 
-fn step_status_marker(step_idx: usize, step_name: &str, success: bool) -> String {
-    let status = if success { "ok" } else { "failed" };
-    format!("step {step_idx} {status}: {step_name}")
+fn stderr_color_enabled() -> bool {
+    std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none()
+}
+
+fn step_title_line(step_idx: usize, name: &str, color: bool) -> String {
+    if color {
+        format!("🤖 ({step_idx}) \x1b[1m{name}\x1b[0m")
+    } else {
+        format!("🤖 ({step_idx}) {name}")
+    }
+}
+
+fn step_status_marker(step_idx: usize, name: &str, success: bool, color: bool) -> String {
+    if color {
+        if success {
+            format!("\x1b[32m✓\x1b[0m ({step_idx}) \x1b[2m{name}\x1b[0m")
+        } else {
+            format!("\x1b[31m✗\x1b[0m ({step_idx}) {name}")
+        }
+    } else {
+        let tick = if success { '✓' } else { '✗' };
+        format!("{tick} ({step_idx}) {name}")
+    }
+}
+
+fn print_step_title(step_idx: usize, step_name: &str) {
+    eprintln!(
+        "{}",
+        step_title_line(step_idx, step_name, stderr_color_enabled())
+    );
 }
 
 fn print_step_status(step_idx: usize, step_name: &str, success: bool) {
-    eprintln!("{}", step_status_marker(step_idx, step_name, success));
+    eprintln!(
+        "{}",
+        step_status_marker(step_idx, step_name, success, stderr_color_enabled())
+    );
 }
 
 fn spawn_output_forwarder<R: Read + Send + 'static>(
@@ -1212,8 +1243,8 @@ mod tests {
     use super::{
         build_guest_env_preamble, default_bootstrap_path, env_merge, load_test_config,
         parse_env_file, resolve_shell, run_host_step, shell_single_quote, step_log_path,
-        step_status_marker, validate_test_ports, validate_test_steps, write_all_resilient,
-        HostStepFiles, StepTarget, TestConfig, TestIso, TestStep, TestUpload,
+        step_status_marker, step_title_line, validate_test_ports, validate_test_steps,
+        write_all_resilient, HostStepFiles, StepTarget, TestConfig, TestIso, TestStep, TestUpload,
     };
     use crate::cli::Cli;
     use crate::qemu::PortSpec;
@@ -2105,10 +2136,65 @@ steps:
 
     #[test]
     fn test_step_status_marker_formats_result() {
-        assert_eq!(step_status_marker(2, "deploy", true), "step 2 ok: deploy");
         assert_eq!(
-            step_status_marker(3, "verify", false),
-            "step 3 failed: verify"
+            step_status_marker(4, "mcp-smoke", false, false),
+            "✗ (4) mcp-smoke"
+        );
+        assert_eq!(
+            step_status_marker(4, "mcp-smoke", true, false),
+            "✓ (4) mcp-smoke"
+        );
+        let success_color = step_status_marker(4, "mcp-smoke", true, true);
+        assert!(
+            success_color.contains("\x1b[32m"),
+            "success color should contain green: {success_color:?}"
+        );
+        assert!(
+            success_color.contains('✓'),
+            "success color should contain tick: {success_color:?}"
+        );
+        assert!(
+            success_color.contains("\x1b[2m"),
+            "success color should dim name: {success_color:?}"
+        );
+        assert!(
+            success_color.contains("\x1b[0m"),
+            "success color should reset: {success_color:?}"
+        );
+        let failure_color = step_status_marker(4, "mcp-smoke", false, true);
+        assert!(
+            failure_color.contains("\x1b[31m"),
+            "failure color should contain red: {failure_color:?}"
+        );
+        assert!(
+            failure_color.contains('✗'),
+            "failure color should contain cross: {failure_color:?}"
+        );
+        assert!(
+            !failure_color.contains("\x1b[2m"),
+            "failure color should NOT dim name: {failure_color:?}"
+        );
+    }
+
+    #[test]
+    fn test_step_title_line_formats() {
+        assert_eq!(step_title_line(4, "mcp-smoke", false), "🤖 (4) mcp-smoke");
+        let colored = step_title_line(4, "mcp-smoke", true);
+        assert!(
+            colored.contains("🤖 (4) "),
+            "colored title should contain robot prefix: {colored:?}"
+        );
+        assert!(
+            colored.contains("\x1b[1m"),
+            "colored title should contain bold code: {colored:?}"
+        );
+        assert!(
+            colored.contains("mcp-smoke"),
+            "colored title should contain name: {colored:?}"
+        );
+        assert!(
+            colored.contains("\x1b[0m"),
+            "colored title should contain reset: {colored:?}"
         );
     }
 
