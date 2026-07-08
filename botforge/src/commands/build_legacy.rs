@@ -1,3 +1,7 @@
+//! BUILD-LEGACY: virt-customize (chroot) image builder.
+//! Superseded by the booted-VM `build` command (shared `plan` runtime).
+//! Remove once botworkz/vm and botworkz/space have cut over to the new `build`.
+
 use anyhow::{bail, Context, Result};
 use clap::Args;
 use serde::Deserialize;
@@ -11,7 +15,7 @@ const DEFAULT_MEMSIZE: u32 = 4096;
 const DEFAULT_SMP: u32 = 4;
 
 #[derive(Args, Debug)]
-pub(crate) struct BuildArgs {
+pub(crate) struct BuildLegacyArgs {
     /// Path to the build spec YAML (default: `build.yaml` next to --source).
     #[arg(long, required = true)]
     spec: PathBuf,
@@ -31,7 +35,7 @@ pub(crate) struct BuildArgs {
 
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
-struct BuildSpec {
+struct BuildLegacySpec {
     #[serde(default)]
     disk_size: Option<String>,
     /// Optional libguestfs partition device (`/dev/sda1`, `/dev/vda2`, …)
@@ -63,11 +67,11 @@ struct BuildSpec {
     smp: Option<u32>,
     #[serde(default)]
     context: Option<ContextSpec>,
-    // singleton_map_recursive lets BuildStep variants render as the
+    // singleton_map_recursive lets BuildLegacyStep variants render as the
     // pleasant `- run: foo` YAML form rather than serde_yaml's default
     // `!Run foo` tagged form.
     #[serde(default, with = "serde_yaml::with::singleton_map_recursive")]
-    steps: Vec<BuildStep>,
+    steps: Vec<BuildLegacyStep>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -128,7 +132,7 @@ impl ContextPath {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
-enum BuildStep {
+enum BuildLegacyStep {
     /// Copy a host script into the guest, chmod +x, and run it as root.
     Run(PathBuf),
     /// Run a shell command in the guest (no host file involved).
@@ -170,7 +174,7 @@ struct WriteSpec {
     content: String,
 }
 
-pub(crate) fn cmd_build(args: BuildArgs) -> Result<()> {
+pub(crate) fn cmd_build_legacy(args: BuildLegacyArgs) -> Result<()> {
     ensure_command("virt-customize")?;
     ensure_command("qemu-img")?;
     ensure_command("tar")?;
@@ -279,7 +283,7 @@ pub(crate) fn cmd_build(args: BuildArgs) -> Result<()> {
     Ok(())
 }
 
-fn load_spec(path: &Path) -> Result<BuildSpec> {
+fn load_spec(path: &Path) -> Result<BuildLegacySpec> {
     let yaml = std::fs::read_to_string(path)
         .with_context(|| format!("cannot read build spec: {}", path.display()))?;
     serde_yaml::from_str(&yaml).with_context(|| format!("invalid build spec: {}", path.display()))
@@ -496,11 +500,11 @@ fn build_context_tarball(
 
 fn extend_virt_args_for_step(
     repo_root: &Path,
-    step: &BuildStep,
+    step: &BuildLegacyStep,
     out: &mut Vec<String>,
 ) -> Result<()> {
     match step {
-        BuildStep::Run(script) => {
+        BuildLegacyStep::Run(script) => {
             let resolved = resolve_under_root(repo_root, script.clone());
             if !resolved.is_file() {
                 bail!("step run script not found: {}", resolved.display());
@@ -508,11 +512,11 @@ fn extend_virt_args_for_step(
             out.push("--run".into());
             out.push(resolved.display().to_string());
         }
-        BuildStep::RunCommand(cmd) => {
+        BuildLegacyStep::RunCommand(cmd) => {
             out.push("--run-command".into());
             out.push(cmd.clone());
         }
-        BuildStep::Upload(spec) => {
+        BuildLegacyStep::Upload(spec) => {
             let src = resolve_under_root(repo_root, spec.src.clone());
             if !src.is_file() {
                 bail!("step upload source is not a file: {}", src.display());
@@ -521,7 +525,7 @@ fn extend_virt_args_for_step(
             out.push("--upload".into());
             out.push(format!("{}:{}", src.display(), spec.dest.display()));
         }
-        BuildStep::CopyIn(spec) => {
+        BuildLegacyStep::CopyIn(spec) => {
             let src = resolve_under_root(repo_root, spec.src.clone());
             if !src.exists() {
                 bail!("step copy_in source does not exist: {}", src.display());
@@ -530,22 +534,22 @@ fn extend_virt_args_for_step(
             out.push("--copy-in".into());
             out.push(format!("{}:{}", src.display(), spec.dest.display()));
         }
-        BuildStep::Mkdir(path) => {
+        BuildLegacyStep::Mkdir(path) => {
             validate_guest_absolute_path(path)?;
             out.push("--mkdir".into());
             out.push(path.display().to_string());
         }
-        BuildStep::Truncate(path) => {
+        BuildLegacyStep::Truncate(path) => {
             validate_guest_absolute_path(path)?;
             out.push("--truncate".into());
             out.push(path.display().to_string());
         }
-        BuildStep::Delete(path) => {
+        BuildLegacyStep::Delete(path) => {
             validate_guest_absolute_path(path)?;
             out.push("--delete".into());
             out.push(path.display().to_string());
         }
-        BuildStep::Write(spec) => {
+        BuildLegacyStep::Write(spec) => {
             validate_guest_absolute_path(&spec.path)?;
             out.push("--write".into());
             out.push(format!("{}:{}", spec.path.display(), spec.content));
@@ -613,8 +617,8 @@ fn shell_single_quote(value: &str) -> String {
 mod tests {
     use super::{
         extend_virt_args_for_step, partial_output_path, shell_single_quote,
-        validate_guest_absolute_path, validate_relative_path, BuildSpec, BuildStep, ContextPath,
-        UploadSpec,
+        validate_guest_absolute_path, validate_relative_path, BuildLegacySpec, BuildLegacyStep,
+        ContextPath, UploadSpec,
     };
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
@@ -641,7 +645,7 @@ steps:
   - delete: /var/lib/dbus/machine-id
   - write: { path: /etc/marker, content: "hello\n" }
 "#;
-        let spec: BuildSpec = serde_yaml::from_str(yaml).unwrap();
+        let spec: BuildLegacySpec = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(spec.disk_size.as_deref(), Some("12G"));
         assert_eq!(spec.expand_partition.as_deref(), Some("/dev/sda1"));
         assert_eq!(spec.memsize, Some(2048));
@@ -663,14 +667,14 @@ steps:
             ContextPath::Bare(_) => panic!("expected mapped context path"),
         }
         assert_eq!(spec.steps.len(), 8);
-        assert!(matches!(spec.steps[0], BuildStep::Run(_)));
-        assert!(matches!(spec.steps[1], BuildStep::RunCommand(_)));
-        assert!(matches!(spec.steps[2], BuildStep::Upload(_)));
-        assert!(matches!(spec.steps[3], BuildStep::CopyIn(_)));
-        assert!(matches!(spec.steps[4], BuildStep::Mkdir(_)));
-        assert!(matches!(spec.steps[5], BuildStep::Truncate(_)));
-        assert!(matches!(spec.steps[6], BuildStep::Delete(_)));
-        assert!(matches!(spec.steps[7], BuildStep::Write(_)));
+        assert!(matches!(spec.steps[0], BuildLegacyStep::Run(_)));
+        assert!(matches!(spec.steps[1], BuildLegacyStep::RunCommand(_)));
+        assert!(matches!(spec.steps[2], BuildLegacyStep::Upload(_)));
+        assert!(matches!(spec.steps[3], BuildLegacyStep::CopyIn(_)));
+        assert!(matches!(spec.steps[4], BuildLegacyStep::Mkdir(_)));
+        assert!(matches!(spec.steps[5], BuildLegacyStep::Truncate(_)));
+        assert!(matches!(spec.steps[6], BuildLegacyStep::Delete(_)));
+        assert!(matches!(spec.steps[7], BuildLegacyStep::Write(_)));
     }
 
     #[test]
@@ -707,7 +711,7 @@ steps:
         let tmp = TempDir::new().unwrap();
         let script = tmp.path().join("provisioner.sh");
         std::fs::write(&script, "#!/bin/sh\ntrue\n").unwrap();
-        let step = BuildStep::Run(PathBuf::from("provisioner.sh"));
+        let step = BuildLegacyStep::Run(PathBuf::from("provisioner.sh"));
         let mut out = Vec::new();
         extend_virt_args_for_step(tmp.path(), &step, &mut out).unwrap();
         assert_eq!(out[0], "--run");
@@ -717,7 +721,7 @@ steps:
     #[test]
     fn extend_virt_args_for_run_step_rejects_missing_script() {
         let tmp = TempDir::new().unwrap();
-        let step = BuildStep::Run(PathBuf::from("nope.sh"));
+        let step = BuildLegacyStep::Run(PathBuf::from("nope.sh"));
         let mut out = Vec::new();
         assert!(extend_virt_args_for_step(tmp.path(), &step, &mut out).is_err());
     }
@@ -727,7 +731,7 @@ steps:
         let tmp = TempDir::new().unwrap();
         let src = tmp.path().join("payload.bin");
         std::fs::write(&src, b"x").unwrap();
-        let step = BuildStep::Upload(UploadSpec {
+        let step = BuildLegacyStep::Upload(UploadSpec {
             src: PathBuf::from("payload.bin"),
             dest: PathBuf::from("/opt/payload.bin"),
         });
@@ -742,7 +746,7 @@ steps:
         let tmp = TempDir::new().unwrap();
         let src = tmp.path().join("payload.bin");
         std::fs::write(&src, b"x").unwrap();
-        let step = BuildStep::Upload(UploadSpec {
+        let step = BuildLegacyStep::Upload(UploadSpec {
             src: PathBuf::from("payload.bin"),
             dest: PathBuf::from("relative/dest"),
         });
@@ -756,19 +760,19 @@ steps:
         let mut out = Vec::new();
         extend_virt_args_for_step(
             tmp.path(),
-            &BuildStep::Mkdir(PathBuf::from("/var/lib/botwork")),
+            &BuildLegacyStep::Mkdir(PathBuf::from("/var/lib/botwork")),
             &mut out,
         )
         .unwrap();
         extend_virt_args_for_step(
             tmp.path(),
-            &BuildStep::Truncate(PathBuf::from("/etc/machine-id")),
+            &BuildLegacyStep::Truncate(PathBuf::from("/etc/machine-id")),
             &mut out,
         )
         .unwrap();
         extend_virt_args_for_step(
             tmp.path(),
-            &BuildStep::Delete(PathBuf::from("/var/lib/dbus/machine-id")),
+            &BuildLegacyStep::Delete(PathBuf::from("/var/lib/dbus/machine-id")),
             &mut out,
         )
         .unwrap();
@@ -790,7 +794,7 @@ steps:
         let mut out = Vec::new();
         extend_virt_args_for_step(
             Path::new("/repo"),
-            &BuildStep::RunCommand("echo hi".to_string()),
+            &BuildLegacyStep::RunCommand("echo hi".to_string()),
             &mut out,
         )
         .unwrap();
@@ -833,7 +837,7 @@ steps:
     #[test]
     fn spec_expand_partition_defaults_to_none() {
         let yaml = "steps: []\n";
-        let spec: BuildSpec = serde_yaml::from_str(yaml).unwrap();
+        let spec: BuildLegacySpec = serde_yaml::from_str(yaml).unwrap();
         assert!(spec.expand_partition.is_none());
     }
 
@@ -844,7 +848,7 @@ disk_size: 10G
 boguous_field: true
 steps: []
 "#;
-        let err = serde_yaml::from_str::<BuildSpec>(yaml).unwrap_err();
+        let err = serde_yaml::from_str::<BuildLegacySpec>(yaml).unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("boguous_field") || msg.contains("unknown field"),

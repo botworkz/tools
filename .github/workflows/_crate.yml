@@ -136,10 +136,10 @@ jobs:
             -v "$PWD/.ci-build-smoke:/work" \
             -w /work \
             "botwork/botforge:ci" \
-            build --spec spec.yaml --source missing.qcow2 --output out.qcow2 \
+            build-legacy --spec spec.yaml --source missing.qcow2 --output out.qcow2 \
             2>&1 | tee /tmp/build-smoke.log
           then
-            echo "expected botforge build to fail on missing source" >&2
+            echo "expected botforge build-legacy to fail on missing source" >&2
             exit 1
           fi
           grep -q "source qcow2 not found" /tmp/build-smoke.log
