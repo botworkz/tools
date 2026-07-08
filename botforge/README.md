@@ -34,7 +34,7 @@ docker run --rm \
 - `-v "$PWD:/work" -w /work` — mount your repo so botforge can read manifests,
   write artifacts, and resolve project-relative paths.
 
-`botforge build` benefits from `/dev/kvm` for libguestfs hardware acceleration
+`botforge build-legacy` benefits from `/dev/kvm` for libguestfs hardware acceleration
 but does not strictly require it. With `LIBGUESTFS_BACKEND=direct` (the image
 default) and no `/dev/kvm`, libguestfs falls back to TCG inside its supermin
 appliance.
@@ -56,7 +56,7 @@ at the shasset manifest and `payload` at the payload config.
 
 | Command | Summary |
 |---|---|
-| `botforge build --spec <file> --source <qcow2> --output <qcow2>` | Run a virt-customize spec against a source qcow2 to produce an output qcow2. |
+| `botforge build-legacy --spec <file> --source <qcow2> --output <qcow2>` | [legacy] Run a virt-customize spec against a source qcow2 to produce an output qcow2. |
 | `botforge deps --out <dir> [name ...]` | Fetch + stage shasset assets into a flat output directory. |
 | `botforge iso --src <dir> --out <file> [--volume-id <id>]` | Build an ISO image from a source tree. Also supports generating a cidata seed ISO with an injected SSH key. |
 | `botforge payload --out <file>` | Build a payload ISO from a config-driven staging plan. |
@@ -326,7 +326,7 @@ steps:
       sudo systemctl reload botwork-envoy
 ```
 
-### `botforge build` spec format
+### `botforge build-legacy` spec format
 
 A build spec is a YAML document with three top-level concerns: disk knobs,
 an optional staged build context, and an ordered list of steps. All host
@@ -388,7 +388,7 @@ steps:
   - write: { path: /etc/marker, content: "hello\n" }
 ```
 
-`botforge build`:
+`botforge build-legacy`:
 
 - Copies `--source` to `<output>.partial` with `cp --reflink=auto` (instant
   CoW on btrfs/xfs, falls back to a plain copy otherwise).
@@ -424,7 +424,7 @@ Accepted truthy values are `1`, `true`, and `yes` (case-insensitive).
 ## What is **not** here
 
 There is no `botforge pack` subcommand. Image builds used to drive Packer +
-HCL; that has been replaced by `botforge build` + a YAML spec per image,
+HCL; that has been replaced by `botforge build-legacy` + a YAML spec per image,
 which dispatches `virt-customize` directly. The change deleted the dependency
 on `releases.hashicorp.com` (and Packer plugin distribution generally) and
 ~150 MB of HCL toolchain from the runtime image.
