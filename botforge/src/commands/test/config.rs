@@ -7,6 +7,25 @@ use std::path::{Component, Path, PathBuf};
 use crate::qemu::PortSpec;
 use crate::util::resolve_under_root;
 
+const DEFAULT_SENTINEL: &str = "__default__";
+
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum InputType {
+    String,
+    Number,
+    Boolean,
+}
+
+#[derive(Debug, Deserialize)]
+struct InputDeclaration {
+    #[serde(rename = "type")]
+    input_type: InputType,
+    #[serde(default)]
+    required: bool,
+    default: Option<String>,
+}
+
 #[derive(Debug, Deserialize, Default)]
 pub(in crate::commands::test) struct TestConfig {
     #[serde(default)]
@@ -45,10 +64,11 @@ enum RawTestStep {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TestStepInclude {
     uses: String,
     #[serde(default)]
-    inputs: BTreeMap<String, String>,
+    with: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -151,7 +171,7 @@ fn expand_test_steps(
                 }
                 include_stack.push(include_path.clone());
                 let nested =
-                    load_test_steps_fragment(&include_path, &include.inputs).and_then(|steps| {
+                    load_test_steps_fragment(&include_path, &include.with).and_then(|steps| {
                         expand_test_steps(repo_root, &include_path, steps, include_stack)
                     });
                 include_stack.pop();
@@ -164,7 +184,7 @@ fn expand_test_steps(
 
 fn load_test_steps_fragment(
     path: &Path,
-    inputs: &BTreeMap<String, String>,
+    with: &BTreeMap<String, String>,
 ) -> Result<Vec<RawTestStep>> {
     let yaml = std::fs::read_to_string(path)
         .with_context(|| format!("cannot read test step include: {}", path.display()))?;
@@ -176,11 +196,105 @@ fn load_test_steps_fragment(
         ))
         .with_context(|| format!("invalid test step include: {}", path.display()));
     }
-    substitute_inputs_in_value(&mut value, inputs)
+    let declarations = extract_fragment_input_declarations(&value)
+        .with_context(|| format!("invalid test step include: {}", path.display()))?;
+    let resolved = resolve_fragment_inputs(path, &declarations, with)
+        .with_context(|| format!("invalid test step include: {}", path.display()))?;
+    substitute_inputs_in_value(&mut value, &resolved)
         .with_context(|| format!("invalid test step include: {}", path.display()))?;
     let fragment: RawTestStepFragment = serde_yaml::from_value(value)
         .with_context(|| format!("invalid test step include: {}", path.display()))?;
     Ok(fragment.steps)
+}
+
+fn extract_fragment_input_declarations(
+    value: &Value,
+) -> Result<BTreeMap<String, InputDeclaration>> {
+    let mapping = match value {
+        Value::Mapping(m) => m,
+        _ => return Ok(BTreeMap::new()),
+    };
+    let inputs_key = Value::String("inputs".to_string());
+    match mapping.get(&inputs_key) {
+        None => Ok(BTreeMap::new()),
+        Some(inputs_value) => {
+            let declarations: BTreeMap<String, InputDeclaration> =
+                serde_yaml::from_value(inputs_value.clone())
+                    .context("invalid inputs: declaration")?;
+            Ok(declarations)
+        }
+    }
+}
+
+fn resolve_fragment_inputs(
+    path: &Path,
+    declarations: &BTreeMap<String, InputDeclaration>,
+    with: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>> {
+    // Declaration-time validation: required: true + default: together is a contradiction.
+    for (name, decl) in declarations {
+        if decl.required && decl.default.is_some() {
+            anyhow::bail!(
+                "input '{}' cannot set both 'required: true' and 'default'",
+                name
+            );
+        }
+    }
+
+    // Caller must not pass keys that the fragment has not declared.
+    for key in with.keys() {
+        if !declarations.contains_key(key.as_str()) {
+            anyhow::bail!(
+                "unexpected input '{}' not declared by fragment {}",
+                key,
+                path.display()
+            );
+        }
+    }
+
+    let mut resolved = BTreeMap::new();
+
+    for (name, decl) in declarations {
+        let caller_value = with.get(name.as_str());
+
+        // Resolution pipeline:
+        //   omitted key or "__default__" sentinel → declared default (or unset if none).
+        //   any other value (including "") → take literally.
+        let effective: Option<String> = match caller_value.map(String::as_str) {
+            None | Some(DEFAULT_SENTINEL) => decl.default.clone(),
+            Some(v) => Some(v.to_string()),
+        };
+
+        // Type-validate the resolved value (sentinel is already gone at this point).
+        if let Some(ref v) = effective {
+            validate_input_type(name, decl.input_type, v)?;
+        }
+
+        // Required check: unset + required → error.
+        if effective.is_none() && decl.required {
+            anyhow::bail!("missing required input '{}'", name);
+        }
+
+        if let Some(v) = effective {
+            resolved.insert(name.clone(), v);
+        }
+    }
+
+    Ok(resolved)
+}
+
+fn validate_input_type(name: &str, input_type: InputType, value: &str) -> Result<()> {
+    match input_type {
+        InputType::String => Ok(()),
+        InputType::Number => value
+            .parse::<f64>()
+            .map(|_| ())
+            .map_err(|_| anyhow::anyhow!("input '{}' must be a number", name)),
+        InputType::Boolean => match value.to_ascii_lowercase().as_str() {
+            "true" | "false" => Ok(()),
+            _ => anyhow::bail!("input '{}' must be a boolean", name),
+        },
+    }
 }
 
 fn resolve_uses_path(repo_root: &Path, uses: &str) -> Result<PathBuf> {
@@ -365,11 +479,13 @@ pub(in crate::commands::test) fn resolve_shell(shell: Option<&str>) -> Result<Ve
 #[cfg(test)]
 mod tests {
     use super::{
-        default_bootstrap_path, load_test_config, resolve_shell, validate_test_ports,
-        validate_test_steps, StepTarget, TestConfig, TestIso, TestStep, TestUpload,
+        default_bootstrap_path, load_test_config, resolve_fragment_inputs, resolve_shell,
+        validate_test_ports, validate_test_steps, InputDeclaration, InputType, StepTarget,
+        TestConfig, TestIso, TestStep, TestUpload,
     };
     use crate::qemu::PortSpec;
-    use std::path::PathBuf;
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
     fn loopback(port: u16) -> PortSpec {
@@ -682,6 +798,13 @@ steps:
         std::fs::write(
             repo.path().join("shared/narrative.yaml"),
             r#"
+inputs:
+  target:
+    type: string
+    required: true
+  shell:
+    type: string
+    default: bash
 steps:
   - on: guest
     name: "narrative-${{ inputs.target }}"
@@ -700,7 +823,7 @@ steps:
             r#"
 steps:
   - uses: "@://shared/narrative.yaml"
-    inputs:
+    with:
       target: edge
       shell: bash
 "#,
@@ -744,6 +867,10 @@ steps:
         std::fs::write(
             repo.path().join("shared/narrative.yaml"),
             r#"
+inputs:
+  target:
+    type: string
+    required: true
 steps:
   - on: guest
     name: "${{ inputs.target }}"
@@ -1037,6 +1164,326 @@ steps:
         assert!(
             msg.contains("fish"),
             "error should mention shell name: {msg}"
+        );
+    }
+
+    // --- fragment input contract (resolve_fragment_inputs unit tests) ---
+
+    fn decl(input_type: InputType, required: bool, default: Option<&str>) -> InputDeclaration {
+        InputDeclaration {
+            input_type,
+            required,
+            default: default.map(str::to_string),
+        }
+    }
+
+    fn dummy_path() -> &'static Path {
+        Path::new("fragment.yaml")
+    }
+
+    fn with_map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn decl_map(pairs: &[(&str, InputDeclaration)]) -> BTreeMap<String, InputDeclaration> {
+        pairs
+            .iter()
+            .map(|(k, d)| {
+                (
+                    k.to_string(),
+                    InputDeclaration {
+                        input_type: d.input_type,
+                        required: d.required,
+                        default: d.default.clone(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_resolve_inputs_declared_default_applied_when_caller_omits_key() {
+        let declarations = decl_map(&[("shell", decl(InputType::String, false, Some("bash")))]);
+        let with = BTreeMap::new();
+        let resolved = resolve_fragment_inputs(dummy_path(), &declarations, &with).unwrap();
+        assert_eq!(resolved.get("shell").map(String::as_str), Some("bash"));
+    }
+
+    #[test]
+    fn test_resolve_inputs_default_sentinel_resolves_to_declared_default() {
+        let declarations = decl_map(&[("shell", decl(InputType::String, false, Some("bash")))]);
+        let with = with_map(&[("shell", "__default__")]);
+        let resolved = resolve_fragment_inputs(dummy_path(), &declarations, &with).unwrap();
+        assert_eq!(resolved.get("shell").map(String::as_str), Some("bash"));
+    }
+
+    #[test]
+    fn test_resolve_inputs_default_sentinel_with_no_declared_default_yields_unset() {
+        let declarations = decl_map(&[("target", decl(InputType::String, false, None))]);
+        let with = with_map(&[("target", "__default__")]);
+        let resolved = resolve_fragment_inputs(dummy_path(), &declarations, &with).unwrap();
+        assert!(
+            !resolved.contains_key("target"),
+            "unset input must not appear in resolved map"
+        );
+    }
+
+    #[test]
+    fn test_resolve_inputs_empty_string_yields_empty_not_default() {
+        let declarations = decl_map(&[("shell", decl(InputType::String, false, Some("bash")))]);
+        let with = with_map(&[("shell", "")]);
+        let resolved = resolve_fragment_inputs(dummy_path(), &declarations, &with).unwrap();
+        assert_eq!(
+            resolved.get("shell").map(String::as_str),
+            Some(""),
+            "empty string must not be replaced by the declared default"
+        );
+    }
+
+    #[test]
+    fn test_resolve_inputs_empty_string_satisfies_required() {
+        let declarations = decl_map(&[("target", decl(InputType::String, true, None))]);
+        let with = with_map(&[("target", "")]);
+        let result = resolve_fragment_inputs(dummy_path(), &declarations, &with);
+        assert!(
+            result.is_ok(),
+            "empty string must satisfy required: {result:?}"
+        );
+        assert_eq!(result.unwrap().get("target").map(String::as_str), Some(""));
+    }
+
+    #[test]
+    fn test_resolve_inputs_number_type_valid() {
+        let declarations = decl_map(&[("count", decl(InputType::Number, false, None))]);
+        let with = with_map(&[("count", "42")]);
+        assert!(resolve_fragment_inputs(dummy_path(), &declarations, &with).is_ok());
+    }
+
+    #[test]
+    fn test_resolve_inputs_number_type_valid_float() {
+        let declarations = decl_map(&[("ratio", decl(InputType::Number, false, None))]);
+        let with = with_map(&[("ratio", "3.14")]);
+        assert!(resolve_fragment_inputs(dummy_path(), &declarations, &with).is_ok());
+    }
+
+    #[test]
+    fn test_resolve_inputs_number_type_invalid() {
+        let declarations = decl_map(&[("count", decl(InputType::Number, false, None))]);
+        let with = with_map(&[("count", "not-a-number")]);
+        let err = resolve_fragment_inputs(dummy_path(), &declarations, &with).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("count") && msg.contains("number"),
+            "error must name the input and type: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_inputs_boolean_type_valid() {
+        let declarations = decl_map(&[("flag", decl(InputType::Boolean, false, None))]);
+        for v in &["true", "false", "True", "FALSE"] {
+            let with = with_map(&[("flag", v)]);
+            assert!(
+                resolve_fragment_inputs(dummy_path(), &declarations, &with).is_ok(),
+                "expected valid boolean for '{v}'"
+            );
+        }
+    }
+
+    #[test]
+    fn test_resolve_inputs_boolean_type_invalid() {
+        let declarations = decl_map(&[("flag", decl(InputType::Boolean, false, None))]);
+        let with = with_map(&[("flag", "yes")]);
+        let err = resolve_fragment_inputs(dummy_path(), &declarations, &with).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("flag") && msg.contains("boolean"),
+            "error must name the input and type: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_inputs_default_sentinel_on_typed_input_is_not_parse_error() {
+        // "__default__" on a number/boolean input resolves to the declared default,
+        // not parsed as the type — so it must never produce a type error.
+        let declarations = decl_map(&[("count", decl(InputType::Number, false, Some("10")))]);
+        let with = with_map(&[("count", "__default__")]);
+        let resolved = resolve_fragment_inputs(dummy_path(), &declarations, &with).unwrap();
+        assert_eq!(resolved.get("count").map(String::as_str), Some("10"));
+    }
+
+    #[test]
+    fn test_resolve_inputs_undeclared_with_key_errors() {
+        let declarations = BTreeMap::new();
+        let with = with_map(&[("unknown", "value")]);
+        let err = resolve_fragment_inputs(dummy_path(), &declarations, &with).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown"),
+            "error must name the undeclared key: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_inputs_missing_required_when_omitted() {
+        let declarations = decl_map(&[("target", decl(InputType::String, true, None))]);
+        let with = BTreeMap::new();
+        let err = resolve_fragment_inputs(dummy_path(), &declarations, &with).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("missing required input 'target'"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_inputs_declaration_required_and_default_contradiction() {
+        let declarations = decl_map(&[("shell", decl(InputType::String, true, Some("bash")))]);
+        let with = BTreeMap::new();
+        let err = resolve_fragment_inputs(dummy_path(), &declarations, &with).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("shell") && msg.contains("required") && msg.contains("default"),
+            "error must describe the contradiction: {msg}"
+        );
+    }
+
+    // --- `with:` at call site (integration tests via load_test_config) ---
+
+    #[test]
+    fn test_load_test_config_with_at_call_site_accepted() {
+        let repo = TempDir::new().unwrap();
+        std::fs::create_dir_all(repo.path().join("shared")).unwrap();
+        std::fs::write(
+            repo.path().join("shared/frag.yaml"),
+            r#"
+inputs:
+  msg:
+    type: string
+    required: true
+steps:
+  - on: guest
+    name: "${{ inputs.msg }}"
+    run: "echo ok"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            r#"
+steps:
+  - uses: "@://shared/frag.yaml"
+    with:
+      msg: hello
+"#,
+        )
+        .unwrap();
+
+        let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+        assert_eq!(config.steps.len(), 1);
+        assert_eq!(config.steps[0].name, "hello");
+    }
+
+    #[test]
+    fn test_load_test_config_inputs_at_call_site_is_rejected() {
+        let repo = TempDir::new().unwrap();
+        std::fs::create_dir_all(repo.path().join("shared")).unwrap();
+        std::fs::write(
+            repo.path().join("shared/frag.yaml"),
+            r#"
+inputs:
+  msg:
+    type: string
+    required: true
+steps:
+  - on: guest
+    name: "${{ inputs.msg }}"
+    run: "echo ok"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            r#"
+steps:
+  - uses: "@://shared/frag.yaml"
+    inputs:
+      msg: hello
+"#,
+        )
+        .unwrap();
+
+        // `inputs:` at the call site is not a recognized field; the step must fail to parse.
+        assert!(
+            load_test_config(repo.path(), &repo.path().join("test.yaml")).is_err(),
+            "`inputs:` at call site must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_load_test_config_declared_default_applied_via_fragment() {
+        let repo = TempDir::new().unwrap();
+        std::fs::create_dir_all(repo.path().join("shared")).unwrap();
+        std::fs::write(
+            repo.path().join("shared/frag.yaml"),
+            r#"
+inputs:
+  shell:
+    type: string
+    default: bash
+steps:
+  - on: guest
+    name: step
+    shell: ${{ inputs.shell }}
+    run: "echo ok"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            r#"
+steps:
+  - uses: "@://shared/frag.yaml"
+"#,
+        )
+        .unwrap();
+
+        let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+        assert_eq!(config.steps[0].shell.as_deref(), Some("bash"));
+    }
+
+    #[test]
+    fn test_load_test_config_undeclared_with_key_errors() {
+        let repo = TempDir::new().unwrap();
+        std::fs::create_dir_all(repo.path().join("shared")).unwrap();
+        std::fs::write(
+            repo.path().join("shared/frag.yaml"),
+            r#"
+steps:
+  - on: guest
+    name: step
+    run: "echo ok"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            r#"
+steps:
+  - uses: "@://shared/frag.yaml"
+    with:
+      undeclared: value
+"#,
+        )
+        .unwrap();
+
+        let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("undeclared"),
+            "error must mention the undeclared key: {err:#}"
         );
     }
 }
