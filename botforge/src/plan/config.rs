@@ -797,6 +797,15 @@ pub(crate) fn validate_test_steps(steps: &[TestStep], ports: &[PortSpec]) -> Res
                         .unwrap_or(step.archive.src.as_str())
                 );
             }
+            TestStep::Upload(step) => {
+                anyhow::bail!(
+                    "test step '{}': `upload` steps are only supported in `type: build` documents",
+                    step.upload
+                        .name
+                        .as_deref()
+                        .unwrap_or(step.upload.src.as_str())
+                );
+            }
         }
     }
     let has_host_step = steps
@@ -827,6 +836,7 @@ pub(crate) fn validate_build_steps(steps: &[TestStep]) -> Result<()> {
                 }
             }
             TestStep::Archive(step) => validate_archive_build_step(step)?,
+            TestStep::Upload(step) => validate_upload_build_step(step)?,
         }
     }
     Ok(())
@@ -899,6 +909,47 @@ fn validate_archive_build_step(step: &crate::plan::step::ArchiveStep) -> Result<
     Ok(())
 }
 
+fn validate_upload_build_step(step: &crate::plan::step::UploadStep) -> Result<()> {
+    use crate::plan::step::StepTarget;
+    let spec = &step.upload;
+    let name = spec.name.as_deref().unwrap_or(spec.src.as_str());
+
+    if spec.src.trim().is_empty() {
+        anyhow::bail!("build step '{name}': upload `src` is required and must be non-empty");
+    }
+    if spec.src.starts_with("@://") {
+        anyhow::bail!("build step '{name}': upload `src` does not support '@://' traversal");
+    }
+    if matches!(spec.target, Some(StepTarget::Host)) {
+        anyhow::bail!(
+            "build step '{name}': `on: host` is not valid for `upload` steps; \
+             upload delivers a file into the guest — use `on: guest` (or omit `on:`, which defaults to guest)"
+        );
+    }
+
+    // `dest` is always required: upload always delivers to a guest path.
+    match spec.dest.as_str() {
+        "" => {
+            anyhow::bail!(
+                "build step '{name}': upload `dest` is required and must be a non-empty absolute path"
+            );
+        }
+        dest if dest.trim().is_empty() => {
+            anyhow::bail!(
+                "build step '{name}': upload `dest` is required and must be a non-empty absolute path"
+            );
+        }
+        dest if !dest.starts_with('/') => {
+            anyhow::bail!(
+                "build step '{name}': upload `dest` must be an absolute path (got '{dest}')"
+            );
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -907,7 +958,8 @@ mod tests {
         ImageRef, InputDeclaration, InputType, TestConfig, TestIso, MAX_INCLUDE_DEPTH,
     };
     use crate::plan::step::{
-        ArchiveStep, ArchiveStepSpec, RunStep, StepTarget, TestStep, TestUpload,
+        ArchiveStep, ArchiveStepSpec, RunStep, StepTarget, TestStep, TestUpload, UploadStep,
+        UploadStepSpec,
     };
     use crate::qemu::PortSpec;
     use std::collections::BTreeMap;
@@ -3101,5 +3153,266 @@ steps:
                 || msg.contains("unknown field"),
             "error should indicate archive/run field conflict: {msg}"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // upload step tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_build_step_deserialize_upload_shasset_src() {
+        let step: TestStep = serde_yaml::from_str(
+            r#"
+upload:
+  src: "@some-file"
+  dest: /etc/foo/thing
+"#,
+        )
+        .unwrap();
+        let TestStep::Upload(upload) = step else {
+            panic!("expected upload step");
+        };
+        assert_eq!(upload.upload.src, "@some-file");
+        assert_eq!(upload.upload.dest, "/etc/foo/thing");
+        assert!(upload.upload.name.is_none());
+        assert!(upload.upload.target.is_none());
+    }
+
+    #[test]
+    fn test_build_step_deserialize_upload_with_on_guest_and_name() {
+        let step: TestStep = serde_yaml::from_str(
+            r#"
+upload:
+  on: guest
+  src: "@some-file"
+  dest: /etc/foo/thing
+  name: install-config
+"#,
+        )
+        .unwrap();
+        let TestStep::Upload(upload) = step else {
+            panic!("expected upload step");
+        };
+        assert_eq!(upload.upload.src, "@some-file");
+        assert_eq!(upload.upload.dest, "/etc/foo/thing");
+        assert_eq!(upload.upload.name.as_deref(), Some("install-config"));
+        assert_eq!(upload.upload.target, Some(StepTarget::Guest));
+    }
+
+    #[test]
+    fn test_build_step_deserialize_upload_repo_relative_src() {
+        let step: TestStep = serde_yaml::from_str(
+            r#"
+upload:
+  src: scripts/setup.sh
+  dest: /usr/local/bin/setup.sh
+"#,
+        )
+        .unwrap();
+        let TestStep::Upload(upload) = step else {
+            panic!("expected upload step");
+        };
+        assert_eq!(upload.upload.src, "scripts/setup.sh");
+        assert_eq!(upload.upload.dest, "/usr/local/bin/setup.sh");
+    }
+
+    #[test]
+    fn test_build_step_deserialize_upload_display_name_uses_name_if_present() {
+        let step = TestStep::Upload(UploadStep {
+            upload: UploadStepSpec {
+                src: "@some-file".to_string(),
+                dest: "/tmp/file".to_string(),
+                name: Some("my-upload".to_string()),
+                target: None,
+            },
+        });
+        assert_eq!(step.display_name(), "my-upload");
+    }
+
+    #[test]
+    fn test_build_step_deserialize_upload_display_name_falls_back_to_src() {
+        let step = TestStep::Upload(UploadStep {
+            upload: UploadStepSpec {
+                src: "@some-file".to_string(),
+                dest: "/tmp/file".to_string(),
+                name: None,
+                target: None,
+            },
+        });
+        assert_eq!(step.display_name(), "@some-file");
+    }
+
+    #[test]
+    fn test_validate_build_steps_accepts_upload_shasset_src_absolute_dest() {
+        let steps = vec![TestStep::Upload(UploadStep {
+            upload: UploadStepSpec {
+                src: "@some-file".to_string(),
+                dest: "/etc/foo/thing".to_string(),
+                name: None,
+                target: None,
+            },
+        })];
+        assert!(validate_build_steps(&steps).is_ok());
+    }
+
+    #[test]
+    fn test_validate_build_steps_accepts_upload_with_explicit_on_guest() {
+        let steps = vec![TestStep::Upload(UploadStep {
+            upload: UploadStepSpec {
+                src: "@some-file".to_string(),
+                dest: "/etc/foo/thing".to_string(),
+                name: None,
+                target: Some(StepTarget::Guest),
+            },
+        })];
+        assert!(validate_build_steps(&steps).is_ok());
+    }
+
+    #[test]
+    fn test_validate_build_steps_accepts_upload_repo_relative_src() {
+        let steps = vec![TestStep::Upload(UploadStep {
+            upload: UploadStepSpec {
+                src: "scripts/setup.sh".to_string(),
+                dest: "/usr/local/bin/setup.sh".to_string(),
+                name: None,
+                target: None,
+            },
+        })];
+        assert!(validate_build_steps(&steps).is_ok());
+    }
+
+    #[test]
+    fn test_validate_build_steps_rejects_upload_empty_src() {
+        let steps = vec![TestStep::Upload(UploadStep {
+            upload: UploadStepSpec {
+                src: "   ".to_string(),
+                dest: "/tmp/file".to_string(),
+                name: Some("bad-upload".to_string()),
+                target: None,
+            },
+        })];
+        let err = validate_build_steps(&steps).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("src"), "error should mention 'src': {msg}");
+    }
+
+    #[test]
+    fn test_validate_build_steps_rejects_upload_src_traversal_scheme() {
+        let steps = vec![TestStep::Upload(UploadStep {
+            upload: UploadStepSpec {
+                src: "@://build/some-output".to_string(),
+                dest: "/tmp/file".to_string(),
+                name: Some("traversal".to_string()),
+                target: None,
+            },
+        })];
+        let err = validate_build_steps(&steps).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("@://"), "error should mention '@://': {msg}");
+    }
+
+    #[test]
+    fn test_validate_build_steps_rejects_upload_on_host() {
+        let steps = vec![TestStep::Upload(UploadStep {
+            upload: UploadStepSpec {
+                src: "@some-file".to_string(),
+                dest: "/tmp/file".to_string(),
+                name: Some("bad-host".to_string()),
+                target: Some(StepTarget::Host),
+            },
+        })];
+        let err = validate_build_steps(&steps).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("host") || msg.contains("guest"),
+            "error should mention 'host' or 'guest': {msg}"
+        );
+    }
+
+    #[test]
+    fn test_validate_build_steps_rejects_upload_empty_dest() {
+        let steps = vec![TestStep::Upload(UploadStep {
+            upload: UploadStepSpec {
+                src: "@some-file".to_string(),
+                dest: String::new(),
+                name: Some("bad-dest".to_string()),
+                target: None,
+            },
+        })];
+        let err = validate_build_steps(&steps).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("dest"), "error should mention 'dest': {msg}");
+    }
+
+    #[test]
+    fn test_validate_build_steps_rejects_upload_relative_dest() {
+        let steps = vec![TestStep::Upload(UploadStep {
+            upload: UploadStepSpec {
+                src: "@some-file".to_string(),
+                dest: "relative/path".to_string(),
+                name: Some("bad-dest".to_string()),
+                target: None,
+            },
+        })];
+        let err = validate_build_steps(&steps).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("absolute") || msg.contains("dest"),
+            "error should mention absolute path requirement: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_validate_test_steps_rejects_upload_step() {
+        use crate::qemu::PortSpec;
+        let steps = vec![TestStep::Upload(UploadStep {
+            upload: UploadStepSpec {
+                src: "@some-file".to_string(),
+                dest: "/tmp/file".to_string(),
+                name: Some("my-upload".to_string()),
+                target: None,
+            },
+        })];
+        let err = validate_test_steps(
+            &steps,
+            &[PortSpec {
+                addr: "127.0.0.1".into(),
+                port: 8080,
+            }],
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("upload") || msg.contains("build"),
+            "error should mention upload/build restriction: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_load_build_config_parses_upload_step() {
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            r#"
+type: build
+image: "@debian-base"
+steps:
+  - upload:
+      on: guest
+      src: "@some-config"
+      dest: /etc/foo/thing
+      name: install-config
+"#,
+        );
+        let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
+        assert_eq!(config.steps.len(), 1);
+        let TestStep::Upload(upload) = &config.steps[0] else {
+            panic!("expected upload step");
+        };
+        assert_eq!(upload.upload.src, "@some-config");
+        assert_eq!(upload.upload.dest, "/etc/foo/thing");
+        assert_eq!(upload.upload.name.as_deref(), Some("install-config"));
+        assert_eq!(upload.upload.target, Some(StepTarget::Guest));
     }
 }
