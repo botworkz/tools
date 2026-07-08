@@ -17,7 +17,7 @@ use super::log::{
     join_output_forwarders, print_step_status, print_step_title, spawn_output_forwarder,
     step_log_path, StepLogWriter, StepOutputStream,
 };
-use super::step::{resolve_shell, ArchiveStep, RunStep, StepTarget, TestStep};
+use super::step::{resolve_shell, ArchiveStep, RunStep, StepTarget, TestStep, UploadStep};
 
 const TEST_SSH_READY_TIMEOUT: Duration = Duration::from_secs(300);
 const TEST_TRANSPORT_RETRIES: usize = 10;
@@ -25,6 +25,7 @@ const TEST_TRANSPORT_RETRY_DELAY: Duration = Duration::from_secs(2);
 const TEST_STABLE_SSH_ATTEMPTS: usize = 5;
 const TEST_STABLE_SSH_REQUIRED: usize = 2;
 type ArchiveExecutor<'a> = dyn FnMut(usize, &ArchiveStep) -> Result<()> + 'a;
+type UploadExecutor<'a> = dyn FnMut(usize, &UploadStep) -> Result<()> + 'a;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct StepTimeoutPolicy {
@@ -70,6 +71,7 @@ pub(crate) fn run_test_flow(
             cloud_init_timeout: Duration::from_secs(config.cloud_init_timeout),
         },
         None,
+        None,
     )
     .map(|_| ())
 }
@@ -83,6 +85,7 @@ pub(crate) fn run_step_flow(
     bootstraps: &[TestIsoBootstrap],
     timeouts: StepTimeoutPolicy,
     mut archive_executor: Option<&mut ArchiveExecutor<'_>>,
+    mut upload_executor: Option<&mut UploadExecutor<'_>>,
 ) -> Result<Instant> {
     let overall_deadline = Instant::now() + timeouts.overall_timeout;
     let step_log_dir = repo_root.join("build").join("logs");
@@ -173,6 +176,22 @@ pub(crate) fn run_step_flow(
                         "step {} ('{}') is an `archive` step, but archive execution is not enabled for this command",
                         step_idx + 1,
                         archive_name
+                    );
+                }
+            }
+            TestStep::Upload(step) => {
+                if let Some(executor) = upload_executor.as_mut() {
+                    executor(step_idx, step)
+                } else {
+                    let upload_name = step
+                        .upload
+                        .name
+                        .as_deref()
+                        .unwrap_or(step.upload.src.as_str());
+                    anyhow::bail!(
+                        "step {} ('{}') is an `upload` step, but upload execution is not enabled for this command",
+                        step_idx + 1,
+                        upload_name
                     );
                 }
             }
