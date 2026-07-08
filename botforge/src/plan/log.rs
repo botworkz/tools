@@ -10,7 +10,7 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 #[derive(Clone, Copy)]
-pub(in crate::commands::test) enum StepOutputStream {
+pub(super) enum StepOutputStream {
     Stdout,
     Stderr,
 }
@@ -31,12 +31,12 @@ struct StepLogRecord<'a> {
     line: String,
 }
 
-pub(in crate::commands::test) struct StepLogWriter {
+pub(super) struct StepLogWriter {
     inner: Mutex<BufWriter<File>>,
 }
 
 impl StepLogWriter {
-    pub(in crate::commands::test) fn create(path: &Path) -> Result<Self> {
+    pub(super) fn create(path: &Path) -> Result<Self> {
         let file = File::create(path)
             .with_context(|| format!("failed to create step log file: {}", path.display()))?;
         Ok(Self {
@@ -44,11 +44,7 @@ impl StepLogWriter {
         })
     }
 
-    pub(in crate::commands::test) fn log_line(
-        &self,
-        stream: StepOutputStream,
-        line: &[u8],
-    ) -> Result<()> {
+    pub(super) fn log_line(&self, stream: StepOutputStream, line: &[u8]) -> Result<()> {
         // Compute the timestamp and lossy-convert the line *before* acquiring
         // the lock so formatting latency is not serialised across both threads.
         let ts = step_log_timestamp()?;
@@ -91,11 +87,7 @@ fn sanitize_step_log_name(name: &str) -> String {
         .collect()
 }
 
-pub(in crate::commands::test) fn step_log_path(
-    log_dir: &Path,
-    step_idx: usize,
-    step_name: &str,
-) -> PathBuf {
+pub(super) fn step_log_path(log_dir: &Path, step_idx: usize, step_name: &str) -> PathBuf {
     log_dir.join(format!(
         "step-{step_idx}-{}.log",
         sanitize_step_log_name(step_name)
@@ -127,18 +119,14 @@ fn step_status_marker(step_idx: usize, name: &str, success: bool, color: bool) -
     }
 }
 
-pub(in crate::commands::test) fn print_step_title(step_idx: usize, step_name: &str) {
+pub(super) fn print_step_title(step_idx: usize, step_name: &str) {
     eprintln!(
         "{}",
         step_title_line(step_idx, step_name, stderr_color_enabled())
     );
 }
 
-pub(in crate::commands::test) fn print_step_status(
-    step_idx: usize,
-    step_name: &str,
-    success: bool,
-) {
+pub(super) fn print_step_status(step_idx: usize, step_name: &str, success: bool) {
     eprintln!(
         "{}",
         step_status_marker(step_idx, step_name, success, stderr_color_enabled())
@@ -223,7 +211,7 @@ fn stream_child_output<R: Read, W: Write>(
     Ok(())
 }
 
-pub(in crate::commands::test) fn spawn_output_forwarder<R: Read + Send + 'static>(
+pub(super) fn spawn_output_forwarder<R: Read + Send + 'static>(
     reader: R,
     stream: StepOutputStream,
     logger: Arc<StepLogWriter>,
@@ -240,9 +228,7 @@ pub(in crate::commands::test) fn spawn_output_forwarder<R: Read + Send + 'static
     })
 }
 
-pub(in crate::commands::test) fn join_output_forwarders(
-    handles: Vec<JoinHandle<Result<()>>>,
-) -> Result<()> {
+pub(super) fn join_output_forwarders(handles: Vec<JoinHandle<Result<()>>>) -> Result<()> {
     for handle in handles {
         handle
             .join()
@@ -257,12 +243,16 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
 
+    // --- step log path ---
+
     #[test]
     fn test_step_log_path_sanitizes_name() {
         let log_dir = PathBuf::from("/tmp/botforge-step-logs");
         let path = step_log_path(&log_dir, 7, "name with/slash\tand*chars");
         assert_eq!(path, log_dir.join("step-7-name_with_slash_and_chars.log"));
     }
+
+    // --- step status marker and title line ---
 
     #[test]
     fn test_step_status_marker_formats_result() {

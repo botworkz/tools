@@ -12,11 +12,12 @@ use crate::ssh::{
 };
 use crate::util::{resolve_under_root, unique_suffix};
 
-use super::config::{resolve_shell, StepTarget, TestConfig, TestIsoBootstrap};
+use super::config::{TestConfig, TestIsoBootstrap};
 use super::log::{
     join_output_forwarders, print_step_status, print_step_title, spawn_output_forwarder,
     step_log_path, StepLogWriter, StepOutputStream,
 };
+use super::step::{resolve_shell, StepTarget};
 
 const TEST_SSH_READY_TIMEOUT: Duration = Duration::from_secs(300);
 const TEST_CLOUD_INIT_TIMEOUT: Duration = Duration::from_secs(300);
@@ -25,7 +26,11 @@ const TEST_TRANSPORT_RETRY_DELAY: Duration = Duration::from_secs(2);
 const TEST_STABLE_SSH_ATTEMPTS: usize = 5;
 const TEST_STABLE_SSH_REQUIRED: usize = 2;
 
-pub(super) fn run_test_flow(
+// ---------------------------------------------------------------------------
+// VM runtime (formerly run.rs)
+// ---------------------------------------------------------------------------
+
+pub(crate) fn run_test_flow(
     repo_root: &Path,
     config: &TestConfig,
     ssh: &SshOptions,
@@ -496,7 +501,7 @@ fn build_guest_env_preamble(accumulated_env: &[(String, String)], remote_env_pat
     preamble
 }
 
-pub(super) fn collect_test_diagnostics(ssh: &SshOptions, units: &[String]) {
+pub(crate) fn collect_test_diagnostics(ssh: &SshOptions, units: &[String]) {
     let _ = ssh_with_retry(
         ssh,
         "systemctl --failed",
@@ -520,7 +525,7 @@ pub(super) fn collect_test_diagnostics(ssh: &SshOptions, units: &[String]) {
     );
 }
 
-pub(super) fn print_log_tail(path: &Path, line_count: usize) {
+pub(crate) fn print_log_tail(path: &Path, line_count: usize) {
     let Ok(file) = File::open(path) else {
         return;
     };
@@ -534,7 +539,7 @@ pub(super) fn print_log_tail(path: &Path, line_count: usize) {
     }
 }
 
-pub(super) fn cleanup_test(vm_child: &mut Option<Child>, overlay_image: &Path) {
+pub(crate) fn cleanup_test(vm_child: &mut Option<Child>, overlay_image: &Path) {
     if let Some(child) = vm_child.as_mut() {
         let _ = child.kill();
         let _ = child.wait();
@@ -549,7 +554,7 @@ mod tests {
         build_guest_env_preamble, env_merge, parse_env_file, run_host_step, shell_single_quote,
         HostStepFiles,
     };
-    use crate::commands::test::config::resolve_shell;
+    use crate::plan::step::resolve_shell;
     use crate::util::unique_suffix;
     use serde::Deserialize;
     use std::path::{Path, PathBuf};
