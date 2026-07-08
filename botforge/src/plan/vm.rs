@@ -616,7 +616,7 @@ fn spawn_logged_child(
 }
 
 fn shell_single_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\"'\"'"))
+    crate::util::shell_single_quote(value)
 }
 
 /// Parse a `$GITHUB_ENV`-style env file, returning key-value pairs in insertion order.

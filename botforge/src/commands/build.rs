@@ -14,12 +14,13 @@ use crate::iso::{
     build_iso, detect_iso_tool, generate_installer_username, render_user_data, write_seed_files,
 };
 use crate::qemu::{qemu_build_args, require_kvm, spawn_qemu_with_log};
-use crate::ssh::{ssh_with_retry, SshOptions, TemporarySshKeypair};
+use crate::ssh::{scp_with_retry, ssh_with_retry, SshOptions, TemporarySshKeypair};
 use crate::util::{
     create_temp_dir, default_cache_dir, ensure_command, materialize_flat, resolve_under_root,
+    unique_suffix,
 };
 
-use crate::plan::step::{ArchiveStep, TestStep};
+use crate::plan::step::{ArchiveStep, StepTarget, TestStep};
 use crate::plan::{
     load_build_config, preserve_failed_build_disk, print_log_tail, run_step_flow,
     shutdown_build_vm, validate_build_steps, vm::StepTimeoutPolicy,
@@ -194,6 +195,7 @@ pub(crate) fn cmd_build(config: &Path, args: BuildArgs) -> Result<()> {
             args.cache_dir.as_deref(),
             step_idx,
             step,
+            &ssh_options,
         )
     };
     let step_result = run_step_flow(
@@ -386,7 +388,10 @@ fn run_archive_step(
     cache_dir_override: Option<&Path>,
     step_idx: usize,
     step: &ArchiveStep,
+    ssh: &SshOptions,
 ) -> Result<()> {
+    use crate::util::shell_single_quote;
+
     let src = step.archive.src.trim();
     let asset_key = parse_archive_asset_key(src)?;
 
@@ -418,32 +423,130 @@ fn run_archive_step(
     })
     .with_context(|| format!("failed to fetch archive asset '{asset_key}'"))?;
 
-    let relative_unpacked = archive_unpack_relative_path(
-        asset_key,
-        step.archive.into.as_deref(),
-        asset.checksum.as_deref(),
-    );
-    let relative_within_build = relative_unpacked
-        .strip_prefix(Path::new("build"))
-        .unwrap_or(&relative_unpacked);
-    let unpack_dir = build_dir.join(relative_within_build);
-    unpack_archive_to_dir(&fetched.blob_path, &unpack_dir).with_context(|| {
-        format!(
-            "archive step '{}': failed to unpack {} into {}",
-            step.archive.name.as_deref().unwrap_or(src),
-            fetched.blob_path.display(),
-            unpack_dir.display()
-        )
-    })?;
+    // Retry constants mirror the vm.rs run-step upload path.
+    const RETRIES: usize = 10;
+    const RETRY_DELAY: Duration = Duration::from_secs(2);
 
-    // TODO: Thread archive outputs into step-input resolution so future steps can consume
-    // them directly via @://build/<path> without manual path wiring.
-    println!(
-        "archive step {} ('{}') unpacked to {}",
-        step_idx + 1,
-        step.archive.name.as_deref().unwrap_or(src),
-        relative_unpacked.display()
-    );
+    if step.target == Some(StepTarget::Guest) {
+        // ------------------------------------------------------------------
+        // Guest mode: scp the fetched archive blob into the guest, then
+        // untar it there via SSH using `sudo tar`.
+        // ------------------------------------------------------------------
+        let dest = step
+            .archive
+            .dest
+            .as_deref()
+            .expect("dest validated as present for on: guest");
+
+        // Derive a temp filename that preserves the archive extension so that
+        // tar can auto-detect the compression format.
+        let ext = fetched
+            .blob_path
+            .extension()
+            .map(|e| format!(".{}", e.to_string_lossy()))
+            .unwrap_or_default();
+        let suffix = unique_suffix();
+        let remote_archive = format!("/tmp/botforge-archive-{step_idx}-{suffix}{ext}");
+
+        // Step 1: Verify that `tar` is available in the guest before doing any
+        // transport, so the error is clear if the guest image lacks tar.
+        ssh_with_retry(
+            ssh,
+            "command -v tar >/dev/null 2>&1",
+            1,
+            Duration::from_secs(0),
+            Duration::from_secs(10),
+        )
+        .with_context(|| {
+            format!(
+                "archive step '{}': `tar` is not available in the guest; \
+                 install tar in the base image before using `on: guest` archive steps",
+                step.archive.name.as_deref().unwrap_or(src)
+            )
+        })?;
+
+        // Step 2: scp the archive blob to the guest temp path.
+        scp_with_retry(
+            ssh,
+            &fetched.blob_path,
+            &remote_archive,
+            RETRIES,
+            RETRY_DELAY,
+        )
+        .with_context(|| {
+            format!(
+                "archive step '{}': failed to scp archive to guest",
+                step.archive.name.as_deref().unwrap_or(src)
+            )
+        })?;
+
+        // Step 3: mkdir + untar inside the guest (sudo for system paths).
+        let dest_q = shell_single_quote(dest);
+        let remote_archive_q = shell_single_quote(&remote_archive);
+        let untar_cmd = guest_untar_command(&dest_q, &remote_archive_q);
+        let untar_result = ssh_with_retry(
+            ssh,
+            &untar_cmd,
+            1,
+            Duration::from_secs(0),
+            Duration::from_secs(300),
+        )
+        .with_context(|| {
+            format!(
+                "archive step '{}': tar extraction into guest path '{}' failed",
+                step.archive.name.as_deref().unwrap_or(src),
+                dest
+            )
+        });
+
+        // Step 4: Best-effort cleanup of the remote temp archive.
+        let _ = ssh_with_retry(
+            ssh,
+            &format!("rm -f {remote_archive_q}"),
+            1,
+            Duration::from_secs(0),
+            Duration::from_secs(10),
+        );
+
+        untar_result?;
+
+        println!(
+            "archive step {} ('{}') extracted into guest at {}",
+            step_idx + 1,
+            step.archive.name.as_deref().unwrap_or(src),
+            dest
+        );
+    } else {
+        // ------------------------------------------------------------------
+        // Host mode (default): unpack into build/archives/<id>/ (unchanged).
+        // ------------------------------------------------------------------
+        let relative_unpacked = archive_unpack_relative_path(
+            asset_key,
+            step.archive.into.as_deref(),
+            asset.checksum.as_deref(),
+        );
+        let relative_within_build = relative_unpacked
+            .strip_prefix(Path::new("build"))
+            .unwrap_or(&relative_unpacked);
+        let unpack_dir = build_dir.join(relative_within_build);
+        unpack_archive_to_dir(&fetched.blob_path, &unpack_dir).with_context(|| {
+            format!(
+                "archive step '{}': failed to unpack {} into {}",
+                step.archive.name.as_deref().unwrap_or(src),
+                fetched.blob_path.display(),
+                unpack_dir.display()
+            )
+        })?;
+
+        // TODO: Thread archive outputs into step-input resolution so future steps can consume
+        // them directly via @://build/<path> without manual path wiring.
+        println!(
+            "archive step {} ('{}') unpacked to {}",
+            step_idx + 1,
+            step.archive.name.as_deref().unwrap_or(src),
+            relative_unpacked.display()
+        );
+    }
 
     Ok(())
 }
@@ -518,6 +621,14 @@ fn archive_identity_hash_hex(
         hash = hash.wrapping_mul(FNV_PRIME);
     }
     format!("{hash:016x}")
+}
+
+/// Build the guest-side untar command for an `on: guest` archive step.
+///
+/// Both `dest_q` and `remote_archive_q` must already be POSIX single-quoted
+/// (via [`crate::util::shell_single_quote`]).
+fn guest_untar_command(dest_q: &str, remote_archive_q: &str) -> String {
+    format!("sudo mkdir -p {dest_q} && sudo tar -xf {remote_archive_q} -C {dest_q}")
 }
 
 fn unpack_archive_to_dir(archive_path: &Path, destination_dir: &Path) -> Result<()> {
@@ -659,9 +770,9 @@ fn resize_qcow2(disk: &Path, size: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        archive_unpack_relative_path, failed_partial_path, installer_teardown_command, output_stem,
-        parse_archive_asset_key, partial_path, resolve_base_image_with_transport,
-        unpack_archive_to_dir,
+        archive_unpack_relative_path, failed_partial_path, guest_untar_command,
+        installer_teardown_command, output_stem, parse_archive_asset_key, partial_path,
+        resolve_base_image_with_transport, unpack_archive_to_dir,
     };
     use crate::cli::Cli;
     use clap::Parser;
@@ -960,5 +1071,57 @@ mod tests {
         assert!(path.exists(), "materialized qcow2 should exist: {path:?}");
         assert_eq!(std::fs::read(&path).unwrap(), body);
         assert_eq!(path.file_name().unwrap(), "debian-13.qcow2");
+    }
+
+    #[test]
+    fn guest_untar_command_constructs_expected_ssh_command() {
+        use crate::util::shell_single_quote;
+        let dest = "/var/lib/foo";
+        let remote_archive = "/tmp/botforge-archive-2-12345.tar.gz";
+        let cmd = guest_untar_command(
+            &shell_single_quote(dest),
+            &shell_single_quote(remote_archive),
+        );
+        assert_eq!(
+            cmd,
+            "sudo mkdir -p '/var/lib/foo' && sudo tar -xf '/tmp/botforge-archive-2-12345.tar.gz' -C '/var/lib/foo'"
+        );
+    }
+
+    #[test]
+    fn guest_untar_command_quotes_paths_with_spaces() {
+        use crate::util::shell_single_quote;
+        let dest = "/var/lib/some tool";
+        let remote_archive = "/tmp/my archive.tar";
+        let cmd = guest_untar_command(
+            &shell_single_quote(dest),
+            &shell_single_quote(remote_archive),
+        );
+        assert_eq!(
+            cmd,
+            "sudo mkdir -p '/var/lib/some tool' && sudo tar -xf '/tmp/my archive.tar' -C '/var/lib/some tool'"
+        );
+    }
+
+    #[test]
+    fn guest_archive_temp_path_has_expected_prefix_and_extension() {
+        // Reproduce the temp-path derivation logic from run_archive_step
+        // to verify it starts with the botforge prefix and ends with the extension.
+        let step_idx: usize = 3;
+        let suffix = "99999-123456789";
+        let ext = ".tar.gz";
+        let path = format!("/tmp/botforge-archive-{step_idx}-{suffix}{ext}");
+        assert!(
+            path.starts_with("/tmp/botforge-archive-"),
+            "temp path should be under /tmp: {path}"
+        );
+        assert!(
+            path.ends_with(".tar.gz"),
+            "temp path should preserve extension: {path}"
+        );
+        assert!(
+            path.contains(&format!("-{step_idx}-")),
+            "temp path should embed step index: {path}"
+        );
     }
 }
