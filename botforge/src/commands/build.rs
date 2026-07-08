@@ -20,7 +20,7 @@ use crate::util::{
     unique_suffix,
 };
 
-use crate::plan::step::{ArchiveStep, StepTarget, TestStep};
+use crate::plan::step::{ArchiveStep, StepTarget, TestStep, UploadStep};
 use crate::plan::{
     load_build_config, preserve_failed_build_disk, print_log_tail, run_step_flow,
     shutdown_build_vm, validate_build_steps, vm::StepTimeoutPolicy,
@@ -198,6 +198,16 @@ pub(crate) fn cmd_build(config: &Path, args: BuildArgs) -> Result<()> {
             &ssh_options,
         )
     };
+    let mut upload_executor = |step_idx: usize, step: &UploadStep| -> Result<()> {
+        run_upload_step(
+            config,
+            &repo_root,
+            args.cache_dir.as_deref(),
+            step_idx,
+            step,
+            &ssh_options,
+        )
+    };
     let step_result = run_step_flow(
         &repo_root,
         &build_config.steps,
@@ -209,6 +219,7 @@ pub(crate) fn cmd_build(config: &Path, args: BuildArgs) -> Result<()> {
             cloud_init_timeout: std::time::Duration::from_secs(build_config.cloud_init_timeout),
         },
         Some(&mut archive_executor),
+        Some(&mut upload_executor),
     );
     let overall_deadline = match step_result {
         Ok(overall_deadline) => overall_deadline,
@@ -547,6 +558,128 @@ fn run_archive_step(
             relative_unpacked.display()
         );
     }
+
+    Ok(())
+}
+
+fn run_upload_step(
+    manifest_path: &Path,
+    repo_root: &Path,
+    cache_dir_override: Option<&Path>,
+    step_idx: usize,
+    step: &UploadStep,
+    ssh: &SshOptions,
+) -> Result<()> {
+    use crate::util::shell_single_quote;
+
+    let spec = &step.upload;
+    let src = spec.src.trim();
+    let dest = spec.dest.as_str();
+    let name = spec.name.as_deref().unwrap_or(src);
+
+    // Retry constants mirror the archive step and run-step upload paths.
+    const RETRIES: usize = 10;
+    const RETRY_DELAY: Duration = Duration::from_secs(2);
+
+    // Resolve the source blob: shasset ref (`@<name>`) or repo-relative path.
+    let local_blob: PathBuf = if let Some(asset_key) = src.strip_prefix('@') {
+        // External: fetch from shasset manifest.
+        let manifest = load(manifest_path).with_context(|| {
+            format!("cannot load shasset manifest: {}", manifest_path.display())
+        })?;
+        let cache_dir = cache_dir_override
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(default_cache_dir);
+        let asset = manifest.assets.get(asset_key).with_context(|| {
+            format!(
+                "upload step '{}': asset '{}' not found in manifest {}",
+                name,
+                asset_key,
+                manifest_path.display()
+            )
+        })?;
+        let fetched = fetch_asset(FetchParams {
+            name: asset_key,
+            asset,
+            out_dir: None,
+            cache_dir: &cache_dir,
+            retries: manifest.settings.retries,
+            backoff: &manifest.settings.backoff,
+            compute_checksum: true,
+            no_reverify: false,
+            materialize_mode: MaterializeMode::Copy,
+            transport: None,
+        })
+        .with_context(|| format!("failed to fetch upload asset '{asset_key}'"))?;
+        fetched.blob_path
+    } else {
+        // Internal: repo-relative path, resolved under repo_root.
+        resolve_under_root(repo_root, PathBuf::from(src))
+    };
+
+    // SCP the resolved blob verbatim to `dest` in the guest (no extraction).
+    let dest_q = shell_single_quote(dest);
+    let parent = std::path::Path::new(dest)
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .filter(|p| !p.is_empty() && p != "/");
+    if let Some(parent_dir) = parent {
+        ssh_with_retry(
+            ssh,
+            &format!("sudo mkdir -p {}", shell_single_quote(&parent_dir)),
+            1,
+            Duration::from_secs(0),
+            Duration::from_secs(30),
+        )
+        .with_context(|| {
+            format!(
+                "upload step '{}': failed to create parent directory '{}' in guest",
+                name, parent_dir
+            )
+        })?;
+    }
+
+    // Step 1: SCP blob to a temp path in the guest.
+    let suffix = unique_suffix();
+    let remote_tmp = format!("/tmp/botforge-upload-{step_idx}-{suffix}");
+    scp_with_retry(ssh, &local_blob, &remote_tmp, RETRIES, RETRY_DELAY)
+        .with_context(|| format!("upload step '{}': failed to scp file to guest", name))?;
+
+    // Step 2: Move the temp file to the final destination (sudo for system paths).
+    let remote_tmp_q = shell_single_quote(&remote_tmp);
+    let mv_result = ssh_with_retry(
+        ssh,
+        &format!("sudo mv {remote_tmp_q} {dest_q}"),
+        1,
+        Duration::from_secs(0),
+        Duration::from_secs(30),
+    )
+    .with_context(|| {
+        format!(
+            "upload step '{}': failed to move file to '{}' in guest",
+            name, dest
+        )
+    });
+
+    // Best-effort cleanup of the remote temp file on failure.
+    if mv_result.is_err() {
+        let _ = ssh_with_retry(
+            ssh,
+            &format!("rm -f {remote_tmp_q}"),
+            1,
+            Duration::from_secs(0),
+            Duration::from_secs(10),
+        );
+    }
+
+    mv_result?;
+
+    println!(
+        "upload step {} ('{}') placed at {}",
+        step_idx + 1,
+        name,
+        dest
+    );
 
     Ok(())
 }
