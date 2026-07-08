@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::ssh::{
-    journalctl_command, require_stable_ssh, scp_with_retry, ssh_capture_stdout, ssh_command_args,
-    ssh_with_retry, wait_for_ssh, SshOptions,
+    journalctl_command, scp_with_retry, ssh_capture_stdout, ssh_command_args, ssh_with_retry,
+    wait_for_ssh, SshOptions,
 };
 use crate::util::{resolve_under_root, unique_suffix};
 
@@ -20,11 +20,24 @@ use super::log::{
 use super::step::{resolve_shell, StepTarget, TestStep};
 
 const TEST_SSH_READY_TIMEOUT: Duration = Duration::from_secs(300);
-const TEST_CLOUD_INIT_TIMEOUT: Duration = Duration::from_secs(300);
 const TEST_TRANSPORT_RETRIES: usize = 10;
 const TEST_TRANSPORT_RETRY_DELAY: Duration = Duration::from_secs(2);
 const TEST_STABLE_SSH_ATTEMPTS: usize = 5;
 const TEST_STABLE_SSH_REQUIRED: usize = 2;
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct StepTimeoutPolicy {
+    pub(crate) overall_timeout: Duration,
+    pub(crate) default_step_timeout: Duration,
+    pub(crate) cloud_init_timeout: Duration,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct StepExecutionBudget {
+    step_timeout: Duration,
+    overall_deadline: Instant,
+    overall_timeout: Duration,
+}
 
 // ---------------------------------------------------------------------------
 // VM runtime (formerly run.rs)
@@ -36,7 +49,18 @@ pub(crate) fn run_test_flow(
     ssh: &SshOptions,
     bootstraps: &[TestIsoBootstrap],
 ) -> Result<()> {
-    run_step_flow(repo_root, &config.steps, ssh, bootstraps)
+    run_step_flow(
+        repo_root,
+        &config.steps,
+        ssh,
+        bootstraps,
+        StepTimeoutPolicy {
+            overall_timeout: Duration::from_secs(config.timeout),
+            default_step_timeout: Duration::from_secs(config.step_timeout),
+            cloud_init_timeout: Duration::from_secs(config.cloud_init_timeout),
+        },
+    )
+    .map(|_| ())
 }
 
 /// Shared boot→wait-for-SSH→wait-for-cloud-init→run-steps spine used by both
@@ -46,7 +70,9 @@ pub(crate) fn run_step_flow(
     steps: &[TestStep],
     ssh: &SshOptions,
     bootstraps: &[TestIsoBootstrap],
-) -> Result<()> {
+    timeouts: StepTimeoutPolicy,
+) -> Result<Instant> {
+    let overall_deadline = Instant::now() + timeouts.overall_timeout;
     let step_log_dir = repo_root.join("build").join("logs");
     std::fs::create_dir_all(&step_log_dir).with_context(|| {
         format!(
@@ -54,17 +80,29 @@ pub(crate) fn run_step_flow(
             step_log_dir.display()
         )
     })?;
-    wait_for_ssh(ssh, TEST_SSH_READY_TIMEOUT)?;
+    ensure_overall_budget(overall_deadline, timeouts.overall_timeout)?;
+    wait_for_ssh(
+        ssh,
+        remaining_budget(overall_deadline).min(TEST_SSH_READY_TIMEOUT),
+    )?;
+    ensure_overall_budget(overall_deadline, timeouts.overall_timeout)?;
     ssh_with_retry(
         ssh,
         "sudo cloud-init status --wait",
         TEST_TRANSPORT_RETRIES,
         TEST_TRANSPORT_RETRY_DELAY,
-        TEST_CLOUD_INIT_TIMEOUT,
+        remaining_budget(overall_deadline).min(timeouts.cloud_init_timeout),
     )?;
-    require_stable_ssh(ssh, TEST_STABLE_SSH_ATTEMPTS, TEST_STABLE_SSH_REQUIRED)?;
+    require_stable_ssh_with_deadline(
+        ssh,
+        TEST_STABLE_SSH_ATTEMPTS,
+        TEST_STABLE_SSH_REQUIRED,
+        overall_deadline,
+        timeouts.overall_timeout,
+    )?;
 
     for bootstrap in bootstraps {
+        ensure_overall_budget(overall_deadline, timeouts.overall_timeout)?;
         let mount = shell_single_quote(&bootstrap.mount.display().to_string());
         let label = shell_single_quote(&bootstrap.label);
         let mount_cmd = format!("sudo mkdir -p {mount} && sudo mount -L {label} -o ro {mount}");
@@ -73,7 +111,7 @@ pub(crate) fn run_step_flow(
             &mount_cmd,
             TEST_TRANSPORT_RETRIES,
             TEST_TRANSPORT_RETRY_DELAY,
-            TEST_CLOUD_INIT_TIMEOUT,
+            remaining_budget(overall_deadline).min(timeouts.cloud_init_timeout),
         )
         .with_context(|| format!("iso bootstrap mount failed for label {}", bootstrap.label))?;
 
@@ -87,7 +125,7 @@ pub(crate) fn run_step_flow(
             &run_cmd,
             TEST_TRANSPORT_RETRIES,
             TEST_TRANSPORT_RETRY_DELAY,
-            TEST_CLOUD_INIT_TIMEOUT,
+            remaining_budget(overall_deadline).min(timeouts.cloud_init_timeout),
         )
         .with_context(|| format!("iso bootstrap script failed for label {}", bootstrap.label))?;
     }
@@ -96,7 +134,14 @@ pub(crate) fn run_step_flow(
     let mut accumulated_env: Vec<(String, String)> = Vec::new();
 
     for (step_idx, step) in steps.iter().enumerate() {
+        ensure_overall_budget(overall_deadline, timeouts.overall_timeout)?;
         let step_log_path = step_log_path(&step_log_dir, step_idx, &step.name);
+        let step_timeout = resolve_step_timeout(step, timeouts.default_step_timeout);
+        let step_budget = StepExecutionBudget {
+            step_timeout,
+            overall_deadline,
+            overall_timeout: timeouts.overall_timeout,
+        };
         // The file is created by StepLogWriter::create inside each step runner;
         // no pre-creation needed here (the directory was already created above).
         print_step_title(step_idx, &step.name);
@@ -152,8 +197,10 @@ pub(crate) fn run_step_flow(
                         .collect::<Vec<_>>()
                         .join(" ");
                     run_ssh_step_with_step_log(
+                        &step.name,
                         ssh_command_args(ssh, &ssh_cmd, Duration::from_secs(300).as_secs()),
                         &step_log_path,
+                        step_budget,
                         TEST_TRANSPORT_RETRIES,
                         TEST_TRANSPORT_RETRY_DELAY,
                     )
@@ -202,7 +249,7 @@ pub(crate) fn run_step_flow(
                     &step.name,
                     &step.run,
                     repo_root,
-                    Duration::from_secs(300),
+                    step_budget,
                     &template,
                     &accumulated_env,
                     HostStepFiles {
@@ -230,17 +277,73 @@ pub(crate) fn run_step_flow(
         print_step_status(step_idx, &step.name, step_result.is_ok());
         step_result?;
     }
+    Ok(overall_deadline)
+}
+
+fn resolve_step_timeout(step: &TestStep, default_step_timeout: Duration) -> Duration {
+    Duration::from_secs(step.timeout.unwrap_or(default_step_timeout.as_secs()))
+}
+
+fn overall_timeout_error(overall_timeout: Duration) -> anyhow::Error {
+    anyhow::anyhow!("overall run timed out after {}s", overall_timeout.as_secs())
+}
+
+fn ensure_overall_budget(overall_deadline: Instant, overall_timeout: Duration) -> Result<()> {
+    if Instant::now() >= overall_deadline {
+        return Err(overall_timeout_error(overall_timeout));
+    }
     Ok(())
 }
 
+fn remaining_budget(overall_deadline: Instant) -> Duration {
+    overall_deadline.saturating_duration_since(Instant::now())
+}
+
+fn require_stable_ssh_with_deadline(
+    ssh: &SshOptions,
+    attempts: usize,
+    required_consecutive: usize,
+    overall_deadline: Instant,
+    overall_timeout: Duration,
+) -> Result<()> {
+    let mut consecutive = 0usize;
+    for attempt_idx in 0..attempts {
+        ensure_overall_budget(overall_deadline, overall_timeout)?;
+        if ssh_with_retry(
+            ssh,
+            "true",
+            1,
+            Duration::from_secs(0),
+            remaining_budget(overall_deadline).min(Duration::from_secs(10)),
+        )
+        .is_ok()
+        {
+            consecutive += 1;
+            if consecutive >= required_consecutive {
+                return Ok(());
+            }
+        } else {
+            consecutive = 0;
+        }
+        if attempt_idx + 1 < attempts {
+            let sleep_for = remaining_budget(overall_deadline).min(Duration::from_secs(2));
+            if sleep_for.is_zero() {
+                return Err(overall_timeout_error(overall_timeout));
+            }
+            std::thread::sleep(sleep_for);
+        }
+    }
+    anyhow::bail!("SSH was not stable enough after {attempts} probes")
+}
+
 fn run_ssh_step_with_step_log(
+    name: &str,
     args: Vec<String>,
     log_path: &Path,
+    budget: StepExecutionBudget,
     retries: usize,
     retry_delay: Duration,
 ) -> Result<()> {
-    // 300s execution timeout per attempt, matching the host-step ceiling.
-    const SSH_STEP_TIMEOUT: Duration = Duration::from_secs(300);
     let logger = Arc::new(StepLogWriter::create(log_path)?);
     let mut attempts = 0usize;
     loop {
@@ -250,16 +353,18 @@ fn run_ssh_step_with_step_log(
             spawn_logged_child(&mut command, Arc::clone(&logger), "failed to execute ssh")?;
 
         // Poll with a bounded deadline; kill and surface a timeout error if
-        // the step does not exit within SSH_STEP_TIMEOUT.
-        let deadline = Instant::now() + SSH_STEP_TIMEOUT;
-        let wait_result: Result<Option<std::process::ExitStatus>> = loop {
+        // the step does not exit within its own timeout or the overall run budget.
+        let step_deadline = Instant::now() + budget.step_timeout;
+        let wait_result: Result<WaitResult> = loop {
             match child.try_wait() {
-                Ok(Some(status)) => break Ok(Some(status)),
+                Ok(Some(status)) => break Ok(WaitResult::Exit(status)),
                 Ok(None) => {
-                    if Instant::now() >= deadline {
+                    if let Some(timeout_result) =
+                        timeout_cause(step_deadline, budget.overall_deadline)
+                    {
                         let _ = child.kill();
                         let _ = child.wait();
-                        break Ok(None); // None signals timeout
+                        break Ok(timeout_result);
                     }
                     std::thread::sleep(Duration::from_millis(200));
                 }
@@ -278,10 +383,17 @@ fn run_ssh_step_with_step_log(
         let _ = join_output_forwarders(forwarders);
 
         let status = match wait_result? {
-            None => {
-                anyhow::bail!("ssh step timed out after {}s", SSH_STEP_TIMEOUT.as_secs());
+            WaitResult::StepTimeout => {
+                anyhow::bail!(
+                    "guest step '{}' timed out after {}s",
+                    name,
+                    budget.step_timeout.as_secs()
+                );
             }
-            Some(s) => s,
+            WaitResult::OverallTimeout => {
+                return Err(overall_timeout_error(budget.overall_timeout))
+            }
+            WaitResult::Exit(status) => status,
         };
 
         if status.success() {
@@ -312,7 +424,7 @@ fn run_host_step(
     name: &str,
     run: &str,
     repo_root: &Path,
-    timeout: Duration,
+    budget: StepExecutionBudget,
     template: &[String],
     accumulated_env: &[(String, String)],
     files: HostStepFiles<'_>,
@@ -353,7 +465,7 @@ fn run_host_step(
         &format!("failed to spawn host step '{name}'"),
     )?;
 
-    let deadline = Instant::now() + timeout;
+    let step_deadline = Instant::now() + budget.step_timeout;
     let step_result = loop {
         match child
             .try_wait()
@@ -368,13 +480,22 @@ fn run_host_step(
                 ));
             }
             None => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    break Err(anyhow::anyhow!(
-                        "host step '{name}' timed out after {}s",
-                        timeout.as_secs()
-                    ));
+                match timeout_cause(step_deadline, budget.overall_deadline) {
+                    Some(WaitResult::StepTimeout) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break Err(anyhow::anyhow!(
+                            "host step '{name}' timed out after {}s",
+                            budget.step_timeout.as_secs()
+                        ));
+                    }
+                    Some(WaitResult::OverallTimeout) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break Err(overall_timeout_error(budget.overall_timeout));
+                    }
+                    Some(WaitResult::Exit(_)) => unreachable!(),
+                    None => {}
                 }
                 std::thread::sleep(Duration::from_millis(200));
             }
@@ -393,6 +514,32 @@ fn run_host_step(
     let _ = std::fs::remove_file(&script);
 
     step_result
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WaitResult {
+    Exit(std::process::ExitStatus),
+    StepTimeout,
+    OverallTimeout,
+}
+
+fn timeout_cause(step_deadline: Instant, overall_deadline: Instant) -> Option<WaitResult> {
+    let now = Instant::now();
+    if step_deadline <= overall_deadline {
+        if now >= step_deadline {
+            Some(WaitResult::StepTimeout)
+        } else if now >= overall_deadline {
+            Some(WaitResult::OverallTimeout)
+        } else {
+            None
+        }
+    } else if now >= overall_deadline {
+        Some(WaitResult::OverallTimeout)
+    } else if now >= step_deadline {
+        Some(WaitResult::StepTimeout)
+    } else {
+        None
+    }
 }
 
 fn spawn_logged_child(
@@ -593,7 +740,19 @@ pub(crate) fn shutdown_build_vm(
     partial: &Path,
     failed_partial: &Path,
     ssh: &SshOptions,
+    overall_deadline: Instant,
+    overall_timeout: Duration,
 ) -> Result<()> {
+    if Instant::now() >= overall_deadline {
+        if let Some(child) = vm_child.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        *vm_child = None;
+        preserve_failed_build_disk(partial, failed_partial)?;
+        return Err(overall_timeout_error(overall_timeout));
+    }
+
     // Best-effort graceful poweroff; ignore SSH errors (VM may be unresponsive).
     let _ = ssh_with_retry(
         ssh,
@@ -603,6 +762,7 @@ pub(crate) fn shutdown_build_vm(
         Duration::from_secs(10),
     );
 
+    let mut timed_out_overall = false;
     let clean_exit = if let Some(child) = vm_child.as_mut() {
         let deadline = Instant::now() + BUILD_POWEROFF_TIMEOUT;
         loop {
@@ -611,6 +771,12 @@ pub(crate) fn shutdown_build_vm(
                     break status.success();
                 }
                 Ok(None) => {
+                    if Instant::now() >= overall_deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        timed_out_overall = true;
+                        break false;
+                    }
                     if Instant::now() >= deadline {
                         let _ = child.kill();
                         let _ = child.wait();
@@ -631,7 +797,10 @@ pub(crate) fn shutdown_build_vm(
     };
     *vm_child = None;
 
-    if clean_exit {
+    if timed_out_overall {
+        preserve_failed_build_disk(partial, failed_partial)?;
+        Err(overall_timeout_error(overall_timeout))
+    } else if clean_exit {
         Ok(())
     } else {
         preserve_failed_build_disk(partial, failed_partial)?;
@@ -646,14 +815,14 @@ pub(crate) fn shutdown_build_vm(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_guest_env_preamble, env_merge, parse_env_file, run_host_step, shell_single_quote,
-        HostStepFiles,
+        build_guest_env_preamble, env_merge, parse_env_file, resolve_step_timeout, run_host_step,
+        shell_single_quote, HostStepFiles, StepExecutionBudget,
     };
-    use crate::plan::step::resolve_shell;
+    use crate::plan::step::{resolve_shell, StepTarget, TestStep};
     use crate::util::unique_suffix;
     use serde::Deserialize;
     use std::path::{Path, PathBuf};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     fn tmp_env_file() -> std::path::PathBuf {
         std::env::temp_dir().join(format!("botforge-test-env-{}.env", unique_suffix()))
@@ -678,6 +847,15 @@ mod tests {
             .collect()
     }
 
+    fn test_budget() -> StepExecutionBudget {
+        let overall_timeout = Duration::from_secs(30);
+        StepExecutionBudget {
+            step_timeout: Duration::from_secs(10),
+            overall_deadline: Instant::now() + overall_timeout,
+            overall_timeout,
+        }
+    }
+
     #[test]
     fn test_host_step_sh_false_fails() {
         let dir = tempfile::tempdir().unwrap();
@@ -688,7 +866,7 @@ mod tests {
             "fail-step",
             "false",
             dir.path(),
-            Duration::from_secs(10),
+            test_budget(),
             &tmpl,
             &[],
             HostStepFiles {
@@ -714,7 +892,7 @@ mod tests {
             "bad",
             "exit 3",
             dir.path(),
-            Duration::from_secs(10),
+            test_budget(),
             &tmpl,
             &[],
             HostStepFiles {
@@ -742,7 +920,7 @@ mod tests {
             "mid-fail",
             "false\necho ok\n",
             dir.path(),
-            Duration::from_secs(10),
+            test_budget(),
             &tmpl,
             &[],
             HostStepFiles {
@@ -768,7 +946,7 @@ mod tests {
             "ok",
             "true",
             dir.path(),
-            Duration::from_secs(10),
+            test_budget(),
             &tmpl,
             &[],
             HostStepFiles {
@@ -794,7 +972,7 @@ mod tests {
             "env-check",
             r#"test "$MY_VAR" = "hello world" && test "$ANOTHER" = "42""#,
             dir.path(),
-            Duration::from_secs(10),
+            test_budget(),
             &tmpl,
             &accumulated,
             HostStepFiles {
@@ -819,7 +997,7 @@ mod tests {
             "write-env",
             r#"echo "WRITTEN=yes" >> "$BOTFORGE_ENV""#,
             dir.path(),
-            Duration::from_secs(10),
+            test_budget(),
             &tmpl,
             &[],
             HostStepFiles {
@@ -846,7 +1024,7 @@ mod tests {
             "log-lines",
             "printf 'alpha\\n'; printf 'beta\\n' >&2; printf 'omega'",
             dir.path(),
-            Duration::from_secs(10),
+            test_budget(),
             &tmpl,
             &[],
             HostStepFiles {
@@ -1114,7 +1292,10 @@ mod tests {
             "slow-step",
             "exec sleep 5",
             dir.path(),
-            Duration::from_millis(400),
+            StepExecutionBudget {
+                step_timeout: Duration::from_millis(400),
+                ..test_budget()
+            },
             &tmpl,
             &[],
             HostStepFiles {
@@ -1138,6 +1319,74 @@ mod tests {
         assert!(
             msg.contains("timed out"),
             "timeout error should mention 'timed out': {msg}"
+        );
+    }
+
+    #[test]
+    fn test_host_step_overall_timeout_returns_distinct_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmpl = resolve_shell(Some("sh")).unwrap();
+        let env_file = tmp_env_file();
+        let log_file = tmp_step_log(dir.path());
+        let overall_timeout = Duration::from_secs(1);
+        let err = run_host_step(
+            "slow-overall",
+            "exec sleep 5",
+            dir.path(),
+            StepExecutionBudget {
+                step_timeout: Duration::from_secs(5),
+                overall_deadline: Instant::now() + overall_timeout,
+                overall_timeout,
+            },
+            &tmpl,
+            &[],
+            HostStepFiles {
+                env_file: &env_file,
+                log_path: &log_file,
+            },
+        )
+        .unwrap_err();
+        let _ = std::fs::remove_file(&env_file);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("overall run timed out after 1s"),
+            "overall timeout error should be distinct: {msg}"
+        );
+        assert!(
+            !msg.contains("slow-overall"),
+            "overall timeout should not be reported as a step timeout: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_step_timeout_prefers_per_step_override() {
+        let step = TestStep {
+            target: StepTarget::Host,
+            name: "timeout-step".to_string(),
+            uploads: vec![],
+            run: "echo ok".to_string(),
+            timeout: Some(45),
+            shell: None,
+        };
+        assert_eq!(
+            resolve_step_timeout(&step, Duration::from_secs(300)),
+            Duration::from_secs(45)
+        );
+    }
+
+    #[test]
+    fn test_resolve_step_timeout_falls_back_to_document_default() {
+        let step = TestStep {
+            target: StepTarget::Host,
+            name: "timeout-step".to_string(),
+            uploads: vec![],
+            run: "echo ok".to_string(),
+            timeout: None,
+            shell: None,
+        };
+        assert_eq!(
+            resolve_step_timeout(&step, Duration::from_secs(1800)),
+            Duration::from_secs(1800)
         );
     }
 }
