@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{de, Deserialize};
 use serde_yaml::Value;
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Component, Path, PathBuf};
@@ -7,7 +7,7 @@ use std::path::{Component, Path, PathBuf};
 use crate::qemu::PortSpec;
 use crate::util::resolve_under_root;
 
-use super::step::{resolve_shell, StepTarget, TestStep};
+use super::step::{deserialize_optional_positive_seconds, resolve_shell, StepTarget, TestStep};
 
 const DEFAULT_SENTINEL: &str = "__default__";
 
@@ -86,6 +86,18 @@ pub(crate) struct TestConfig {
     pub(crate) steps: Vec<TestStep>,
     #[serde(default)]
     pub(crate) diagnostics_units: Vec<String>,
+    #[serde(
+        default = "default_test_step_timeout",
+        deserialize_with = "deserialize_positive_seconds"
+    )]
+    pub(crate) step_timeout: u64,
+    #[serde(
+        default = "default_test_timeout",
+        deserialize_with = "deserialize_positive_seconds"
+    )]
+    pub(crate) timeout: u64,
+    #[serde(skip, default = "default_test_cloud_init_timeout")]
+    pub(crate) cloud_init_timeout: u64,
 }
 
 /// Raw deserialization target for a top-level `botforge test` document.
@@ -103,6 +115,16 @@ struct RawTestDocument {
     steps: Vec<RawTestStep>,
     #[serde(default)]
     diagnostics_units: Vec<String>,
+    #[serde(
+        default = "default_test_step_timeout",
+        deserialize_with = "deserialize_positive_seconds"
+    )]
+    step_timeout: u64,
+    #[serde(
+        default = "default_test_timeout",
+        deserialize_with = "deserialize_positive_seconds"
+    )]
+    timeout: u64,
 }
 
 fn default_disk_size() -> String {
@@ -117,6 +139,30 @@ fn default_smp() -> u32 {
     4
 }
 
+fn default_test_step_timeout() -> u64 {
+    300
+}
+
+fn default_build_step_timeout() -> u64 {
+    1800
+}
+
+fn default_test_timeout() -> u64 {
+    1800
+}
+
+fn default_build_timeout() -> u64 {
+    7200
+}
+
+fn default_test_cloud_init_timeout() -> u64 {
+    300
+}
+
+fn default_build_cloud_init_timeout() -> u64 {
+    600
+}
+
 /// Resolved configuration for a `botforge build` run.
 #[derive(Debug)]
 pub(crate) struct BuildConfig {
@@ -124,6 +170,9 @@ pub(crate) struct BuildConfig {
     pub(crate) memsize: u32,
     pub(crate) smp: u32,
     pub(crate) steps: Vec<TestStep>,
+    pub(crate) step_timeout: u64,
+    pub(crate) timeout: u64,
+    pub(crate) cloud_init_timeout: u64,
 }
 
 /// Raw deserialization target for a top-level `botforge build` document.
@@ -140,6 +189,16 @@ struct RawBuildDocument {
     smp: u32,
     #[serde(default)]
     steps: Vec<RawTestStep>,
+    #[serde(
+        default = "default_build_step_timeout",
+        deserialize_with = "deserialize_positive_seconds"
+    )]
+    step_timeout: u64,
+    #[serde(
+        default = "default_build_timeout",
+        deserialize_with = "deserialize_positive_seconds"
+    )]
+    timeout: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -148,11 +207,37 @@ struct RawTestStepFragment {
     steps: Vec<RawTestStep>,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
+fn deserialize_positive_seconds<'de, D>(deserializer: D) -> std::result::Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_optional_positive_seconds(deserializer)?
+        .ok_or_else(|| serde::de::Error::custom("expected a positive integer number of seconds"))
+}
+
+#[derive(Debug)]
 enum RawTestStep {
     Step(TestStep),
     Include(TestStepInclude),
+}
+
+impl<'de> Deserialize<'de> for RawTestStep {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        if let Value::Mapping(mapping) = &value {
+            if mapping.contains_key(Value::String("uses".to_string())) {
+                return serde_yaml::from_value::<TestStepInclude>(value)
+                    .map(Self::Include)
+                    .map_err(de::Error::custom);
+            }
+        }
+        serde_yaml::from_value::<TestStep>(value)
+            .map(Self::Step)
+            .map_err(de::Error::custom)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -208,6 +293,9 @@ pub(crate) fn load_test_config(repo_root: &Path, path: &Path) -> Result<TestConf
         ports: raw.ports,
         steps: expand_test_steps(repo_root, path, raw.steps, &mut include_stack)?,
         diagnostics_units: raw.diagnostics_units,
+        step_timeout: raw.step_timeout,
+        timeout: raw.timeout,
+        cloud_init_timeout: default_test_cloud_init_timeout(),
     })
 }
 
@@ -231,6 +319,9 @@ pub(crate) fn load_build_config(repo_root: &Path, path: &Path) -> Result<BuildCo
         memsize: raw.memsize,
         smp: raw.smp,
         steps: expand_test_steps(repo_root, path, raw.steps, &mut include_stack)?,
+        step_timeout: raw.step_timeout,
+        timeout: raw.timeout,
+        cloud_init_timeout: default_build_cloud_init_timeout(),
     })
 }
 
@@ -344,7 +435,8 @@ fn check_fragment_document_type(uses: &str, value: &Value) -> Result<()> {
 }
 
 /// Reject entrypoint-only sections (`ports:`, `isos:`, `diagnostics_units:`,
-/// `disk_size:`, `memsize:`, `smp:`) inside a `type: fragment` document.
+/// `disk_size:`, `memsize:`, `smp:`, `step_timeout:`, `timeout:`) inside a
+/// `type: fragment` document.
 /// Serde would silently ignore them; this turns a misplaced key into an explicit
 /// load-time error.
 fn check_no_entrypoint_sections_in_fragment(path: &Path, value: &Value) -> Result<()> {
@@ -359,6 +451,8 @@ fn check_no_entrypoint_sections_in_fragment(path: &Path, value: &Value) -> Resul
         "disk_size",
         "memsize",
         "smp",
+        "step_timeout",
+        "timeout",
     ] {
         if mapping.contains_key(Value::String(section.to_string())) {
             anyhow::bail!(
@@ -913,6 +1007,22 @@ steps:
     }
 
     #[test]
+    fn test_step_parses_timeout_seconds() {
+        let config: TestConfig = serde_yaml::from_str(
+            r#"
+steps:
+  - on: guest
+    name: long-step
+    timeout: 900
+    run: echo hello
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.steps[0].timeout, Some(900));
+    }
+
+    #[test]
     fn test_step_parses_interleaved_guest_and_host_steps_in_order() {
         let config: TestConfig = serde_yaml::from_str(
             r#"
@@ -1126,6 +1236,7 @@ steps:
             target,
             name: name.to_string(),
             run: "echo ok".to_string(),
+            timeout: None,
             shell: None,
             uploads: if with_uploads {
                 vec![TestUpload {
@@ -1967,6 +2078,9 @@ steps:
         assert_eq!(config.disk_size, "10G");
         assert_eq!(config.memsize, 4096);
         assert_eq!(config.smp, 4);
+        assert_eq!(config.step_timeout, 1800);
+        assert_eq!(config.timeout, 7200);
+        assert_eq!(config.cloud_init_timeout, 600);
         assert_eq!(config.steps.len(), 1);
         assert_eq!(config.steps[0].name, "provision");
     }
@@ -1982,6 +2096,8 @@ type: build
 disk_size: "20G"
 memsize: 8192
 smp: 8
+step_timeout: 2400
+timeout: 9600
 steps: []
 "#,
         );
@@ -1989,7 +2105,33 @@ steps: []
         assert_eq!(config.disk_size, "20G");
         assert_eq!(config.memsize, 8192);
         assert_eq!(config.smp, 8);
+        assert_eq!(config.step_timeout, 2400);
+        assert_eq!(config.timeout, 9600);
         assert!(config.steps.is_empty());
+    }
+
+    #[test]
+    fn test_load_test_config_defaults_timeouts() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(repo.path().join("test.yaml"), "type: test\nsteps: []\n").unwrap();
+        let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+        assert_eq!(config.step_timeout, 300);
+        assert_eq!(config.timeout, 1800);
+        assert_eq!(config.cloud_init_timeout, 300);
+    }
+
+    #[test]
+    fn test_load_test_config_overrides_timeouts() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            "type: test\nstep_timeout: 600\ntimeout: 2400\nsteps: []\n",
+        )
+        .unwrap();
+        let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+        assert_eq!(config.step_timeout, 600);
+        assert_eq!(config.timeout, 2400);
+        assert_eq!(config.cloud_init_timeout, 300);
     }
 
     #[test]
@@ -2143,6 +2285,40 @@ steps: []
     }
 
     #[test]
+    fn test_fragment_rejects_step_timeout() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("frag.yaml"),
+            "type: fragment\nstep_timeout: 600\nsteps: []\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            "type: test\nsteps:\n  - uses: \"@://frag.yaml\"\n",
+        )
+        .unwrap();
+        let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+        assert!(format!("{err:#}").contains("step_timeout"));
+    }
+
+    #[test]
+    fn test_fragment_rejects_timeout() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("frag.yaml"),
+            "type: fragment\ntimeout: 600\nsteps: []\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            "type: test\nsteps:\n  - uses: \"@://frag.yaml\"\n",
+        )
+        .unwrap();
+        let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+        assert!(format!("{err:#}").contains("timeout"));
+    }
+
+    #[test]
     fn test_build_config_accepts_fragment_via_uses() {
         let repo = TempDir::new().unwrap();
         std::fs::write(
@@ -2152,6 +2328,7 @@ type: fragment
 steps:
   - on: guest
     name: frag-step
+    timeout: 42
     run: echo from-fragment
 "#,
         )
@@ -2168,6 +2345,89 @@ steps:
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
         assert_eq!(config.steps.len(), 1);
         assert_eq!(config.steps[0].name, "frag-step");
+        assert_eq!(config.steps[0].timeout, Some(42));
+    }
+
+    #[test]
+    fn test_build_config_fragment_input_substitution_preserves_step_timeout() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("frag.yaml"),
+            r#"
+type: fragment
+inputs:
+  seconds:
+    type: number
+    required: true
+steps:
+  - on: guest
+    name: frag-step
+    timeout: ${{ inputs.seconds }}
+    run: echo from-fragment
+"#,
+        )
+        .unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            r#"
+type: build
+steps:
+  - uses: "@://frag.yaml"
+    with:
+      seconds: "75"
+"#,
+        );
+        let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
+        assert_eq!(config.steps[0].timeout, Some(75));
+    }
+
+    #[test]
+    fn test_load_test_config_rejects_non_positive_document_timeouts() {
+        let repo = TempDir::new().unwrap();
+        for (name, content, needle) in [
+            (
+                "test-zero-step-timeout.yaml",
+                "type: test\nstep_timeout: 0\nsteps: []\n",
+                "positive integer",
+            ),
+            (
+                "test-negative-timeout.yaml",
+                "type: test\ntimeout: -1\nsteps: []\n",
+                "positive integer",
+            ),
+        ] {
+            std::fs::write(repo.path().join(name), content).unwrap();
+            let err = load_test_config(repo.path(), &repo.path().join(name)).unwrap_err();
+            assert!(
+                format!("{err:#}").contains(needle),
+                "error should mention invalid timeout value: {err:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_load_build_config_rejects_non_positive_timeouts() {
+        let repo = TempDir::new().unwrap();
+        for (name, content, needle) in [
+            (
+                "build-zero-step-timeout.yaml",
+                "type: build\nstep_timeout: 0\nsteps: []\n",
+                "positive integer",
+            ),
+            (
+                "build-negative-step-timeout.yaml",
+                "type: build\nsteps:\n  - on: host\n    name: slow\n    timeout: -5\n    run: echo ok\n",
+                "positive integer",
+            ),
+        ] {
+            write_build_config(&repo, name, content);
+            let err = load_build_config(repo.path(), &repo.path().join(name)).unwrap_err();
+            assert!(
+                format!("{err:#}").contains(needle),
+                "error should mention invalid timeout value: {err:#}"
+            );
+        }
     }
 
     #[test]

@@ -14,7 +14,7 @@ use crate::util::{create_temp_dir, ensure_command, resolve_under_root};
 
 use crate::plan::{
     load_build_config, preserve_failed_build_disk, print_log_tail, run_step_flow,
-    shutdown_build_vm, validate_build_steps,
+    shutdown_build_vm, validate_build_steps, vm::StepTimeoutPolicy,
 };
 
 #[derive(Args, Debug)]
@@ -132,33 +132,53 @@ pub(crate) fn cmd_build(args: BuildArgs) -> Result<()> {
     // ---------------------------------------------------------------------------
     // Disk lifecycle step 4: run build steps via shared flow
     // ---------------------------------------------------------------------------
-    let step_result = run_step_flow(&repo_root, &build_config.steps, &ssh_options, &[]);
-    if let Err(err) = step_result {
-        eprintln!("build steps failed: {err:#}");
-        print_log_tail(&vm_log, 200);
-        // Kill the VM. On step failure the partial is tainted — preserve it at
-        // <output>.partial.failed for post-mortem instead of the stale .partial path.
-        if let Some(child) = vm_child.as_mut() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        if let Err(preserve_err) = preserve_failed_build_disk(&partial, &failed_partial) {
-            return Err(err.context(format!(
-                "additionally failed to preserve tainted partial at {}: {preserve_err:#}",
+    let step_result = run_step_flow(
+        &repo_root,
+        &build_config.steps,
+        &ssh_options,
+        &[],
+        StepTimeoutPolicy {
+            overall_timeout: std::time::Duration::from_secs(build_config.timeout),
+            default_step_timeout: std::time::Duration::from_secs(build_config.step_timeout),
+            cloud_init_timeout: std::time::Duration::from_secs(build_config.cloud_init_timeout),
+        },
+    );
+    let overall_deadline = match step_result {
+        Ok(overall_deadline) => overall_deadline,
+        Err(err) => {
+            eprintln!("build steps failed: {err:#}");
+            print_log_tail(&vm_log, 200);
+            // Kill the VM. On step failure the partial is tainted — preserve it at
+            // <output>.partial.failed for post-mortem instead of the stale .partial path.
+            if let Some(child) = vm_child.as_mut() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            if let Err(preserve_err) = preserve_failed_build_disk(&partial, &failed_partial) {
+                return Err(err.context(format!(
+                    "additionally failed to preserve tainted partial at {}: {preserve_err:#}",
+                    failed_partial.display()
+                )));
+            }
+            eprintln!(
+                "tainted partial disk left at {} for post-mortem",
                 failed_partial.display()
-            )));
+            );
+            return Err(err);
         }
-        eprintln!(
-            "tainted partial disk left at {} for post-mortem",
-            failed_partial.display()
-        );
-        return Err(err);
-    }
+    };
 
     // ---------------------------------------------------------------------------
     // Disk lifecycle step 5: graceful shutdown
     // ---------------------------------------------------------------------------
-    let shutdown_result = shutdown_build_vm(&mut vm_child, &partial, &failed_partial, &ssh_options);
+    let shutdown_result = shutdown_build_vm(
+        &mut vm_child,
+        &partial,
+        &failed_partial,
+        &ssh_options,
+        overall_deadline,
+        std::time::Duration::from_secs(build_config.timeout),
+    );
     if let Err(err) = shutdown_result {
         eprintln!("build VM shutdown failed: {err:#}");
         print_log_tail(&vm_log, 200);
