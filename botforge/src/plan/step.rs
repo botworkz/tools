@@ -47,6 +47,9 @@ pub(crate) struct ArchiveStepSpec {
     pub(crate) into: Option<String>,
     #[serde(default)]
     pub(crate) name: Option<String>,
+    /// Guest destination path. Only valid when the step's `on:` is `guest`.
+    #[serde(default)]
+    pub(crate) dest: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

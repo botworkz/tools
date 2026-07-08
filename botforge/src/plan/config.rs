@@ -833,6 +833,7 @@ pub(crate) fn validate_build_steps(steps: &[TestStep]) -> Result<()> {
 }
 
 fn validate_archive_build_step(step: &crate::plan::step::ArchiveStep) -> Result<()> {
+    use crate::plan::step::StepTarget;
     let name = step
         .archive
         .name
@@ -847,9 +848,6 @@ fn validate_archive_build_step(step: &crate::plan::step::ArchiveStep) -> Result<
     if step.archive.src.starts_with("@://") {
         anyhow::bail!("build step '{name}': archive `src` does not support '@://' traversal");
     }
-    if step.target.is_some() {
-        anyhow::bail!("build step '{name}': `on` is not valid on an `archive` step");
-    }
     if step.run.is_some() {
         anyhow::bail!("build step '{name}': `run` is not valid on an `archive` step");
     }
@@ -862,6 +860,42 @@ fn validate_archive_build_step(step: &crate::plan::step::ArchiveStep) -> Result<
     if step.timeout.is_some() {
         anyhow::bail!("build step '{name}': `timeout` is not valid on an `archive` step");
     }
+
+    match step.target.as_ref() {
+        None | Some(StepTarget::Host) => {
+            // Host mode (default): dest is not valid.
+            if step.archive.dest.is_some() {
+                anyhow::bail!(
+                    "build step '{name}': `dest` is only valid on `on: guest` archive steps; \
+                     omit `dest` for host-mode extraction into the build directory"
+                );
+            }
+        }
+        Some(StepTarget::Guest) => {
+            // Guest mode: dest is required and must be an absolute path.
+            match step.archive.dest.as_deref() {
+                None | Some("") => {
+                    anyhow::bail!(
+                        "build step '{name}': `on: guest` archive step requires `dest` \
+                         (an absolute guest path to extract into)"
+                    );
+                }
+                Some(dest) if dest.trim().is_empty() => {
+                    anyhow::bail!(
+                        "build step '{name}': `on: guest` archive step requires `dest` \
+                         (an absolute guest path to extract into)"
+                    );
+                }
+                Some(dest) if !dest.starts_with('/') => {
+                    anyhow::bail!(
+                        "build step '{name}': archive `dest` must be an absolute path (got '{dest}')"
+                    );
+                }
+                Some(_) => {}
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -2789,6 +2823,7 @@ run: echo ok
                 src: "@some-tool".to_string(),
                 into: Some("some-tool".to_string()),
                 name: Some("unpack".to_string()),
+                dest: None,
             },
             target: None,
             uploads: vec![],
@@ -2806,6 +2841,7 @@ run: echo ok
                 src: "   ".to_string(),
                 into: None,
                 name: Some("bad-archive".to_string()),
+                dest: None,
             },
             target: None,
             uploads: vec![],
@@ -2825,6 +2861,7 @@ run: echo ok
                 src: "some-tool".to_string(),
                 into: None,
                 name: Some("bad-archive".to_string()),
+                dest: None,
             },
             target: None,
             uploads: vec![],
@@ -2843,6 +2880,7 @@ run: echo ok
                 src: "@some-tool".to_string(),
                 into: None,
                 name: Some("bad-archive".to_string()),
+                dest: None,
             },
             target: Some(StepTarget::Host),
             uploads: vec![TestUpload {
@@ -2854,9 +2892,13 @@ run: echo ok
             shell: Some("bash".to_string()),
         })];
         let err = validate_build_steps(&steps).unwrap_err();
+        // run/uploads/shell/timeout are still forbidden regardless of on: host.
         assert!(
-            format!("{err:#}").contains("on"),
-            "error should mention first offending field: {err:#}"
+            format!("{err:#}").contains("run")
+                || format!("{err:#}").contains("uploads")
+                || format!("{err:#}").contains("shell")
+                || format!("{err:#}").contains("timeout"),
+            "error should mention a forbidden field: {err:#}"
         );
     }
 
@@ -2867,6 +2909,7 @@ run: echo ok
                 src: "@://provider/asset".to_string(),
                 into: None,
                 name: Some("bad-archive".to_string()),
+                dest: None,
             },
             target: None,
             uploads: vec![],
@@ -2876,6 +2919,156 @@ run: echo ok
         })];
         let err = validate_build_steps(&steps).unwrap_err();
         assert!(format!("{err:#}").contains("@://"));
+    }
+
+    #[test]
+    fn test_validate_build_steps_accepts_explicit_on_host_archive_step() {
+        // on: host is now a legal explicit spelling of the default.
+        let steps = vec![TestStep::Archive(ArchiveStep {
+            archive: ArchiveStepSpec {
+                src: "@some-tool".to_string(),
+                into: None,
+                name: Some("fetch-tool".to_string()),
+                dest: None,
+            },
+            target: Some(StepTarget::Host),
+            uploads: vec![],
+            run: None,
+            timeout: None,
+            shell: None,
+        })];
+        assert!(validate_build_steps(&steps).is_ok());
+    }
+
+    #[test]
+    fn test_validate_build_steps_accepts_guest_archive_with_absolute_dest() {
+        let steps = vec![TestStep::Archive(ArchiveStep {
+            archive: ArchiveStepSpec {
+                src: "@some-tool".to_string(),
+                into: None,
+                name: Some("install-tool".to_string()),
+                dest: Some("/var/lib/foo".to_string()),
+            },
+            target: Some(StepTarget::Guest),
+            uploads: vec![],
+            run: None,
+            timeout: None,
+            shell: None,
+        })];
+        assert!(validate_build_steps(&steps).is_ok());
+    }
+
+    #[test]
+    fn test_validate_build_steps_rejects_guest_archive_without_dest() {
+        let steps = vec![TestStep::Archive(ArchiveStep {
+            archive: ArchiveStepSpec {
+                src: "@some-tool".to_string(),
+                into: None,
+                name: Some("bad-guest".to_string()),
+                dest: None,
+            },
+            target: Some(StepTarget::Guest),
+            uploads: vec![],
+            run: None,
+            timeout: None,
+            shell: None,
+        })];
+        let err = validate_build_steps(&steps).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("dest"), "error should mention 'dest': {msg}");
+        assert!(
+            msg.contains("bad-guest"),
+            "error should mention step name: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_validate_build_steps_rejects_guest_archive_with_relative_dest() {
+        let steps = vec![TestStep::Archive(ArchiveStep {
+            archive: ArchiveStepSpec {
+                src: "@some-tool".to_string(),
+                into: None,
+                name: Some("bad-dest".to_string()),
+                dest: Some("relative/path".to_string()),
+            },
+            target: Some(StepTarget::Guest),
+            uploads: vec![],
+            run: None,
+            timeout: None,
+            shell: None,
+        })];
+        let err = validate_build_steps(&steps).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("absolute"),
+            "error should mention absolute path: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_validate_build_steps_rejects_host_archive_with_dest() {
+        // dest is only valid on on: guest — reject it for on: host or omitted.
+        for (label, target) in [("on: host", Some(StepTarget::Host)), ("on: omitted", None)] {
+            let steps = vec![TestStep::Archive(ArchiveStep {
+                archive: ArchiveStepSpec {
+                    src: "@some-tool".to_string(),
+                    into: None,
+                    name: Some("bad-dest".to_string()),
+                    dest: Some("/var/lib/foo".to_string()),
+                },
+                target,
+                uploads: vec![],
+                run: None,
+                timeout: None,
+                shell: None,
+            })];
+            let err = validate_build_steps(&steps).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("dest"),
+                "error should mention 'dest' ({label}): {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_step_deserialize_archive_guest_mode() {
+        let step: TestStep = serde_yaml::from_str(
+            r#"
+on: guest
+archive:
+  src: "@some-tool"
+  name: install-some-tool
+  dest: /var/lib/foo
+"#,
+        )
+        .unwrap();
+        let TestStep::Archive(archive) = step else {
+            panic!("expected archive step");
+        };
+        assert_eq!(archive.target, Some(StepTarget::Guest));
+        assert_eq!(archive.archive.src, "@some-tool");
+        assert_eq!(archive.archive.name.as_deref(), Some("install-some-tool"));
+        assert_eq!(archive.archive.dest.as_deref(), Some("/var/lib/foo"));
+    }
+
+    #[test]
+    fn test_build_step_deserialize_archive_host_mode_dest_absent() {
+        // Host-mode archive (on: omitted) keeps dest absent.
+        let step: TestStep = serde_yaml::from_str(
+            r#"
+archive:
+  src: "@some-tool"
+  into: some-tool
+  name: unpack-some-tool
+"#,
+        )
+        .unwrap();
+        let TestStep::Archive(archive) = step else {
+            panic!("expected archive step");
+        };
+        assert!(archive.target.is_none());
+        assert!(archive.archive.dest.is_none());
     }
 
     #[test]

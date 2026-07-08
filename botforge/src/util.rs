@@ -171,6 +171,16 @@ pub(crate) fn unique_suffix() -> String {
     )
 }
 
+/// Wrap `value` in POSIX single-quotes, escaping any embedded single-quotes so that the
+/// result is safe to embed in a shell command string passed to `sh -c` or `ssh`.
+///
+/// ```text
+/// shell_single_quote("it's fine")  →  'it'"'"'s fine'
+/// ```
+pub(crate) fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::materialize_flat;
