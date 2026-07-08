@@ -9,11 +9,12 @@ use std::process::Command;
 
 use crate::iso::{build_iso, detect_iso_tool, render_user_data, write_seed_files};
 use crate::qemu::{qemu_build_args, require_kvm, spawn_qemu_with_log};
-use crate::ssh::SshOptions;
+use crate::ssh::{SshOptions, TemporarySshKeypair};
 use crate::util::{create_temp_dir, ensure_command, resolve_under_root};
 
 use crate::plan::{
-    load_build_config, print_log_tail, run_step_flow, shutdown_build_vm, validate_build_steps,
+    load_build_config, preserve_failed_build_disk, print_log_tail, run_step_flow,
+    shutdown_build_vm, validate_build_steps,
 };
 
 #[derive(Args, Debug)]
@@ -30,9 +31,6 @@ pub(crate) struct BuildArgs {
     /// Repo root for resolving relative spec/source/output/step paths (default: current dir).
     #[arg(long)]
     repo_root: Option<PathBuf>,
-    /// SSH private key path for guest access.
-    #[arg(long, required = true)]
-    ssh_key: PathBuf,
     /// SSH host forwarded port.
     #[arg(long, default_value_t = 2222)]
     ssh_port: u16,
@@ -50,6 +48,7 @@ pub(crate) fn cmd_build(args: BuildArgs) -> Result<()> {
     ensure_command("qemu-img")?;
     ensure_command("ssh")?;
     ensure_command("scp")?;
+    ensure_command("ssh-keygen")?;
     detect_iso_tool()?;
 
     let repo_root = std::fs::canonicalize(
@@ -61,8 +60,6 @@ pub(crate) fn cmd_build(args: BuildArgs) -> Result<()> {
     let spec_path = resolve_under_root(&repo_root, args.spec.clone());
     let source = resolve_under_root(&repo_root, args.source.clone());
     let output = resolve_under_root(&repo_root, args.output.clone());
-    let ssh_key = resolve_under_root(&repo_root, args.ssh_key.clone());
-    let ssh_pub = PathBuf::from(format!("{}.pub", ssh_key.display()));
 
     let build_config = load_build_config(&repo_root, &spec_path)?;
     validate_build_steps(&build_config.steps)?;
@@ -79,6 +76,7 @@ pub(crate) fn cmd_build(args: BuildArgs) -> Result<()> {
     // Disk lifecycle step 1: copy source → <output>.partial
     // ---------------------------------------------------------------------------
     let partial = partial_path(&output);
+    let failed_partial = failed_partial_path(&output);
     // Clear any stale .partial from a previous failed run.
     if partial.exists() {
         std::fs::remove_file(&partial).with_context(|| {
@@ -98,12 +96,18 @@ pub(crate) fn cmd_build(args: BuildArgs) -> Result<()> {
     let build_dir = repo_root.join("build");
     std::fs::create_dir_all(&build_dir)
         .with_context(|| format!("cannot create build dir: {}", build_dir.display()))?;
-    let seed_iso = build_dir.join("build-seed.iso");
-    let vm_log = build_dir.join("build-vm.log");
+    let output_stem = output_stem(&output);
+    let seed_iso = build_dir.join(format!("{output_stem}-seed.iso"));
+    let vm_log = build_dir.join(format!("{output_stem}-vm.log"));
+    let ssh_keypair = TemporarySshKeypair::generate("botforge-build-ssh")?;
     let seed_dir = create_temp_dir("botforge-build-seed")?;
 
-    let ssh_public_key = std::fs::read_to_string(&ssh_pub)
-        .with_context(|| format!("cannot read SSH public key: {}", ssh_pub.display()))?;
+    let ssh_public_key = std::fs::read_to_string(ssh_keypair.public_key()).with_context(|| {
+        format!(
+            "cannot read SSH public key: {}",
+            ssh_keypair.public_key().display()
+        )
+    })?;
     let user_data = render_user_data(None, ssh_public_key.trim(), Some(args.ssh_user.as_str()));
     write_seed_files(&seed_dir, &user_data)?;
     build_iso(&seed_dir, &seed_iso, "cidata")?;
@@ -122,7 +126,7 @@ pub(crate) fn cmd_build(args: BuildArgs) -> Result<()> {
         host: args.ssh_host.clone(),
         port: args.ssh_port,
         user: args.ssh_user.clone(),
-        key: ssh_key.clone(),
+        key: ssh_keypair.private_key().to_path_buf(),
     };
 
     // ---------------------------------------------------------------------------
@@ -132,18 +136,29 @@ pub(crate) fn cmd_build(args: BuildArgs) -> Result<()> {
     if let Err(err) = step_result {
         eprintln!("build steps failed: {err:#}");
         print_log_tail(&vm_log, 200);
-        // Kill the VM. On step failure the partial is tainted — leave it for post-mortem.
+        // Kill the VM. On step failure the partial is tainted — preserve it at
+        // <output>.partial.failed for post-mortem instead of the stale .partial path.
         if let Some(child) = vm_child.as_mut() {
             let _ = child.kill();
             let _ = child.wait();
         }
+        if let Err(preserve_err) = preserve_failed_build_disk(&partial, &failed_partial) {
+            return Err(err.context(format!(
+                "additionally failed to preserve tainted partial at {}: {preserve_err:#}",
+                failed_partial.display()
+            )));
+        }
+        eprintln!(
+            "tainted partial disk left at {} for post-mortem",
+            failed_partial.display()
+        );
         return Err(err);
     }
 
     // ---------------------------------------------------------------------------
     // Disk lifecycle step 5: graceful shutdown
     // ---------------------------------------------------------------------------
-    let shutdown_result = shutdown_build_vm(&mut vm_child, &partial, &ssh_options);
+    let shutdown_result = shutdown_build_vm(&mut vm_child, &partial, &failed_partial, &ssh_options);
     if let Err(err) = shutdown_result {
         eprintln!("build VM shutdown failed: {err:#}");
         print_log_tail(&vm_log, 200);
@@ -174,6 +189,26 @@ fn partial_path(output: &Path) -> PathBuf {
     name.push(".partial");
     let parent = output.parent().unwrap_or_else(|| Path::new("."));
     parent.join(name)
+}
+
+/// Returns `<output>.partial.failed` — the tainted disk path preserved on build failure.
+fn failed_partial_path(output: &Path) -> PathBuf {
+    let mut name = output
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(".partial.failed");
+    let parent = output.parent().unwrap_or_else(|| Path::new("."));
+    parent.join(name)
+}
+
+fn output_stem(output: &Path) -> String {
+    output
+        .file_stem()
+        .or_else(|| output.file_name())
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or_else(|| "build".to_string())
 }
 
 /// Copy a qcow2 image, preferring `cp --reflink=auto` for instant CoW on
@@ -213,7 +248,7 @@ fn resize_qcow2(disk: &Path, size: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::partial_path;
+    use super::{failed_partial_path, output_stem, partial_path};
     use crate::cli::Cli;
     use clap::Parser;
     use std::path::Path;
@@ -228,6 +263,17 @@ mod tests {
     fn partial_path_nested_directory() {
         let out = partial_path(Path::new("/a/b/c/image.qcow2"));
         assert_eq!(out, Path::new("/a/b/c/image.qcow2.partial"));
+    }
+
+    #[test]
+    fn failed_partial_path_appends_failed_suffix() {
+        let out = failed_partial_path(Path::new("/build/out.qcow2"));
+        assert_eq!(out, Path::new("/build/out.qcow2.partial.failed"));
+    }
+
+    #[test]
+    fn output_stem_uses_output_file_stem() {
+        assert_eq!(output_stem(Path::new("/build/out.qcow2")), "out");
     }
 
     #[test]
@@ -249,11 +295,41 @@ mod tests {
             help.contains("--repo-root"),
             "--repo-root missing from help: {help}"
         );
+        assert!(
+            help.contains("--ssh-port"),
+            "--ssh-port missing from help: {help}"
+        );
+        assert!(
+            help.contains("--ssh-host"),
+            "--ssh-host missing from help: {help}"
+        );
+        assert!(
+            help.contains("--ssh-user"),
+            "--ssh-user missing from help: {help}"
+        );
+        assert!(
+            !help.contains("--ssh-key"),
+            "--ssh-key should not appear in help: {help}"
+        );
     }
 
     #[test]
-    fn build_cli_requires_spec_source_output_ssh_key() {
+    fn build_cli_requires_spec_source_output() {
         let err = Cli::try_parse_from(["botforge", "build"]).unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+        let err_text = err.to_string();
+        assert!(err_text.contains("--spec"), "expected --spec in error: {err_text}");
+        assert!(
+            err_text.contains("--source"),
+            "expected --source in error: {err_text}"
+        );
+        assert!(
+            err_text.contains("--output"),
+            "expected --output in error: {err_text}"
+        );
+        assert!(
+            !err_text.contains("--ssh-key"),
+            "--ssh-key should not be required: {err_text}"
+        );
     }
 }

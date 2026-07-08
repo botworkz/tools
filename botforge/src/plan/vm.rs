@@ -559,19 +559,39 @@ pub(crate) fn cleanup_test(vm_child: &mut Option<Child>, overlay_image: &Path) {
     let _ = std::fs::remove_file(overlay_image);
 }
 
+pub(crate) fn preserve_failed_build_disk(partial: &Path, failed_partial: &Path) -> Result<()> {
+    if failed_partial.exists() {
+        std::fs::remove_file(failed_partial).with_context(|| {
+            format!(
+                "cannot replace previous failed build disk: {}",
+                failed_partial.display()
+            )
+        })?;
+    }
+    std::fs::rename(partial, failed_partial).with_context(|| {
+        format!(
+            "cannot preserve failed build disk from {} to {}",
+            partial.display(),
+            failed_partial.display()
+        )
+    })?;
+    Ok(())
+}
+
 const BUILD_POWEROFF_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Issue a graceful poweroff over SSH, then poll for the qemu process to exit cleanly.
 ///
 /// On a clean shutdown (`Ok(())`), the caller should atomically rename the partial disk
-/// to the final output path.  On failure (`Err(...)`), the partial disk is **left in
-/// place** for post-mortem; the caller must NOT rename it to the output path.
+/// to the final output path. On failure (`Err(...)`), this preserves the tainted disk at
+/// `<output>.partial.failed` for post-mortem; the caller must NOT rename it to the output path.
 ///
 /// Only calls `child.kill()` if the 120 s timeout fires — killing a live-write qcow2
 /// yields a non-fsck-clean image.
 pub(crate) fn shutdown_build_vm(
     vm_child: &mut Option<Child>,
     partial: &Path,
+    failed_partial: &Path,
     ssh: &SshOptions,
 ) -> Result<()> {
     // Best-effort graceful poweroff; ignore SSH errors (VM may be unresponsive).
@@ -614,10 +634,11 @@ pub(crate) fn shutdown_build_vm(
     if clean_exit {
         Ok(())
     } else {
+        preserve_failed_build_disk(partial, failed_partial)?;
         anyhow::bail!(
             "build VM did not shut down cleanly; \
              partial disk left at {} for post-mortem",
-            partial.display()
+            failed_partial.display()
         )
     }
 }
