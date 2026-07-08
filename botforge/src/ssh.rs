@@ -3,12 +3,57 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use crate::util::create_temp_dir;
+
 #[derive(Clone)]
 pub(crate) struct SshOptions {
     pub(crate) host: String,
     pub(crate) port: u16,
     pub(crate) user: String,
     pub(crate) key: PathBuf,
+}
+
+pub(crate) struct TemporarySshKeypair {
+    dir: PathBuf,
+    private_key: PathBuf,
+    public_key: PathBuf,
+}
+
+impl TemporarySshKeypair {
+    pub(crate) fn generate(prefix: &str) -> Result<Self> {
+        let dir = create_temp_dir(prefix)?;
+        let private_key = dir.join("id_ed25519");
+        let public_key = dir.join("id_ed25519.pub");
+        let keypair = Self {
+            dir,
+            private_key,
+            public_key,
+        };
+        let status = Command::new("ssh-keygen")
+            .args(["-q", "-t", "ed25519", "-N", ""])
+            .arg("-f")
+            .arg(&keypair.private_key)
+            .status()
+            .context("failed to execute ssh-keygen")?;
+        if !status.success() {
+            bail!("ssh-keygen failed (exit status: {status})");
+        }
+        Ok(keypair)
+    }
+
+    pub(crate) fn private_key(&self) -> &Path {
+        &self.private_key
+    }
+
+    pub(crate) fn public_key(&self) -> &Path {
+        &self.public_key
+    }
+}
+
+impl Drop for TemporarySshKeypair {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
 }
 
 /// Returns true when ssh/scp should use full OpenSSH verbosity instead of the
