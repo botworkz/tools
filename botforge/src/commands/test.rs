@@ -1,10 +1,11 @@
 use anyhow::{Context, Result};
 use clap::Args;
 use serde::Deserialize;
-use std::collections::HashSet;
+use serde_yaml::Value;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Child;
 use std::time::{Duration, Instant};
 
@@ -45,9 +46,9 @@ pub(crate) struct TestArgs {
     /// SSH user.
     #[arg(long, default_value = "bot")]
     ssh_user: String,
-    /// Repo root for resolving relative test paths (default: current dir).
-    #[arg(long)]
-    repo_root: Option<PathBuf>,
+    /// Repo root for resolving relative test paths and `uses:` step includes.
+    #[arg(long, required = true)]
+    repo_root: PathBuf,
     /// Leave VM running and preserve overlay on exit.
     #[arg(long)]
     keep_running: bool,
@@ -63,6 +64,32 @@ struct TestConfig {
     steps: Vec<TestStep>,
     #[serde(default)]
     diagnostics_units: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct RawTestConfig {
+    #[serde(default)]
+    isos: Vec<TestIso>,
+    #[serde(default)]
+    ports: Vec<PortSpec>,
+    #[serde(default)]
+    steps: Vec<RawTestStep>,
+    #[serde(default)]
+    diagnostics_units: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RawTestStep {
+    Step(TestStep),
+    Include(TestStepInclude),
+}
+
+#[derive(Debug, Deserialize)]
+struct TestStepInclude {
+    uses: String,
+    #[serde(default)]
+    inputs: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -135,17 +162,13 @@ pub(crate) fn cmd_test(args: TestArgs) -> Result<()> {
     ensure_command("scp")?;
     detect_iso_tool()?;
 
-    let repo_root = std::fs::canonicalize(
-        args.repo_root
-            .unwrap_or(std::env::current_dir().context("failed to determine current directory")?),
-    )
-    .context("failed to resolve repo root")?;
+    let repo_root = std::fs::canonicalize(args.repo_root).context("failed to resolve repo root")?;
     let test_config_path = resolve_under_root(&repo_root, args.test_config);
     let base_image = resolve_under_root(&repo_root, args.base_image);
     let ssh_key = resolve_under_root(&repo_root, args.ssh_key);
     let ssh_pub = PathBuf::from(format!("{}.pub", ssh_key.display()));
 
-    let test_config = load_test_config(&test_config_path)?;
+    let test_config = load_test_config(&repo_root, &test_config_path)?;
     validate_test_steps(&test_config.steps, &test_config.ports)?;
     let build_dir = repo_root.join("build");
     std::fs::create_dir_all(&build_dir)
@@ -399,10 +422,155 @@ fn run_test_flow(
     Ok(())
 }
 
-fn load_test_config(path: &Path) -> Result<TestConfig> {
+fn load_test_config(repo_root: &Path, path: &Path) -> Result<TestConfig> {
     let yaml = std::fs::read_to_string(path)
         .with_context(|| format!("cannot read test config: {}", path.display()))?;
-    serde_yaml::from_str(&yaml).with_context(|| format!("invalid test config: {}", path.display()))
+    let raw: RawTestConfig = serde_yaml::from_str(&yaml)
+        .with_context(|| format!("invalid test config: {}", path.display()))?;
+    let mut include_stack = Vec::new();
+    Ok(TestConfig {
+        isos: raw.isos,
+        ports: raw.ports,
+        steps: expand_test_steps(repo_root, path, raw.steps, &mut include_stack)?,
+        diagnostics_units: raw.diagnostics_units,
+    })
+}
+
+fn expand_test_steps(
+    repo_root: &Path,
+    current_file: &Path,
+    steps: Vec<RawTestStep>,
+    include_stack: &mut Vec<PathBuf>,
+) -> Result<Vec<TestStep>> {
+    let mut expanded = Vec::new();
+    for step in steps {
+        match step {
+            RawTestStep::Step(step) => expanded.push(step),
+            RawTestStep::Include(include) => {
+                let include_path =
+                    resolve_uses_path(repo_root, &include.uses).with_context(|| {
+                        format!("invalid test step include in {}", current_file.display())
+                    })?;
+                if include_stack.contains(&include_path) {
+                    let mut chain: Vec<String> = include_stack
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect();
+                    chain.push(include_path.display().to_string());
+                    anyhow::bail!("cyclic test step include detected: {}", chain.join(" -> "));
+                }
+                include_stack.push(include_path.clone());
+                let nested =
+                    load_test_steps_fragment(&include_path, &include.inputs).and_then(|steps| {
+                        expand_test_steps(repo_root, &include_path, steps, include_stack)
+                    });
+                include_stack.pop();
+                expanded.extend(nested?);
+            }
+        }
+    }
+    Ok(expanded)
+}
+
+fn load_test_steps_fragment(
+    path: &Path,
+    inputs: &BTreeMap<String, String>,
+) -> Result<Vec<RawTestStep>> {
+    let yaml = std::fs::read_to_string(path)
+        .with_context(|| format!("cannot read test step include: {}", path.display()))?;
+    let mut value: Value = serde_yaml::from_str(&yaml)
+        .with_context(|| format!("invalid test step include: {}", path.display()))?;
+    substitute_inputs_in_value(&mut value, inputs)
+        .with_context(|| format!("invalid test step include: {}", path.display()))?;
+    serde_yaml::from_value(value)
+        .with_context(|| format!("invalid test step include: {}", path.display()))
+}
+
+fn resolve_uses_path(repo_root: &Path, uses: &str) -> Result<PathBuf> {
+    let (scheme, raw_path) = uses
+        .split_once("://")
+        .ok_or_else(|| anyhow::anyhow!("invalid uses value '{uses}': expected @://<path>"))?;
+    match scheme {
+        "@" => {
+            let path = PathBuf::from(raw_path);
+            validate_uses_repo_path(&path)?;
+            Ok(resolve_under_root(repo_root, path))
+        }
+        other => anyhow::bail!(
+            "unsupported uses scheme '{other}' in '{uses}'; only @://<path> is supported"
+        ),
+    }
+}
+
+fn validate_uses_repo_path(path: &Path) -> Result<()> {
+    if path.as_os_str().is_empty() {
+        anyhow::bail!("uses path must not be empty");
+    }
+    if path.is_absolute() {
+        anyhow::bail!("uses path must be repo-relative, got: {}", path.display());
+    }
+    for component in path.components() {
+        match component {
+            Component::Normal(_) => {}
+            _ => anyhow::bail!(
+                "uses path must contain no '.' or '..' segments: {}",
+                path.display()
+            ),
+        }
+    }
+    Ok(())
+}
+
+fn substitute_inputs_in_value(value: &mut Value, inputs: &BTreeMap<String, String>) -> Result<()> {
+    match value {
+        Value::String(text) => {
+            *text = substitute_inputs_in_string(text, inputs)?;
+        }
+        Value::Sequence(items) => {
+            for item in items {
+                substitute_inputs_in_value(item, inputs)?;
+            }
+        }
+        Value::Mapping(entries) => {
+            for (_, value) in entries.iter_mut() {
+                substitute_inputs_in_value(value, inputs)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn substitute_inputs_in_string(text: &str, inputs: &BTreeMap<String, String>) -> Result<String> {
+    let mut rendered = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("${{") {
+        rendered.push_str(&rest[..start]);
+        let after_open = &rest[start + 3..];
+        let end = after_open
+            .find("}}")
+            .ok_or_else(|| anyhow::anyhow!("unterminated input expression in '{text}'"))?;
+        let expr = after_open[..end].trim();
+        let name = expr.strip_prefix("inputs.").ok_or_else(|| {
+            anyhow::anyhow!(
+                "unsupported expression '${{{{{expr}}}}}'; only ${{{{ inputs.NAME }}}} is supported"
+            )
+        })?;
+        if name.is_empty()
+            || name
+                .chars()
+                .any(|ch| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'))
+        {
+            anyhow::bail!("invalid input name '{name}' in '{text}'");
+        }
+        let value = inputs
+            .get(name)
+            .ok_or_else(|| anyhow::anyhow!("missing required input '{name}'"))?;
+        rendered.push_str(value);
+        rest = &after_open[end + 2..];
+    }
+    rendered.push_str(rest);
+    Ok(rendered)
 }
 
 fn validate_test_ports(ports: &[PortSpec], ssh_port: u16) -> Result<()> {
@@ -719,14 +887,17 @@ fn build_guest_env_preamble(accumulated_env: &[(String, String)], remote_env_pat
 #[cfg(test)]
 mod tests {
     use super::{
-        build_guest_env_preamble, default_bootstrap_path, env_merge, parse_env_file, resolve_shell,
-        run_host_step, shell_single_quote, validate_test_ports, validate_test_steps, StepTarget,
-        TestConfig, TestIso, TestStep, TestUpload,
+        build_guest_env_preamble, default_bootstrap_path, env_merge, load_test_config,
+        parse_env_file, resolve_shell, run_host_step, shell_single_quote, validate_test_ports,
+        validate_test_steps, StepTarget, TestConfig, TestIso, TestStep, TestUpload,
     };
+    use crate::cli::Cli;
     use crate::qemu::PortSpec;
     use crate::util::unique_suffix;
+    use clap::Parser;
     use std::path::PathBuf;
     use std::time::Duration;
+    use tempfile::TempDir;
 
     fn loopback(port: u16) -> PortSpec {
         PortSpec {
@@ -1031,6 +1202,109 @@ steps:
         assert!(result.is_err());
     }
 
+    #[test]
+    fn test_load_test_config_expands_uses_steps_with_inputs() {
+        let repo = TempDir::new().unwrap();
+        std::fs::create_dir_all(repo.path().join("shared")).unwrap();
+        std::fs::write(
+            repo.path().join("shared/narrative.yaml"),
+            r#"
+- on: guest
+  name: "narrative-${{ inputs.target }}"
+  shell: ${{ inputs.shell }}
+  uploads:
+    - src: scripts/${{ inputs.target }}.sh
+      dest: /tmp/${{ inputs.target }}.sh
+  run: |
+    echo "${USER}"
+    bash /tmp/${{ inputs.target }}.sh
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            r#"
+steps:
+  - uses: "@://shared/narrative.yaml"
+    inputs:
+      target: edge
+      shell: bash
+"#,
+        )
+        .unwrap();
+
+        let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+
+        assert_eq!(config.steps.len(), 1);
+        assert_eq!(config.steps[0].name, "narrative-edge");
+        assert_eq!(config.steps[0].shell.as_deref(), Some("bash"));
+        assert_eq!(
+            config.steps[0].uploads[0].src,
+            PathBuf::from("scripts/edge.sh")
+        );
+        assert_eq!(config.steps[0].uploads[0].dest, "/tmp/edge.sh");
+        assert!(config.steps[0].run.contains(r#"echo "${USER}""#));
+        assert!(config.steps[0].run.contains("bash /tmp/edge.sh"));
+    }
+
+    #[test]
+    fn test_load_test_config_rejects_unsupported_uses_scheme() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            r#"
+steps:
+  - uses: "file://shared/narrative.yaml"
+"#,
+        )
+        .unwrap();
+
+        let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+        assert!(format!("{err:#}").contains("unsupported uses scheme 'file'"));
+    }
+
+    #[test]
+    fn test_load_test_config_rejects_missing_include_input() {
+        let repo = TempDir::new().unwrap();
+        std::fs::create_dir_all(repo.path().join("shared")).unwrap();
+        std::fs::write(
+            repo.path().join("shared/narrative.yaml"),
+            r#"
+- on: guest
+  name: "${{ inputs.target }}"
+  run: "echo ok"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            r#"
+steps:
+  - uses: "@://shared/narrative.yaml"
+"#,
+        )
+        .unwrap();
+
+        let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+        assert!(format!("{err:#}").contains("missing required input 'target'"));
+    }
+
+    #[test]
+    fn test_load_test_config_rejects_parent_segments_in_uses_path() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            r#"
+steps:
+  - uses: "@://shared/../narrative.yaml"
+"#,
+        )
+        .unwrap();
+
+        let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+        assert!(format!("{err:#}").contains("must contain no '.' or '..' segments"));
+    }
+
     // --- step validation ---
 
     fn make_step(target: StepTarget, name: &str, with_uploads: bool) -> TestStep {
@@ -1095,6 +1369,23 @@ steps:
     fn test_validate_steps_accepts_guest_only_without_ports() {
         let steps = vec![make_step(StepTarget::Guest, "s", false)];
         assert!(validate_test_steps(&steps, &[]).is_ok());
+    }
+
+    #[test]
+    fn test_test_cli_requires_repo_root() {
+        let err = Cli::try_parse_from([
+            "botforge",
+            "test",
+            "--test-config",
+            "test.yaml",
+            "--base-image",
+            "base.qcow2",
+            "--ssh-key",
+            "id_ed25519",
+        ])
+        .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+        assert!(err.to_string().contains("--repo-root"));
     }
 
     // --- shell resolver ---
