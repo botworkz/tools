@@ -65,6 +65,62 @@ shasset manifest used to resolve `base-image:` assets.
 | `botforge run …` | Launch a VM with qemu (KVM-only). |
 | `botforge test …` | Boot a packed qcow2 with a cloud-init cidata seed, SSH in, and execute the steps in a `test-packed.yaml` plan. |
 
+## Ephemeral installer identity
+
+`botforge build` and `botforge test` provision the guest over SSH as a
+**botforge-owned ephemeral installer account** rather than assuming any
+particular user exists in the base image.
+
+### How it works
+
+1. At seed time botforge generates a per-run username of the form
+   `botforge-<20-hex-chars>` (80 bits of entropy from `/dev/urandom`; unique
+   per run, never reused).
+2. A `#cloud-config` `users:` entry for this account is injected into the
+   cidata seed ISO:
+   - `sudo: 'ALL=(ALL) NOPASSWD:ALL'` — the installer must be able to `sudo`
+     non-interactively to run `cloud-init status --wait`, provisioner scripts,
+     and the final teardown.
+   - `ssh_authorized_keys:` — the harness's ephemeral ed25519 public key.
+   - `lock_passwd: true`, `shell: /bin/bash` — key-only access, login shell.
+   - `- default` is preserved (harmless; keeps the base image's own default
+     user).
+3. All provisioning steps (`sudo cloud-init status --wait`, `sudo bash
+   <provisioner>`, etc.) run as this installer.
+4. **On the success path** (build only), botforge issues a final teardown over
+   the same SSH connection immediately before power-off:
+   ```
+   sudo bash -c 'userdel -f <installer> &&
+                  rm -rf /home/<installer> &&
+                  rm -f /etc/sudoers.d/90-cloud-init-users &&
+                  systemctl poweroff'
+   ```
+   This runs as root inside a single sudo bash so user deletion does not
+   affect the calling SSH session. A failure to remove the installer is
+   surfaced as a hard error (the committed image must not contain the
+   installer). The test overlay is discarded on exit, so teardown is not
+   required there.
+5. Any **shipped runner account** (e.g. a `bot` runner created by a
+   provisioner such as `10-bot-user.sh`) is entirely the consuming repo's
+   responsibility — botforge neither assumes nor names such accounts.
+
+### `--ssh-user` override
+
+`--ssh-user <name>` (on both `build` and `test`) opts out of the ephemeral
+installer:
+
+- botforge connects as the supplied user and does **not** create or delete it.
+- The caller is responsible for ensuring the user exists in the base image.
+- For `build`: the ephemeral public key is injected via the top-level
+  `ssh_authorized_keys` in cloud-init (consumed by the default cloud-init
+  user); the override works best when the supplied user IS the default
+  cloud-init user.
+- For `test`: pair `--ssh-user` with `--ssh-key`; the specified user must
+  already have the corresponding public key in its `authorized_keys` (e.g.
+  from the build that produced the image). Providing one without the other
+  is a runtime error.
+
+
 For `botforge test`, the test config is a YAML document with a required
 `type: test` field at the top level.  Two document kinds exist:
 
