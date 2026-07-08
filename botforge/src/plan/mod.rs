@@ -1,4 +1,5 @@
 pub(crate) mod config;
+pub(super) mod log;
 pub(crate) mod step;
 pub(crate) mod vm;
 
