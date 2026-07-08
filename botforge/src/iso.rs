@@ -1,9 +1,35 @@
 use anyhow::{bail, Context, Result};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::util::{command_exists, run_command, unique_suffix};
 
 const USER_DATA_PLACEHOLDER: &str = "REPLACE_WITH_SSH_PUBLIC_KEY";
+
+/// Generate a per-run ephemeral installer username of the form `botforge-<20 hex chars>`.
+///
+/// The suffix is sourced from `/dev/urandom` (80 bits of entropy, effectively zero collision
+/// probability) with a time+pid mix as fallback. The result is always a valid Linux username:
+/// lowercase, starts with a letter, `[a-z0-9-]`, total length 29 (well within the 32-char limit).
+pub(crate) fn generate_installer_username() -> String {
+    let mut bytes = [0u8; 10]; // 10 bytes → 20 hex chars
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        let _ = f.read_exact(&mut bytes);
+    } else {
+        // Fallback: mix nanosecond timestamp and process ID
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let pid = std::process::id() as u128;
+        let mix = nanos ^ (pid << 32) ^ (pid >> 32);
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = ((mix >> (i * 8)) & 0xff) as u8;
+        }
+    }
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    format!("botforge-{hex}")
+}
 
 pub(crate) fn read_ssh_public_key(
     ssh_public_key: Option<String>,
@@ -32,8 +58,11 @@ pub(crate) fn render_user_data(
         return template.replace(USER_DATA_PLACEHOLDER, ssh_public_key);
     }
     if let Some(user) = ssh_user {
+        // The named user is always a botforge-owned ephemeral installer: it needs
+        // passwordless sudo to run provisioner steps and cloud-init waits, a
+        // login shell for SSH execution, and key-only (locked password) access.
         return format!(
-            "#cloud-config\nusers:\n  - default\n  - name: {user}\n    ssh_authorized_keys:\n      - {ssh_public_key}\n"
+            "#cloud-config\nusers:\n  - default\n  - name: {user}\n    shell: /bin/bash\n    lock_passwd: true\n    sudo: 'ALL=(ALL) NOPASSWD:ALL'\n    ssh_authorized_keys:\n      - {ssh_public_key}\n"
         );
     }
     format!("#cloud-config\nssh_authorized_keys:\n  - {ssh_public_key}\n")
@@ -126,7 +155,7 @@ pub(crate) fn iso_args(
 
 #[cfg(test)]
 mod tests {
-    use super::{iso_args, render_user_data};
+    use super::{generate_installer_username, iso_args, render_user_data};
     use std::path::Path;
 
     #[test]
@@ -135,6 +164,83 @@ mod tests {
         let rendered = render_user_data(Some(template), "ssh-ed25519 AAAA test", None);
         assert!(rendered.contains("ssh-ed25519 AAAA test"));
         assert!(!rendered.contains("REPLACE_WITH_SSH_PUBLIC_KEY"));
+    }
+
+    #[test]
+    fn render_user_data_no_user_emits_top_level_key() {
+        let rendered = render_user_data(None, "ssh-ed25519 AAAA nouser", None);
+        assert!(rendered.contains("ssh_authorized_keys:"));
+        assert!(rendered.contains("ssh-ed25519 AAAA nouser"));
+        assert!(!rendered.contains("users:"));
+        assert!(!rendered.contains("sudo:"));
+    }
+
+    #[test]
+    fn render_user_data_installer_has_sudo_key_and_lock_passwd() {
+        let rendered =
+            render_user_data(None, "ssh-ed25519 AAAA installer", Some("botforge-abc123"));
+        // Must include the installer user entry
+        assert!(
+            rendered.contains("name: botforge-abc123"),
+            "missing user name: {rendered}"
+        );
+        // Must grant passwordless sudo (installer must be able to sudo without a terminal)
+        assert!(
+            rendered.contains("sudo: 'ALL=(ALL) NOPASSWD:ALL'"),
+            "missing sudo grant: {rendered}"
+        );
+        // Must carry the harness ephemeral SSH public key
+        assert!(
+            rendered.contains("ssh-ed25519 AAAA installer"),
+            "missing ssh key: {rendered}"
+        );
+        // Must lock the password (key-only access)
+        assert!(
+            rendered.contains("lock_passwd: true"),
+            "missing lock_passwd: {rendered}"
+        );
+        // Must preserve the default user
+        assert!(
+            rendered.contains("- default"),
+            "missing default: {rendered}"
+        );
+    }
+
+    #[test]
+    fn generate_installer_username_is_valid_linux_username() {
+        let name = generate_installer_username();
+        // Must start with "botforge-"
+        assert!(
+            name.starts_with("botforge-"),
+            "username must start with botforge-: {name}"
+        );
+        // Must only contain [a-z0-9-]
+        assert!(
+            name.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+            "invalid chars in username: {name}"
+        );
+        // Must be within the Linux 32-char limit
+        assert!(
+            name.len() <= 32,
+            "username exceeds 32-char Linux limit: {name} (len={})",
+            name.len()
+        );
+        // suffix must be 20 hex chars (10 bytes)
+        let suffix = &name["botforge-".len()..];
+        assert_eq!(suffix.len(), 20, "suffix length must be 20: {suffix}");
+        assert!(
+            suffix.chars().all(|c| c.is_ascii_hexdigit()),
+            "suffix must be hex: {suffix}"
+        );
+    }
+
+    #[test]
+    fn generate_installer_username_produces_unique_names() {
+        // Two calls must produce different names (collision probability ~1/2^80)
+        let a = generate_installer_username();
+        let b = generate_installer_username();
+        assert_ne!(a, b, "two calls produced identical installer usernames");
     }
 
     #[test]

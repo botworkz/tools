@@ -6,10 +6,13 @@ use anyhow::{bail, Context, Result};
 use clap::Args;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
-use crate::iso::{build_iso, detect_iso_tool, render_user_data, write_seed_files};
+use crate::iso::{
+    build_iso, detect_iso_tool, generate_installer_username, render_user_data, write_seed_files,
+};
 use crate::qemu::{qemu_build_args, require_kvm, spawn_qemu_with_log};
-use crate::ssh::{SshOptions, TemporarySshKeypair};
+use crate::ssh::{ssh_with_retry, SshOptions, TemporarySshKeypair};
 use crate::util::{create_temp_dir, ensure_command, resolve_under_root};
 
 use crate::plan::{
@@ -37,9 +40,13 @@ pub(crate) struct BuildArgs {
     /// SSH host.
     #[arg(long, default_value = "127.0.0.1")]
     ssh_host: String,
-    /// SSH user.
-    #[arg(long, default_value = "bot")]
-    ssh_user: String,
+    /// SSH user. When omitted (the default), botforge generates a private ephemeral installer
+    /// account (`botforge-<suffix>`) with passwordless sudo, seeds it via cloud-init, provisions
+    /// as that user, and removes it before committing the image. When explicitly provided,
+    /// botforge connects as that existing user without creating or deleting it (the caller is
+    /// responsible for ensuring the user exists in the base image and can accept connections).
+    #[arg(long)]
+    ssh_user: Option<String>,
 }
 
 pub(crate) fn cmd_build(args: BuildArgs) -> Result<()> {
@@ -71,6 +78,19 @@ pub(crate) fn cmd_build(args: BuildArgs) -> Result<()> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("cannot create output dir: {}", parent.display()))?;
     }
+
+    // ---------------------------------------------------------------------------
+    // Determine installer identity: ephemeral (botforge-owned) or caller-supplied.
+    // ---------------------------------------------------------------------------
+    // When --ssh-user is omitted, botforge generates a private per-run installer
+    // account (botforge-<suffix>) with passwordless sudo, creates it via cloud-init,
+    // and removes it before committing the image so it never ships.
+    // When --ssh-user is provided, botforge connects as that existing user and does
+    // NOT create or delete it (caller is responsible for the account's existence).
+    let (installer_user, botforge_owned) = match args.ssh_user {
+        Some(user) => (user, false),
+        None => (generate_installer_username(), true),
+    };
 
     // ---------------------------------------------------------------------------
     // Disk lifecycle step 1: copy source → <output>.partial
@@ -108,7 +128,17 @@ pub(crate) fn cmd_build(args: BuildArgs) -> Result<()> {
             ssh_keypair.public_key().display()
         )
     })?;
-    let user_data = render_user_data(None, ssh_public_key.trim(), Some(args.ssh_user.as_str()));
+
+    // When botforge owns the installer user, seed it with passwordless sudo so the harness
+    // can run `sudo cloud-init status --wait`, provisioner steps, and final teardown.
+    // When the caller supplied an explicit --ssh-user, we do NOT create that user in
+    // cloud-init (the caller owns the account); just inject the ephemeral key for the
+    // default cloud-init user via the top-level ssh_authorized_keys path.
+    let user_data = if botforge_owned {
+        render_user_data(None, ssh_public_key.trim(), Some(installer_user.as_str()))
+    } else {
+        render_user_data(None, ssh_public_key.trim(), None)
+    };
     write_seed_files(&seed_dir, &user_data)?;
     build_iso(&seed_dir, &seed_iso, "cidata")?;
     std::fs::remove_dir_all(&seed_dir)
@@ -125,7 +155,7 @@ pub(crate) fn cmd_build(args: BuildArgs) -> Result<()> {
     let ssh_options = SshOptions {
         host: args.ssh_host.clone(),
         port: args.ssh_port,
-        user: args.ssh_user.clone(),
+        user: installer_user.clone(),
         key: ssh_keypair.private_key().to_path_buf(),
     };
 
@@ -169,7 +199,47 @@ pub(crate) fn cmd_build(args: BuildArgs) -> Result<()> {
     };
 
     // ---------------------------------------------------------------------------
-    // Disk lifecycle step 5: graceful shutdown
+    // Disk lifecycle step 5: installer teardown (botforge-owned identity only)
+    //
+    // Remove the ephemeral installer account from the guest before committing the
+    // image, so it never ships. This is botforge's last guest action and runs as
+    // a single sudo bash invocation so the entire sequence (userdel, sudoers
+    // cleanup, poweroff) executes as root — user deletion does not affect the
+    // still-running SSH session, and systemctl poweroff is issued while root
+    // context is still active. A failure here is a hard error: a shipped image
+    // must not contain the installer account.
+    //
+    // On the failure path (step 4 or teardown error), the VM is killed and the
+    // tainted disk is preserved at <output>.partial.failed for post-mortem;
+    // leaving the installer present in that tainted disk is acceptable.
+    // ---------------------------------------------------------------------------
+    if botforge_owned {
+        let teardown_result =
+            run_installer_teardown(&ssh_options, &installer_user, overall_deadline);
+        if let Err(err) = teardown_result {
+            eprintln!("installer teardown failed: {err:#}");
+            print_log_tail(&vm_log, 200);
+            if let Some(child) = vm_child.as_mut() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            if let Err(preserve_err) = preserve_failed_build_disk(&partial, &failed_partial) {
+                return Err(err.context(format!(
+                    "additionally failed to preserve tainted partial at {}: {preserve_err:#}",
+                    failed_partial.display()
+                )));
+            }
+            eprintln!(
+                "tainted partial disk left at {} for post-mortem",
+                failed_partial.display()
+            );
+            return Err(err);
+        }
+        // Teardown issued poweroff; shutdown_build_vm waits for the VM to exit.
+    }
+
+    // ---------------------------------------------------------------------------
+    // Disk lifecycle step 6 (was 5): graceful shutdown
     // ---------------------------------------------------------------------------
     let shutdown_result = shutdown_build_vm(
         &mut vm_child,
@@ -186,7 +256,7 @@ pub(crate) fn cmd_build(args: BuildArgs) -> Result<()> {
     }
 
     // ---------------------------------------------------------------------------
-    // Disk lifecycle step 6: atomic rename partial → output
+    // Disk lifecycle step 7 (was 6): atomic rename partial → output
     // ---------------------------------------------------------------------------
     std::fs::rename(&partial, &output).with_context(|| {
         format!(
@@ -198,6 +268,44 @@ pub(crate) fn cmd_build(args: BuildArgs) -> Result<()> {
 
     println!("built image at {}", output.display());
     Ok(())
+}
+
+/// Remove the botforge-owned ephemeral installer user from the guest and power off.
+///
+/// Runs as a single `sudo bash -c '...'` so all commands execute as root: user
+/// deletion does not affect the calling SSH session, and `systemctl poweroff` is
+/// issued while root context is still active (i.e. before the sudoers drop-in is
+/// removed). `systemctl poweroff` returns immediately (exit 0); the shutdown
+/// happens asynchronously so the SSH command exits cleanly.
+///
+/// Returns `Err` if any step fails so the caller can surface it as a hard error
+/// (the image must not ship with the installer present).
+fn run_installer_teardown(
+    ssh: &SshOptions,
+    installer: &str,
+    overall_deadline: Instant,
+) -> Result<()> {
+    let timeout = overall_deadline
+        .saturating_duration_since(Instant::now())
+        .min(Duration::from_secs(60));
+
+    // Single root shell: delete the installer user, wipe its home explicitly
+    // (tolerates missing home with rm -rf), remove any cloud-init sudoers drop-in
+    // that names it, then power off. All commands are chained with && so a failure
+    // aborts early and surfaces a non-zero exit to the SSH caller.
+    let cmd = format!(
+        "sudo bash -c 'userdel -f {installer} && \
+         rm -rf /home/{installer} && \
+         rm -f /etc/sudoers.d/90-cloud-init-users && \
+         systemctl poweroff'"
+    );
+
+    ssh_with_retry(ssh, &cmd, 1, Duration::from_secs(0), timeout).with_context(|| {
+        format!(
+            "installer teardown failed: could not remove installer user '{installer}'; \
+             the committed image must not contain the installer account"
+        )
+    })
 }
 
 /// Returns `<output>.partial` — the in-progress disk path during the build.
