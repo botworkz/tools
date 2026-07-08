@@ -740,13 +740,13 @@ fn step_title_line(step_idx: usize, name: &str, color: bool) -> String {
 fn step_status_marker(step_idx: usize, name: &str, success: bool, color: bool) -> String {
     if color {
         if success {
-            format!("\x1b[32m✓\x1b[0m ({step_idx}) \x1b[2m{name}\x1b[0m")
+            format!(" \x1b[32m✓\x1b[0m ({step_idx}) \x1b[2m{name}\x1b[0m")
         } else {
-            format!("\x1b[31m✗\x1b[0m ({step_idx}) {name}")
+            format!(" \x1b[31m✗\x1b[0m ({step_idx}) {name}")
         }
     } else {
         let tick = if success { '✓' } else { '✗' };
-        format!("{tick} ({step_idx}) {name}")
+        format!(" {tick} ({step_idx}) {name}")
     }
 }
 
@@ -2138,13 +2138,17 @@ steps:
     fn test_step_status_marker_formats_result() {
         assert_eq!(
             step_status_marker(4, "mcp-smoke", false, false),
-            "✗ (4) mcp-smoke"
+            " ✗ (4) mcp-smoke"
         );
         assert_eq!(
             step_status_marker(4, "mcp-smoke", true, false),
-            "✓ (4) mcp-smoke"
+            " ✓ (4) mcp-smoke"
         );
         let success_color = step_status_marker(4, "mcp-smoke", true, true);
+        assert!(
+            success_color.starts_with(' '),
+            "success color marker should start with a space: {success_color:?}"
+        );
         assert!(
             success_color.contains("\x1b[32m"),
             "success color should contain green: {success_color:?}"
@@ -2162,6 +2166,10 @@ steps:
             "success color should reset: {success_color:?}"
         );
         let failure_color = step_status_marker(4, "mcp-smoke", false, true);
+        assert!(
+            failure_color.starts_with(' '),
+            "failure color marker should start with a space: {failure_color:?}"
+        );
         assert!(
             failure_color.contains("\x1b[31m"),
             "failure color should contain red: {failure_color:?}"
