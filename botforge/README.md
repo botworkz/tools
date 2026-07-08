@@ -63,7 +63,25 @@ at the shasset manifest and `payload` at the payload config.
 | `botforge run …` | Launch a VM with qemu (KVM-only). |
 | `botforge test …` | Boot a packed qcow2 with a cloud-init cidata seed, SSH in, and execute the steps in a `test-packed.yaml` plan. |
 
-For `botforge test`, the `isos:` list in test config supports two forms:
+For `botforge test`, the test config is a YAML document with a required
+`type: test` field at the top level.  Two document kinds exist:
+
+- **`type: test`** — an entrypoint document, consumed directly by
+  `botforge test`.  May carry `isos:`, `ports:`, `diagnostics_units:`, and
+  `steps:`.
+- **`type: fragment`** — a reusable document spliced in via `uses:`.  May
+  carry `steps:` (and an `inputs:` contract) only; declaring `isos:`, `ports:`,
+  or `diagnostics_units:` on a fragment is a load-time error.  The same
+  fragment file is reusable from any entrypoint kind.  `type: build` is a
+  planned future entrypoint kind and is not implemented yet.
+
+`botforge test` requires a `type: test` document as its top-level plan; passing
+any other `type:` value (including `type: fragment`) is a hard load-time error.
+A `uses:` reference must point at a `type: fragment` document; pointing it at
+any entrypoint document (`type: test`, or a future `type: build`) is also a
+load-time error.
+
+The `isos:` list in test config supports two forms:
 
 - A bare string path (attach only).
 - A mapping with `path:`, `label:`, `mount:`, and optional `bootstrap:`
@@ -82,6 +100,7 @@ on the botforge container so it is reachable from the host and sibling
 containers on the compose network.
 
 ```yaml
+type: test
 ports:
   - 80              # bind 127.0.0.1:80 -> guest :80  (loopback only)
   - "0.0.0.0:9901"  # bind 0.0.0.0:9901 -> guest :9901 (all interfaces)
@@ -113,8 +132,9 @@ the same repository:
 
 - `uses: "@://path/within/repo.yaml"` resolves from the explicit
   `--repo-root` passed to `botforge test`.
-- The referenced file must be a mapping with a top-level `steps:` key whose
-  value is a list of steps, consistent with the top-level config shape.
+- The referenced file must be a `type: fragment` document (see below).  Any
+  other `type:` value — including future entrypoint kinds such as `type: build`
+  — is rejected as a non-consumable include target.
 - The fragment declares its **input contract** in a top-level `inputs:` block
   (see below). The caller passes values via `with:` at the call site.
 - `${{ inputs.NAME }}` placeholders in the fragment body are substituted with
@@ -124,6 +144,7 @@ the same repository:
 
 ```yaml
 # test.yaml
+type: test
 steps:
   - uses: "@://smoke/vm-narrative.steps.yaml"
     with:
@@ -133,6 +154,7 @@ steps:
 
 ```yaml
 # smoke/vm-narrative.steps.yaml
+type: fragment
 inputs:
   target:
     type: string
@@ -186,7 +208,16 @@ by the fragment (`unexpected input '<name>' not declared by fragment <path>`);
 missing required input (`missing required input '<name>'`); type mismatch
 (`input '<name>' must be a <type>`); `required: true` combined with `default`
 in a declaration (`input '<name>' cannot set both 'required: true' and
-'default'`); fragment missing a `steps:` list.
+'default'`); fragment missing a `steps:` list; missing `type:` field on a
+document (`<path> is missing required 'type:' field`); unknown `type:` value;
+document kind mismatch on the root (`botforge test requires a 'type: test'
+document, got 'type: <x>'`); `uses:` pointing at a non-fragment document
+(`<uses> is not a consumable fragment (type: <x>)`); entrypoint-only section
+(`ports:`, `isos:`, or `diagnostics_units:`) declared in a `type: fragment`
+document (`<section>: is not valid in a 'type: fragment' document`); cyclic
+`uses:` chain (`cyclic test step include detected: <chain>`); `uses:` nesting
+exceeding the maximum include depth (`test step include depth limit (32)
+exceeded: <chain>`).
 
 On **any** step failure (guest or host) the usual guest diagnostics are
 collected (`systemctl --failed`, `journalctl`, `cloud-init status`, VM log
@@ -273,6 +304,7 @@ guest steps) are removed best-effort after each step, on both success and
 failure paths. A cleanup failure never masks the step result.
 
 ```yaml
+type: test
 ports:
   - 80
 steps:

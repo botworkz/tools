@@ -9,6 +9,46 @@ use crate::util::resolve_under_root;
 
 const DEFAULT_SENTINEL: &str = "__default__";
 
+/// Maximum number of active `uses:` includes on the call stack at any one time.
+/// Includes the root document, which is always on the stack; so this limits nesting
+/// to `MAX_INCLUDE_DEPTH - 1` fragment levels below the root.
+const MAX_INCLUDE_DEPTH: usize = 32;
+
+/// The kind of a botforge YAML document, specified by the required `type:` field.
+///
+/// Every document must carry exactly one `type:` discriminator.  The loader
+/// dispatches on it to enforce command-boundary separation and per-kind presence
+/// rules.  Future entrypoint kinds (e.g. `build`) are registered here without
+/// changing the loader logic.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum DocumentType {
+    /// An entrypoint document consumed directly by `botforge test`.
+    Test,
+    /// A reusable document spliced in via `uses:`.  May not carry
+    /// entrypoint-only sections (`ports:`, `isos:`, `diagnostics_units:`).
+    Fragment,
+}
+
+impl DocumentType {
+    fn as_str(self) -> &'static str {
+        match self {
+            DocumentType::Test => "test",
+            DocumentType::Fragment => "fragment",
+        }
+    }
+
+    /// Returns `true` if this kind is the expected entrypoint for `botforge test`.
+    fn is_test_entrypoint(self) -> bool {
+        matches!(self, DocumentType::Test)
+    }
+
+    /// Returns `true` if this kind can be consumed via a `uses:` reference.
+    fn is_consumable_fragment(self) -> bool {
+        matches!(self, DocumentType::Fragment)
+    }
+}
+
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 enum InputType {
@@ -38,8 +78,13 @@ pub(in crate::commands::test) struct TestConfig {
     pub(in crate::commands::test) diagnostics_units: Vec<String>,
 }
 
-#[derive(Debug, Deserialize, Default)]
-struct RawTestConfig {
+/// Raw deserialization target for a top-level `botforge test` document.
+/// The `type:` field is required; parsing fails with a descriptive error when it
+/// is absent or carries an unrecognised value.
+#[derive(Debug, Deserialize)]
+struct RawTestDocument {
+    #[serde(rename = "type")]
+    doc_type: DocumentType,
     #[serde(default)]
     isos: Vec<TestIso>,
     #[serde(default)]
@@ -135,9 +180,17 @@ pub(in crate::commands::test) struct TestUpload {
 pub(super) fn load_test_config(repo_root: &Path, path: &Path) -> Result<TestConfig> {
     let yaml = std::fs::read_to_string(path)
         .with_context(|| format!("cannot read test config: {}", path.display()))?;
-    let raw: RawTestConfig = serde_yaml::from_str(&yaml)
+    let raw: RawTestDocument = serde_yaml::from_str(&yaml)
         .with_context(|| format!("invalid test config: {}", path.display()))?;
-    let mut include_stack = Vec::new();
+    if !raw.doc_type.is_test_entrypoint() {
+        anyhow::bail!(
+            "botforge test requires a 'type: test' document, got 'type: {}'",
+            raw.doc_type.as_str()
+        );
+    }
+    // Seed the stack with the root document so that a fragment including the root
+    // is caught by the cycle check (A → B → A).
+    let mut include_stack = vec![path.to_path_buf()];
     Ok(TestConfig {
         isos: raw.isos,
         ports: raw.ports,
@@ -169,9 +222,21 @@ fn expand_test_steps(
                     chain.push(include_path.display().to_string());
                     anyhow::bail!("cyclic test step include detected: {}", chain.join(" -> "));
                 }
+                if include_stack.len() >= MAX_INCLUDE_DEPTH {
+                    let mut chain: Vec<String> = include_stack
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect();
+                    chain.push(include_path.display().to_string());
+                    anyhow::bail!(
+                        "test step include depth limit ({}) exceeded: {}",
+                        MAX_INCLUDE_DEPTH,
+                        chain.join(" -> ")
+                    );
+                }
                 include_stack.push(include_path.clone());
-                let nested =
-                    load_test_steps_fragment(&include_path, &include.with).and_then(|steps| {
+                let nested = load_test_steps_fragment(&include_path, &include.uses, &include.with)
+                    .and_then(|steps| {
                         expand_test_steps(repo_root, &include_path, steps, include_stack)
                     });
                 include_stack.pop();
@@ -184,6 +249,7 @@ fn expand_test_steps(
 
 fn load_test_steps_fragment(
     path: &Path,
+    uses: &str,
     with: &BTreeMap<String, String>,
 ) -> Result<Vec<RawTestStep>> {
     let yaml = std::fs::read_to_string(path)
@@ -196,6 +262,10 @@ fn load_test_steps_fragment(
         ))
         .with_context(|| format!("invalid test step include: {}", path.display()));
     }
+    // Enforce `type: fragment` — entrypoint documents must not be used as fragments.
+    check_fragment_document_type(uses, &value)?;
+    // Entrypoint-only sections are not valid in fragment documents.
+    check_no_entrypoint_sections_in_fragment(path, &value)?;
     let declarations = extract_fragment_input_declarations(&value)
         .with_context(|| format!("invalid test step include: {}", path.display()))?;
     let resolved = resolve_fragment_inputs(path, &declarations, with)
@@ -205,6 +275,57 @@ fn load_test_steps_fragment(
     let fragment: RawTestStepFragment = serde_yaml::from_value(value)
         .with_context(|| format!("invalid test step include: {}", path.display()))?;
     Ok(fragment.steps)
+}
+
+/// Verify that a `uses:` target is a `type: fragment` document.
+///
+/// A missing `type:` field or a non-fragment kind (e.g. `type: test`) is a hard
+/// load-time error.  The `uses` string (the original `@://...` value) is used in
+/// the error message so the caller can pinpoint the offending include.
+fn check_fragment_document_type(uses: &str, value: &Value) -> Result<()> {
+    let mapping = match value {
+        Value::Mapping(m) => m,
+        _ => return Ok(()),
+    };
+    let type_key = Value::String("type".to_string());
+    match mapping.get(&type_key) {
+        None => anyhow::bail!("{} is missing required 'type:' field", uses),
+        Some(Value::String(t)) => {
+            // Deserialize the type string as a DocumentType so that the generic
+            // `is_consumable_fragment` predicate drives the decision — adding a new
+            // entrypoint kind (`build`) later does not require touching this check.
+            match serde_yaml::from_str::<DocumentType>(t) {
+                Ok(doc_type) if doc_type.is_consumable_fragment() => Ok(()),
+                Ok(doc_type) => anyhow::bail!(
+                    "{} is not a consumable fragment (type: {})",
+                    uses,
+                    doc_type.as_str()
+                ),
+                Err(_) => anyhow::bail!("{} is not a consumable fragment (type: {})", uses, t),
+            }
+        }
+        Some(_) => anyhow::bail!("{}: 'type:' field must be a string", uses),
+    }
+}
+
+/// Reject entrypoint-only sections (`ports:`, `isos:`, `diagnostics_units:`) inside
+/// a `type: fragment` document.  Serde would silently ignore them; this turns a
+/// misplaced key into an explicit load-time error.
+fn check_no_entrypoint_sections_in_fragment(path: &Path, value: &Value) -> Result<()> {
+    let mapping = match value {
+        Value::Mapping(m) => m,
+        _ => return Ok(()),
+    };
+    for section in &["ports", "isos", "diagnostics_units"] {
+        if mapping.contains_key(Value::String(section.to_string())) {
+            anyhow::bail!(
+                "{}: is not valid in a 'type: fragment' document ({})",
+                section,
+                path.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 fn extract_fragment_input_declarations(
@@ -798,6 +919,7 @@ steps:
         std::fs::write(
             repo.path().join("shared/narrative.yaml"),
             r#"
+type: fragment
 inputs:
   target:
     type: string
@@ -821,6 +943,7 @@ steps:
         std::fs::write(
             repo.path().join("test.yaml"),
             r#"
+type: test
 steps:
   - uses: "@://shared/narrative.yaml"
     with:
@@ -850,6 +973,7 @@ steps:
         std::fs::write(
             repo.path().join("test.yaml"),
             r#"
+type: test
 steps:
   - uses: "file://shared/narrative.yaml"
 "#,
@@ -867,6 +991,7 @@ steps:
         std::fs::write(
             repo.path().join("shared/narrative.yaml"),
             r#"
+type: fragment
 inputs:
   target:
     type: string
@@ -881,6 +1006,7 @@ steps:
         std::fs::write(
             repo.path().join("test.yaml"),
             r#"
+type: test
 steps:
   - uses: "@://shared/narrative.yaml"
 "#,
@@ -907,6 +1033,7 @@ steps:
         std::fs::write(
             repo.path().join("test.yaml"),
             r#"
+type: test
 steps:
   - uses: "@://shared/narrative.yaml"
 "#,
@@ -926,6 +1053,7 @@ steps:
         std::fs::write(
             repo.path().join("test.yaml"),
             r#"
+type: test
 steps:
   - uses: "@://shared/../narrative.yaml"
 "#,
@@ -1360,6 +1488,7 @@ steps:
         std::fs::write(
             repo.path().join("shared/frag.yaml"),
             r#"
+type: fragment
 inputs:
   msg:
     type: string
@@ -1374,6 +1503,7 @@ steps:
         std::fs::write(
             repo.path().join("test.yaml"),
             r#"
+type: test
 steps:
   - uses: "@://shared/frag.yaml"
     with:
@@ -1394,6 +1524,7 @@ steps:
         std::fs::write(
             repo.path().join("shared/frag.yaml"),
             r#"
+type: fragment
 inputs:
   msg:
     type: string
@@ -1408,6 +1539,7 @@ steps:
         std::fs::write(
             repo.path().join("test.yaml"),
             r#"
+type: test
 steps:
   - uses: "@://shared/frag.yaml"
     inputs:
@@ -1430,6 +1562,7 @@ steps:
         std::fs::write(
             repo.path().join("shared/frag.yaml"),
             r#"
+type: fragment
 inputs:
   shell:
     type: string
@@ -1445,6 +1578,7 @@ steps:
         std::fs::write(
             repo.path().join("test.yaml"),
             r#"
+type: test
 steps:
   - uses: "@://shared/frag.yaml"
 "#,
@@ -1462,6 +1596,7 @@ steps:
         std::fs::write(
             repo.path().join("shared/frag.yaml"),
             r#"
+type: fragment
 steps:
   - on: guest
     name: step
@@ -1472,6 +1607,7 @@ steps:
         std::fs::write(
             repo.path().join("test.yaml"),
             r#"
+type: test
 steps:
   - uses: "@://shared/frag.yaml"
     with:
@@ -1484,6 +1620,393 @@ steps:
         assert!(
             format!("{err:#}").contains("undeclared"),
             "error must mention the undeclared key: {err:#}"
+        );
+    }
+
+    // --- type discriminator on root documents ---
+
+    #[test]
+    fn test_load_test_config_requires_type_field() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            r#"
+steps: []
+"#,
+        )
+        .unwrap();
+        let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("type"), "error must mention 'type': {msg}");
+    }
+
+    #[test]
+    fn test_load_test_config_rejects_unknown_type() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            r#"
+type: unknown
+steps: []
+"#,
+        )
+        .unwrap();
+        let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("unknown"),
+            "error must mention the bad type value: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_load_test_config_rejects_fragment_as_root() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            r#"
+type: fragment
+steps: []
+"#,
+        )
+        .unwrap();
+        let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("botforge test requires a 'type: test' document")
+                && msg.contains("fragment"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    // --- type discriminator on fragment documents ---
+
+    #[test]
+    fn test_load_test_config_uses_requires_type_field_on_fragment() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("frag.yaml"),
+            r#"
+steps:
+  - on: guest
+    name: step
+    run: "echo ok"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            r#"
+type: test
+steps:
+  - uses: "@://frag.yaml"
+"#,
+        )
+        .unwrap();
+        let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("missing required 'type:' field") || msg.contains("type"),
+            "error must mention missing 'type:': {msg}"
+        );
+    }
+
+    #[test]
+    fn test_load_test_config_uses_rejects_entrypoint_document_as_fragment() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("frag.yaml"),
+            r#"
+type: test
+steps:
+  - on: guest
+    name: step
+    run: "echo ok"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            r#"
+type: test
+steps:
+  - uses: "@://frag.yaml"
+"#,
+        )
+        .unwrap();
+        let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("not a consumable fragment") && msg.contains("test"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    // --- per-kind presence validation ---
+
+    #[test]
+    fn test_fragment_with_ports_is_rejected() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("frag.yaml"),
+            r#"
+type: fragment
+ports:
+  - 80
+steps:
+  - on: guest
+    name: step
+    run: "echo ok"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            r#"
+type: test
+steps:
+  - uses: "@://frag.yaml"
+"#,
+        )
+        .unwrap();
+        let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("ports") && msg.contains("fragment"),
+            "error must mention 'ports' and 'fragment': {msg}"
+        );
+    }
+
+    #[test]
+    fn test_fragment_with_isos_is_rejected() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("frag.yaml"),
+            r#"
+type: fragment
+isos:
+  - some/payload.iso
+steps:
+  - on: guest
+    name: step
+    run: "echo ok"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            r#"
+type: test
+steps:
+  - uses: "@://frag.yaml"
+"#,
+        )
+        .unwrap();
+        let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("isos") && msg.contains("fragment"),
+            "error must mention 'isos' and 'fragment': {msg}"
+        );
+    }
+
+    #[test]
+    fn test_fragment_with_diagnostics_units_is_rejected() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("frag.yaml"),
+            r#"
+type: fragment
+diagnostics_units:
+  - some-service.service
+steps:
+  - on: guest
+    name: step
+    run: "echo ok"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            r#"
+type: test
+steps:
+  - uses: "@://frag.yaml"
+"#,
+        )
+        .unwrap();
+        let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("diagnostics_units") && msg.contains("fragment"),
+            "error must mention 'diagnostics_units' and 'fragment': {msg}"
+        );
+    }
+
+    #[test]
+    fn test_type_test_with_all_entrypoint_sections_loads() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            r#"
+type: test
+isos:
+  - some/payload.iso
+ports:
+  - 80
+diagnostics_units:
+  - myservice.service
+steps:
+  - on: guest
+    name: basic
+    run: "echo ok"
+"#,
+        )
+        .unwrap();
+        let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+        assert_eq!(config.isos.len(), 1);
+        assert_eq!(config.ports.len(), 1);
+        assert_eq!(config.diagnostics_units.len(), 1);
+        assert_eq!(config.steps.len(), 1);
+    }
+
+    // --- recursion: cycle, re-entry, max depth ---
+
+    #[test]
+    fn test_load_test_config_cyclic_include_errors() {
+        // root → frag_a → frag_b → frag_a  (cycle through two fragments)
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("frag_a.yaml"),
+            r#"
+type: fragment
+steps:
+  - uses: "@://frag_b.yaml"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("frag_b.yaml"),
+            r#"
+type: fragment
+steps:
+  - uses: "@://frag_a.yaml"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            r#"
+type: test
+steps:
+  - uses: "@://frag_a.yaml"
+"#,
+        )
+        .unwrap();
+        let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("cyclic test step include detected"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_load_test_config_root_includes_self_cycle_errors() {
+        // root → root (direct self-cycle)
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            r#"
+type: test
+steps:
+  - uses: "@://test.yaml"
+"#,
+        )
+        .unwrap();
+        let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        // The root is a type: test document, so the fragment type check fires first.
+        // Either "cyclic" or "not a consumable fragment" is an acceptable error here —
+        // both prevent the self-include.
+        assert!(
+            msg.contains("cyclic") || msg.contains("not a consumable fragment"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_load_test_config_reentrant_include_succeeds_and_expands_twice() {
+        // Including the same fragment from two independent steps (not a cycle).
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("frag.yaml"),
+            r#"
+type: fragment
+steps:
+  - on: guest
+    name: reused-step
+    run: "echo ok"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            r#"
+type: test
+steps:
+  - uses: "@://frag.yaml"
+  - uses: "@://frag.yaml"
+"#,
+        )
+        .unwrap();
+        let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+        assert_eq!(
+            config.steps.len(),
+            2,
+            "same fragment included twice must expand to two steps"
+        );
+        assert_eq!(config.steps[0].name, "reused-step");
+        assert_eq!(config.steps[1].name, "reused-step");
+    }
+
+    #[test]
+    fn test_load_test_config_max_depth_exceeded_errors() {
+        // Create a chain of MAX_INCLUDE_DEPTH fragments deep, which should trigger the
+        // depth-limit error.  With the root document seeded into the stack the limit is
+        // MAX_INCLUDE_DEPTH total entries, meaning MAX_INCLUDE_DEPTH - 1 fragment levels
+        // below the root.  We create exactly that many chain links plus one extra to
+        // ensure the limit fires.
+        let repo = TempDir::new().unwrap();
+        let depth = super::MAX_INCLUDE_DEPTH; // 32
+                                              // Each fragment 0..depth-2 includes the next one.
+                                              // Fragment depth-1 is the one we try to include when the stack is full.
+        for i in 0..(depth - 1) {
+            let name = format!("frag{i:02}.yaml");
+            let next = format!("frag{:02}.yaml", i + 1);
+            std::fs::write(
+                repo.path().join(&name),
+                format!("type: fragment\nsteps:\n  - uses: \"@://{next}\"\n"),
+            )
+            .unwrap();
+        }
+        // The deepest fragment (depth-1) doesn't need to exist; the depth check fires
+        // before loading it.  Write it anyway as a leaf so the test is self-contained.
+        std::fs::write(
+            repo.path().join(format!("frag{:02}.yaml", depth - 1)),
+            "type: fragment\nsteps: []\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            "type: test\nsteps:\n  - uses: \"@://frag00.yaml\"\n",
+        )
+        .unwrap();
+        let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("depth limit") && msg.contains(&depth.to_string()),
+            "error must mention the depth limit: {msg}"
         );
     }
 }
