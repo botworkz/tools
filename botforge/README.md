@@ -154,6 +154,15 @@ Each step also writes a JSONL transcript to
 Console output still streams live unchanged while the log captures the stream
 (`stdout` or `stderr`) and timestamp for each recorded line.
 
+Before each step runs, a **bold title line** is printed to stderr:
+`🤖 (<n>) <name>` (the name is bold when stderr is a TTY and `NO_COLOR` is
+unset; plain otherwise). After the step completes, a **colored status marker**
+replaces the old `step N ok/failed` line: green `✓ (<n>) <name>` with a
+dimmed name on success, or red `✗ (<n>) <name>` on failure. The
+`🤖`/`✓`/`✗` glyphs always print regardless of color support. `scp` progress
+output is suppressed by default and restored under `BOTFORGE_DEBUG=1` /
+`BOTFORGE_SSH_VERBOSE=1`.
+
 #### `shell:` field (optional)
 
 Every step has an optional `shell:` field that selects the interpreter used to
