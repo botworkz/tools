@@ -120,29 +120,27 @@ jobs:
           docker run --rm --entrypoint qemu-img "botwork/botforge:ci" --version
           docker run --rm --entrypoint xorriso "botwork/botforge:ci" -version
           docker run --rm --entrypoint ssh "botwork/botforge:ci" -V
-          docker run --rm --entrypoint virt-customize "botwork/botforge:ci" --version
 
-          # botforge build: verify the CLI parses a minimal spec and reports
-          # a sensible error when --source does not exist. We can't run
-          # virt-customize for real in this job (it needs /dev/kvm and a
-          # multi-GB qcow2), but we *can* exercise the YAML parser + CLI
-          # plumbing end-to-end here, which catches regressions like
-          # required-args being silently dropped from the wrapper.
+          # botforge build: on a KVM-less CI runner we cannot boot a guest, so
+          # `botforge build` fails fast on its /dev/kvm precondition. Assert that
+          # exact early exit — it still exercises the binary entrypoint + CLI arg
+          # parsing (reaches cmd_build) without needing /dev/kvm or a real qcow2.
           rm -rf .ci-build-smoke
           mkdir -p .ci-build-smoke
-          printf 'disk_size: 1G\nsteps:\n  - run_command: "true"\n' \
+          printf 'type: build\nimage: "@none"\ndisk_size: 1G\nsteps:\n  - ' \
+                 'on: guest\n    name: noop\n    run: "true"\n' \
             > .ci-build-smoke/spec.yaml
           if docker run --rm \
             -v "$PWD/.ci-build-smoke:/work" \
             -w /work \
             "botwork/botforge:ci" \
-            build-legacy --spec spec.yaml --source missing.qcow2 --output out.qcow2 \
+            build --spec spec.yaml --source missing.qcow2 --output out.qcow2 \
             2>&1 | tee /tmp/build-smoke.log
           then
-            echo "expected botforge build-legacy to fail on missing source" >&2
+            echo "expected botforge build to fail without /dev/kvm on CI runner" >&2
             exit 1
           fi
-          grep -q "source qcow2 not found" /tmp/build-smoke.log
+          grep -q "KVM is required" /tmp/build-smoke.log
 
           rm -rf .ci-deps-smoke
           mkdir -p .ci-deps-smoke/out

@@ -42,8 +42,9 @@ ARG BINARY_SOURCE=source
 
 # Install orchestration toolchain:
 #   qemu-system-x86 / qemu-utils  — qemu-system-x86_64, qemu-img
-#   libguestfs-tools              — virt-customize, virt-copy-in, guestfish, …
-#   linux-image-amd64             — kernel for the libguestfs appliance
+#   libguestfs-tools / linux-image-amd64 — retained for potential future use;
+#                                 no longer required by the modern build path
+#                                 (potential follow-up: remove if confirmed unused)
 #   xorriso / genisoimage         — ISO building (cidata seed for `botforge test`)
 #   openssh-client                — ssh, scp, ssh-keygen
 #   ca-certificates               — TLS roots
