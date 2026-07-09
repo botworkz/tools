@@ -8,7 +8,9 @@ use crate::iso::BootcmdEntry;
 use crate::qemu::PortSpec;
 use crate::util::resolve_under_root;
 
-use super::step::{deserialize_optional_positive_seconds, resolve_shell, StepTarget, TestStep};
+use super::step::{
+    deserialize_optional_positive_seconds, resolve_shell, StepTarget, TestStep, TopLevelUpload,
+};
 
 const DEFAULT_SENTINEL: &str = "__default__";
 
@@ -86,6 +88,8 @@ pub(crate) struct TestConfig {
     #[serde(default)]
     pub(crate) steps: Vec<TestStep>,
     #[serde(default)]
+    pub(crate) uploads: Vec<TopLevelUpload>,
+    #[serde(default)]
     pub(crate) diagnostics_units: Vec<String>,
     #[serde(
         default = "default_test_step_timeout",
@@ -114,6 +118,8 @@ struct RawTestDocument {
     ports: Vec<PortSpec>,
     #[serde(default)]
     steps: Vec<RawTestStep>,
+    #[serde(default)]
+    uploads: Vec<TopLevelUpload>,
     #[serde(default)]
     diagnostics_units: Vec<String>,
     #[serde(
@@ -250,6 +256,7 @@ pub(crate) struct BuildConfig {
     pub(crate) memsize: u32,
     pub(crate) smp: u32,
     pub(crate) steps: Vec<TestStep>,
+    pub(crate) uploads: Vec<TopLevelUpload>,
     pub(crate) step_timeout: u64,
     pub(crate) timeout: u64,
     pub(crate) cloud_init_timeout: u64,
@@ -280,6 +287,8 @@ struct RawBuildDocument {
     smp: u32,
     #[serde(default)]
     steps: Vec<RawTestStep>,
+    #[serde(default)]
+    uploads: Vec<TopLevelUpload>,
     #[serde(
         default = "default_build_step_timeout",
         deserialize_with = "deserialize_positive_seconds"
@@ -391,6 +400,11 @@ pub(crate) fn load_test_config(repo_root: &Path, path: &Path) -> Result<TestConf
         isos: raw.isos,
         ports: raw.ports,
         steps: expand_test_steps(repo_root, path, raw.steps, &mut include_stack)?,
+        uploads: {
+            validate_top_level_uploads("test", &raw.uploads)
+                .with_context(|| format!("invalid test config: {}", path.display()))?;
+            raw.uploads
+        },
         diagnostics_units: raw.diagnostics_units,
         step_timeout: raw.step_timeout,
         timeout: raw.timeout,
@@ -434,6 +448,11 @@ pub(crate) fn load_build_config(repo_root: &Path, path: &Path) -> Result<BuildCo
         memsize: raw.memsize,
         smp: raw.smp,
         steps: expand_test_steps(repo_root, path, raw.steps, &mut include_stack)?,
+        uploads: {
+            validate_top_level_uploads("build", &raw.uploads)
+                .with_context(|| format!("invalid build config: {}", path.display()))?;
+            raw.uploads
+        },
         step_timeout: raw.step_timeout,
         timeout: raw.timeout,
         cloud_init_timeout: default_build_cloud_init_timeout(),
@@ -572,6 +591,7 @@ fn check_no_entrypoint_sections_in_fragment(path: &Path, value: &Value) -> Resul
         "timeout",
         "image",
         "compress",
+        "uploads",
     ] {
         if mapping.contains_key(Value::String(section.to_string())) {
             anyhow::bail!(
@@ -747,6 +767,50 @@ fn validate_uses_repo_path(path: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn validate_top_level_uploads(kind: &str, uploads: &[TopLevelUpload]) -> Result<()> {
+    for upload in uploads {
+        validate_top_level_upload(kind, upload)?;
+    }
+    Ok(())
+}
+
+fn validate_top_level_upload(kind: &str, upload: &TopLevelUpload) -> Result<()> {
+    let src = upload.src.trim();
+    let dest = upload.dest.trim();
+
+    if src.is_empty() {
+        anyhow::bail!("{kind} uploads entry: `src` is required and must be non-empty");
+    }
+    if src.starts_with('@') {
+        anyhow::bail!(
+            "{kind} uploads entry '{src}': top-level `uploads:` only supports repo-relative files/globs; use a standalone `upload:` or `archive:` step for shasset assets"
+        );
+    }
+    validate_uses_repo_path(Path::new(src)).with_context(|| {
+        format!("{kind} uploads entry '{src}': `src` must be repo-relative and contain no '.' or '..' segments")
+    })?;
+    if dest.is_empty() {
+        anyhow::bail!(
+            "{kind} uploads entry '{src}': `dest` is required and must be a non-empty absolute path"
+        );
+    }
+    if !dest.starts_with('/') {
+        anyhow::bail!(
+            "{kind} uploads entry '{src}': `dest` must be an absolute guest path (got '{dest}')"
+        );
+    }
+    if src_has_glob_metacharacters(src) && !dest.ends_with('/') {
+        anyhow::bail!(
+            "{kind} uploads entry '{src}': glob `src` requires `dest` to be a directory path ending with '/'"
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn src_has_glob_metacharacters(src: &str) -> bool {
+    src.contains('*') || src.contains('?') || src.contains('[')
 }
 
 fn substitute_inputs_in_value(value: &mut Value, inputs: &BTreeMap<String, String>) -> Result<()> {
@@ -1012,8 +1076,8 @@ mod tests {
         ImageRef, InputDeclaration, InputType, TestConfig, TestIso, MAX_INCLUDE_DEPTH,
     };
     use crate::plan::step::{
-        ArchiveStep, ArchiveStepSpec, RunStep, StepTarget, TestStep, TestUpload, UploadStep,
-        UploadStepSpec,
+        ArchiveStep, ArchiveStepSpec, RunStep, StepTarget, TestStep, TestUpload, TopLevelUpload,
+        UploadStep, UploadStepSpec,
     };
     use crate::qemu::PortSpec;
     use std::collections::BTreeMap;
@@ -2449,6 +2513,159 @@ steps: []
         assert!(config.bootcmd.is_empty(), "bootcmd should default to empty");
     }
 
+    #[test]
+    fn test_load_build_config_uploads_absent_is_empty() {
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            "type: build\nimage: \"@base\"\nsteps: []\n",
+        );
+        let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
+        assert!(config.uploads.is_empty(), "uploads should default to empty");
+    }
+
+    #[test]
+    fn test_load_build_config_parses_top_level_uploads() {
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            r#"
+type: build
+image: "@base"
+uploads:
+  - src: images/botspace/envoy/**/*.yaml
+    dest: /tmp/bake-staging/envoy/
+  - src: build/images/payload/*.tar
+    dest: /usr/share/botwork/images/
+steps: []
+"#,
+        );
+        let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
+        assert_eq!(
+            config.uploads,
+            vec![
+                TopLevelUpload {
+                    src: "images/botspace/envoy/**/*.yaml".to_string(),
+                    dest: "/tmp/bake-staging/envoy/".to_string(),
+                },
+                TopLevelUpload {
+                    src: "build/images/payload/*.tar".to_string(),
+                    dest: "/usr/share/botwork/images/".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_load_build_config_rejects_top_level_upload_at_prefixed_src() {
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            r#"
+type: build
+image: "@base"
+uploads:
+  - src: "@payload"
+    dest: /tmp/payload
+steps: []
+"#,
+        );
+        let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("upload:") || msg.contains("archive:"));
+        assert!(msg.contains("@payload"));
+    }
+
+    #[test]
+    fn test_load_build_config_rejects_top_level_upload_relative_dest() {
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            r#"
+type: build
+image: "@base"
+uploads:
+  - src: payload/file.txt
+    dest: relative/path
+steps: []
+"#,
+        );
+        let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("absolute"),
+            "error should mention absolute dest: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_load_build_config_rejects_top_level_upload_src_traversal() {
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            r#"
+type: build
+image: "@base"
+uploads:
+  - src: payload/../secret.txt
+    dest: /tmp/secret.txt
+steps: []
+"#,
+        );
+        let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains(".."), "error should mention traversal: {msg}");
+    }
+
+    #[test]
+    fn test_load_build_config_rejects_top_level_upload_glob_with_non_directory_dest() {
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            r#"
+type: build
+image: "@base"
+uploads:
+  - src: payload/*.tar
+    dest: /tmp/payload.tar
+steps: []
+"#,
+        );
+        let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("ending with '/'"),
+            "error should mention directory dest: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_load_build_config_rejects_top_level_upload_unknown_field() {
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            r#"
+type: build
+image: "@base"
+uploads:
+  - src: payload/file.txt
+    dest: /tmp/file.txt
+    owner: root
+steps: []
+"#,
+        );
+        let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("owner") || msg.contains("unknown field"));
+    }
+
     // -----------------------------------------------------------------
     // bootcmd field tests
     // -----------------------------------------------------------------
@@ -2726,6 +2943,59 @@ bootcmd:
         assert!(
             msg.contains("compress"),
             "error should reject compress in fragment doc: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_load_fragment_rejects_uploads_section() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("frag.yaml"),
+            "type: fragment\nuploads:\n  - src: payload/file.txt\n    dest: /tmp/file.txt\nsteps: []\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            "type: test\nsteps:\n  - uses: \"@://frag.yaml\"\n",
+        )
+        .unwrap();
+        let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("uploads"),
+            "error should reject uploads in fragment doc: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_load_test_config_uploads_absent_is_empty() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(repo.path().join("test.yaml"), "type: test\nsteps: []\n").unwrap();
+        let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+        assert!(config.uploads.is_empty(), "uploads should default to empty");
+    }
+
+    #[test]
+    fn test_load_test_config_parses_top_level_uploads() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            r#"
+type: test
+uploads:
+  - src: fixtures/envoy/**/*.yaml
+    dest: /tmp/envoy/
+steps: []
+"#,
+        )
+        .unwrap();
+        let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+        assert_eq!(
+            config.uploads,
+            vec![TopLevelUpload {
+                src: "fixtures/envoy/**/*.yaml".to_string(),
+                dest: "/tmp/envoy/".to_string(),
+            }]
         );
     }
 

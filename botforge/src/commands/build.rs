@@ -24,7 +24,8 @@ use crate::plan::config::CompressConfig;
 use crate::plan::step::{ArchiveStep, StepTarget, TestStep, UploadStep};
 use crate::plan::{
     load_build_config, preserve_failed_build_disk, print_log_tail, run_step_flow,
-    shutdown_build_vm, validate_build_steps, vm::StepTimeoutPolicy,
+    shutdown_build_vm, validate_build_steps, vm::stage_local_file_to_guest, vm::StepFlowPlan,
+    vm::StepTimeoutPolicy,
 };
 
 #[derive(Args, Debug)]
@@ -216,9 +217,12 @@ pub(crate) fn cmd_build(config: &Path, args: BuildArgs) -> Result<()> {
     };
     let step_result = run_step_flow(
         &repo_root,
-        &build_config.steps,
+        StepFlowPlan {
+            top_level_uploads: &build_config.uploads,
+            steps: &build_config.steps,
+            bootstraps: &[],
+        },
         &ssh_options,
-        &[],
         StepTimeoutPolicy {
             overall_timeout: std::time::Duration::from_secs(build_config.timeout),
             default_step_timeout: std::time::Duration::from_secs(build_config.step_timeout),
@@ -642,16 +646,10 @@ fn run_upload_step(
     step: &UploadStep,
     ssh: &SshOptions,
 ) -> Result<()> {
-    use crate::util::shell_single_quote;
-
     let spec = &step.upload;
     let src = spec.src.trim();
     let dest = spec.dest.as_str();
     let name = spec.name.as_deref().unwrap_or(src);
-
-    // Retry constants mirror the archive step and run-step upload paths.
-    const RETRIES: usize = 10;
-    const RETRY_DELAY: Duration = Duration::from_secs(2);
 
     // Resolve the source blob: shasset ref (`@<name>`) or repo-relative path.
     let local_blob: PathBuf = if let Some(asset_key) = src.strip_prefix('@') {
@@ -690,61 +688,8 @@ fn run_upload_step(
     };
 
     // SCP the resolved blob verbatim to `dest` in the guest (no extraction).
-    let dest_q = shell_single_quote(dest);
-    let parent = std::path::Path::new(dest)
-        .parent()
-        .map(|p| p.to_string_lossy().into_owned())
-        .filter(|p| !p.is_empty() && p != "/");
-    if let Some(parent_dir) = parent {
-        ssh_with_retry(
-            ssh,
-            &format!("sudo mkdir -p {}", shell_single_quote(&parent_dir)),
-            1,
-            Duration::from_secs(0),
-            Duration::from_secs(30),
-        )
-        .with_context(|| {
-            format!(
-                "upload step '{}': failed to create parent directory '{}' in guest",
-                name, parent_dir
-            )
-        })?;
-    }
-
-    // Step 1: SCP blob to a temp path in the guest.
-    let suffix = unique_suffix();
-    let remote_tmp = format!("/tmp/botforge-upload-{step_idx}-{suffix}");
-    scp_with_retry(ssh, &local_blob, &remote_tmp, RETRIES, RETRY_DELAY)
-        .with_context(|| format!("upload step '{}': failed to scp file to guest", name))?;
-
-    // Step 2: Move the temp file to the final destination (sudo for system paths).
-    let remote_tmp_q = shell_single_quote(&remote_tmp);
-    let mv_result = ssh_with_retry(
-        ssh,
-        &format!("sudo mv {remote_tmp_q} {dest_q}"),
-        1,
-        Duration::from_secs(0),
-        Duration::from_secs(30),
-    )
-    .with_context(|| {
-        format!(
-            "upload step '{}': failed to move file to '{}' in guest",
-            name, dest
-        )
-    });
-
-    // Best-effort cleanup of the remote temp file on failure.
-    if mv_result.is_err() {
-        let _ = ssh_with_retry(
-            ssh,
-            &format!("rm -f {remote_tmp_q}"),
-            1,
-            Duration::from_secs(0),
-            Duration::from_secs(10),
-        );
-    }
-
-    mv_result?;
+    stage_local_file_to_guest(ssh, &local_blob, dest, &step_idx.to_string())
+        .with_context(|| format!("upload step '{}': failed to stage file into guest", name))?;
 
     println!(
         "upload step {} ('{}') placed at {}",

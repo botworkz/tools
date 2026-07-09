@@ -152,6 +152,13 @@ pub(crate) struct TestUpload {
     pub(crate) dest: String,
 }
 
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TopLevelUpload {
+    pub(crate) src: String,
+    pub(crate) dest: String,
+}
+
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum SecondsValue {
