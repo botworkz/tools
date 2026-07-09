@@ -39,7 +39,7 @@ pub(crate) fn cmd_iso(args: IsoArgs) -> Result<()> {
             })
             .transpose()?;
         let temp_dir = create_temp_dir("botforge-seed")?;
-        let user_data = render_user_data(template_content.as_deref(), &key, None);
+        let user_data = render_user_data(template_content.as_deref(), &key, None, &[]);
         write_seed_files(&temp_dir, &user_data)?;
         build_iso(&temp_dir, &args.out, &args.volume_id)?;
         std::fs::remove_dir_all(&temp_dir)
