@@ -160,10 +160,39 @@ type: test
 ports:
   - 80              # bind 127.0.0.1:80 -> guest :80  (loopback only)
   - "0.0.0.0:9901"  # bind 0.0.0.0:9901 -> guest :9901 (all interfaces)
+uploads:
+  - src: fixtures/envoy/**/*.yaml
+    dest: /tmp/test-staging/envoy/
 steps:
   - name: check-edge
     run: curl -fsS http://127.0.0.1/
 ```
+
+#### Top-level `uploads:` (optional)
+
+Both `type: test` and `type: build` support an optional top-level `uploads:`
+list that stages files into the guest **once, after cloud-init is ready and
+before the first `steps:` entry runs**.
+
+Each entry is a strict `{ src, dest }` mapping:
+
+- `src` — required repo-relative path or glob, resolved under `--repo-root`.
+  `*`, `**`, `?`, and `[...]` are supported. `@<shasset>` and `@://...` are
+  **not** supported here; use a standalone `upload:` or `archive:` step for
+  shasset assets.
+- `dest` — required absolute guest path. For glob `src`, `dest` must end in
+  `/` and is treated as a guest base directory.
+
+Semantics:
+
+- Literal `src` behaves like a single-file upload: `dest` is the final file
+  path, or `dest/<basename>` when `dest` ends in `/`.
+- Glob `src` preserves paths relative to the pattern's fixed literal prefix.
+  Example: `images/botspace/envoy/**/*.yaml` staged to `/tmp/envoy/` places
+  `images/botspace/envoy/ecds/ext_authz.yaml` at
+  `/tmp/envoy/ecds/ext_authz.yaml`.
+- Globs that match zero files are a hard error.
+- Only regular files are staged; directories matched by a glob are skipped.
 
 ### `botforge test` step model
 
@@ -426,12 +455,15 @@ bootcmd:                         # optional; merged into the first-boot cloud-in
 compress:                        # optional; absent = plain rename (no compression)
   enabled: true
   cluster_size: "1M"             # optional; omit for qemu default
+uploads:                         # optional; guest-only pre-step staging
+  - src: images/botspace/envoy/**/*.yaml
+    dest: /tmp/bake-staging/envoy/
+  - src: scripts/install.sh
+    dest: /tmp/bake-staging/install.sh
 steps:
   - on: guest
     name: provision
-    uploads:
-      - { src: scripts/setup.sh, dest: /tmp/setup.sh }
-    run: sudo bash /tmp/setup.sh
+    run: sudo bash /tmp/bake-staging/install.sh
   - on: host
     name: verify
     run: echo "build host check"
@@ -493,6 +525,21 @@ steps run inside the qemu VM via SSH; host steps run in the botforge container.
 `type: test`).
 
 Reusable `uses:` fragment includes work exactly as in `type: test`.
+
+#### `uploads:` (optional) — guest pre-staging before `steps:`
+
+`type: build` supports the same top-level `uploads:` list described above for
+`type: test`. Entries are always guest-only and run once before the first
+configured step.
+
+- `src` must be a repo-relative file path or glob under `--repo-root`.
+- `src` may not start with `@`; top-level `uploads:` is filesystem-only.
+- `dest` must be an absolute guest path.
+- Glob `src` requires `dest` to end in `/`, and matched files are staged with
+  path preservation relative to the glob's fixed literal prefix.
+
+The existing standalone `upload:` step and per-run-step `uploads:` field are
+unchanged; top-level `uploads:` is an additive pre-staging mechanism.
 
 #### `bootcmd:` (optional) — early first-boot commands
 

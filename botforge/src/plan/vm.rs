@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
+use glob::MatchOptions;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -12,12 +13,14 @@ use crate::ssh::{
 };
 use crate::util::{resolve_under_root, unique_suffix};
 
-use super::config::{TestConfig, TestIsoBootstrap};
+use super::config::{src_has_glob_metacharacters, TestConfig, TestIsoBootstrap};
 use super::log::{
     join_output_forwarders, print_step_status, print_step_title, spawn_output_forwarder,
     step_log_path, StepLogWriter, StepOutputStream,
 };
-use super::step::{resolve_shell, ArchiveStep, RunStep, StepTarget, TestStep, UploadStep};
+use super::step::{
+    resolve_shell, ArchiveStep, RunStep, StepTarget, TestStep, TopLevelUpload, UploadStep,
+};
 
 const TEST_SSH_READY_TIMEOUT: Duration = Duration::from_secs(300);
 const TEST_TRANSPORT_RETRIES: usize = 10;
@@ -26,6 +29,12 @@ const TEST_STABLE_SSH_ATTEMPTS: usize = 5;
 const TEST_STABLE_SSH_REQUIRED: usize = 2;
 type ArchiveExecutor<'a> = dyn FnMut(usize, &ArchiveStep) -> Result<()> + 'a;
 type UploadExecutor<'a> = dyn FnMut(usize, &UploadStep) -> Result<()> + 'a;
+
+pub(crate) struct StepFlowPlan<'a> {
+    pub(crate) top_level_uploads: &'a [TopLevelUpload],
+    pub(crate) steps: &'a [TestStep],
+    pub(crate) bootstraps: &'a [TestIsoBootstrap],
+}
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct StepTimeoutPolicy {
@@ -62,9 +71,12 @@ pub(crate) fn run_test_flow(
 ) -> Result<()> {
     run_step_flow(
         repo_root,
-        &config.steps,
+        StepFlowPlan {
+            top_level_uploads: &config.uploads,
+            steps: &config.steps,
+            bootstraps,
+        },
         ssh,
-        bootstraps,
         StepTimeoutPolicy {
             overall_timeout: Duration::from_secs(config.timeout),
             default_step_timeout: Duration::from_secs(config.step_timeout),
@@ -80,9 +92,8 @@ pub(crate) fn run_test_flow(
 /// `botforge test` and `botforge build`.  `bootstraps` is empty for build runs.
 pub(crate) fn run_step_flow(
     repo_root: &Path,
-    steps: &[TestStep],
+    plan: StepFlowPlan<'_>,
     ssh: &SshOptions,
-    bootstraps: &[TestIsoBootstrap],
     timeouts: StepTimeoutPolicy,
     mut archive_executor: Option<&mut ArchiveExecutor<'_>>,
     mut upload_executor: Option<&mut UploadExecutor<'_>>,
@@ -116,7 +127,7 @@ pub(crate) fn run_step_flow(
         timeouts.overall_timeout,
     )?;
 
-    for bootstrap in bootstraps {
+    for bootstrap in plan.bootstraps {
         ensure_overall_budget(overall_deadline, timeouts.overall_timeout)?;
         let mount = shell_single_quote(&bootstrap.mount.display().to_string());
         let label = shell_single_quote(&bootstrap.label);
@@ -145,6 +156,11 @@ pub(crate) fn run_step_flow(
         .with_context(|| format!("iso bootstrap script failed for label {}", bootstrap.label))?;
     }
 
+    if !plan.top_level_uploads.is_empty() {
+        ensure_overall_budget(overall_deadline, timeouts.overall_timeout)?;
+        stage_top_level_uploads(repo_root, plan.top_level_uploads, ssh)?;
+    }
+
     // Shared ordered env map threaded across all steps (both guest and host).
     let mut accumulated_env: Vec<(String, String)> = Vec::new();
     let run_context = RunStepContext {
@@ -156,7 +172,7 @@ pub(crate) fn run_step_flow(
         default_step_timeout: timeouts.default_step_timeout,
     };
 
-    for (step_idx, step) in steps.iter().enumerate() {
+    for (step_idx, step) in plan.steps.iter().enumerate() {
         ensure_overall_budget(overall_deadline, timeouts.overall_timeout)?;
         // The file is created by StepLogWriter::create inside each step runner;
         // no pre-creation needed here (the directory was already created above).
@@ -200,6 +216,226 @@ pub(crate) fn run_step_flow(
         step_result?;
     }
     Ok(overall_deadline)
+}
+
+pub(crate) fn stage_local_file_to_guest(
+    ssh: &SshOptions,
+    local_blob: &Path,
+    dest: &str,
+    temp_label: &str,
+) -> Result<()> {
+    let dest_q = shell_single_quote(dest);
+    let parent = Path::new(dest)
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .filter(|p| !p.is_empty() && p != "/");
+    if let Some(parent_dir) = parent {
+        ssh_with_retry(
+            ssh,
+            &format!("sudo mkdir -p {}", shell_single_quote(&parent_dir)),
+            1,
+            Duration::from_secs(0),
+            Duration::from_secs(30),
+        )
+        .with_context(|| {
+            format!(
+                "failed to create parent directory '{}' in guest",
+                parent_dir
+            )
+        })?;
+    }
+
+    let suffix = unique_suffix();
+    let remote_tmp = format!("/tmp/botforge-upload-{temp_label}-{suffix}");
+    scp_with_retry(
+        ssh,
+        local_blob,
+        &remote_tmp,
+        TEST_TRANSPORT_RETRIES,
+        TEST_TRANSPORT_RETRY_DELAY,
+    )
+    .with_context(|| format!("failed to scp file to guest destination '{dest}'"))?;
+
+    let remote_tmp_q = shell_single_quote(&remote_tmp);
+    let mv_result = ssh_with_retry(
+        ssh,
+        &format!("sudo mv {remote_tmp_q} {dest_q}"),
+        1,
+        Duration::from_secs(0),
+        Duration::from_secs(30),
+    )
+    .with_context(|| format!("failed to move file to '{dest}' in guest"));
+
+    if mv_result.is_err() {
+        let _ = ssh_with_retry(
+            ssh,
+            &format!("rm -f {remote_tmp_q}"),
+            1,
+            Duration::from_secs(0),
+            Duration::from_secs(10),
+        );
+    }
+
+    mv_result
+}
+
+fn stage_top_level_uploads(
+    repo_root: &Path,
+    uploads: &[TopLevelUpload],
+    ssh: &SshOptions,
+) -> Result<()> {
+    for (upload_idx, upload) in uploads.iter().enumerate() {
+        let mappings = resolve_top_level_upload_mappings(repo_root, upload)?;
+        for (mapping_idx, mapping) in mappings.iter().enumerate() {
+            stage_local_file_to_guest(
+                ssh,
+                &mapping.local_path,
+                &mapping.guest_dest,
+                &format!("{upload_idx}-{mapping_idx}"),
+            )
+            .with_context(|| {
+                format!(
+                    "top-level upload '{}' failed while staging '{}' to '{}'",
+                    upload.src,
+                    mapping.local_path.display(),
+                    mapping.guest_dest
+                )
+            })?;
+            println!(
+                "top-level upload {} staged {} -> {}",
+                upload_idx + 1,
+                mapping.local_path.display(),
+                mapping.guest_dest
+            );
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct UploadMapping {
+    pub(crate) local_path: PathBuf,
+    pub(crate) guest_dest: String,
+}
+
+pub(crate) fn resolve_top_level_upload_mappings(
+    repo_root: &Path,
+    upload: &TopLevelUpload,
+) -> Result<Vec<UploadMapping>> {
+    let src = upload.src.trim();
+    let dest = upload.dest.trim();
+    validate_top_level_upload_src_for_runtime(src)?;
+    if !src_has_glob_metacharacters(src) {
+        let local_path = resolve_under_root(repo_root, PathBuf::from(src));
+        if !local_path.is_file() {
+            anyhow::bail!(
+                "upload src '{}' does not resolve to a regular file under {}",
+                src,
+                repo_root.display()
+            );
+        }
+        let guest_dest = if dest.ends_with('/') {
+            let basename = local_path.file_name().with_context(|| {
+                format!("upload src '{}' has no file name", local_path.display())
+            })?;
+            Path::new(dest)
+                .join(basename)
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            dest.to_string()
+        };
+        return Ok(vec![UploadMapping {
+            local_path,
+            guest_dest,
+        }]);
+    }
+
+    let fixed_prefix = fixed_glob_prefix(src);
+    let fixed_prefix_root = repo_root.join(&fixed_prefix);
+    let pattern = repo_root.join(src).to_string_lossy().into_owned();
+    let match_options = MatchOptions {
+        case_sensitive: true,
+        require_literal_separator: false,
+        require_literal_leading_dot: false,
+    };
+    let mut mappings = Vec::new();
+    for entry in glob::glob_with(&pattern, match_options)
+        .with_context(|| format!("invalid upload src glob '{}'", src))?
+    {
+        let local_path = entry.with_context(|| {
+            format!(
+                "failed while expanding upload src glob '{}' under {}",
+                src,
+                repo_root.display()
+            )
+        })?;
+        if !local_path.is_file() {
+            continue;
+        }
+        let relative = local_path
+            .strip_prefix(&fixed_prefix_root)
+            .with_context(|| {
+                format!(
+                    "upload src glob '{}' produced '{}' outside fixed prefix '{}'",
+                    src,
+                    local_path.display(),
+                    fixed_prefix_root.display()
+                )
+            })?;
+        let guest_dest = Path::new(dest)
+            .join(relative)
+            .to_string_lossy()
+            .into_owned();
+        mappings.push(UploadMapping {
+            local_path,
+            guest_dest,
+        });
+    }
+
+    if mappings.is_empty() {
+        anyhow::bail!(
+            "no files matched upload src glob '{}' under {}",
+            src,
+            repo_root.display()
+        );
+    }
+
+    Ok(mappings)
+}
+
+fn fixed_glob_prefix(src: &str) -> PathBuf {
+    let mut prefix = PathBuf::new();
+    for component in Path::new(src).components() {
+        let std::path::Component::Normal(part) = component else {
+            break;
+        };
+        if src_has_glob_metacharacters(&part.to_string_lossy()) {
+            break;
+        }
+        prefix.push(part);
+    }
+    prefix
+}
+
+fn validate_top_level_upload_src_for_runtime(src: &str) -> Result<()> {
+    let path = Path::new(src);
+    if path.as_os_str().is_empty() {
+        anyhow::bail!("upload src must not be empty");
+    }
+    if path.is_absolute() {
+        anyhow::bail!("upload src must be repo-relative, got: {}", path.display());
+    }
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(_) => {}
+            _ => anyhow::bail!(
+                "upload src must contain no '.' or '..' segments: {}",
+                path.display()
+            ),
+        }
+    }
+    Ok(())
 }
 
 fn run_run_step(
@@ -886,10 +1122,11 @@ pub(crate) fn shutdown_build_vm(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_guest_env_preamble, env_merge, parse_env_file, resolve_step_timeout, run_host_step,
-        shell_single_quote, HostStepFiles, StepExecutionBudget,
+        build_guest_env_preamble, env_merge, parse_env_file, resolve_step_timeout,
+        resolve_top_level_upload_mappings, run_host_step, shell_single_quote, HostStepFiles,
+        StepExecutionBudget, UploadMapping,
     };
-    use crate::plan::step::{resolve_shell, RunStep, StepTarget};
+    use crate::plan::step::{resolve_shell, RunStep, StepTarget, TopLevelUpload};
     use crate::util::unique_suffix;
     use serde::Deserialize;
     use std::path::{Path, PathBuf};
@@ -925,6 +1162,126 @@ mod tests {
             overall_deadline: Instant::now() + overall_timeout,
             overall_timeout,
         }
+    }
+
+    #[test]
+    fn test_resolve_top_level_upload_mappings_preserves_glob_relative_paths() {
+        let repo = tempfile::tempdir().unwrap();
+        let ecds = repo.path().join("images/botspace/envoy/ecds");
+        std::fs::create_dir_all(&ecds).unwrap();
+        let file = ecds.join("ext_authz.yaml");
+        std::fs::write(&file, "kind: envoy\n").unwrap();
+
+        let mappings = resolve_top_level_upload_mappings(
+            repo.path(),
+            &TopLevelUpload {
+                src: "images/botspace/envoy/**/*.yaml".to_string(),
+                dest: "/tmp/bake-staging/envoy/".to_string(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            mappings,
+            vec![UploadMapping {
+                local_path: file,
+                guest_dest: "/tmp/bake-staging/envoy/ecds/ext_authz.yaml".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn test_resolve_top_level_upload_mappings_preserves_flat_glob_matches() {
+        let repo = tempfile::tempdir().unwrap();
+        let payload = repo.path().join("build/images/payload");
+        std::fs::create_dir_all(&payload).unwrap();
+        let file = payload.join("mcp-fs.tar");
+        std::fs::write(&file, "tarball").unwrap();
+
+        let mappings = resolve_top_level_upload_mappings(
+            repo.path(),
+            &TopLevelUpload {
+                src: "build/images/payload/*.tar".to_string(),
+                dest: "/usr/share/botwork/images/".to_string(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            mappings,
+            vec![UploadMapping {
+                local_path: file,
+                guest_dest: "/usr/share/botwork/images/mcp-fs.tar".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn test_resolve_top_level_upload_mappings_literal_dest_directory_uses_basename() {
+        let repo = tempfile::tempdir().unwrap();
+        let local = repo.path().join("scripts/setup.sh");
+        std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+        std::fs::write(&local, "#!/bin/sh\n").unwrap();
+
+        let mappings = resolve_top_level_upload_mappings(
+            repo.path(),
+            &TopLevelUpload {
+                src: "scripts/setup.sh".to_string(),
+                dest: "/tmp/staging/".to_string(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            mappings,
+            vec![UploadMapping {
+                local_path: local,
+                guest_dest: "/tmp/staging/setup.sh".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn test_resolve_top_level_upload_mappings_zero_match_is_error() {
+        let repo = tempfile::tempdir().unwrap();
+        let err = resolve_top_level_upload_mappings(
+            repo.path(),
+            &TopLevelUpload {
+                src: "images/**/*.yaml".to_string(),
+                dest: "/tmp/staging/".to_string(),
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("no files matched"));
+    }
+
+    #[test]
+    fn test_resolve_top_level_upload_mappings_rejects_traversal() {
+        let repo = tempfile::tempdir().unwrap();
+        let err = resolve_top_level_upload_mappings(
+            repo.path(),
+            &TopLevelUpload {
+                src: "images/../secret.txt".to_string(),
+                dest: "/tmp/staging/".to_string(),
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains(".."));
+    }
+
+    #[test]
+    fn test_resolve_top_level_upload_mappings_skips_directories_and_requires_files() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("images/botspace/envoy/ecds")).unwrap();
+        let err = resolve_top_level_upload_mappings(
+            repo.path(),
+            &TopLevelUpload {
+                src: "images/botspace/envoy/**".to_string(),
+                dest: "/tmp/staging/".to_string(),
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("no files matched"));
     }
 
     #[test]
