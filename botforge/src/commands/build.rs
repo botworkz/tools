@@ -24,7 +24,8 @@ use crate::plan::config::CompressConfig;
 use crate::plan::step::{ArchiveStep, StepTarget, TestStep, UploadStep};
 use crate::plan::{
     load_build_config, preserve_failed_build_disk, print_log_tail, run_step_flow,
-    shutdown_build_vm, validate_build_steps, vm::stage_local_file_to_guest, vm::StepTimeoutPolicy,
+    shutdown_build_vm, validate_build_steps, vm::stage_local_file_to_guest, vm::StepFlowPlan,
+    vm::StepTimeoutPolicy,
 };
 
 #[derive(Args, Debug)]
@@ -216,10 +217,12 @@ pub(crate) fn cmd_build(config: &Path, args: BuildArgs) -> Result<()> {
     };
     let step_result = run_step_flow(
         &repo_root,
-        &build_config.uploads,
-        &build_config.steps,
+        StepFlowPlan {
+            top_level_uploads: &build_config.uploads,
+            steps: &build_config.steps,
+            bootstraps: &[],
+        },
         &ssh_options,
-        &[],
         StepTimeoutPolicy {
             overall_timeout: std::time::Duration::from_secs(build_config.timeout),
             default_step_timeout: std::time::Duration::from_secs(build_config.step_timeout),

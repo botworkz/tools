@@ -30,6 +30,12 @@ const TEST_STABLE_SSH_REQUIRED: usize = 2;
 type ArchiveExecutor<'a> = dyn FnMut(usize, &ArchiveStep) -> Result<()> + 'a;
 type UploadExecutor<'a> = dyn FnMut(usize, &UploadStep) -> Result<()> + 'a;
 
+pub(crate) struct StepFlowPlan<'a> {
+    pub(crate) top_level_uploads: &'a [TopLevelUpload],
+    pub(crate) steps: &'a [TestStep],
+    pub(crate) bootstraps: &'a [TestIsoBootstrap],
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct StepTimeoutPolicy {
     pub(crate) overall_timeout: Duration,
@@ -65,10 +71,12 @@ pub(crate) fn run_test_flow(
 ) -> Result<()> {
     run_step_flow(
         repo_root,
-        &config.uploads,
-        &config.steps,
+        StepFlowPlan {
+            top_level_uploads: &config.uploads,
+            steps: &config.steps,
+            bootstraps,
+        },
         ssh,
-        bootstraps,
         StepTimeoutPolicy {
             overall_timeout: Duration::from_secs(config.timeout),
             default_step_timeout: Duration::from_secs(config.step_timeout),
@@ -84,10 +92,8 @@ pub(crate) fn run_test_flow(
 /// `botforge test` and `botforge build`.  `bootstraps` is empty for build runs.
 pub(crate) fn run_step_flow(
     repo_root: &Path,
-    top_level_uploads: &[TopLevelUpload],
-    steps: &[TestStep],
+    plan: StepFlowPlan<'_>,
     ssh: &SshOptions,
-    bootstraps: &[TestIsoBootstrap],
     timeouts: StepTimeoutPolicy,
     mut archive_executor: Option<&mut ArchiveExecutor<'_>>,
     mut upload_executor: Option<&mut UploadExecutor<'_>>,
@@ -121,7 +127,7 @@ pub(crate) fn run_step_flow(
         timeouts.overall_timeout,
     )?;
 
-    for bootstrap in bootstraps {
+    for bootstrap in plan.bootstraps {
         ensure_overall_budget(overall_deadline, timeouts.overall_timeout)?;
         let mount = shell_single_quote(&bootstrap.mount.display().to_string());
         let label = shell_single_quote(&bootstrap.label);
@@ -150,9 +156,9 @@ pub(crate) fn run_step_flow(
         .with_context(|| format!("iso bootstrap script failed for label {}", bootstrap.label))?;
     }
 
-    if !top_level_uploads.is_empty() {
+    if !plan.top_level_uploads.is_empty() {
         ensure_overall_budget(overall_deadline, timeouts.overall_timeout)?;
-        stage_top_level_uploads(repo_root, top_level_uploads, ssh)?;
+        stage_top_level_uploads(repo_root, plan.top_level_uploads, ssh)?;
     }
 
     // Shared ordered env map threaded across all steps (both guest and host).
@@ -166,7 +172,7 @@ pub(crate) fn run_step_flow(
         default_step_timeout: timeouts.default_step_timeout,
     };
 
-    for (step_idx, step) in steps.iter().enumerate() {
+    for (step_idx, step) in plan.steps.iter().enumerate() {
         ensure_overall_budget(overall_deadline, timeouts.overall_timeout)?;
         // The file is created by StepLogWriter::create inside each step runner;
         // no pre-creation needed here (the directory was already created above).
