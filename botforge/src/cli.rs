@@ -22,8 +22,6 @@ pub(crate) struct Cli {
 pub(crate) enum Commands {
     /// Build a qcow2 image by booting the source image and provisioning it via plan steps.
     Build(commands::build::BuildArgs),
-    /// [legacy] Build a qcow2 image by running a virt-customize spec against a source qcow2.
-    BuildLegacy(commands::build_legacy::BuildLegacyArgs),
     /// Fetch and stage one or all assets from shasset.yaml into a flat output directory.
     Deps(commands::deps::DepsArgs),
     /// Build an ISO image from a source directory.

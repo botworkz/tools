@@ -22,7 +22,6 @@ fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::Build(args) => commands::build::cmd_build(&cli.config, args),
-        Commands::BuildLegacy(args) => commands::build_legacy::cmd_build_legacy(args),
         Commands::Deps(args) => commands::deps::cmd_deps(&cli.config, args),
         Commands::Iso(args) => commands::iso::cmd_iso(args),
         Commands::Payload(args) => commands::payload::cmd_payload(&cli.config, args),
