@@ -98,38 +98,63 @@ fn stderr_color_enabled() -> bool {
     std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none()
 }
 
-fn step_title_line(step_idx: usize, name: &str, color: bool) -> String {
+fn step_title_line(step_idx: usize, name: &str, id: Option<&str>, color: bool) -> String {
+    let counter = match id {
+        Some(id) => format!("{step_idx}/{id}"),
+        None => format!("{step_idx}"),
+    };
     if color {
-        format!("🤖 ({step_idx}) \x1b[1m{name}\x1b[0m")
+        format!("🤖 ({counter}) \x1b[1m{name}\x1b[0m")
     } else {
-        format!("🤖 ({step_idx}) {name}")
+        format!("🤖 ({counter}) {name}")
     }
 }
 
-fn step_status_marker(step_idx: usize, name: &str, success: bool, color: bool) -> String {
+fn step_status_marker(
+    step_idx: usize,
+    name: &str,
+    success: bool,
+    id: Option<&str>,
+    color: bool,
+) -> String {
+    let counter = match id {
+        Some(id) => format!("{step_idx}/{id}"),
+        None => format!("{step_idx}"),
+    };
     if color {
         if success {
-            format!(" \x1b[32m✓\x1b[0m ({step_idx}) \x1b[2m{name}\x1b[0m")
+            format!(" \x1b[32m✓\x1b[0m ({counter}) \x1b[2m{name}\x1b[0m")
         } else {
-            format!(" \x1b[31m✗\x1b[0m ({step_idx}) {name}")
+            format!(" \x1b[31m✗\x1b[0m ({counter}) {name}")
         }
     } else {
         let tick = if success { '✓' } else { '✗' };
-        format!(" {tick} ({step_idx}) {name}")
+        format!(" {tick} ({counter}) {name}")
     }
 }
 
-pub(super) fn print_step_title(step_idx: usize, step_name: &str) {
+pub(super) fn print_step_title(step_idx: usize, step_name: &str, step_id: Option<&str>) {
     eprintln!(
         "{}",
-        step_title_line(step_idx, step_name, stderr_color_enabled())
+        step_title_line(step_idx, step_name, step_id, stderr_color_enabled())
     );
 }
 
-pub(super) fn print_step_status(step_idx: usize, step_name: &str, success: bool) {
+pub(super) fn print_step_status(
+    step_idx: usize,
+    step_name: &str,
+    step_id: Option<&str>,
+    success: bool,
+) {
     eprintln!(
         "{}",
-        step_status_marker(step_idx, step_name, success, stderr_color_enabled())
+        step_status_marker(
+            step_idx,
+            step_name,
+            success,
+            step_id,
+            stderr_color_enabled()
+        )
     );
 }
 
@@ -257,14 +282,14 @@ mod tests {
     #[test]
     fn test_step_status_marker_formats_result() {
         assert_eq!(
-            step_status_marker(4, "mcp-smoke", false, false),
+            step_status_marker(4, "mcp-smoke", false, None, false),
             " ✗ (4) mcp-smoke"
         );
         assert_eq!(
-            step_status_marker(4, "mcp-smoke", true, false),
+            step_status_marker(4, "mcp-smoke", true, None, false),
             " ✓ (4) mcp-smoke"
         );
-        let success_color = step_status_marker(4, "mcp-smoke", true, true);
+        let success_color = step_status_marker(4, "mcp-smoke", true, None, true);
         assert!(
             success_color.starts_with(' '),
             "success color marker should start with a space: {success_color:?}"
@@ -285,7 +310,7 @@ mod tests {
             success_color.contains("\x1b[0m"),
             "success color should reset: {success_color:?}"
         );
-        let failure_color = step_status_marker(4, "mcp-smoke", false, true);
+        let failure_color = step_status_marker(4, "mcp-smoke", false, None, true);
         assert!(
             failure_color.starts_with(' '),
             "failure color marker should start with a space: {failure_color:?}"
@@ -305,9 +330,54 @@ mod tests {
     }
 
     #[test]
+    fn test_step_status_marker_with_id() {
+        assert_eq!(
+            step_status_marker(4, "mcp-smoke", true, Some("build"), false),
+            " ✓ (4/build) mcp-smoke"
+        );
+        assert_eq!(
+            step_status_marker(4, "mcp-smoke", false, Some("build"), false),
+            " ✗ (4/build) mcp-smoke"
+        );
+        let success_color = step_status_marker(4, "mcp-smoke", true, Some("build"), true);
+        assert!(
+            success_color.contains("(4/build)"),
+            "success color with id should contain counter: {success_color:?}"
+        );
+        assert!(
+            success_color.contains("\x1b[32m"),
+            "success color with id should contain green: {success_color:?}"
+        );
+        assert!(
+            success_color.contains('✓'),
+            "success color with id should contain tick: {success_color:?}"
+        );
+        assert!(
+            success_color.contains("\x1b[0m"),
+            "success color with id should contain reset: {success_color:?}"
+        );
+        let failure_color = step_status_marker(4, "mcp-smoke", false, Some("build"), true);
+        assert!(
+            failure_color.contains("(4/build)"),
+            "failure color with id should contain counter: {failure_color:?}"
+        );
+        assert!(
+            failure_color.contains("\x1b[31m"),
+            "failure color with id should contain red: {failure_color:?}"
+        );
+        assert!(
+            failure_color.contains('✗'),
+            "failure color with id should contain cross: {failure_color:?}"
+        );
+    }
+
+    #[test]
     fn test_step_title_line_formats() {
-        assert_eq!(step_title_line(4, "mcp-smoke", false), "🤖 (4) mcp-smoke");
-        let colored = step_title_line(4, "mcp-smoke", true);
+        assert_eq!(
+            step_title_line(4, "mcp-smoke", None, false),
+            "🤖 (4) mcp-smoke"
+        );
+        let colored = step_title_line(4, "mcp-smoke", None, true);
         assert!(
             colored.contains("🤖 (4) "),
             "colored title should contain robot prefix: {colored:?}"
@@ -323,6 +393,31 @@ mod tests {
         assert!(
             colored.contains("\x1b[0m"),
             "colored title should contain reset: {colored:?}"
+        );
+    }
+
+    #[test]
+    fn test_step_title_line_with_id() {
+        assert_eq!(
+            step_title_line(4, "mcp-smoke", Some("build"), false),
+            "🤖 (4/build) mcp-smoke"
+        );
+        let colored = step_title_line(4, "mcp-smoke", Some("build"), true);
+        assert!(
+            colored.contains("(4/build)"),
+            "colored title with id should contain counter: {colored:?}"
+        );
+        assert!(
+            colored.contains("\x1b[1m"),
+            "colored title with id should contain bold code: {colored:?}"
+        );
+        assert!(
+            colored.contains("mcp-smoke"),
+            "colored title with id should contain name: {colored:?}"
+        );
+        assert!(
+            colored.contains("\x1b[0m"),
+            "colored title with id should contain reset: {colored:?}"
         );
     }
 

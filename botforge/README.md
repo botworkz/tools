@@ -355,6 +355,26 @@ dimmed name on success, or red `✗ (<n>) <name>` on failure. The
 output is suppressed by default and restored under `BOTFORGE_DEBUG=1` /
 `BOTFORGE_SSH_VERBOSE=1`.
 
+#### `id:` field (optional)
+
+Every run step has an optional `id:` field. When set, the step counter in
+title and status lines is rendered as `(<n>/<id>)` instead of `(<n>)`. For
+example:
+
+```yaml
+steps:
+  - on: guest
+    name: flip-spigot
+    id: flip-spigot
+    run: systemctl reload botwork-envoy
+```
+
+produces `🤖 (0/flip-spigot) flip-spigot` instead of `🤖 (0) flip-spigot`.
+
+`id:` is a **display label only** — it is not required to be unique, is not
+validated for charset, and is not addressable by other steps. When absent,
+output is identical to the no-id form. Archive steps have no `id:` field.
+
 #### `shell:` field (optional)
 
 Every step has an optional `shell:` field that selects the interpreter used to
