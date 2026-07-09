@@ -466,7 +466,9 @@ mod tests {
         let exec_yaml = serde_yaml::to_string(&exec).expect("exec entry must serialize");
         let exec_back: serde_yaml::Value =
             serde_yaml::from_str(&exec_yaml).expect("exec entry must reparse");
-        let seq = exec_back.as_sequence().expect("exec entry reparses as a sequence");
+        let seq = exec_back
+            .as_sequence()
+            .expect("exec entry reparses as a sequence");
         let flat: Vec<Option<&str>> = seq.iter().map(|v| v.as_str()).collect();
         assert_eq!(
             flat,
