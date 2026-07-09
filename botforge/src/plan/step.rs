@@ -33,6 +33,11 @@ pub(crate) struct RunStep {
     /// automatic `sh -e {0}` fallback if bash is not available.
     #[serde(default)]
     pub(crate) shell: Option<String>,
+    /// Optional identifier for the step. When set, it is shown in the step's
+    /// title/status line as `(<index>/<id>)`. Purely a display label today — it is
+    /// not required to be unique and is not addressable by other steps.
+    #[serde(default)]
+    pub(crate) id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -77,6 +82,13 @@ impl TestStep {
                 .name
                 .as_deref()
                 .unwrap_or(step.archive.src.as_str()),
+        }
+    }
+
+    pub(crate) fn display_id(&self) -> Option<&str> {
+        match self {
+            Self::Run(step) => step.id.as_deref(),
+            Self::Archive(_) => None,
         }
     }
 }

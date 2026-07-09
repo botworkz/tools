@@ -171,7 +171,7 @@ pub(crate) fn run_step_flow(
         ensure_overall_budget(overall_deadline, timeouts.overall_timeout)?;
         // The file is created by StepLogWriter::create inside each step runner;
         // no pre-creation needed here (the directory was already created above).
-        print_step_title(step_idx, step.display_name());
+        print_step_title(step_idx, step.display_name(), step.display_id());
         let step_result = match step {
             TestStep::Run(step) => run_run_step(&run_context, step_idx, step, &mut accumulated_env),
             TestStep::Archive(step) => {
@@ -191,7 +191,7 @@ pub(crate) fn run_step_flow(
                 }
             }
         };
-        print_step_status(step_idx, step.display_name(), step_result.is_ok());
+        print_step_status(step_idx, step.display_name(), step.display_id(), step_result.is_ok());
         step_result?;
     }
     Ok(overall_deadline)
@@ -1809,6 +1809,7 @@ mod tests {
             run: "echo ok".to_string(),
             timeout: Some(45),
             shell: None,
+            id: None,
         };
         assert_eq!(
             resolve_step_timeout(step.timeout, Duration::from_secs(300)),
@@ -1824,6 +1825,7 @@ mod tests {
             run: "echo ok".to_string(),
             timeout: None,
             shell: None,
+            id: None,
         };
         assert_eq!(
             resolve_step_timeout(step.timeout, Duration::from_secs(1800)),
