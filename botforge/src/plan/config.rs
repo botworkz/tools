@@ -776,6 +776,36 @@ fn validate_top_level_uploads(kind: &str, uploads: &[TopLevelUpload]) -> Result<
     Ok(())
 }
 
+/// Validate a `mode` string: must be 3–4 octal digits (same rule as `payload.rs`).
+fn validate_mode_string(mode: &str, src: &str, kind: &str) -> Result<()> {
+    if mode.len() < 3 || mode.len() > 4 || !mode.chars().all(|ch| ('0'..='7').contains(&ch)) {
+        anyhow::bail!(
+            "{kind} uploads entry '{src}': `mode` must be 3–4 octal digits, got '{mode}'"
+        );
+    }
+    Ok(())
+}
+
+/// Validate an `owner` or `group` string: non-empty, no whitespace, no `/`, no shell metacharacters.
+fn validate_owner_group_string(value: &str, field: &str, src: &str, kind: &str) -> Result<()> {
+    if value.trim().is_empty() {
+        anyhow::bail!(
+            "{kind} uploads entry '{src}': `{field}` must be non-empty"
+        );
+    }
+    for ch in value.chars() {
+        if ch.is_whitespace()
+            || matches!(ch, '/' | '\'' | '"' | '`' | '$' | ';' | '&' | '|' | '<' | '>')
+        {
+            anyhow::bail!(
+                "{kind} uploads entry '{src}': `{field}` contains invalid character '{ch}'; \
+                 must not contain whitespace, '/', or shell metacharacters"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn validate_top_level_upload(kind: &str, upload: &TopLevelUpload) -> Result<()> {
     let src = upload.src.trim();
     let dest = upload.dest.trim();
@@ -805,6 +835,15 @@ fn validate_top_level_upload(kind: &str, upload: &TopLevelUpload) -> Result<()> 
         anyhow::bail!(
             "{kind} uploads entry '{src}': glob `src` requires `dest` to be a directory path ending with '/'"
         );
+    }
+    if let Some(mode) = &upload.mode {
+        validate_mode_string(mode, src, kind)?;
+    }
+    if let Some(owner) = &upload.owner {
+        validate_owner_group_string(owner, "owner", src, kind)?;
+    }
+    if let Some(group) = &upload.group {
+        validate_owner_group_string(group, "group", src, kind)?;
     }
     Ok(())
 }
@@ -2549,10 +2588,12 @@ steps: []
                 TopLevelUpload {
                     src: "images/botspace/envoy/**/*.yaml".to_string(),
                     dest: "/tmp/bake-staging/envoy/".to_string(),
+                    ..Default::default()
                 },
                 TopLevelUpload {
                     src: "build/images/payload/*.tar".to_string(),
                     dest: "/usr/share/botwork/images/".to_string(),
+                    ..Default::default()
                 },
             ]
         );
@@ -2657,13 +2698,115 @@ image: "@base"
 uploads:
   - src: payload/file.txt
     dest: /tmp/file.txt
-    owner: root
+    bogus: 1
 steps: []
 "#,
         );
         let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("owner") || msg.contains("unknown field"));
+        assert!(msg.contains("bogus") || msg.contains("unknown field"));
+    }
+
+    #[test]
+    fn test_load_build_config_parses_top_level_upload_permission_fields() {
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            r#"
+type: build
+image: "@base"
+uploads:
+  - src: payload/file.txt
+    dest: /usr/local/bin/file
+    mode: "0755"
+    owner: root
+    group: root
+    overwrite: true
+    parents: true
+steps: []
+"#,
+        );
+        let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
+        assert_eq!(config.uploads.len(), 1);
+        let upload = &config.uploads[0];
+        assert_eq!(upload.mode.as_deref(), Some("0755"));
+        assert_eq!(upload.owner.as_deref(), Some("root"));
+        assert_eq!(upload.group.as_deref(), Some("root"));
+        assert_eq!(upload.overwrite, Some(true));
+        assert_eq!(upload.parents, Some(true));
+    }
+
+    #[test]
+    fn test_load_build_config_rejects_top_level_upload_invalid_mode() {
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            r#"
+type: build
+image: "@base"
+uploads:
+  - src: payload/file.txt
+    dest: /tmp/file.txt
+    mode: "abc"
+steps: []
+"#,
+        );
+        let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("mode") && msg.contains("octal"),
+            "error should mention mode and octal: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_load_build_config_rejects_top_level_upload_owner_with_slash() {
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            r#"
+type: build
+image: "@base"
+uploads:
+  - src: payload/file.txt
+    dest: /tmp/file.txt
+    owner: "root/admin"
+steps: []
+"#,
+        );
+        let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("owner") && msg.contains('/'),
+            "error should mention owner and invalid char: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_load_build_config_rejects_top_level_upload_group_with_metachar() {
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            r#"
+type: build
+image: "@base"
+uploads:
+  - src: payload/file.txt
+    dest: /tmp/file.txt
+    group: "adm;in"
+steps: []
+"#,
+        );
+        let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("group"),
+            "error should mention group: {msg}"
+        );
     }
 
     // -----------------------------------------------------------------
@@ -2995,6 +3138,7 @@ steps: []
             vec![TopLevelUpload {
                 src: "fixtures/envoy/**/*.yaml".to_string(),
                 dest: "/tmp/envoy/".to_string(),
+                ..Default::default()
             }]
         );
     }

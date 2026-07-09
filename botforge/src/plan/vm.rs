@@ -279,6 +279,104 @@ pub(crate) fn stage_local_file_to_guest(
     mv_result
 }
 
+/// Options controlling how `install_file_to_guest` places a file in the guest.
+struct InstallOpts<'a> {
+    /// File permission mode (3–4 octal digits). Defaults to `"0644"`.
+    mode: Option<&'a str>,
+    /// Owner (user name or numeric uid). Defaults to `"root"`.
+    owner: Option<&'a str>,
+    /// Group (group name or numeric gid). Defaults to `"root"`.
+    group: Option<&'a str>,
+    /// If `false`, fail with an error when `dest` already exists. Defaults to `true`.
+    overwrite: Option<bool>,
+    /// If `true` (default), create intermediate destination directories (`install -D`).
+    parents: Option<bool>,
+}
+
+/// Stage a local file to the guest using `sudo install`, applying the given `opts`.
+///
+/// Unlike [`stage_local_file_to_guest`] (which uses `sudo mv`), this function uses
+/// `sudo install` so it can set mode, owner, and group atomically.  The temporary file
+/// is always cleaned up after the install attempt.
+fn install_file_to_guest(
+    ssh: &SshOptions,
+    local_blob: &Path,
+    dest: &str,
+    opts: &InstallOpts<'_>,
+    temp_label: &str,
+) -> Result<()> {
+    let dest_q = shell_single_quote(dest);
+    let suffix = unique_suffix();
+    let remote_tmp = format!("/tmp/botforge-upload-{temp_label}-{suffix}");
+    let remote_tmp_q = shell_single_quote(&remote_tmp);
+
+    scp_with_retry(
+        ssh,
+        local_blob,
+        &remote_tmp,
+        TEST_TRANSPORT_RETRIES,
+        TEST_TRANSPORT_RETRY_DELAY,
+    )
+    .with_context(|| format!("failed to scp file to guest for install to '{dest}'"))?;
+
+    // If overwrite is disabled, precheck that dest does not exist.
+    let overwrite = opts.overwrite.unwrap_or(true);
+    if !overwrite {
+        let precheck_result = ssh_with_retry(
+            ssh,
+            &format!("sudo test ! -e {dest_q}"),
+            1,
+            Duration::from_secs(0),
+            Duration::from_secs(30),
+        );
+        if precheck_result.is_err() {
+            let _ = ssh_with_retry(
+                ssh,
+                &format!("rm -f {remote_tmp_q}"),
+                1,
+                Duration::from_secs(0),
+                Duration::from_secs(10),
+            );
+            anyhow::bail!(
+                "upload dest '{dest}' already exists and overwrite is false"
+            );
+        }
+    }
+
+    let mode = opts.mode.unwrap_or("0644");
+    let owner = opts.owner.unwrap_or("root");
+    let group = opts.group.unwrap_or("root");
+    let parents = opts.parents.unwrap_or(true);
+    let owner_q = shell_single_quote(owner);
+    let group_q = shell_single_quote(group);
+
+    let install_cmd = if parents {
+        format!("sudo install -D -m {mode} -o {owner_q} -g {group_q} {remote_tmp_q} {dest_q}")
+    } else {
+        format!("sudo install -m {mode} -o {owner_q} -g {group_q} {remote_tmp_q} {dest_q}")
+    };
+
+    let install_result = ssh_with_retry(
+        ssh,
+        &install_cmd,
+        1,
+        Duration::from_secs(0),
+        Duration::from_secs(30),
+    )
+    .with_context(|| format!("failed to install file to '{dest}' in guest"));
+
+    // Best-effort cleanup of the temp file regardless of install success/failure.
+    let _ = ssh_with_retry(
+        ssh,
+        &format!("rm -f {remote_tmp_q}"),
+        1,
+        Duration::from_secs(0),
+        Duration::from_secs(10),
+    );
+
+    install_result
+}
+
 fn stage_top_level_uploads(
     repo_root: &Path,
     uploads: &[TopLevelUpload],
@@ -286,11 +384,19 @@ fn stage_top_level_uploads(
 ) -> Result<()> {
     for (upload_idx, upload) in uploads.iter().enumerate() {
         let mappings = resolve_top_level_upload_mappings(repo_root, upload)?;
+        let opts = InstallOpts {
+            mode: upload.mode.as_deref(),
+            owner: upload.owner.as_deref(),
+            group: upload.group.as_deref(),
+            overwrite: upload.overwrite,
+            parents: upload.parents,
+        };
         for (mapping_idx, mapping) in mappings.iter().enumerate() {
-            stage_local_file_to_guest(
+            install_file_to_guest(
                 ssh,
                 &mapping.local_path,
                 &mapping.guest_dest,
+                &opts,
                 &format!("{upload_idx}-{mapping_idx}"),
             )
             .with_context(|| {
@@ -1177,6 +1283,7 @@ mod tests {
             &TopLevelUpload {
                 src: "images/botspace/envoy/**/*.yaml".to_string(),
                 dest: "/tmp/bake-staging/envoy/".to_string(),
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1203,6 +1310,7 @@ mod tests {
             &TopLevelUpload {
                 src: "build/images/payload/*.tar".to_string(),
                 dest: "/usr/share/botwork/images/".to_string(),
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1228,6 +1336,7 @@ mod tests {
             &TopLevelUpload {
                 src: "scripts/setup.sh".to_string(),
                 dest: "/tmp/staging/".to_string(),
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1249,6 +1358,7 @@ mod tests {
             &TopLevelUpload {
                 src: "images/**/*.yaml".to_string(),
                 dest: "/tmp/staging/".to_string(),
+                ..Default::default()
             },
         )
         .unwrap_err();
@@ -1263,6 +1373,7 @@ mod tests {
             &TopLevelUpload {
                 src: "images/../secret.txt".to_string(),
                 dest: "/tmp/staging/".to_string(),
+                ..Default::default()
             },
         )
         .unwrap_err();
@@ -1278,6 +1389,7 @@ mod tests {
             &TopLevelUpload {
                 src: "images/botspace/envoy/**".to_string(),
                 dest: "/tmp/staging/".to_string(),
+                ..Default::default()
             },
         )
         .unwrap_err();
