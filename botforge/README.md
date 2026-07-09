@@ -1,6 +1,6 @@
 # botforge
 
-`botforge` is the build-time companion CLI for botworkz VM artifact workflows. It wraps the external toolchain (QEMU/KVM, libguestfs, xorriso, OpenSSH) so the same commands work identically inside the published container image and in local development.
+`botforge` is the build-time companion CLI for botworkz VM artifact workflows. It wraps the external toolchain (QEMU/KVM, xorriso, OpenSSH) so the same commands work identically inside the published container image and in local development.
 
 ## Container image
 
