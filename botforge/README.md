@@ -174,14 +174,25 @@ Both `type: test` and `type: build` support an optional top-level `uploads:`
 list that stages files into the guest **once, after cloud-init is ready and
 before the first `steps:` entry runs**.
 
-Each entry is a strict `{ src, dest }` mapping:
+Each entry supports the following fields:
 
-- `src` — required repo-relative path or glob, resolved under `--repo-root`.
+- `src` — **required** repo-relative path or glob, resolved under `--repo-root`.
   `*`, `**`, `?`, and `[...]` are supported. `@<shasset>` and `@://...` are
   **not** supported here; use a standalone `upload:` or `archive:` step for
   shasset assets.
-- `dest` — required absolute guest path. For glob `src`, `dest` must end in
+- `dest` — **required** absolute guest path. For glob `src`, `dest` must end in
   `/` and is treated as a guest base directory.
+- `mode` — optional; 3–4 octal digits (e.g. `"0755"`). Defaults to `"0644"`.
+  Applied via `install -m <mode>` for every matched file.
+- `owner` — optional; user name or numeric uid (e.g. `root`). Defaults to `root`.
+  Applied via `install -o <owner>`.
+- `group` — optional; group name or numeric gid (e.g. `root`). Defaults to `root`.
+  Applied via `install -g <group>`.
+- `overwrite` — optional boolean. Defaults to `true`. When `false`, the upload
+  fails with a hard error if `dest` already exists in the guest.
+- `parents` — optional boolean. Defaults to `true`. When `true`, intermediate
+  destination directories are created automatically (`install -D`). When `false`,
+  the parent directory must already exist.
 
 Semantics:
 
@@ -193,6 +204,8 @@ Semantics:
   `/tmp/envoy/ecds/ext_authz.yaml`.
 - Globs that match zero files are a hard error.
 - Only regular files are staged; directories matched by a glob are skipped.
+- When `src` is a glob, `mode`/`owner`/`group`/`overwrite`/`parents` apply to
+  **every** matched file.
 
 ### `botforge test` step model
 
@@ -537,6 +550,10 @@ configured step.
 - `dest` must be an absolute guest path.
 - Glob `src` requires `dest` to end in `/`, and matched files are staged with
   path preservation relative to the glob's fixed literal prefix.
+- Optional `mode`, `owner`, `group`, `overwrite`, and `parents` fields are
+  supported (see [Top-level `uploads:` (optional)](#top-level-uploads-optional)
+  for details). Files are installed via `sudo install` so mode and ownership are
+  applied atomically without a follow-up `chmod`/`chown` step.
 
 The existing standalone `upload:` step and per-run-step `uploads:` field are
 unchanged; top-level `uploads:` is an additive pre-staging mechanism.
