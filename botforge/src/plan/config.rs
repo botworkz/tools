@@ -951,6 +951,12 @@ pub(crate) fn validate_test_steps(steps: &[TestStep], ports: &[PortSpec]) -> Res
     for step in steps {
         match step {
             TestStep::Run(step) => {
+                if step.target == StepTarget::Host && step.sudo == Some(true) {
+                    anyhow::bail!(
+                        "test step '{}': 'sudo: true' is only supported on 'on: guest' steps",
+                        step.name
+                    );
+                }
                 resolve_shell(step.shell.as_deref()).with_context(|| {
                     format!("test step '{}': invalid `shell:` value", step.name)
                 })?;
@@ -982,6 +988,12 @@ pub(crate) fn validate_build_steps(steps: &[TestStep]) -> Result<()> {
     for step in steps {
         match step {
             TestStep::Run(step) => {
+                if step.target == StepTarget::Host && step.sudo == Some(true) {
+                    anyhow::bail!(
+                        "build step '{}': 'sudo: true' is only supported on 'on: guest' steps",
+                        step.name
+                    );
+                }
                 resolve_shell(step.shell.as_deref()).with_context(|| {
                     format!("build step '{}': invalid `shell:` value", step.name)
                 })?;
@@ -1439,6 +1451,38 @@ steps:
     }
 
     #[test]
+    fn test_load_test_config_preserves_fragment_sudo_via_uses() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("frag.yaml"),
+            r#"
+type: fragment
+steps:
+  - on: guest
+    name: frag-root-step
+    sudo: true
+    run: echo from-fragment
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            r#"
+type: test
+steps:
+  - uses: "@://frag.yaml"
+"#,
+        )
+        .unwrap();
+
+        let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+
+        assert_eq!(config.steps.len(), 1);
+        assert_eq!(run_ref(&config.steps[0]).name, "frag-root-step");
+        assert_eq!(run_ref(&config.steps[0]).sudo, Some(true));
+    }
+
+    #[test]
     fn test_load_test_config_rejects_unsupported_uses_scheme() {
         let repo = TempDir::new().unwrap();
         std::fs::write(
@@ -1544,6 +1588,7 @@ steps:
             run: "echo ok".to_string(),
             timeout: None,
             shell: None,
+            sudo: None,
         })
     }
 
@@ -1572,6 +1617,33 @@ steps:
     fn test_validate_steps_accepts_guest_only_without_ports() {
         let steps = vec![make_step(StepTarget::Guest, "s")];
         assert!(validate_test_steps(&steps, &[]).is_ok());
+    }
+
+    #[test]
+    fn test_validate_steps_rejects_host_step_with_sudo() {
+        let mut step = make_step(StepTarget::Host, "host-root");
+        let TestStep::Run(run) = &mut step else {
+            panic!("expected run step");
+        };
+        run.sudo = Some(true);
+        let err = validate_test_steps(&[step], &[loopback(80)]).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("host-root"),
+            "error should mention step name: {msg}"
+        );
+        assert!(msg.contains("sudo"), "error should mention sudo: {msg}");
+        assert!(msg.contains("guest"), "error should mention guest: {msg}");
+    }
+
+    #[test]
+    fn test_validate_steps_accepts_guest_step_with_sudo() {
+        let mut step = make_step(StepTarget::Guest, "guest-root");
+        let TestStep::Run(run) = &mut step else {
+            panic!("expected run step");
+        };
+        run.sudo = Some(true);
+        assert!(validate_test_steps(&[step], &[]).is_ok());
     }
 
     // --- shell deserialization ---
@@ -3335,6 +3407,37 @@ steps:
     }
 
     #[test]
+    fn test_build_config_preserves_fragment_sudo_via_uses() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("frag.yaml"),
+            r#"
+type: fragment
+steps:
+  - on: guest
+    name: frag-step
+    sudo: true
+    run: echo from-fragment
+"#,
+        )
+        .unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            r#"
+type: build
+image: "@debian-base"
+steps:
+  - uses: "@://frag.yaml"
+"#,
+        );
+        let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
+        assert_eq!(config.steps.len(), 1);
+        assert_eq!(run_ref(&config.steps[0]).name, "frag-step");
+        assert_eq!(run_ref(&config.steps[0]).sudo, Some(true));
+    }
+
+    #[test]
     fn test_build_config_fragment_input_substitution_preserves_step_timeout() {
         let repo = TempDir::new().unwrap();
         std::fs::write(
@@ -3451,6 +3554,33 @@ steps:
         // Unlike test, build does not require ports for host steps.
         let steps = vec![make_step(StepTarget::Host, "h")];
         assert!(validate_build_steps(&steps).is_ok());
+    }
+
+    #[test]
+    fn test_validate_build_steps_rejects_host_step_with_sudo() {
+        let mut step = make_step(StepTarget::Host, "host-root");
+        let TestStep::Run(run) = &mut step else {
+            panic!("expected run step");
+        };
+        run.sudo = Some(true);
+        let err = validate_build_steps(&[step]).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("host-root"),
+            "error should mention step name: {msg}"
+        );
+        assert!(msg.contains("sudo"), "error should mention sudo: {msg}");
+        assert!(msg.contains("guest"), "error should mention guest: {msg}");
+    }
+
+    #[test]
+    fn test_validate_build_steps_accepts_guest_step_with_sudo() {
+        let mut step = make_step(StepTarget::Guest, "guest-root");
+        let TestStep::Run(run) = &mut step else {
+            panic!("expected run step");
+        };
+        run.sudo = Some(true);
+        assert!(validate_build_steps(&[step]).is_ok());
     }
 
     #[test]

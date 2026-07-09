@@ -501,17 +501,8 @@ fn run_run_step(
             .with_context(|| format!("test step '{}' script upload failed", step.name));
 
             let step_result = if scp_result.is_ok() {
-                let ssh_cmd = template
-                    .iter()
-                    .map(|a| {
-                        if a == "{0}" {
-                            shell_single_quote(&remote_script)
-                        } else {
-                            a.clone()
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" ");
+                let ssh_cmd =
+                    build_guest_ssh_cmd(&template, &remote_script, step.sudo == Some(true));
                 run_ssh_step_with_step_log(
                     &step.name,
                     ssh_command_args(context.ssh, &ssh_cmd, Duration::from_secs(300).as_secs()),
@@ -883,6 +874,25 @@ fn shell_single_quote(value: &str) -> String {
     crate::util::shell_single_quote(value)
 }
 
+fn build_guest_ssh_cmd(template: &[String], remote_script: &str, sudo: bool) -> String {
+    let ssh_cmd = template
+        .iter()
+        .map(|arg| {
+            if arg == "{0}" {
+                shell_single_quote(remote_script)
+            } else {
+                arg.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    if sudo {
+        format!("sudo -E {ssh_cmd}")
+    } else {
+        ssh_cmd
+    }
+}
+
 /// Parse a `$GITHUB_ENV`-style env file, returning key-value pairs in insertion order.
 ///
 /// Supported formats:
@@ -1131,9 +1141,9 @@ pub(crate) fn shutdown_build_vm(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_guest_env_preamble, env_merge, parse_env_file, resolve_step_timeout,
-        resolve_top_level_upload_mappings, run_host_step, shell_single_quote, HostStepFiles,
-        StepExecutionBudget, UploadMapping,
+        build_guest_env_preamble, build_guest_ssh_cmd, env_merge, parse_env_file,
+        resolve_step_timeout, resolve_top_level_upload_mappings, run_host_step, shell_single_quote,
+        HostStepFiles, StepExecutionBudget, UploadMapping,
     };
     use crate::plan::step::{resolve_shell, RunStep, StepTarget, TopLevelUpload};
     use crate::util::unique_suffix;
@@ -1719,6 +1729,23 @@ mod tests {
         assert!(preamble.contains(&expected), "preamble: {preamble}");
     }
 
+    #[test]
+    fn test_build_guest_ssh_cmd_prefixes_sudo_for_guest_root_step() {
+        let tmpl = resolve_shell(None).unwrap();
+        let cmd = build_guest_ssh_cmd(&tmpl, "/tmp/botforge-step.sh", true);
+        assert_eq!(
+            cmd,
+            "sudo -E bash --noprofile --norc -e -o pipefail '/tmp/botforge-step.sh'"
+        );
+    }
+
+    #[test]
+    fn test_build_guest_ssh_cmd_without_sudo_matches_previous_command() {
+        let tmpl = resolve_shell(Some("sh")).unwrap();
+        let cmd = build_guest_ssh_cmd(&tmpl, "/tmp/botforge-step.sh", false);
+        assert_eq!(cmd, "sh -e '/tmp/botforge-step.sh'");
+    }
+
     // --- host step timeout ---
 
     #[test]
@@ -1809,6 +1836,7 @@ mod tests {
             run: "echo ok".to_string(),
             timeout: Some(45),
             shell: None,
+            sudo: None,
         };
         assert_eq!(
             resolve_step_timeout(step.timeout, Duration::from_secs(300)),
@@ -1824,6 +1852,7 @@ mod tests {
             run: "echo ok".to_string(),
             timeout: None,
             shell: None,
+            sudo: None,
         };
         assert_eq!(
             resolve_step_timeout(step.timeout, Duration::from_secs(1800)),

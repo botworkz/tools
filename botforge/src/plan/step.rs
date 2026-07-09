@@ -33,6 +33,11 @@ pub(crate) struct RunStep {
     /// automatic `sh -e {0}` fallback if bash is not available.
     #[serde(default)]
     pub(crate) shell: Option<String>,
+    /// When `true`, run the step's interpreter under `sudo -E` so the entire
+    /// `run:` body executes as root. Only valid on `on: guest` steps (host steps
+    /// run in the botforge container as the harness user). Defaults to `false`.
+    #[serde(default)]
+    pub(crate) sudo: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -206,7 +211,7 @@ pub(crate) fn resolve_shell(shell: Option<&str>) -> Result<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_shell;
+    use super::{resolve_shell, RunStep};
 
     #[test]
     fn test_resolve_shell_absent_returns_bash_template() {
@@ -324,5 +329,60 @@ mod tests {
             })
             .collect();
         assert_eq!(argv, vec!["sh", "-e", "/tmp/step.sh"]);
+    }
+
+    #[test]
+    fn test_run_step_parses_sudo_true() {
+        let step: RunStep = serde_yaml::from_str(
+            r#"
+on: guest
+name: root-step
+sudo: true
+run: echo ok
+"#,
+        )
+        .unwrap();
+        assert_eq!(step.sudo, Some(true));
+    }
+
+    #[test]
+    fn test_run_step_parses_sudo_false() {
+        let step: RunStep = serde_yaml::from_str(
+            r#"
+on: guest
+name: unprivileged-step
+sudo: false
+run: echo ok
+"#,
+        )
+        .unwrap();
+        assert_eq!(step.sudo, Some(false));
+    }
+
+    #[test]
+    fn test_run_step_parses_without_sudo_defaults_to_none() {
+        let step: RunStep = serde_yaml::from_str(
+            r#"
+on: guest
+name: no-sudo
+run: echo ok
+"#,
+        )
+        .unwrap();
+        assert_eq!(step.sudo, None);
+    }
+
+    #[test]
+    fn test_run_step_unknown_field_still_fails() {
+        let err = serde_yaml::from_str::<RunStep>(
+            r#"
+on: guest
+name: bad-step
+run: echo ok
+surprise: nope
+"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown field"));
     }
 }
