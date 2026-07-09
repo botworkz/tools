@@ -18,9 +18,7 @@ use super::log::{
     join_output_forwarders, print_step_status, print_step_title, spawn_output_forwarder,
     step_log_path, StepLogWriter, StepOutputStream,
 };
-use super::step::{
-    resolve_shell, ArchiveStep, RunStep, StepTarget, TestStep, TopLevelUpload, UploadStep,
-};
+use super::step::{resolve_shell, ArchiveStep, RunStep, StepTarget, TestStep, TopLevelUpload};
 
 const TEST_SSH_READY_TIMEOUT: Duration = Duration::from_secs(300);
 const TEST_TRANSPORT_RETRIES: usize = 10;
@@ -28,7 +26,6 @@ const TEST_TRANSPORT_RETRY_DELAY: Duration = Duration::from_secs(2);
 const TEST_STABLE_SSH_ATTEMPTS: usize = 5;
 const TEST_STABLE_SSH_REQUIRED: usize = 2;
 type ArchiveExecutor<'a> = dyn FnMut(usize, &ArchiveStep) -> Result<()> + 'a;
-type UploadExecutor<'a> = dyn FnMut(usize, &UploadStep) -> Result<()> + 'a;
 
 pub(crate) struct StepFlowPlan<'a> {
     pub(crate) top_level_uploads: &'a [TopLevelUpload],
@@ -83,7 +80,6 @@ pub(crate) fn run_test_flow(
             cloud_init_timeout: Duration::from_secs(config.cloud_init_timeout),
         },
         None,
-        None,
     )
     .map(|_| ())
 }
@@ -96,7 +92,6 @@ pub(crate) fn run_step_flow(
     ssh: &SshOptions,
     timeouts: StepTimeoutPolicy,
     mut archive_executor: Option<&mut ArchiveExecutor<'_>>,
-    mut upload_executor: Option<&mut UploadExecutor<'_>>,
 ) -> Result<Instant> {
     let overall_deadline = Instant::now() + timeouts.overall_timeout;
     let step_log_dir = repo_root.join("build").join("logs");
@@ -195,88 +190,11 @@ pub(crate) fn run_step_flow(
                     );
                 }
             }
-            TestStep::Upload(step) => {
-                if let Some(executor) = upload_executor.as_mut() {
-                    executor(step_idx, step)
-                } else {
-                    let upload_name = step
-                        .upload
-                        .name
-                        .as_deref()
-                        .unwrap_or(step.upload.src.as_str());
-                    anyhow::bail!(
-                        "step {} ('{}') is an `upload` step, but upload execution is not enabled for this command",
-                        step_idx + 1,
-                        upload_name
-                    );
-                }
-            }
         };
         print_step_status(step_idx, step.display_name(), step_result.is_ok());
         step_result?;
     }
     Ok(overall_deadline)
-}
-
-pub(crate) fn stage_local_file_to_guest(
-    ssh: &SshOptions,
-    local_blob: &Path,
-    dest: &str,
-    temp_label: &str,
-) -> Result<()> {
-    let dest_q = shell_single_quote(dest);
-    let parent = Path::new(dest)
-        .parent()
-        .map(|p| p.to_string_lossy().into_owned())
-        .filter(|p| !p.is_empty() && p != "/");
-    if let Some(parent_dir) = parent {
-        ssh_with_retry(
-            ssh,
-            &format!("sudo mkdir -p {}", shell_single_quote(&parent_dir)),
-            1,
-            Duration::from_secs(0),
-            Duration::from_secs(30),
-        )
-        .with_context(|| {
-            format!(
-                "failed to create parent directory '{}' in guest",
-                parent_dir
-            )
-        })?;
-    }
-
-    let suffix = unique_suffix();
-    let remote_tmp = format!("/tmp/botforge-upload-{temp_label}-{suffix}");
-    scp_with_retry(
-        ssh,
-        local_blob,
-        &remote_tmp,
-        TEST_TRANSPORT_RETRIES,
-        TEST_TRANSPORT_RETRY_DELAY,
-    )
-    .with_context(|| format!("failed to scp file to guest destination '{dest}'"))?;
-
-    let remote_tmp_q = shell_single_quote(&remote_tmp);
-    let mv_result = ssh_with_retry(
-        ssh,
-        &format!("sudo mv {remote_tmp_q} {dest_q}"),
-        1,
-        Duration::from_secs(0),
-        Duration::from_secs(30),
-    )
-    .with_context(|| format!("failed to move file to '{dest}' in guest"));
-
-    if mv_result.is_err() {
-        let _ = ssh_with_retry(
-            ssh,
-            &format!("rm -f {remote_tmp_q}"),
-            1,
-            Duration::from_secs(0),
-            Duration::from_secs(10),
-        );
-    }
-
-    mv_result
 }
 
 /// Options controlling how `install_file_to_guest` places a file in the guest.
@@ -295,8 +213,7 @@ struct InstallOpts<'a> {
 
 /// Stage a local file to the guest using `sudo install`, applying the given `opts`.
 ///
-/// Unlike [`stage_local_file_to_guest`] (which uses `sudo mv`), this function uses
-/// `sudo install` so it can set mode, owner, and group atomically.  The temporary file
+/// Uses `sudo install` so it can set mode, owner, and group atomically.  The temporary file
 /// is always cleaned up after the install attempt.
 fn install_file_to_guest(
     ssh: &SshOptions,
@@ -558,18 +475,6 @@ fn run_run_step(
 
     match step.target {
         StepTarget::Guest => (|| -> Result<()> {
-            for upload in &step.uploads {
-                let src = resolve_under_root(context.repo_root, upload.src.clone());
-                scp_with_retry(
-                    context.ssh,
-                    &src,
-                    &upload.dest,
-                    TEST_TRANSPORT_RETRIES,
-                    TEST_TRANSPORT_RETRY_DELAY,
-                )
-                .with_context(|| format!("test step '{}' upload failed", step.name))?;
-            }
-
             let suffix = unique_suffix();
             let local_script =
                 std::env::temp_dir().join(format!("botforge-step-{step_idx}-{suffix}.sh"));
@@ -1901,7 +1806,6 @@ mod tests {
         let step = RunStep {
             target: StepTarget::Host,
             name: "timeout-step".to_string(),
-            uploads: vec![],
             run: "echo ok".to_string(),
             timeout: Some(45),
             shell: None,
@@ -1917,7 +1821,6 @@ mod tests {
         let step = RunStep {
             target: StepTarget::Host,
             name: "timeout-step".to_string(),
-            uploads: vec![],
             run: "echo ok".to_string(),
             timeout: None,
             shell: None,
