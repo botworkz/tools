@@ -178,7 +178,7 @@ Each entry supports the following fields:
 
 - `src` — **required** repo-relative path or glob, resolved under `--repo-root`.
   `*`, `**`, `?`, and `[...]` are supported. `@<shasset>` and `@://...` are
-  **not** supported here; use a standalone `upload:` or `archive:` step for
+  **not** supported here; use an `archive:` step for
   shasset assets.
 - `dest` — **required** absolute guest path. For glob `src`, `dest` must end in
   `/` and is treated as a guest base directory.
@@ -211,13 +211,12 @@ Semantics:
 
 Each entry in `steps:` has a required `on:` field that selects where it runs:
 
-- **`on: guest`** — runs inside the VM via SSH. `uploads:` scp files into the
-  guest first, then `run:` executes there. This is the traditional test step.
+- **`on: guest`** — runs inside the VM via SSH. `run:` executes inside the
+  guest. This is the traditional test step.
 - **`on: host`** — runs locally in the **botforge container / harness** (where
   botforge itself executes), _not_ inside the guest. Reaches the guest only
   via ports declared in `ports:`. Inherits the harness environment (so CI
-  variables such as `GH_TOKEN` are visible). `uploads:` is not valid on host
-  steps.
+  variables such as `GH_TOKEN` are visible).
 
 Steps execute in the exact order written; guest and host steps may interleave
 freely. This lets you flip guest state, hit the guest from outside, then
@@ -321,8 +320,7 @@ string instead, emit `""` from the expression.
 For this first iteration, `@://` is the only supported `uses:` scheme. Plain
 filesystem paths, `../` traversal, and other schemes are rejected.
 
-Config errors are reported at load time for: missing or invalid `on:`; `uploads:`
-on an `on: host` step; any `on: host` step present when `ports:` is empty;
+Config errors are reported at load time for: missing or invalid `on:`; any `on: host` step present when `ports:` is empty;
 invalid `shell:` value; invalid `uses:` scheme/path; `with:` key not declared
 by the fragment (`unexpected input '<name>' not declared by fragment <path>`);
 missing required input (`missing required input '<name>'`); type mismatch
@@ -420,7 +418,7 @@ currently are). If bash is unavailable the explicit `shell: sh` fallback
   `/tmp/botforge-step-<n>-<id>.sh`), then executed there via `ssh_with_retry`
   with the same 10-retry transport semantics as today. Each SSH attempt uses
   the effective step timeout and is also bounded by the overall document
-  `timeout`. The guest `uploads:` still happen first, exactly as before.
+  `timeout`. Guest steps execute `run:` over SSH with the same transport semantics.
 
 Temp script files (both the local container copy and the guest `/tmp` copy for
 guest steps) are removed best-effort after each step, on both success and
@@ -554,9 +552,6 @@ configured step.
   supported (see [Top-level `uploads:` (optional)](#top-level-uploads-optional)
   for details). Files are installed via `sudo install` so mode and ownership are
   applied atomically without a follow-up `chmod`/`chown` step.
-
-The existing standalone `upload:` step and per-run-step `uploads:` field are
-unchanged; top-level `uploads:` is an additive pre-staging mechanism.
 
 #### `bootcmd:` (optional) — early first-boot commands
 

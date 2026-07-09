@@ -2,7 +2,6 @@ use anyhow::Result;
 use serde::de::{self, Deserializer};
 use serde::Deserialize;
 use serde_yaml::Value;
-use std::path::PathBuf;
 
 /// Where a test step executes: inside the guest (SSH) or on the harness host (local).
 #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -23,9 +22,6 @@ pub(crate) struct RunStep {
     #[serde(rename = "on")]
     pub(crate) target: StepTarget,
     pub(crate) name: String,
-    /// Files to scp into the guest before running. Only valid on `on: guest` steps.
-    #[serde(default)]
-    pub(crate) uploads: Vec<TestUpload>,
     pub(crate) run: String,
     #[serde(default, deserialize_with = "deserialize_optional_positive_seconds")]
     pub(crate) timeout: Option<u64>,
@@ -59,8 +55,6 @@ pub(crate) struct ArchiveStep {
     #[serde(rename = "on", default)]
     pub(crate) target: Option<StepTarget>,
     #[serde(default)]
-    pub(crate) uploads: Vec<TestUpload>,
-    #[serde(default)]
     pub(crate) run: Option<String>,
     #[serde(default, deserialize_with = "deserialize_optional_positive_seconds")]
     pub(crate) timeout: Option<u64>,
@@ -68,40 +62,10 @@ pub(crate) struct ArchiveStep {
     pub(crate) shell: Option<String>,
 }
 
-/// Spec for a standalone `upload` step: deliver a single file verbatim into the guest.
-///
-/// Unlike `archive`, no extraction is performed — the resolved blob is placed at `dest` as-is.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct UploadStepSpec {
-    /// Source of the file to deliver.
-    ///
-    /// - `@<shasset-name>`: external asset fetched and verified via shasset.
-    /// - A repo-relative path (no `@` prefix): internal file delivered verbatim.
-    /// - `@://build/<id>` is reserved for a future build-output resolver and is
-    ///   currently rejected.
-    pub(crate) src: String,
-    /// Absolute guest path where the resolved file is placed (e.g. `/etc/foo/thing`).
-    pub(crate) dest: String,
-    /// Optional human-readable display name shown in step output.
-    #[serde(default)]
-    pub(crate) name: Option<String>,
-    /// Where the file is delivered. Only `guest` is valid; may be omitted (defaults to guest).
-    #[serde(rename = "on", default)]
-    pub(crate) target: Option<StepTarget>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct UploadStep {
-    pub(crate) upload: UploadStepSpec,
-}
-
 #[derive(Debug)]
 pub(crate) enum TestStep {
     Run(RunStep),
     Archive(ArchiveStep),
-    Upload(UploadStep),
 }
 
 impl TestStep {
@@ -113,11 +77,6 @@ impl TestStep {
                 .name
                 .as_deref()
                 .unwrap_or(step.archive.src.as_str()),
-            Self::Upload(step) => step
-                .upload
-                .name
-                .as_deref()
-                .unwrap_or(step.upload.src.as_str()),
         }
     }
 }
@@ -134,22 +93,11 @@ impl<'de> Deserialize<'de> for TestStep {
                     .map(Self::Archive)
                     .map_err(de::Error::custom);
             }
-            if mapping.contains_key(Value::String("upload".to_string())) {
-                return serde_yaml::from_value::<UploadStep>(value)
-                    .map(Self::Upload)
-                    .map_err(de::Error::custom);
-            }
         }
         serde_yaml::from_value::<RunStep>(value)
             .map(Self::Run)
             .map_err(de::Error::custom)
     }
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct TestUpload {
-    pub(crate) src: PathBuf,
-    pub(crate) dest: String,
 }
 
 #[derive(Debug, Deserialize, Clone, PartialEq, Eq, Default)]
