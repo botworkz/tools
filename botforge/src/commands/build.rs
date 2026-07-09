@@ -21,11 +21,10 @@ use crate::util::{
 };
 
 use crate::plan::config::CompressConfig;
-use crate::plan::step::{ArchiveStep, StepTarget, TestStep, UploadStep};
+use crate::plan::step::{ArchiveStep, StepTarget, TestStep};
 use crate::plan::{
     load_build_config, preserve_failed_build_disk, print_log_tail, run_step_flow,
-    shutdown_build_vm, validate_build_steps, vm::stage_local_file_to_guest, vm::StepFlowPlan,
-    vm::StepTimeoutPolicy,
+    shutdown_build_vm, validate_build_steps, vm::StepFlowPlan, vm::StepTimeoutPolicy,
 };
 
 #[derive(Args, Debug)]
@@ -205,16 +204,6 @@ pub(crate) fn cmd_build(config: &Path, args: BuildArgs) -> Result<()> {
             &ssh_options,
         )
     };
-    let mut upload_executor = |step_idx: usize, step: &UploadStep| -> Result<()> {
-        run_upload_step(
-            config,
-            &repo_root,
-            args.cache_dir.as_deref(),
-            step_idx,
-            step,
-            &ssh_options,
-        )
-    };
     let step_result = run_step_flow(
         &repo_root,
         StepFlowPlan {
@@ -229,7 +218,6 @@ pub(crate) fn cmd_build(config: &Path, args: BuildArgs) -> Result<()> {
             cloud_init_timeout: std::time::Duration::from_secs(build_config.cloud_init_timeout),
         },
         Some(&mut archive_executor),
-        Some(&mut upload_executor),
     );
     let overall_deadline = match step_result {
         Ok(overall_deadline) => overall_deadline,
@@ -634,69 +622,6 @@ fn run_archive_step(
             relative_unpacked.display()
         );
     }
-
-    Ok(())
-}
-
-fn run_upload_step(
-    manifest_path: &Path,
-    repo_root: &Path,
-    cache_dir_override: Option<&Path>,
-    step_idx: usize,
-    step: &UploadStep,
-    ssh: &SshOptions,
-) -> Result<()> {
-    let spec = &step.upload;
-    let src = spec.src.trim();
-    let dest = spec.dest.as_str();
-    let name = spec.name.as_deref().unwrap_or(src);
-
-    // Resolve the source blob: shasset ref (`@<name>`) or repo-relative path.
-    let local_blob: PathBuf = if let Some(asset_key) = src.strip_prefix('@') {
-        // External: fetch from shasset manifest.
-        let manifest = load(manifest_path).with_context(|| {
-            format!("cannot load shasset manifest: {}", manifest_path.display())
-        })?;
-        let cache_dir = cache_dir_override
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(default_cache_dir);
-        let asset = manifest.assets.get(asset_key).with_context(|| {
-            format!(
-                "upload step '{}': asset '{}' not found in manifest {}",
-                name,
-                asset_key,
-                manifest_path.display()
-            )
-        })?;
-        let fetched = fetch_asset(FetchParams {
-            name: asset_key,
-            asset,
-            out_dir: None,
-            cache_dir: &cache_dir,
-            retries: manifest.settings.retries,
-            backoff: &manifest.settings.backoff,
-            compute_checksum: true,
-            no_reverify: false,
-            materialize_mode: MaterializeMode::Copy,
-            transport: None,
-        })
-        .with_context(|| format!("failed to fetch upload asset '{asset_key}'"))?;
-        fetched.blob_path
-    } else {
-        // Internal: repo-relative path, resolved under repo_root.
-        resolve_under_root(repo_root, PathBuf::from(src))
-    };
-
-    // SCP the resolved blob verbatim to `dest` in the guest (no extraction).
-    stage_local_file_to_guest(ssh, &local_blob, dest, &step_idx.to_string())
-        .with_context(|| format!("upload step '{}': failed to stage file into guest", name))?;
-
-    println!(
-        "upload step {} ('{}') placed at {}",
-        step_idx + 1,
-        name,
-        dest
-    );
 
     Ok(())
 }

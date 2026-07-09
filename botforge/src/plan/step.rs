@@ -68,40 +68,10 @@ pub(crate) struct ArchiveStep {
     pub(crate) shell: Option<String>,
 }
 
-/// Spec for a standalone `upload` step: deliver a single file verbatim into the guest.
-///
-/// Unlike `archive`, no extraction is performed — the resolved blob is placed at `dest` as-is.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct UploadStepSpec {
-    /// Source of the file to deliver.
-    ///
-    /// - `@<shasset-name>`: external asset fetched and verified via shasset.
-    /// - A repo-relative path (no `@` prefix): internal file delivered verbatim.
-    /// - `@://build/<id>` is reserved for a future build-output resolver and is
-    ///   currently rejected.
-    pub(crate) src: String,
-    /// Absolute guest path where the resolved file is placed (e.g. `/etc/foo/thing`).
-    pub(crate) dest: String,
-    /// Optional human-readable display name shown in step output.
-    #[serde(default)]
-    pub(crate) name: Option<String>,
-    /// Where the file is delivered. Only `guest` is valid; may be omitted (defaults to guest).
-    #[serde(rename = "on", default)]
-    pub(crate) target: Option<StepTarget>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct UploadStep {
-    pub(crate) upload: UploadStepSpec,
-}
-
 #[derive(Debug)]
 pub(crate) enum TestStep {
     Run(RunStep),
     Archive(ArchiveStep),
-    Upload(UploadStep),
 }
 
 impl TestStep {
@@ -113,11 +83,6 @@ impl TestStep {
                 .name
                 .as_deref()
                 .unwrap_or(step.archive.src.as_str()),
-            Self::Upload(step) => step
-                .upload
-                .name
-                .as_deref()
-                .unwrap_or(step.upload.src.as_str()),
         }
     }
 }
@@ -132,11 +97,6 @@ impl<'de> Deserialize<'de> for TestStep {
             if mapping.contains_key(Value::String("archive".to_string())) {
                 return serde_yaml::from_value::<ArchiveStep>(value)
                     .map(Self::Archive)
-                    .map_err(de::Error::custom);
-            }
-            if mapping.contains_key(Value::String("upload".to_string())) {
-                return serde_yaml::from_value::<UploadStep>(value)
-                    .map(Self::Upload)
                     .map_err(de::Error::custom);
             }
         }
