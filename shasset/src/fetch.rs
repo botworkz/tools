@@ -1650,6 +1650,7 @@ mod tests {
             filename: Some("tool.bin".to_string()),
             auth: None,
             platform: None,
+            archive: false,
         }
     }
 
@@ -1878,6 +1879,7 @@ mod tests {
             filename: Some("tool.bin".to_string()),
             auth: None,
             platform: None,
+            archive: false,
         };
         let cache = TempDir::new().unwrap();
         let (transport, calls) = MockTransport::new(data.to_vec());
@@ -1945,6 +1947,7 @@ mod tests {
             filename: None,
             auth: Some("${SHASSET_TEST_TOKEN}".to_string()),
             platform: None,
+            archive: false,
         };
         std::env::set_var("SHASSET_TEST_TOKEN", "token123");
 
@@ -2032,6 +2035,7 @@ mod tests {
             filename: None,
             auth: Some("${SHASSET_TEST_TOKEN}".to_string()),
             platform: None,
+            archive: false,
         };
         std::env::set_var("SHASSET_TEST_TOKEN", "token123");
 
@@ -2101,6 +2105,7 @@ mod tests {
             filename: None,
             auth: None,
             platform: None,
+            archive: false,
         };
         let out = TempDir::new().unwrap();
         let cache = TempDir::new().unwrap();
@@ -2143,6 +2148,7 @@ mod tests {
             filename: None,
             auth: None,
             platform: None,
+            archive: false,
         };
 
         let err = download_via_scheme(
@@ -2375,6 +2381,7 @@ mod tests {
             filename: Some("svc.tar".to_string()),
             auth: None,
             platform: None,
+            archive: false,
         };
 
         let cache = TempDir::new().unwrap();
@@ -2489,6 +2496,7 @@ mod tests {
             filename: Some("svc.tar".to_string()),
             auth: None,
             platform: None,
+            archive: false,
         };
 
         let cache = TempDir::new().unwrap();
@@ -2545,6 +2553,7 @@ mod tests {
             filename: Some("svc.tar".to_string()),
             auth: None,
             platform: None,
+            archive: false,
         };
 
         let cache = TempDir::new().unwrap();
@@ -2616,6 +2625,7 @@ mod tests {
             filename: Some("svc.tar".to_string()),
             auth: None,
             platform: None,
+            archive: false,
         };
 
         let cache = TempDir::new().unwrap();
@@ -2707,6 +2717,7 @@ mod tests {
             filename: Some("svc.tar".to_string()),
             auth: None,
             platform: None,
+            archive: false,
         };
 
         let cache = TempDir::new().unwrap();
@@ -2763,6 +2774,7 @@ mod tests {
             filename: Some("svc.tar".to_string()),
             auth: None,
             platform: Some("linux/amd64".to_string()),
+            archive: false,
         };
 
         let cache = TempDir::new().unwrap();
@@ -2842,6 +2854,7 @@ mod tests {
                 filename: Some("svc.tar".to_string()),
                 auth: None,
                 platform: None,
+                archive: false,
             };
             let cache = TempDir::new().unwrap();
             let (transport, _) = MockTransport::with_outcomes(vec![
@@ -2913,6 +2926,7 @@ mod tests {
             filename: Some("svc.tar".to_string()),
             auth: None,
             platform: None,
+            archive: false,
         };
 
         let cache = TempDir::new().unwrap();
@@ -3002,6 +3016,7 @@ mod tests {
             filename: Some("svc.tar".to_string()),
             auth: None,
             platform: None,
+            archive: false,
         };
         let (transport1, _) = MockTransport::with_outcomes(vec![
             MockOutcome::Body {
@@ -3041,6 +3056,7 @@ mod tests {
             filename: Some("svc.tar".to_string()),
             auth: None,
             platform: None,
+            archive: false,
         };
         // Transport with NO outcomes — any real request would panic.
         let (transport2, calls2) = MockTransport::with_outcomes(vec![]);
@@ -3082,6 +3098,7 @@ mod tests {
             filename: Some("svc.tar".to_string()),
             auth: None,
             platform: None,
+            archive: false,
         };
 
         let cache = TempDir::new().unwrap();
@@ -3263,6 +3280,7 @@ mod tests {
             filename: Some("svc.tar".to_string()),
             auth: auth_value.map(str::to_string),
             platform: None,
+            archive: false,
         };
 
         let cache = TempDir::new().unwrap();

@@ -95,6 +95,16 @@ pub struct Asset {
     /// for OCI URIs that resolve to a single-platform manifest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub platform: Option<String>,
+    /// When `true`, this asset is an archive (tar, zip, etc.) that may be
+    /// traversed via `@<name>://path` references in botforge.  Defaults to
+    /// `false`.  Using a traversal reference (`@<name>://path`) against an
+    /// asset without `archive: true` is a hard resolution error.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub archive: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !b
 }
 
 impl Asset {
@@ -338,6 +348,7 @@ mod tests {
             filename: Some("svc.tar".to_string()),
             auth: None,
             platform: None,
+            archive: false,
         };
         assert_eq!(
             default_asset.resolved_platform().unwrap(),
@@ -379,6 +390,7 @@ mod tests {
                 filename: Some("svc.tar".to_string()),
                 auth: None,
                 platform: Some(raw.to_string()),
+                archive: false,
             };
             let err = asset.resolved_platform().unwrap_err();
             assert!(
@@ -401,6 +413,7 @@ mod tests {
             filename: Some("svc.tar".to_string()),
             auth: None,
             platform: None,
+            archive: false,
         }
     }
 

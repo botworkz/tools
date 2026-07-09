@@ -3,6 +3,7 @@ mod commands;
 mod iso;
 mod plan;
 mod qemu;
+mod resolver;
 mod ssh;
 mod util;
 
