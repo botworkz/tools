@@ -4,6 +4,7 @@ use serde_yaml::Value;
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 
+use crate::iso::BootcmdEntry;
 use crate::qemu::PortSpec;
 use crate::util::resolve_under_root;
 
@@ -217,6 +218,10 @@ pub(crate) struct BuildConfig {
     pub(crate) step_timeout: u64,
     pub(crate) timeout: u64,
     pub(crate) cloud_init_timeout: u64,
+    /// Optional cloud-init `bootcmd:` entries to merge into the first-boot
+    /// user-data.  Absent/empty ⇒ no `bootcmd:` key emitted (zero change to
+    /// existing behaviour).
+    pub(crate) bootcmd: Vec<BootcmdEntry>,
 }
 
 /// Raw deserialization target for a top-level `botforge build` document.
@@ -247,6 +252,11 @@ struct RawBuildDocument {
         deserialize_with = "deserialize_positive_seconds"
     )]
     timeout: u64,
+    /// Optional cloud-init `bootcmd:` entries.  Each item is either a plain
+    /// shell string or a sequence of strings (exec/argv form).  Absent or
+    /// empty ⇒ no `bootcmd:` key in the generated user-data.
+    #[serde(default)]
+    bootcmd: Vec<BootcmdEntry>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -386,6 +396,7 @@ pub(crate) fn load_build_config(repo_root: &Path, path: &Path) -> Result<BuildCo
         step_timeout: raw.step_timeout,
         timeout: raw.timeout,
         cloud_init_timeout: default_build_cloud_init_timeout(),
+        bootcmd: raw.bootcmd,
     })
 }
 
@@ -2392,6 +2403,155 @@ steps: []
         assert_eq!(config.step_timeout, 2400);
         assert_eq!(config.timeout, 9600);
         assert!(config.steps.is_empty());
+        assert!(config.bootcmd.is_empty(), "bootcmd should default to empty");
+    }
+
+    // -----------------------------------------------------------------
+    // bootcmd field tests
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_load_build_config_bootcmd_absent_is_empty() {
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            "type: build\nimage: \"@base\"\nsteps: []\n",
+        );
+        let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
+        assert!(
+            config.bootcmd.is_empty(),
+            "absent bootcmd must deserialize as empty vec"
+        );
+    }
+
+    #[test]
+    fn test_load_build_config_bootcmd_string_entries() {
+        use crate::iso::BootcmdEntry;
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            r#"
+type: build
+image: "@base"
+steps: []
+bootcmd:
+  - echo hello
+  - echo world
+"#,
+        );
+        let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
+        assert_eq!(config.bootcmd.len(), 2);
+        assert_eq!(
+            config.bootcmd[0],
+            BootcmdEntry::Shell("echo hello".to_string())
+        );
+        assert_eq!(
+            config.bootcmd[1],
+            BootcmdEntry::Shell("echo world".to_string())
+        );
+    }
+
+    #[test]
+    fn test_load_build_config_bootcmd_exec_entry() {
+        use crate::iso::BootcmdEntry;
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            r#"
+type: build
+image: "@base"
+steps: []
+bootcmd:
+  - [ cloud-init-per, once, mask-stack, sh, -c, "systemctl mask a.service" ]
+"#,
+        );
+        let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
+        assert_eq!(config.bootcmd.len(), 1);
+        assert_eq!(
+            config.bootcmd[0],
+            BootcmdEntry::Exec(vec![
+                "cloud-init-per".to_string(),
+                "once".to_string(),
+                "mask-stack".to_string(),
+                "sh".to_string(),
+                "-c".to_string(),
+                "systemctl mask a.service".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_load_build_config_bootcmd_mixed_entries() {
+        use crate::iso::BootcmdEntry;
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            r#"
+type: build
+image: "@base"
+steps: []
+bootcmd:
+  - echo shell-entry
+  - [ cloud-init-per, once, mask-stack, sh, -c, "systemctl mask a.service b.service" ]
+"#,
+        );
+        let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
+        assert_eq!(config.bootcmd.len(), 2);
+        assert_eq!(
+            config.bootcmd[0],
+            BootcmdEntry::Shell("echo shell-entry".to_string())
+        );
+        assert!(
+            matches!(&config.bootcmd[1], BootcmdEntry::Exec(args) if args[0] == "cloud-init-per"),
+            "second entry should be exec form: {:?}",
+            config.bootcmd[1]
+        );
+    }
+
+    #[test]
+    fn test_load_build_config_bootcmd_is_a_known_field() {
+        // Verify that `bootcmd:` is recognised as a known field and not silently
+        // discarded or treated as an error.  This guards against the field being
+        // accidentally removed from RawBuildDocument.
+        use crate::iso::BootcmdEntry;
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            r#"
+type: build
+image: "@base"
+steps: []
+bootcmd:
+  - echo hello
+"#,
+        );
+        let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
+        assert_eq!(config.bootcmd.len(), 1);
+        assert_eq!(
+            config.bootcmd[0],
+            BootcmdEntry::Shell("echo hello".to_string()),
+            "bootcmd entry must be preserved, not silently dropped"
+        );
+    }
+
+    #[test]
+    fn test_load_build_config_bootcmd_empty_list_is_empty() {
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            "type: build\nimage: \"@base\"\nsteps: []\nbootcmd: []\n",
+        );
+        let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
+        assert!(
+            config.bootcmd.is_empty(),
+            "explicit empty bootcmd list must deserialize as empty vec"
+        );
     }
 
     #[test]

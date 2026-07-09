@@ -118,9 +118,14 @@ pub(crate) fn cmd_test(args: TestArgs) -> Result<()> {
     // provisioner steps. When the caller supplied an explicit user, don't create
     // it in cloud-init (caller owns the account and its key).
     let user_data = if _kept_keypair.is_some() {
-        render_user_data(None, ssh_public_key.trim(), Some(ssh_user_string.as_str()))
+        render_user_data(
+            None,
+            ssh_public_key.trim(),
+            Some(ssh_user_string.as_str()),
+            &[],
+        )
     } else {
-        render_user_data(None, ssh_public_key.trim(), None)
+        render_user_data(None, ssh_public_key.trim(), None, &[])
     };
     write_seed_files(&seed_dir, &user_data)?;
     build_iso(&seed_dir, &seed_iso, "cidata")?;

@@ -1,8 +1,29 @@
 use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::util::{command_exists, run_command, unique_suffix};
+
+/// A single entry in a cloud-init `bootcmd:` list.
+///
+/// Cloud-init supports two forms for each entry:
+/// - A plain string, which it passes to `sh -c`.
+/// - A sequence of strings (argv/exec form), which cloud-init passes directly
+///   to `execvp`.  This is useful for `cloud-init-per` invocations such as
+///   `[ cloud-init-per, once, mask-stack, sh, -c, "systemctl mask …" ]`.
+///
+/// `#[serde(untagged)]` lets serde pick the right variant by structure: a YAML
+/// scalar becomes [`BootcmdEntry::Shell`] and a YAML sequence becomes
+/// [`BootcmdEntry::Exec`].
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(untagged)]
+pub(crate) enum BootcmdEntry {
+    /// A shell string passed to `sh -c` by cloud-init.
+    Shell(String),
+    /// An argv list executed directly by cloud-init (exec form).
+    Exec(Vec<String>),
+}
 
 const USER_DATA_PLACEHOLDER: &str = "REPLACE_WITH_SSH_PUBLIC_KEY";
 
@@ -53,19 +74,43 @@ pub(crate) fn render_user_data(
     template: Option<&str>,
     ssh_public_key: &str,
     ssh_user: Option<&str>,
+    bootcmd: &[BootcmdEntry],
 ) -> String {
     if let Some(template) = template {
         return template.replace(USER_DATA_PLACEHOLDER, ssh_public_key);
     }
-    if let Some(user) = ssh_user {
+    let base = if let Some(user) = ssh_user {
         // The named user is always a botforge-owned ephemeral installer: it needs
         // passwordless sudo to run provisioner steps and cloud-init waits, a
         // login shell for SSH execution, and key-only (locked password) access.
-        return format!(
+        format!(
             "#cloud-config\nusers:\n  - default\n  - name: {user}\n    shell: /bin/bash\n    lock_passwd: true\n    sudo: 'ALL=(ALL) NOPASSWD:ALL'\n    ssh_authorized_keys:\n      - {ssh_public_key}\n"
-        );
+        )
+    } else {
+        format!("#cloud-config\nssh_authorized_keys:\n  - {ssh_public_key}\n")
+    };
+    if bootcmd.is_empty() {
+        return base;
     }
-    format!("#cloud-config\nssh_authorized_keys:\n  - {ssh_public_key}\n")
+    let bootcmd_block = render_bootcmd_block(bootcmd);
+    format!("{base}{bootcmd_block}")
+}
+
+/// Serialize a non-empty `bootcmd` entry list into a `bootcmd:` YAML block
+/// suitable for appending to a `#cloud-config` document.
+///
+/// Uses `serde_yaml` so that string values are escaped/quoted correctly and
+/// the output is guaranteed to round-trip through a standard YAML parser.
+fn render_bootcmd_block(entries: &[BootcmdEntry]) -> String {
+    debug_assert!(!entries.is_empty(), "caller must check non-empty");
+    // Build a one-key mapping {"bootcmd": <entries>} and serialise it.
+    // serde_yaml 0.9 serialises a Mapping without a leading `---` document
+    // marker, so the result appends cleanly to the existing cloud-config string.
+    let yaml_value = serde_yaml::to_value(entries).expect("BootcmdEntry is always serializable");
+    let mut mapping = serde_yaml::Mapping::new();
+    mapping.insert(serde_yaml::Value::String("bootcmd".to_string()), yaml_value);
+    serde_yaml::to_string(&serde_yaml::Value::Mapping(mapping))
+        .expect("bootcmd mapping is always serializable")
 }
 
 pub(crate) fn write_seed_files(seed_dir: &Path, user_data: &str) -> Result<()> {
@@ -155,20 +200,20 @@ pub(crate) fn iso_args(
 
 #[cfg(test)]
 mod tests {
-    use super::{generate_installer_username, iso_args, render_user_data};
+    use super::{generate_installer_username, iso_args, render_user_data, BootcmdEntry};
     use std::path::Path;
 
     #[test]
     fn render_user_data_replaces_placeholder() {
         let template = "#cloud-config\nssh_authorized_keys:\n  - REPLACE_WITH_SSH_PUBLIC_KEY\n";
-        let rendered = render_user_data(Some(template), "ssh-ed25519 AAAA test", None);
+        let rendered = render_user_data(Some(template), "ssh-ed25519 AAAA test", None, &[]);
         assert!(rendered.contains("ssh-ed25519 AAAA test"));
         assert!(!rendered.contains("REPLACE_WITH_SSH_PUBLIC_KEY"));
     }
 
     #[test]
     fn render_user_data_no_user_emits_top_level_key() {
-        let rendered = render_user_data(None, "ssh-ed25519 AAAA nouser", None);
+        let rendered = render_user_data(None, "ssh-ed25519 AAAA nouser", None, &[]);
         assert!(rendered.contains("ssh_authorized_keys:"));
         assert!(rendered.contains("ssh-ed25519 AAAA nouser"));
         assert!(!rendered.contains("users:"));
@@ -177,8 +222,12 @@ mod tests {
 
     #[test]
     fn render_user_data_installer_has_sudo_key_and_lock_passwd() {
-        let rendered =
-            render_user_data(None, "ssh-ed25519 AAAA installer", Some("botforge-abc123"));
+        let rendered = render_user_data(
+            None,
+            "ssh-ed25519 AAAA installer",
+            Some("botforge-abc123"),
+            &[],
+        );
         // Must include the installer user entry
         assert!(
             rendered.contains("name: botforge-abc123"),
@@ -203,6 +252,147 @@ mod tests {
         assert!(
             rendered.contains("- default"),
             "missing default: {rendered}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // bootcmd tests
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn render_user_data_without_bootcmd_is_identical_to_baseline() {
+        // Empty bootcmd slice must produce byte-for-byte the same output as no
+        // bootcmd at all (regression guard: adding the parameter must not change
+        // existing behaviour).
+        let with_empty = render_user_data(None, "ssh-ed25519 AAAA key", Some("botforge-abc"), &[]);
+        let baseline = "#cloud-config\nusers:\n  - default\n  - name: botforge-abc\n    shell: /bin/bash\n    lock_passwd: true\n    sudo: 'ALL=(ALL) NOPASSWD:ALL'\n    ssh_authorized_keys:\n      - ssh-ed25519 AAAA key\n";
+        assert_eq!(
+            with_empty, baseline,
+            "empty bootcmd must not alter user-data"
+        );
+    }
+
+    #[test]
+    fn render_user_data_no_bootcmd_key_when_entries_absent() {
+        // Verify the no-user variant also produces no `bootcmd:` key when absent.
+        let rendered = render_user_data(None, "ssh-ed25519 AAAA key", None, &[]);
+        assert!(
+            !rendered.contains("bootcmd"),
+            "no bootcmd: key expected when entries are empty: {rendered}"
+        );
+    }
+
+    #[test]
+    fn render_user_data_single_string_bootcmd_entry() {
+        let entries = vec![BootcmdEntry::Shell("echo hello world".to_string())];
+        let rendered =
+            render_user_data(None, "ssh-ed25519 AAAA key", Some("botforge-abc"), &entries);
+
+        // Must contain the bootcmd: key
+        assert!(rendered.contains("bootcmd:"), "missing bootcmd: {rendered}");
+        // Must contain the shell string
+        assert!(
+            rendered.contains("echo hello world"),
+            "missing shell entry: {rendered}"
+        );
+        // Must still contain the installer user (botforge content preserved)
+        assert!(
+            rendered.contains("name: botforge-abc"),
+            "installer user must be preserved: {rendered}"
+        );
+        // Output must parse as valid YAML and round-trip the entry
+        let parsed: serde_yaml::Value =
+            serde_yaml::from_str(&rendered).expect("output must be valid YAML");
+        let bootcmd = parsed["bootcmd"]
+            .as_sequence()
+            .expect("bootcmd must be a sequence");
+        assert_eq!(bootcmd.len(), 1);
+        assert_eq!(bootcmd[0].as_str(), Some("echo hello world"));
+    }
+
+    #[test]
+    fn render_user_data_mixed_bootcmd_entries() {
+        let entries = vec![
+            BootcmdEntry::Shell("echo first".to_string()),
+            BootcmdEntry::Exec(vec![
+                "cloud-init-per".to_string(),
+                "once".to_string(),
+                "mask-stack".to_string(),
+                "sh".to_string(),
+                "-c".to_string(),
+                "systemctl mask a.service b.service".to_string(),
+            ]),
+        ];
+        let rendered =
+            render_user_data(None, "ssh-ed25519 AAAA key", Some("botforge-abc"), &entries);
+
+        // Must parse as valid YAML
+        let parsed: serde_yaml::Value =
+            serde_yaml::from_str(&rendered).expect("output must be valid YAML");
+        let bootcmd = parsed["bootcmd"]
+            .as_sequence()
+            .expect("bootcmd must be a sequence");
+        assert_eq!(bootcmd.len(), 2);
+
+        // First entry: plain string
+        assert_eq!(
+            bootcmd[0].as_str(),
+            Some("echo first"),
+            "first entry must be a plain string"
+        );
+
+        // Second entry: sequence (exec form)
+        let exec = bootcmd[1]
+            .as_sequence()
+            .expect("second entry must be a sequence");
+        assert_eq!(exec[0].as_str(), Some("cloud-init-per"));
+        assert_eq!(exec[1].as_str(), Some("once"));
+        assert_eq!(exec[5].as_str(), Some("systemctl mask a.service b.service"));
+
+        // Installer user must still be present
+        assert!(
+            rendered.contains("name: botforge-abc"),
+            "installer user must be preserved: {rendered}"
+        );
+    }
+
+    #[test]
+    fn render_user_data_bootcmd_with_special_chars_is_valid_yaml() {
+        // Strings with colons, quotes, etc. must be properly escaped.
+        let entries = vec![BootcmdEntry::Shell(
+            "sh -c 'systemctl mask a.service: echo done'".to_string(),
+        )];
+        let rendered = render_user_data(None, "ssh-ed25519 AAAA key", None, &entries);
+        // Must parse without error and round-trip the entry
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&rendered)
+            .expect("output must be valid YAML even with special chars");
+        let bootcmd = parsed["bootcmd"]
+            .as_sequence()
+            .expect("bootcmd must be a sequence");
+        assert_eq!(bootcmd.len(), 1);
+        assert!(
+            bootcmd[0].as_str().is_some(),
+            "entry must round-trip as a string"
+        );
+    }
+
+    #[test]
+    fn bootcmd_entry_deserialize_shell_form() {
+        let entry: BootcmdEntry = serde_yaml::from_str("echo hello").unwrap();
+        assert_eq!(entry, BootcmdEntry::Shell("echo hello".to_string()));
+    }
+
+    #[test]
+    fn bootcmd_entry_deserialize_exec_form() {
+        let entry: BootcmdEntry =
+            serde_yaml::from_str("- cloud-init-per\n- once\n- mask\n").unwrap();
+        assert_eq!(
+            entry,
+            BootcmdEntry::Exec(vec![
+                "cloud-init-per".to_string(),
+                "once".to_string(),
+                "mask".to_string()
+            ])
         );
     }
 

@@ -161,9 +161,14 @@ pub(crate) fn cmd_build(config: &Path, args: BuildArgs) -> Result<()> {
     // cloud-init (the caller owns the account); just inject the ephemeral key for the
     // default cloud-init user via the top-level ssh_authorized_keys path.
     let user_data = if botforge_owned {
-        render_user_data(None, ssh_public_key.trim(), Some(installer_user.as_str()))
+        render_user_data(
+            None,
+            ssh_public_key.trim(),
+            Some(installer_user.as_str()),
+            &build_config.bootcmd,
+        )
     } else {
-        render_user_data(None, ssh_public_key.trim(), None)
+        render_user_data(None, ssh_public_key.trim(), None, &build_config.bootcmd)
     };
     write_seed_files(&seed_dir, &user_data)?;
     build_iso(&seed_dir, &seed_iso, "cidata")?;
