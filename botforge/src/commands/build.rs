@@ -20,6 +20,7 @@ use crate::util::{
     unique_suffix,
 };
 
+use crate::plan::config::CompressConfig;
 use crate::plan::step::{ArchiveStep, StepTarget, TestStep, UploadStep};
 use crate::plan::{
     load_build_config, preserve_failed_build_disk, print_log_tail, run_step_flow,
@@ -309,17 +310,83 @@ pub(crate) fn cmd_build(config: &Path, args: BuildArgs) -> Result<()> {
     }
 
     // ---------------------------------------------------------------------------
-    // Disk lifecycle step 7 (was 6): atomic rename partial → output
+    // Disk lifecycle step 7 (was 6): commit partial → output (plain rename or
+    // compress-and-rename depending on the spec's `compress:` config).
     // ---------------------------------------------------------------------------
-    std::fs::rename(&partial, &output).with_context(|| {
-        format!(
-            "cannot atomically materialize output from {} to {}",
-            partial.display(),
-            output.display()
-        )
-    })?;
+    commit_output(&partial, &output, build_config.compress.as_ref())?;
 
     println!("built image at {}", output.display());
+    Ok(())
+}
+
+/// Build the `qemu-img convert` argument list for output compression.
+///
+/// Pure function — constructs the argv without invoking the process, enabling
+/// unit tests that mirror the existing `iso_args_*` test pattern.
+///
+/// Produces: `["convert", "-O", "qcow2", "-c", <partial>, <out>]`
+/// or with cluster_size: `["convert", "-O", "qcow2", "-c", "-o", "cluster_size=<val>", <partial>, <out>]`
+pub(crate) fn qemu_convert_args(
+    partial: &Path,
+    out: &Path,
+    cluster_size: Option<&str>,
+) -> Vec<String> {
+    let mut args = vec!["convert".into(), "-O".into(), "qcow2".into(), "-c".into()];
+    if let Some(cs) = cluster_size {
+        args.push("-o".into());
+        args.push(format!("cluster_size={cs}"));
+    }
+    args.push(partial.display().to_string());
+    args.push(out.display().to_string());
+    args
+}
+
+/// Commit `partial` to `output`, optionally compressing via `qemu-img convert`.
+///
+/// - `compress` is `None` or `Some { enabled: false, .. }` → plain atomic
+///   rename (byte-identical to prior behaviour).
+/// - `compress` is `Some { enabled: true, cluster_size }` → runs
+///   `qemu-img convert -O qcow2 -c [-o cluster_size=<val>] <partial> <tmp>`
+///   then atomically renames `<tmp>` to `output` and removes `partial`.
+fn commit_output(partial: &Path, output: &Path, compress: Option<&CompressConfig>) -> Result<()> {
+    match compress {
+        Some(c) if c.enabled => {
+            // Write to a temp path beside the output so the final rename is
+            // atomic (same filesystem as the intended output location).
+            let tmp = output.with_extension("partial.compress");
+            let args = qemu_convert_args(partial, &tmp, c.cluster_size.as_deref());
+            let status = Command::new("qemu-img")
+                .args(&args)
+                .status()
+                .context("failed to execute qemu-img convert")?;
+            if !status.success() {
+                bail!("qemu-img convert failed (exit status: {status})");
+            }
+            std::fs::rename(&tmp, output).with_context(|| {
+                format!(
+                    "cannot atomically materialize compressed output from {} to {}",
+                    tmp.display(),
+                    output.display()
+                )
+            })?;
+            std::fs::remove_file(partial).with_context(|| {
+                format!(
+                    "cannot remove partial disk after compression: {}",
+                    partial.display()
+                )
+            })?;
+        }
+        _ => {
+            // No compression — plain atomic rename (unchanged from prior behaviour).
+            std::fs::rename(partial, output).with_context(|| {
+                format!(
+                    "cannot atomically materialize output from {} to {}",
+                    partial.display(),
+                    output.display()
+                )
+            })?;
+        }
+    }
     Ok(())
 }
 
@@ -910,7 +977,7 @@ mod tests {
     use super::{
         archive_unpack_relative_path, failed_partial_path, guest_untar_command,
         installer_teardown_command, output_stem, parse_archive_asset_key, partial_path,
-        resolve_base_image_with_transport, unpack_archive_to_dir,
+        qemu_convert_args, resolve_base_image_with_transport, unpack_archive_to_dir,
     };
     use crate::cli::Cli;
     use clap::Parser;
@@ -1260,6 +1327,52 @@ mod tests {
         assert!(
             path.contains(&format!("-{step_idx}-")),
             "temp path should embed step index: {path}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // qemu_convert_args tests
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn qemu_convert_args_no_cluster_size() {
+        let args = qemu_convert_args(
+            Path::new("/build/out.qcow2.partial"),
+            Path::new("/build/out.qcow2"),
+            None,
+        );
+        assert_eq!(
+            args,
+            vec![
+                "convert",
+                "-O",
+                "qcow2",
+                "-c",
+                "/build/out.qcow2.partial",
+                "/build/out.qcow2",
+            ]
+        );
+    }
+
+    #[test]
+    fn qemu_convert_args_with_cluster_size() {
+        let args = qemu_convert_args(
+            Path::new("/build/out.qcow2.partial"),
+            Path::new("/build/out.qcow2"),
+            Some("1M"),
+        );
+        assert_eq!(
+            args,
+            vec![
+                "convert",
+                "-O",
+                "qcow2",
+                "-c",
+                "-o",
+                "cluster_size=1M",
+                "/build/out.qcow2.partial",
+                "/build/out.qcow2",
+            ]
         );
     }
 }

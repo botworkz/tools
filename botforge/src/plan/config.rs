@@ -206,6 +206,41 @@ pub(crate) fn parse_image_ref(raw: &str) -> Result<ImageRef> {
     Ok(ImageRef::ShassetDefault(name.to_string()))
 }
 
+/// Output-compression options for `botforge build`.
+///
+/// Modelled as an optional map with a required `enabled:` field so it can
+/// carry additional knobs without changing shape.  The struct is kept strict
+/// (`deny_unknown_fields`) to catch typos at parse time.
+///
+/// ```yaml
+/// # default off — plain atomic rename (byte-identical to today)
+/// # compress: absent
+///
+/// # on, qemu default cluster size
+/// compress:
+///   enabled: true
+///
+/// # on, explicit cluster size
+/// compress:
+///   enabled: true
+///   cluster_size: "1M"
+///
+/// # explicit off (equivalent to omitting the block)
+/// compress:
+///   enabled: false
+/// ```
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CompressConfig {
+    /// Whether compression is enabled.  Required — a `compress:` block without
+    /// `enabled:` is a hard parse error.
+    pub(crate) enabled: bool,
+    /// Optional cluster size passed verbatim as `-o cluster_size=<val>` to
+    /// `qemu-img convert`.  Omitted ⇒ qemu default cluster size.
+    #[serde(default)]
+    pub(crate) cluster_size: Option<String>,
+}
+
 /// Resolved configuration for a `botforge build` run.
 #[derive(Debug)]
 pub(crate) struct BuildConfig {
@@ -222,6 +257,9 @@ pub(crate) struct BuildConfig {
     /// user-data.  Absent/empty ⇒ no `bootcmd:` key emitted (zero change to
     /// existing behaviour).
     pub(crate) bootcmd: Vec<BootcmdEntry>,
+    /// Optional output compression.  `None` (or `Some { enabled: false }`) ⇒
+    /// plain atomic rename, byte-identical to existing behaviour.
+    pub(crate) compress: Option<CompressConfig>,
 }
 
 /// Raw deserialization target for a top-level `botforge build` document.
@@ -257,6 +295,9 @@ struct RawBuildDocument {
     /// empty ⇒ no `bootcmd:` key in the generated user-data.
     #[serde(default)]
     bootcmd: Vec<BootcmdEntry>,
+    /// Optional output-compression config.  Absent ⇒ plain atomic rename.
+    #[serde(default)]
+    compress: Option<CompressConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -397,6 +438,7 @@ pub(crate) fn load_build_config(repo_root: &Path, path: &Path) -> Result<BuildCo
         timeout: raw.timeout,
         cloud_init_timeout: default_build_cloud_init_timeout(),
         bootcmd: raw.bootcmd,
+        compress: raw.compress,
     })
 }
 
@@ -510,8 +552,8 @@ fn check_fragment_document_type(uses: &str, value: &Value) -> Result<()> {
 }
 
 /// Reject entrypoint-only sections (`ports:`, `isos:`, `diagnostics_units:`,
-/// `disk_size:`, `memsize:`, `smp:`, `step_timeout:`, `timeout:`) inside a
-/// `type: fragment` document.
+/// `disk_size:`, `memsize:`, `smp:`, `step_timeout:`, `timeout:`, `image:`,
+/// `compress:`) inside a `type: fragment` document.
 /// Serde would silently ignore them; this turns a misplaced key into an explicit
 /// load-time error.
 fn check_no_entrypoint_sections_in_fragment(path: &Path, value: &Value) -> Result<()> {
@@ -529,6 +571,7 @@ fn check_no_entrypoint_sections_in_fragment(path: &Path, value: &Value) -> Resul
         "step_timeout",
         "timeout",
         "image",
+        "compress",
     ] {
         if mapping.contains_key(Value::String(section.to_string())) {
             anyhow::bail!(
@@ -549,7 +592,7 @@ fn check_no_build_sections_in_test_doc(path: &Path, value: &Value) -> Result<()>
         Value::Mapping(m) => m,
         _ => return Ok(()),
     };
-    for section in &["disk_size", "memsize", "smp", "image"] {
+    for section in &["disk_size", "memsize", "smp", "image", "compress"] {
         if mapping.contains_key(Value::String(section.to_string())) {
             anyhow::bail!(
                 "{}: is not valid in a 'type: test' document ({})",
@@ -2551,6 +2594,138 @@ bootcmd:
         assert!(
             config.bootcmd.is_empty(),
             "explicit empty bootcmd list must deserialize as empty vec"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // compress field tests
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_load_build_config_compress_absent_is_none() {
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            "type: build\nimage: \"@base\"\nsteps: []\n",
+        );
+        let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
+        assert!(
+            config.compress.is_none(),
+            "absent compress must deserialize as None"
+        );
+    }
+
+    #[test]
+    fn test_load_build_config_compress_enabled_true_no_cluster_size() {
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            "type: build\nimage: \"@base\"\nsteps: []\ncompress:\n  enabled: true\n",
+        );
+        let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
+        let compress = config.compress.expect("compress should be Some");
+        assert!(compress.enabled, "enabled must be true");
+        assert!(
+            compress.cluster_size.is_none(),
+            "cluster_size must default to None"
+        );
+    }
+
+    #[test]
+    fn test_load_build_config_compress_enabled_true_with_cluster_size() {
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            "type: build\nimage: \"@base\"\nsteps: []\ncompress:\n  enabled: true\n  cluster_size: \"1M\"\n",
+        );
+        let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
+        let compress = config.compress.expect("compress should be Some");
+        assert!(compress.enabled);
+        assert_eq!(compress.cluster_size.as_deref(), Some("1M"));
+    }
+
+    #[test]
+    fn test_load_build_config_compress_enabled_false() {
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            "type: build\nimage: \"@base\"\nsteps: []\ncompress:\n  enabled: false\n",
+        );
+        let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
+        let compress = config.compress.expect("compress should be Some");
+        assert!(!compress.enabled, "enabled must be false");
+    }
+
+    #[test]
+    fn test_load_build_config_compress_missing_enabled_is_error() {
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            "type: build\nimage: \"@base\"\nsteps: []\ncompress:\n  cluster_size: \"1M\"\n",
+        );
+        let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("enabled") || msg.contains("missing"),
+            "error should mention missing enabled field: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_load_build_config_compress_unknown_field_is_error() {
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            "type: build\nimage: \"@base\"\nsteps: []\ncompress:\n  enabled: true\n  bogus: 1\n",
+        );
+        let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("bogus") || msg.contains("unknown"),
+            "error should mention unknown field: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_load_test_config_rejects_compress_section() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            "type: test\ncompress:\n  enabled: true\nsteps: []\n",
+        )
+        .unwrap();
+        let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("compress") && msg.contains("type: test"),
+            "error should reject compress in test doc: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_load_fragment_rejects_compress_section() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("frag.yaml"),
+            "type: fragment\ncompress:\n  enabled: true\nsteps: []\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            "type: test\nsteps:\n  - uses: \"@://frag.yaml\"\n",
+        )
+        .unwrap();
+        let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("compress"),
+            "error should reject compress in fragment doc: {msg}"
         );
     }
 
