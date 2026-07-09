@@ -221,6 +221,24 @@ pub(crate) fn parse_image_ref(raw: &str) -> Result<ImageRef> {
 /// Modelled as an optional map with a required `enabled:` field so it can
 /// carry additional knobs without changing shape.  The struct is kept strict
 /// (`deny_unknown_fields`) to catch typos at parse time.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum ReclaimMode {
+    /// Default — no reclaim step before commit.
+    #[default]
+    None,
+    /// Run in-guest `fstrim` as the last guest action before shutdown.
+    Fstrim,
+    /// Run host-side offline reclaim via qemu-nbd discard+fstrim after shutdown.
+    Discard,
+}
+
+/// Output-compression options for `botforge build`.
+///
+/// `reclaim` is nested under `compress` because it is primarily used to make
+/// `qemu-img convert -c` effective by reclaiming freed guest blocks before
+/// commit.  `reclaim` still runs even when `enabled: false` (plain rename) so
+/// users can reclaim space without compression.
 ///
 /// ```yaml
 /// # default off — plain atomic rename (byte-identical to today)
@@ -234,6 +252,11 @@ pub(crate) fn parse_image_ref(raw: &str) -> Result<ImageRef> {
 /// compress:
 ///   enabled: true
 ///   cluster_size: "1M"
+///
+/// # reclaim freed blocks before commit/compress
+/// compress:
+///   enabled: true
+///   reclaim: fstrim
 ///
 /// # explicit off (equivalent to omitting the block)
 /// compress:
@@ -249,6 +272,11 @@ pub(crate) struct CompressConfig {
     /// `qemu-img convert`.  Omitted ⇒ qemu default cluster size.
     #[serde(default)]
     pub(crate) cluster_size: Option<String>,
+    /// Optional reclaim mode that runs before commit/compress.
+    ///
+    /// Defaults to `none`. Runs even when `enabled: false`.
+    #[serde(default)]
+    pub(crate) reclaim: ReclaimMode,
 }
 
 /// Resolved configuration for a `botforge build` run.
@@ -1085,7 +1113,7 @@ mod tests {
     use super::{
         default_bootstrap_path, load_build_config, load_test_config, parse_image_ref,
         resolve_fragment_inputs, validate_build_steps, validate_test_ports, validate_test_steps,
-        ImageRef, InputDeclaration, InputType, TestConfig, TestIso, MAX_INCLUDE_DEPTH,
+        ImageRef, InputDeclaration, InputType, ReclaimMode, TestConfig, TestIso, MAX_INCLUDE_DEPTH,
     };
     use crate::plan::step::{
         ArchiveStep, ArchiveStepSpec, RunStep, StepTarget, TestStep, TopLevelUpload,
@@ -3048,6 +3076,11 @@ bootcmd:
             compress.cluster_size.is_none(),
             "cluster_size must default to None"
         );
+        assert_eq!(
+            compress.reclaim,
+            ReclaimMode::None,
+            "reclaim must default to none"
+        );
     }
 
     #[test]
@@ -3062,6 +3095,7 @@ bootcmd:
         let compress = config.compress.expect("compress should be Some");
         assert!(compress.enabled);
         assert_eq!(compress.cluster_size.as_deref(), Some("1M"));
+        assert_eq!(compress.reclaim, ReclaimMode::None);
     }
 
     #[test]
@@ -3075,6 +3109,63 @@ bootcmd:
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
         let compress = config.compress.expect("compress should be Some");
         assert!(!compress.enabled, "enabled must be false");
+        assert_eq!(compress.reclaim, ReclaimMode::None);
+    }
+
+    #[test]
+    fn test_load_build_config_compress_reclaim_fstrim() {
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            "type: build\nimage: \"@base\"\nsteps: []\ncompress:\n  enabled: true\n  reclaim: fstrim\n",
+        );
+        let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
+        let compress = config.compress.expect("compress should be Some");
+        assert!(compress.enabled);
+        assert_eq!(compress.reclaim, ReclaimMode::Fstrim);
+    }
+
+    #[test]
+    fn test_load_build_config_compress_reclaim_discard() {
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            "type: build\nimage: \"@base\"\nsteps: []\ncompress:\n  enabled: true\n  reclaim: discard\n",
+        );
+        let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
+        let compress = config.compress.expect("compress should be Some");
+        assert!(compress.enabled);
+        assert_eq!(compress.reclaim, ReclaimMode::Discard);
+    }
+
+    #[test]
+    fn test_load_build_config_compress_reclaim_none() {
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            "type: build\nimage: \"@base\"\nsteps: []\ncompress:\n  enabled: true\n  reclaim: none\n",
+        );
+        let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
+        let compress = config.compress.expect("compress should be Some");
+        assert!(compress.enabled);
+        assert_eq!(compress.reclaim, ReclaimMode::None);
+    }
+
+    #[test]
+    fn test_load_build_config_compress_enabled_false_reclaim_fstrim() {
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            "type: build\nimage: \"@base\"\nsteps: []\ncompress:\n  enabled: false\n  reclaim: fstrim\n",
+        );
+        let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
+        let compress = config.compress.expect("compress should be Some");
+        assert!(!compress.enabled);
+        assert_eq!(compress.reclaim, ReclaimMode::Fstrim);
     }
 
     #[test]
@@ -3084,6 +3175,22 @@ bootcmd:
             &repo,
             "build.yaml",
             "type: build\nimage: \"@base\"\nsteps: []\ncompress:\n  cluster_size: \"1M\"\n",
+        );
+        let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("enabled") || msg.contains("missing"),
+            "error should mention missing enabled field: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_load_build_config_compress_reclaim_missing_enabled_is_error() {
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            "type: build\nimage: \"@base\"\nsteps: []\ncompress:\n  reclaim: fstrim\n",
         );
         let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
         let msg = format!("{err:#}");
@@ -3106,6 +3213,38 @@ bootcmd:
         assert!(
             msg.contains("bogus") || msg.contains("unknown"),
             "error should mention unknown field: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_load_build_config_compress_reclaim_unknown_value_is_error() {
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            "type: build\nimage: \"@base\"\nsteps: []\ncompress:\n  enabled: true\n  reclaim: bogus\n",
+        );
+        let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("bogus") || msg.contains("unknown variant"),
+            "error should mention reclaim enum variant parse failure: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_load_build_config_compress_reclaim_typo_key_is_error() {
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            "type: build\nimage: \"@base\"\nsteps: []\ncompress:\n  enabled: true\n  recliam: fstrim\n",
+        );
+        let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("recliam") || msg.contains("unknown field"),
+            "error should mention typo key in strict compress map: {msg}"
         );
     }
 

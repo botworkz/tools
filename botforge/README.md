@@ -656,19 +656,31 @@ output — there is zero behaviour change for existing specs that omit the field
 before committing it.  When absent (the default), the disk is committed via a
 plain atomic rename — behaviour byte-identical to all prior botforge versions.
 
-`compress:` is a **map** with one required field (`enabled:`) and one optional
-field (`cluster_size:`):
+`compress:` is a **map** with one required field (`enabled:`) and two optional
+fields (`cluster_size:`, `reclaim:`):
 
 | Field | Required | Type | Description |
 |---|---|---|---|
 | `enabled` | **yes** | bool | `true` ⇒ compress; `false` ⇒ plain rename (same as omitting the block) |
 | `cluster_size` | no | string | Passed verbatim as `-o cluster_size=<val>` to `qemu-img convert`. Omit ⇒ qemu default. |
+| `reclaim` | no | enum | Reclaim freed blocks before commit: `none` (default), `fstrim`, or `discard`. |
 
 A `compress:` block **without** `enabled:` is a hard parse error.  Unknown
 fields inside the block (e.g. `clustersize`) are also hard errors
 (`deny_unknown_fields`), catching typos at load time.
 
-When `enabled: true`, `botforge build` runs:
+`reclaim:` always runs **before** commit/compression, and it still runs when
+`enabled: false` (plain rename). This lets you reclaim space even when you
+don't want `qemu-img convert -c`.
+
+- `reclaim: none` (default): no reclaim step (current behaviour).
+- `reclaim: fstrim`: in-guest `sudo fstrim -av` as the last guest action before
+  shutdown. Light-weight, but requires guest discard support.
+- `reclaim: discard`: host-side offline reclaim after shutdown via
+  `qemu-nbd --discard=unmap` + mount with `-o discard` + `fstrim -v`.
+  More robust, but requires `qemu-nbd`.
+
+When `enabled: true`, `botforge build` then runs:
 ```
 qemu-img convert -O qcow2 -c [-o cluster_size=<val>] <output>.partial <output>
 ```
@@ -691,9 +703,21 @@ compress:
   enabled: true
   cluster_size: "1M"
 
+# on, reclaim guest-freed blocks before convert -c
+# (useful when your build deletes large temporary payloads, e.g. docker image tars)
+compress:
+  enabled: true
+  cluster_size: "1M"
+  reclaim: fstrim
+
 # explicit off (equivalent to omitting the block)
 compress:
   enabled: false
+
+# plain rename output, but still reclaim space before commit
+compress:
+  enabled: false
+  reclaim: discard
 ```
 
 `compress:` is a `type: build`-only field; it is rejected in `type: test` and
