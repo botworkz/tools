@@ -652,36 +652,33 @@ fn run_upload_step(
     let name = spec.name.as_deref().unwrap_or(src);
 
     // Resolve the source blob: shasset ref (`@<name>`) or repo-relative path.
-    let local_blob: PathBuf = if let Some(asset_key) = src.strip_prefix('@') {
-        // External: fetch from shasset manifest.
-        let manifest = load(manifest_path).with_context(|| {
-            format!("cannot load shasset manifest: {}", manifest_path.display())
-        })?;
-        let cache_dir = cache_dir_override
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(default_cache_dir);
-        let asset = manifest.assets.get(asset_key).with_context(|| {
-            format!(
-                "upload step '{}': asset '{}' not found in manifest {}",
-                name,
-                asset_key,
-                manifest_path.display()
-            )
-        })?;
-        let fetched = fetch_asset(FetchParams {
-            name: asset_key,
-            asset,
-            out_dir: None,
-            cache_dir: &cache_dir,
-            retries: manifest.settings.retries,
-            backoff: &manifest.settings.backoff,
-            compute_checksum: true,
-            no_reverify: false,
-            materialize_mode: MaterializeMode::Copy,
-            transport: None,
-        })
-        .with_context(|| format!("failed to fetch upload asset '{asset_key}'"))?;
-        fetched.blob_path
+    let local_blob: PathBuf = if src.starts_with('@') {
+        use crate::resolver::{Reference, Resolver};
+        let reference = Reference::parse(src)
+            .with_context(|| format!("upload step '{}': invalid source reference", name))?;
+        match &reference {
+            Reference::Asset { name: asset_key, path: None } => {
+                // External: resolve via the resolver (fetches + verifies the blob).
+                let resolver = Resolver::new(
+                    repo_root,
+                    manifest_path,
+                    cache_dir_override.map(|p| p.to_path_buf()),
+                );
+                resolver
+                    .resolve(&reference)
+                    .with_context(|| {
+                        format!("upload step '{}': failed to resolve asset '{asset_key}'", name)
+                    })?
+                    .into_path()
+            }
+            _ => {
+                bail!(
+                    "upload step '{}': source reference '{}' is not accepted; \
+                     use `@<asset-name>` for shasset assets or a repo-relative path",
+                    name, src
+                )
+            }
+        }
     } else {
         // Internal: repo-relative path, resolved under repo_root.
         resolve_under_root(repo_root, PathBuf::from(src))
@@ -702,19 +699,25 @@ fn run_upload_step(
 }
 
 fn parse_archive_asset_key(src: &str) -> Result<&str> {
+    use crate::resolver::Reference;
     if src.is_empty() {
         bail!("archive `src` is required");
     }
-    if src.starts_with("@://") {
-        bail!("archive `src` does not support '@://' traversal");
+    let reference = Reference::parse(src)
+        .map_err(|_| anyhow::anyhow!("archive `src` must start with '@'"))?;
+    match reference {
+        Reference::Asset { path: None, .. } => {
+            // src is `@<name>`; return the name as a slice of `src`.
+            Ok(&src[1..])
+        }
+        _ => {
+            if src.contains("://") {
+                bail!("archive `src` does not support '@://' traversal")
+            } else {
+                bail!("archive `src` must include a shasset name after '@'")
+            }
+        }
     }
-    let Some(asset_key) = src.strip_prefix('@') else {
-        bail!("archive `src` must start with '@'");
-    };
-    if asset_key.trim().is_empty() {
-        bail!("archive `src` must include a shasset name after '@'");
-    }
-    Ok(asset_key)
 }
 
 fn archive_unpack_relative_path(

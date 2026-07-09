@@ -184,32 +184,36 @@ pub(crate) enum ImageRef {
 
 /// Parse the raw `image:` string from a `type: build` spec into an [`ImageRef`].
 ///
-/// Parsing rules (all errors are hard/parse-time):
-/// 1. Value must start with `@`; bare names are rejected.
-/// 2. Any value containing `://` is rejected (traversal not yet supported).
-/// 3. The part after `@` must be non-empty.
+/// Delegates to [`crate::resolver::Reference::parse`] for the grammar, then
+/// enforces the `image:`-specific policy:
+/// - Only `Reference::Asset { path: None }` is accepted (`@<name>` form).
+/// - `@` alone, `@output`, and all `://`-traversal forms are rejected.
 pub(crate) fn parse_image_ref(raw: &str) -> Result<ImageRef> {
-    if !raw.starts_with('@') {
-        anyhow::bail!(
+    use crate::resolver::Reference;
+    let reference = Reference::parse(raw).map_err(|_| {
+        anyhow::anyhow!(
             "image reference must use the `@` scheme (e.g. `@debian-base`); \
              bare names are not supported: {raw:?}"
-        );
+        )
+    })?;
+    match reference {
+        Reference::Asset { name, path: None } => Ok(ImageRef::ShassetDefault(name)),
+        Reference::Repo { path: None } => {
+            anyhow::bail!(
+                "image reference is missing a shasset name after `@` \
+                 (e.g. `@debian-base`)"
+            )
+        }
+        Reference::Asset { path: Some(_), .. }
+        | Reference::Repo { path: Some(_) }
+        | Reference::Output { .. } => {
+            anyhow::bail!(
+                "`@` scheme traversal (`@://…`) is not yet supported for image references; \
+                 use `@<shasset-name>` to resolve a provider's default artifact \
+                 (e.g. `@debian-base`)"
+            )
+        }
     }
-    if raw.contains("://") {
-        anyhow::bail!(
-            "`@` scheme traversal (`@://…`) is not yet supported; \
-             use `@<shasset-name>` to resolve a provider's default artifact \
-             (e.g. `@debian-base`)"
-        );
-    }
-    let name = &raw[1..]; // strip leading `@`
-    if name.is_empty() {
-        anyhow::bail!(
-            "image reference is missing a shasset name after `@` \
-             (e.g. `@debian-base`)"
-        );
-    }
-    Ok(ImageRef::ShassetDefault(name.to_string()))
 }
 
 /// Output-compression options for `botforge build`.
@@ -735,17 +739,31 @@ fn validate_input_type(name: &str, input_type: InputType, value: &str) -> Result
 }
 
 fn resolve_uses_path(repo_root: &Path, uses: &str) -> Result<PathBuf> {
-    let (scheme, raw_path) = uses
-        .split_once("://")
-        .ok_or_else(|| anyhow::anyhow!("invalid uses value '{uses}': expected @://<path>"))?;
-    match scheme {
-        "@" => {
-            let path = PathBuf::from(raw_path);
-            validate_uses_repo_path(&path)?;
-            Ok(resolve_under_root(repo_root, path))
+    use crate::resolver::Reference;
+
+    // Preserve backward-compatible error messages for schemes like `file://`
+    // that look plausible but are not the `@` reference grammar.
+    if !uses.starts_with('@') {
+        if let Some((scheme, _)) = uses.split_once("://") {
+            anyhow::bail!(
+                "unsupported uses scheme '{scheme}' in '{uses}'; only @://<path> is supported"
+            );
         }
-        other => anyhow::bail!(
-            "unsupported uses scheme '{other}' in '{uses}'; only @://<path> is supported"
+        anyhow::bail!("invalid uses value '{uses}': expected @://<path>");
+    }
+
+    // Parse as a Reference; path-validation errors (e.g. `..` segments, absolute
+    // paths) propagate via context so the caller sees the original diagnostic.
+    let reference = Reference::parse(uses)
+        .with_context(|| format!("invalid uses value '{uses}'"))?;
+
+    match reference {
+        Reference::Repo { path: Some(p) } => Ok(resolve_under_root(repo_root, p)),
+        Reference::Repo { path: None } => {
+            anyhow::bail!("invalid uses value '{uses}': expected @://<path>")
+        }
+        _ => anyhow::bail!(
+            "unsupported uses scheme in '{uses}'; only @://<path> is supported"
         ),
     }
 }
@@ -962,19 +980,32 @@ pub(crate) fn validate_build_steps(steps: &[TestStep]) -> Result<()> {
 
 fn validate_archive_build_step(step: &crate::plan::step::ArchiveStep) -> Result<()> {
     use crate::plan::step::StepTarget;
+    use crate::resolver::Reference;
     let name = step
         .archive
         .name
         .as_deref()
         .unwrap_or(step.archive.src.as_str());
-    if step.archive.src.trim().is_empty() {
+    let src = step.archive.src.trim();
+    if src.is_empty() {
         anyhow::bail!("build step '{name}': archive `src` is required and must be non-empty");
     }
-    if !step.archive.src.starts_with('@') {
-        anyhow::bail!("build step '{name}': archive `src` must start with '@'");
-    }
-    if step.archive.src.starts_with("@://") {
-        anyhow::bail!("build step '{name}': archive `src` does not support '@://' traversal");
+    let reference = Reference::parse(src).map_err(|_| {
+        anyhow::anyhow!("build step '{name}': archive `src` must start with '@'")
+    })?;
+    match reference {
+        Reference::Asset { path: None, .. } => {} // valid
+        _ => {
+            if src.contains("://") {
+                anyhow::bail!(
+                    "build step '{name}': archive `src` does not support '@://' traversal"
+                );
+            } else {
+                anyhow::bail!(
+                    "build step '{name}': archive `src` must include a shasset name after '@'"
+                );
+            }
+        }
     }
     if step.run.is_some() {
         anyhow::bail!("build step '{name}': `run` is not valid on an `archive` step");
@@ -1029,14 +1060,27 @@ fn validate_archive_build_step(step: &crate::plan::step::ArchiveStep) -> Result<
 
 fn validate_upload_build_step(step: &crate::plan::step::UploadStep) -> Result<()> {
     use crate::plan::step::StepTarget;
+    use crate::resolver::Reference;
     let spec = &step.upload;
     let name = spec.name.as_deref().unwrap_or(spec.src.as_str());
+    let src = spec.src.trim();
 
-    if spec.src.trim().is_empty() {
+    if src.is_empty() {
         anyhow::bail!("build step '{name}': upload `src` is required and must be non-empty");
     }
-    if spec.src.starts_with("@://") {
-        anyhow::bail!("build step '{name}': upload `src` does not support '@://' traversal");
+    // Validate `@`-prefixed sources via the resolver grammar; only `@<name>` is accepted.
+    if src.starts_with('@') {
+        let reference = Reference::parse(src).map_err(|_| {
+            anyhow::anyhow!("build step '{name}': upload `src` has an invalid `@` reference: {src:?}")
+        })?;
+        match reference {
+            Reference::Asset { path: None, .. } => {} // valid: `@<name>` asset reference
+            _ => {
+                anyhow::bail!(
+                    "build step '{name}': upload `src` does not support '@://' traversal"
+                );
+            }
+        }
     }
     if matches!(spec.target, Some(StepTarget::Host)) {
         anyhow::bail!(
