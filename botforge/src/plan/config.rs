@@ -1589,6 +1589,7 @@ steps:
             timeout: None,
             shell: None,
             sudo: None,
+            id: None,
         })
     }
 
@@ -1689,6 +1690,93 @@ steps:
         assert!(
             msg.contains("fish"),
             "error should mention shell name: {msg}"
+        );
+    }
+
+    // --- id field deserialization ---
+
+    #[test]
+    fn test_step_parses_id_field() {
+        let config: TestConfig = serde_yaml::from_str(
+            r#"
+steps:
+  - on: guest
+    name: my-step
+    id: my-step
+    run: echo hello
+"#,
+        )
+        .unwrap();
+        assert_eq!(run_ref(&config.steps[0]).id.as_deref(), Some("my-step"));
+    }
+
+    #[test]
+    fn test_step_without_id_defaults_to_none() {
+        let config: TestConfig = serde_yaml::from_str(
+            r#"
+steps:
+  - on: guest
+    name: no-id-step
+    run: echo hello
+"#,
+        )
+        .unwrap();
+        assert!(run_ref(&config.steps[0]).id.is_none());
+    }
+
+    #[test]
+    fn test_step_unknown_field_still_errors() {
+        let err = serde_yaml::from_str::<TestConfig>(
+            r#"
+steps:
+  - on: guest
+    name: my-step
+    run: echo hello
+    bogus_field: not-allowed
+"#,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("bogus_field") || msg.contains("unknown field"),
+            "error should mention the unknown field: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_step_id_flows_through_uses_fragment() {
+        let repo = TempDir::new().unwrap();
+        std::fs::create_dir_all(repo.path().join("shared")).unwrap();
+        std::fs::write(
+            repo.path().join("shared/frag.yaml"),
+            r#"
+type: fragment
+steps:
+  - on: guest
+    name: frag-step
+    id: my-frag-id
+    run: echo hello
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            r#"
+type: test
+steps:
+  - uses: "@://shared/frag.yaml"
+"#,
+        )
+        .unwrap();
+
+        let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+
+        assert_eq!(config.steps.len(), 1);
+        assert_eq!(run_ref(&config.steps[0]).name, "frag-step");
+        assert_eq!(
+            run_ref(&config.steps[0]).id.as_deref(),
+            Some("my-frag-id"),
+            "id should be preserved through fragment splice"
         );
     }
 
