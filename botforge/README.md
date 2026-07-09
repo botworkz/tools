@@ -421,6 +421,8 @@ memsize: 4096                    # optional, default 4096 MiB
 smp: 4                           # optional, default 4 vCPUs
 step_timeout: 1800               # optional, default 1800 s; applies to each step
 timeout: 7200                    # optional, default 7200 s; overall wall-clock budget
+bootcmd:                         # optional; merged into the first-boot cloud-init user-data
+  - echo "early boot hook"
 steps:
   - on: guest
     name: provision
@@ -488,6 +490,55 @@ steps run inside the qemu VM via SSH; host steps run in the botforge container.
 `type: test`).
 
 Reusable `uses:` fragment includes work exactly as in `type: test`.
+
+#### `bootcmd:` (optional) — early first-boot commands
+
+`bootcmd:` injects commands into the cloud-init **`bootcmd`** module of the
+first-boot user-data that `botforge build` generates.  The `bootcmd` module
+runs very early in the boot sequence — before `multi-user.target` and before
+most systemd services start — making it the right hook for operations that
+must complete before the service stack activates (e.g. masking units so they
+never start during the provisioning boot).
+
+**`bootcmd:` does NOT replace botforge's generated user-data.** The installer
+user, SSH key injection, and sudo grant that botforge creates remain
+authoritative; `bootcmd:` entries are merged in as an additional top-level key
+in the same `#cloud-config` document.
+
+Each list item is either:
+- A **plain string** — cloud-init passes it to `sh -c`.
+- A **sequence of strings** — cloud-init runs it directly via `execvp`
+  (useful for `cloud-init-per`, `systemctl`, etc.).
+
+**Example — mask systemd units before they start:**
+
+```yaml
+type: build
+image: "@botwork-vm"
+bootcmd:
+  # Mask the application stack before multi-user.target; the provisioning
+  # steps will unmask them after plugin installation.
+  - - cloud-init-per
+    - once
+    - mask-app-stack
+    - sh
+    - -c
+    - >-
+      systemctl mask
+      botwork-api.service
+      botwork-envoy.service
+      botwork-ui.service
+steps:
+  - on: guest
+    name: install-plugins
+    run: sudo bash /opt/install-plugins.sh
+  - on: guest
+    name: unmask-app-stack
+    run: sudo systemctl unmask botwork-api.service botwork-envoy.service botwork-ui.service
+```
+
+Absent or empty `bootcmd:` produces user-data byte-identical to the current
+output — there is zero behaviour change for existing specs that omit the field.
 
 ## SSH verbosity
 
