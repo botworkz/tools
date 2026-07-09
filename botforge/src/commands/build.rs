@@ -20,7 +20,7 @@ use crate::util::{
     unique_suffix,
 };
 
-use crate::plan::config::CompressConfig;
+use crate::plan::config::{CompressConfig, ReclaimMode};
 use crate::plan::step::{ArchiveStep, StepTarget, TestStep};
 use crate::plan::{
     load_build_config, preserve_failed_build_disk, print_log_tail, run_step_flow,
@@ -81,6 +81,11 @@ pub(crate) fn cmd_build(config: &Path, args: BuildArgs) -> Result<()> {
     let output = resolve_under_root(&repo_root, args.output.clone());
 
     let build_config = load_build_config(&repo_root, &spec_path)?;
+    let reclaim_mode = build_config
+        .compress
+        .as_ref()
+        .map(|c| c.reclaim)
+        .unwrap_or_default();
     validate_build_steps(&build_config.steps)?;
     if build_config
         .steps
@@ -88,6 +93,9 @@ pub(crate) fn cmd_build(config: &Path, args: BuildArgs) -> Result<()> {
         .any(|step| matches!(step, TestStep::Archive(_)))
     {
         ensure_command("tar")?;
+    }
+    if matches!(reclaim_mode, ReclaimMode::Discard) {
+        ensure_command("qemu-nbd")?;
     }
 
     // Resolve the source qcow2: --source wins; otherwise fetch image via shasset.
@@ -283,6 +291,12 @@ pub(crate) fn cmd_build(config: &Path, args: BuildArgs) -> Result<()> {
         // only needs to wait for the VM to exit.
     }
 
+    if matches!(reclaim_mode, ReclaimMode::Fstrim) {
+        if let Err(err) = run_guest_reclaim_fstrim(&ssh_options, overall_deadline) {
+            eprintln!("warning: guest reclaim fstrim failed; continuing build: {err:#}");
+        }
+    }
+
     // ---------------------------------------------------------------------------
     // Disk lifecycle step 6 (was 5): graceful shutdown
     // ---------------------------------------------------------------------------
@@ -299,6 +313,10 @@ pub(crate) fn cmd_build(config: &Path, args: BuildArgs) -> Result<()> {
         eprintln!("build VM shutdown failed: {err:#}");
         print_log_tail(&vm_log, 200);
         return Err(err);
+    }
+
+    if matches!(reclaim_mode, ReclaimMode::Discard) {
+        reclaim_host_discard_offline(&partial)?;
     }
 
     // ---------------------------------------------------------------------------
@@ -782,6 +800,271 @@ fn run_installer_teardown(
     })
 }
 
+fn fstrim_guest_command() -> &'static str {
+    "sudo fstrim -av"
+}
+
+fn run_guest_reclaim_fstrim(ssh: &SshOptions, overall_deadline: Instant) -> Result<()> {
+    let timeout = overall_deadline
+        .saturating_duration_since(Instant::now())
+        .min(Duration::from_secs(30));
+    let timeout = if timeout.is_zero() {
+        Duration::from_secs(1)
+    } else {
+        timeout
+    };
+    ssh_with_retry(
+        ssh,
+        fstrim_guest_command(),
+        1,
+        Duration::from_secs(0),
+        timeout,
+    )
+    .context("guest fstrim reclaim failed")
+}
+
+fn qemu_nbd_connect_args(partial: &Path, nbd_device: &Path) -> Vec<String> {
+    vec![
+        "--discard=unmap".to_string(),
+        format!("--connect={}", nbd_device.display()),
+        partial.display().to_string(),
+    ]
+}
+
+fn qemu_nbd_disconnect_args(nbd_device: &Path) -> Vec<String> {
+    vec!["--disconnect".to_string(), nbd_device.display().to_string()]
+}
+
+fn mount_discard_args(block_device: &Path, mountpoint: &Path) -> Vec<String> {
+    vec![
+        "-o".to_string(),
+        "discard".to_string(),
+        block_device.display().to_string(),
+        mountpoint.display().to_string(),
+    ]
+}
+
+fn fstrim_mount_args(mountpoint: &Path) -> Vec<String> {
+    vec!["-v".to_string(), mountpoint.display().to_string()]
+}
+
+fn probe_nbd_device_ready(nbd_device: &Path, timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    let mut last_error = None;
+    while Instant::now() < deadline {
+        let output = Command::new("blockdev")
+            .arg("--getsize64")
+            .arg(nbd_device)
+            .output();
+        match output {
+            Ok(output) if output.status.success() => {
+                let size = String::from_utf8_lossy(&output.stdout)
+                    .trim()
+                    .parse::<u64>()
+                    .unwrap_or(0);
+                if size > 0 {
+                    return Ok(());
+                }
+            }
+            Ok(output) => {
+                last_error = Some(format!(
+                    "blockdev exited with status {}: {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ));
+            }
+            Err(err) => {
+                last_error = Some(format!("failed to execute blockdev: {err}"));
+            }
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    match last_error {
+        Some(err) => bail!(
+            "timed out waiting for nbd device {} to become ready: {err}",
+            nbd_device.display()
+        ),
+        None => bail!(
+            "timed out waiting for nbd device {} to become ready",
+            nbd_device.display()
+        ),
+    }
+}
+
+fn root_device_for_discard(nbd_device: &Path) -> Result<PathBuf> {
+    let output = Command::new("lsblk")
+        .arg("-brno")
+        .arg("PATH,TYPE,SIZE")
+        .arg(nbd_device)
+        .output()
+        .with_context(|| format!("failed to execute lsblk for {}", nbd_device.display()))?;
+    if !output.status.success() {
+        bail!(
+            "lsblk failed for {} (exit status: {})",
+            nbd_device.display(),
+            output.status
+        );
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut largest_part: Option<(u64, PathBuf)> = None;
+    let mut disk_path: Option<PathBuf> = None;
+    for line in stdout.lines() {
+        let mut cols = line.split_whitespace();
+        let Some(path) = cols.next() else { continue };
+        let Some(kind) = cols.next() else { continue };
+        let Some(size) = cols.next() else { continue };
+        let Ok(size) = size.parse::<u64>() else {
+            continue;
+        };
+        let path = PathBuf::from(path);
+        if kind == "disk" {
+            disk_path = Some(path.clone());
+        }
+        if kind == "part" {
+            match &largest_part {
+                Some((current, _)) if *current >= size => {}
+                _ => largest_part = Some((size, path)),
+            }
+        }
+    }
+
+    if let Some((_, part)) = largest_part {
+        return Ok(part);
+    }
+    if let Some(disk) = disk_path {
+        return Ok(disk);
+    }
+    bail!(
+        "could not determine partition layout for {} from lsblk output",
+        nbd_device.display()
+    )
+}
+
+fn ensure_nbd_devices_loaded() -> Result<()> {
+    let status = Command::new("modprobe")
+        .args(["nbd", "max_part=8"])
+        .status();
+    if let Err(err) = status {
+        eprintln!("warning: failed to run modprobe nbd max_part=8: {err}");
+    }
+    let nbd0 = Path::new("/dev/nbd0");
+    if !nbd0.exists() {
+        bail!(
+            "nbd device nodes are unavailable ({} missing) after attempting `modprobe nbd max_part=8`",
+            nbd0.display()
+        );
+    }
+    Ok(())
+}
+
+struct DiscardCleanup {
+    mountpoint: Option<PathBuf>,
+    mounted: bool,
+    nbd_device: Option<PathBuf>,
+}
+
+impl DiscardCleanup {
+    fn new() -> Self {
+        Self {
+            mountpoint: None,
+            mounted: false,
+            nbd_device: None,
+        }
+    }
+}
+
+impl Drop for DiscardCleanup {
+    fn drop(&mut self) {
+        if self.mounted {
+            if let Some(mountpoint) = &self.mountpoint {
+                let status = Command::new("umount").arg(mountpoint).status();
+                if let Err(err) = status {
+                    eprintln!(
+                        "warning: failed to unmount discard temp mountpoint {}: {err}",
+                        mountpoint.display()
+                    );
+                }
+            }
+        }
+        if let Some(nbd_device) = &self.nbd_device {
+            let args = qemu_nbd_disconnect_args(nbd_device);
+            let status = Command::new("qemu-nbd").args(&args).status();
+            if let Err(err) = status {
+                eprintln!(
+                    "warning: failed to disconnect qemu-nbd device {}: {err}",
+                    nbd_device.display()
+                );
+            }
+        }
+        if let Some(mountpoint) = &self.mountpoint {
+            if let Err(err) = std::fs::remove_dir_all(mountpoint) {
+                eprintln!(
+                    "warning: failed to remove discard temp mountpoint {}: {err}",
+                    mountpoint.display()
+                );
+            }
+        }
+    }
+}
+
+fn reclaim_host_discard_offline(partial: &Path) -> Result<()> {
+    ensure_nbd_devices_loaded()?;
+    let mut cleanup = DiscardCleanup::new();
+
+    let nbd_device = (0..16)
+        .map(|i| PathBuf::from(format!("/dev/nbd{i}")))
+        .find(|candidate| {
+            let args = qemu_nbd_connect_args(partial, candidate);
+            Command::new("qemu-nbd")
+                .args(&args)
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false)
+        })
+        .context("failed to attach image via qemu-nbd: no free /dev/nbd0..15 device")?;
+    cleanup.nbd_device = Some(nbd_device.clone());
+
+    probe_nbd_device_ready(&nbd_device, Duration::from_secs(10))?;
+    let root_device = root_device_for_discard(&nbd_device)?;
+
+    let mountpoint = create_temp_dir("botforge-reclaim-discard-mnt")?;
+    cleanup.mountpoint = Some(mountpoint.clone());
+
+    let mount_args = mount_discard_args(&root_device, &mountpoint);
+    let mount_status = Command::new("mount")
+        .args(&mount_args)
+        .status()
+        .with_context(|| {
+            format!(
+                "failed to execute mount for discard reclaim ({})",
+                root_device.display()
+            )
+        })?;
+    if !mount_status.success() {
+        bail!(
+            "mount failed for discard reclaim of {} (exit status: {mount_status})",
+            root_device.display()
+        );
+    }
+    cleanup.mounted = true;
+
+    let fstrim_args = fstrim_mount_args(&mountpoint);
+    let fstrim_status = Command::new("fstrim")
+        .args(&fstrim_args)
+        .status()
+        .with_context(|| {
+            format!(
+                "failed to execute host fstrim for discard reclaim at {}",
+                mountpoint.display()
+            )
+        })?;
+    if !fstrim_status.success() {
+        bail!("host fstrim failed during discard reclaim (exit status: {fstrim_status})");
+    }
+    Ok(())
+}
+
 /// Returns `<output>.partial` — the in-progress disk path during the build.
 fn partial_path(output: &Path) -> PathBuf {
     let mut name = output
@@ -851,9 +1134,10 @@ fn resize_qcow2(disk: &Path, size: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        archive_unpack_relative_path, failed_partial_path, guest_untar_command,
-        installer_teardown_command, output_stem, parse_archive_asset_key, partial_path,
-        qemu_convert_args, resolve_base_image_with_transport, unpack_archive_to_dir,
+        archive_unpack_relative_path, failed_partial_path, fstrim_guest_command, fstrim_mount_args,
+        guest_untar_command, installer_teardown_command, mount_discard_args, output_stem,
+        parse_archive_asset_key, partial_path, qemu_convert_args, qemu_nbd_connect_args,
+        qemu_nbd_disconnect_args, resolve_base_image_with_transport, unpack_archive_to_dir,
     };
     use crate::cli::Cli;
     use clap::Parser;
@@ -1250,5 +1534,44 @@ mod tests {
                 "/build/out.qcow2",
             ]
         );
+    }
+
+    #[test]
+    fn fstrim_guest_command_matches_expected_literal() {
+        assert_eq!(fstrim_guest_command(), "sudo fstrim -av");
+    }
+
+    #[test]
+    fn qemu_nbd_connect_args_include_discard_unmap() {
+        let args = qemu_nbd_connect_args(
+            Path::new("/build/out.qcow2.partial"),
+            Path::new("/dev/nbd3"),
+        );
+        assert_eq!(
+            args,
+            vec![
+                "--discard=unmap",
+                "--connect=/dev/nbd3",
+                "/build/out.qcow2.partial",
+            ]
+        );
+    }
+
+    #[test]
+    fn qemu_nbd_disconnect_args_match_expected_argv() {
+        let args = qemu_nbd_disconnect_args(Path::new("/dev/nbd3"));
+        assert_eq!(args, vec!["--disconnect", "/dev/nbd3"]);
+    }
+
+    #[test]
+    fn mount_discard_args_match_expected_argv() {
+        let args = mount_discard_args(Path::new("/dev/nbd3p2"), Path::new("/tmp/mnt"));
+        assert_eq!(args, vec!["-o", "discard", "/dev/nbd3p2", "/tmp/mnt"]);
+    }
+
+    #[test]
+    fn fstrim_mount_args_match_expected_argv() {
+        let args = fstrim_mount_args(Path::new("/tmp/mnt"));
+        assert_eq!(args, vec!["-v", "/tmp/mnt"]);
     }
 }
