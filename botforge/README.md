@@ -423,6 +423,9 @@ step_timeout: 1800               # optional, default 1800 s; applies to each ste
 timeout: 7200                    # optional, default 7200 s; overall wall-clock budget
 bootcmd:                         # optional; merged into the first-boot cloud-init user-data
   - echo "early boot hook"
+compress:                        # optional; absent = plain rename (no compression)
+  enabled: true
+  cluster_size: "1M"             # optional; omit for qemu default
 steps:
   - on: guest
     name: provision
@@ -539,6 +542,55 @@ steps:
 
 Absent or empty `bootcmd:` produces user-data byte-identical to the current
 output — there is zero behaviour change for existing specs that omit the field.
+
+#### `compress:` (optional) — compress the output qcow2
+
+`compress:` controls whether `botforge build` compresses the output qcow2
+before committing it.  When absent (the default), the disk is committed via a
+plain atomic rename — behaviour byte-identical to all prior botforge versions.
+
+`compress:` is a **map** with one required field (`enabled:`) and one optional
+field (`cluster_size:`):
+
+| Field | Required | Type | Description |
+|---|---|---|---|
+| `enabled` | **yes** | bool | `true` ⇒ compress; `false` ⇒ plain rename (same as omitting the block) |
+| `cluster_size` | no | string | Passed verbatim as `-o cluster_size=<val>` to `qemu-img convert`. Omit ⇒ qemu default. |
+
+A `compress:` block **without** `enabled:` is a hard parse error.  Unknown
+fields inside the block (e.g. `clustersize`) are also hard errors
+(`deny_unknown_fields`), catching typos at load time.
+
+When `enabled: true`, `botforge build` runs:
+```
+qemu-img convert -O qcow2 -c [-o cluster_size=<val>] <output>.partial <output>
+```
+then atomically renames the result into place and removes the `.partial` file.
+A non-zero exit from `qemu-img` is a hard error.  `qemu-img` is already
+required by `botforge build`, so no new dependency is introduced.
+
+**Examples:**
+
+```yaml
+# off (default) — plain atomic rename, byte-identical to prior behaviour
+# (compress: absent)
+
+# on, qemu default cluster size
+compress:
+  enabled: true
+
+# on, explicit cluster size (e.g. to match space's bake output)
+compress:
+  enabled: true
+  cluster_size: "1M"
+
+# explicit off (equivalent to omitting the block)
+compress:
+  enabled: false
+```
+
+`compress:` is a `type: build`-only field; it is rejected in `type: test` and
+`type: fragment` documents at load time.
 
 ## SSH verbosity
 
