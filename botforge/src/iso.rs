@@ -103,14 +103,13 @@ pub(crate) fn render_user_data(
 /// the output is guaranteed to round-trip through a standard YAML parser.
 fn render_bootcmd_block(entries: &[BootcmdEntry]) -> String {
     debug_assert!(!entries.is_empty(), "caller must check non-empty");
-    // Build a one-key mapping {"bootcmd": <entries>} and serialise it.
-    // serde_yaml 0.9 serialises a Mapping without a leading `---` document
-    // marker, so the result appends cleanly to the existing cloud-config string.
-    let yaml_value = serde_yaml::to_value(entries).expect("BootcmdEntry is always serializable");
-    let mut mapping = serde_yaml::Mapping::new();
-    mapping.insert(serde_yaml::Value::String("bootcmd".to_string()), yaml_value);
-    serde_yaml::to_string(&serde_yaml::Value::Mapping(mapping))
-        .expect("bootcmd mapping is always serializable")
+    // A single-key map {"bootcmd": entries}. serde_yaml serialises a mapping
+    // without a leading `---` document marker, so the result appends cleanly to
+    // the existing cloud-config string. Serialising a map of
+    // &str -> &[BootcmdEntry] (each a String or Vec<String>) is infallible,
+    // hence the expect().
+    let map = std::collections::BTreeMap::from([("bootcmd", entries)]);
+    serde_yaml::to_string(&map).expect("bootcmd mapping is always serializable")
 }
 
 pub(crate) fn write_seed_files(seed_dir: &Path, user_data: &str) -> Result<()> {
@@ -373,6 +372,157 @@ mod tests {
         assert!(
             bootcmd[0].as_str().is_some(),
             "entry must round-trip as a string"
+        );
+    }
+
+    #[test]
+    fn render_user_data_bootcmd_merges_with_no_user_variant() {
+        // The caller-supplied-user path (ssh_user: None) must keep the top-level
+        // ssh_authorized_keys AND append a valid bootcmd: block. This mirrors the
+        // `else` arm of cmd_build's user_data construction (build.rs), which was
+        // otherwise only exercised with an empty bootcmd slice.
+        let entries = vec![BootcmdEntry::Shell(
+            "systemctl mask botwork-api.service".to_string(),
+        )];
+        let rendered = render_user_data(None, "ssh-ed25519 AAAA nouser", None, &entries);
+
+        // Top-level SSH key must be preserved (no `users:` block in this variant).
+        assert!(
+            rendered.contains("ssh_authorized_keys:"),
+            "top-level ssh_authorized_keys must be preserved: {rendered}"
+        );
+        assert!(
+            rendered.contains("ssh-ed25519 AAAA nouser"),
+            "ssh key must be preserved: {rendered}"
+        );
+        assert!(
+            !rendered.contains("users:"),
+            "no-user variant must not emit a users: block: {rendered}"
+        );
+
+        // The whole document must remain a single valid #cloud-config with both
+        // the ssh key and the bootcmd entry.
+        assert!(
+            rendered.starts_with("#cloud-config\n"),
+            "must be a single cloud-config doc: {rendered}"
+        );
+        let parsed: serde_yaml::Value =
+            serde_yaml::from_str(&rendered).expect("output must be valid YAML");
+        let bootcmd = parsed["bootcmd"]
+            .as_sequence()
+            .expect("bootcmd must be a sequence");
+        assert_eq!(bootcmd.len(), 1);
+        assert_eq!(
+            bootcmd[0].as_str(),
+            Some("systemctl mask botwork-api.service")
+        );
+        // ssh_authorized_keys must also survive in the parsed document.
+        assert!(
+            parsed["ssh_authorized_keys"].is_sequence(),
+            "ssh_authorized_keys must remain a sequence in the merged doc: {rendered}"
+        );
+    }
+
+    #[test]
+    fn render_user_data_multiple_string_bootcmd_entries_preserve_order() {
+        // Multiple shell entries must appear in the rendered sequence in the same
+        // order they were supplied (only "single" and "mixed" were covered before).
+        let entries = vec![
+            BootcmdEntry::Shell("echo one".to_string()),
+            BootcmdEntry::Shell("echo two".to_string()),
+            BootcmdEntry::Shell("echo three".to_string()),
+        ];
+        let rendered =
+            render_user_data(None, "ssh-ed25519 AAAA key", Some("botforge-abc"), &entries);
+        let parsed: serde_yaml::Value =
+            serde_yaml::from_str(&rendered).expect("output must be valid YAML");
+        let bootcmd = parsed["bootcmd"]
+            .as_sequence()
+            .expect("bootcmd must be a sequence");
+        let order: Vec<Option<&str>> = bootcmd.iter().map(|v| v.as_str()).collect();
+        assert_eq!(
+            order,
+            vec![Some("echo one"), Some("echo two"), Some("echo three")],
+            "bootcmd entries must preserve their supplied order"
+        );
+    }
+
+    #[test]
+    fn bootcmd_entry_serialize_round_trips_both_forms() {
+        // Guards the `render_bootcmd_block` invariant that BootcmdEntry always
+        // serialises cleanly (the `.expect()` there): serialize each variant and
+        // parse it back, asserting the value survives.
+        let shell = BootcmdEntry::Shell("echo hi".to_string());
+        let shell_yaml = serde_yaml::to_string(&shell).expect("shell entry must serialize");
+        let shell_back: serde_yaml::Value =
+            serde_yaml::from_str(&shell_yaml).expect("shell entry must reparse");
+        assert_eq!(shell_back.as_str(), Some("echo hi"));
+
+        let exec = BootcmdEntry::Exec(vec![
+            "cloud-init-per".to_string(),
+            "once".to_string(),
+            "mask".to_string(),
+        ]);
+        let exec_yaml = serde_yaml::to_string(&exec).expect("exec entry must serialize");
+        let exec_back: serde_yaml::Value =
+            serde_yaml::from_str(&exec_yaml).expect("exec entry must reparse");
+        let seq = exec_back.as_sequence().expect("exec entry reparses as a sequence");
+        let flat: Vec<Option<&str>> = seq.iter().map(|v| v.as_str()).collect();
+        assert_eq!(
+            flat,
+            vec![Some("cloud-init-per"), Some("once"), Some("mask")]
+        );
+    }
+
+    #[test]
+    fn render_user_data_bootcmd_reaches_seed_for_both_identity_paths() {
+        // End-to-end seam between BuildConfig.bootcmd and the rendered seed:
+        // cmd_build renders user-data via render_user_data(..., &build_config.bootcmd)
+        // in two arms — botforge-owned (installer user) and caller-supplied
+        // (ssh_user: None). A `Vec<BootcmdEntry>` (as BuildConfig would hold) must
+        // land as a valid `bootcmd:` block in BOTH, alongside the identity content.
+        let bootcmd = vec![
+            BootcmdEntry::Shell("echo start".to_string()),
+            BootcmdEntry::Exec(vec![
+                "cloud-init-per".to_string(),
+                "once".to_string(),
+                "mask".to_string(),
+                "sh".to_string(),
+                "-c".to_string(),
+                "systemctl mask botwork-api.service".to_string(),
+            ]),
+        ];
+
+        // botforge-owned arm: installer user + bootcmd both present.
+        let owned = render_user_data(None, "ssh-ed25519 AAAA k", Some("botforge-xyz"), &bootcmd);
+        let owned_parsed: serde_yaml::Value =
+            serde_yaml::from_str(&owned).expect("owned user-data must be valid YAML");
+        assert!(
+            owned.contains("name: botforge-xyz"),
+            "installer user must be present in owned arm: {owned}"
+        );
+        assert_eq!(
+            owned_parsed["bootcmd"]
+                .as_sequence()
+                .expect("owned bootcmd must be a sequence")
+                .len(),
+            2
+        );
+
+        // caller-supplied arm: top-level key + bootcmd both present.
+        let supplied = render_user_data(None, "ssh-ed25519 AAAA k", None, &bootcmd);
+        let supplied_parsed: serde_yaml::Value =
+            serde_yaml::from_str(&supplied).expect("supplied user-data must be valid YAML");
+        assert!(
+            supplied_parsed["ssh_authorized_keys"].is_sequence(),
+            "ssh_authorized_keys must be present in caller-supplied arm: {supplied}"
+        );
+        assert_eq!(
+            supplied_parsed["bootcmd"]
+                .as_sequence()
+                .expect("supplied bootcmd must be a sequence")
+                .len(),
+            2
         );
     }
 
