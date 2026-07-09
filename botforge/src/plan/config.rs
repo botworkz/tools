@@ -832,7 +832,7 @@ fn validate_top_level_upload(kind: &str, upload: &TopLevelUpload) -> Result<()> 
     }
     if src.starts_with('@') {
         anyhow::bail!(
-            "{kind} uploads entry '{src}': top-level `uploads:` only supports repo-relative files/globs; use a standalone `upload:` or `archive:` step for shasset assets"
+            "{kind} uploads entry '{src}': top-level `uploads:` only supports repo-relative files/globs; use an `archive:` step for shasset assets"
         );
     }
     validate_uses_repo_path(Path::new(src)).with_context(|| {
@@ -954,13 +954,6 @@ pub(crate) fn validate_test_steps(steps: &[TestStep], ports: &[PortSpec]) -> Res
                 resolve_shell(step.shell.as_deref()).with_context(|| {
                     format!("test step '{}': invalid `shell:` value", step.name)
                 })?;
-                if step.target == StepTarget::Host && !step.uploads.is_empty() {
-                    anyhow::bail!(
-                        "test step '{}': `uploads` is not valid on an `on: host` step; \
-                         files are already local in the harness",
-                        step.name
-                    );
-                }
             }
             TestStep::Archive(step) => {
                 anyhow::bail!(
@@ -969,15 +962,6 @@ pub(crate) fn validate_test_steps(steps: &[TestStep], ports: &[PortSpec]) -> Res
                         .name
                         .as_deref()
                         .unwrap_or(step.archive.src.as_str())
-                );
-            }
-            TestStep::Upload(step) => {
-                anyhow::bail!(
-                    "test step '{}': `upload` steps are only supported in `type: build` documents",
-                    step.upload
-                        .name
-                        .as_deref()
-                        .unwrap_or(step.upload.src.as_str())
                 );
             }
         }
@@ -1001,16 +985,8 @@ pub(crate) fn validate_build_steps(steps: &[TestStep]) -> Result<()> {
                 resolve_shell(step.shell.as_deref()).with_context(|| {
                     format!("build step '{}': invalid `shell:` value", step.name)
                 })?;
-                if step.target == StepTarget::Host && !step.uploads.is_empty() {
-                    anyhow::bail!(
-                        "build step '{}': `uploads` is not valid on an `on: host` step; \
-                         files are already local in the harness",
-                        step.name
-                    );
-                }
             }
             TestStep::Archive(step) => validate_archive_build_step(step)?,
-            TestStep::Upload(step) => validate_upload_build_step(step)?,
         }
     }
     Ok(())
@@ -1046,9 +1022,6 @@ fn validate_archive_build_step(step: &crate::plan::step::ArchiveStep) -> Result<
     }
     if step.run.is_some() {
         anyhow::bail!("build step '{name}': `run` is not valid on an `archive` step");
-    }
-    if !step.uploads.is_empty() {
-        anyhow::bail!("build step '{name}': `uploads` is not valid on an `archive` step");
     }
     if step.shell.is_some() {
         anyhow::bail!("build step '{name}': `shell` is not valid on an `archive` step");
@@ -1095,62 +1068,6 @@ fn validate_archive_build_step(step: &crate::plan::step::ArchiveStep) -> Result<
     Ok(())
 }
 
-fn validate_upload_build_step(step: &crate::plan::step::UploadStep) -> Result<()> {
-    use crate::plan::step::StepTarget;
-    use crate::resolver::Reference;
-    let spec = &step.upload;
-    let name = spec.name.as_deref().unwrap_or(spec.src.as_str());
-    let src = spec.src.trim();
-
-    if src.is_empty() {
-        anyhow::bail!("build step '{name}': upload `src` is required and must be non-empty");
-    }
-    // Validate `@`-prefixed sources via the resolver grammar; only `@<name>` is accepted.
-    if src.starts_with('@') {
-        let reference = Reference::parse(src).map_err(|_| {
-            anyhow::anyhow!(
-                "build step '{name}': upload `src` has an invalid `@` reference: {src:?}"
-            )
-        })?;
-        match reference {
-            Reference::Asset { path: None, .. } => {} // valid: `@<name>` asset reference
-            _ => {
-                anyhow::bail!(
-                    "build step '{name}': upload `src` does not support '@://' traversal"
-                );
-            }
-        }
-    }
-    if matches!(spec.target, Some(StepTarget::Host)) {
-        anyhow::bail!(
-            "build step '{name}': `on: host` is not valid for `upload` steps; \
-             upload delivers a file into the guest — use `on: guest` (or omit `on:`, which defaults to guest)"
-        );
-    }
-
-    // `dest` is always required: upload always delivers to a guest path.
-    match spec.dest.as_str() {
-        "" => {
-            anyhow::bail!(
-                "build step '{name}': upload `dest` is required and must be a non-empty absolute path"
-            );
-        }
-        dest if dest.trim().is_empty() => {
-            anyhow::bail!(
-                "build step '{name}': upload `dest` is required and must be a non-empty absolute path"
-            );
-        }
-        dest if !dest.starts_with('/') => {
-            anyhow::bail!(
-                "build step '{name}': upload `dest` must be an absolute path (got '{dest}')"
-            );
-        }
-        _ => {}
-    }
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1159,8 +1076,7 @@ mod tests {
         ImageRef, InputDeclaration, InputType, TestConfig, TestIso, MAX_INCLUDE_DEPTH,
     };
     use crate::plan::step::{
-        ArchiveStep, ArchiveStepSpec, RunStep, StepTarget, TestStep, TestUpload, TopLevelUpload,
-        UploadStep, UploadStepSpec,
+        ArchiveStep, ArchiveStepSpec, RunStep, StepTarget, TestStep, TopLevelUpload,
     };
     use crate::qemu::PortSpec;
     use std::collections::BTreeMap;
@@ -1379,7 +1295,6 @@ steps:
             run_ref(&config.steps[0]).run,
             "goss -g /path/goss.yaml validate"
         );
-        assert!(run_ref(&config.steps[0]).uploads.is_empty());
     }
 
     #[test]
@@ -1403,29 +1318,6 @@ steps:
             run_ref(&config.steps[0]).run,
             "bash smoke/vm-narrative.sh 127.0.0.1"
         );
-    }
-
-    #[test]
-    fn test_step_parses_guest_step_with_uploads() {
-        let config: TestConfig = serde_yaml::from_str(
-            r#"
-steps:
-  - on: guest
-    name: upload-and-run
-    uploads:
-      - src: local/file.sh
-        dest: /tmp/file.sh
-    run: bash /tmp/file.sh
-"#,
-        )
-        .unwrap();
-
-        assert_eq!(run_ref(&config.steps[0]).uploads.len(), 1);
-        assert_eq!(
-            run_ref(&config.steps[0]).uploads[0].src,
-            PathBuf::from("local/file.sh")
-        );
-        assert_eq!(run_ref(&config.steps[0]).uploads[0].dest, "/tmp/file.sh");
     }
 
     #[test]
@@ -1518,9 +1410,6 @@ steps:
   - on: guest
     name: "narrative-${{ inputs.target }}"
     shell: ${{ inputs.shell }}
-    uploads:
-      - src: scripts/${{ inputs.target }}.sh
-        dest: /tmp/${{ inputs.target }}.sh
     run: |
       echo "${USER}"
       bash /tmp/${{ inputs.target }}.sh
@@ -1545,11 +1434,6 @@ steps:
         assert_eq!(config.steps.len(), 1);
         assert_eq!(run_ref(&config.steps[0]).name, "narrative-edge");
         assert_eq!(run_ref(&config.steps[0]).shell.as_deref(), Some("bash"));
-        assert_eq!(
-            run_ref(&config.steps[0]).uploads[0].src,
-            PathBuf::from("scripts/edge.sh")
-        );
-        assert_eq!(run_ref(&config.steps[0]).uploads[0].dest, "/tmp/edge.sh");
         assert!(run_ref(&config.steps[0]).run.contains(r#"echo "${USER}""#));
         assert!(run_ref(&config.steps[0]).run.contains("bash /tmp/edge.sh"));
     }
@@ -1653,53 +1537,25 @@ steps:
 
     // --- step validation ---
 
-    fn make_step(target: StepTarget, name: &str, with_uploads: bool) -> TestStep {
+    fn make_step(target: StepTarget, name: &str) -> TestStep {
         TestStep::Run(RunStep {
             target,
             name: name.to_string(),
             run: "echo ok".to_string(),
             timeout: None,
             shell: None,
-            uploads: if with_uploads {
-                vec![TestUpload {
-                    src: PathBuf::from("src/file"),
-                    dest: "/tmp/file".to_string(),
-                }]
-            } else {
-                vec![]
-            },
         })
     }
 
     #[test]
-    fn test_validate_steps_accepts_guest_with_uploads() {
-        let steps = vec![make_step(StepTarget::Guest, "s", true)];
+    fn test_validate_steps_accepts_host_step() {
+        let steps = vec![make_step(StepTarget::Host, "s")];
         assert!(validate_test_steps(&steps, &[loopback(80)]).is_ok());
-    }
-
-    #[test]
-    fn test_validate_steps_accepts_host_without_uploads() {
-        let steps = vec![make_step(StepTarget::Host, "s", false)];
-        assert!(validate_test_steps(&steps, &[loopback(80)]).is_ok());
-    }
-
-    #[test]
-    fn test_validate_steps_rejects_uploads_on_host_step() {
-        let steps = vec![make_step(StepTarget::Host, "bad", true)];
-        let err = validate_test_steps(&steps, &[loopback(80)]).unwrap_err();
-        assert!(
-            err.to_string().contains("uploads"),
-            "error should mention 'uploads': {err}"
-        );
-        assert!(
-            err.to_string().contains("bad"),
-            "error should mention step name: {err}"
-        );
     }
 
     #[test]
     fn test_validate_steps_rejects_host_step_without_ports() {
-        let steps = vec![make_step(StepTarget::Host, "edge", false)];
+        let steps = vec![make_step(StepTarget::Host, "edge")];
         let err = validate_test_steps(&steps, &[]).unwrap_err();
         assert!(
             err.to_string().contains("ports"),
@@ -1714,7 +1570,7 @@ steps:
 
     #[test]
     fn test_validate_steps_accepts_guest_only_without_ports() {
-        let steps = vec![make_step(StepTarget::Guest, "s", false)];
+        let steps = vec![make_step(StepTarget::Guest, "s")];
         assert!(validate_test_steps(&steps, &[]).is_ok());
     }
 
@@ -1751,7 +1607,7 @@ steps:
 
     #[test]
     fn test_validate_steps_rejects_bad_shell() {
-        let mut step = make_step(StepTarget::Guest, "bad-shell", false);
+        let mut step = make_step(StepTarget::Guest, "bad-shell");
         let TestStep::Run(run) = &mut step else {
             panic!("expected run step");
         };
@@ -2660,7 +2516,7 @@ steps: []
         );
         let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("upload:") || msg.contains("archive:"));
+        assert!(msg.contains("archive:"));
         assert!(msg.contains("@payload"));
     }
 
@@ -3585,35 +3441,21 @@ steps:
     // --- validate_build_steps ---
 
     #[test]
-    fn test_validate_build_steps_accepts_guest_with_uploads() {
-        let steps = vec![make_step(StepTarget::Guest, "s", true)];
+    fn test_validate_build_steps_accepts_guest_step() {
+        let steps = vec![make_step(StepTarget::Guest, "s")];
         assert!(validate_build_steps(&steps).is_ok());
-    }
-
-    #[test]
-    fn test_validate_build_steps_accepts_guest_without_uploads() {
-        let steps = vec![make_step(StepTarget::Guest, "s", false)];
-        assert!(validate_build_steps(&steps).is_ok());
-    }
-
-    #[test]
-    fn test_validate_build_steps_rejects_uploads_on_host_step() {
-        let steps = vec![make_step(StepTarget::Host, "bad", true)];
-        let err = validate_build_steps(&steps).unwrap_err();
-        assert!(err.to_string().contains("uploads"));
-        assert!(err.to_string().contains("bad"));
     }
 
     #[test]
     fn test_validate_build_steps_accepts_host_step_without_ports() {
         // Unlike test, build does not require ports for host steps.
-        let steps = vec![make_step(StepTarget::Host, "h", false)];
+        let steps = vec![make_step(StepTarget::Host, "h")];
         assert!(validate_build_steps(&steps).is_ok());
     }
 
     #[test]
     fn test_validate_build_steps_rejects_bad_shell() {
-        let mut step = make_step(StepTarget::Guest, "bad-shell", false);
+        let mut step = make_step(StepTarget::Guest, "bad-shell");
         let TestStep::Run(run) = &mut step else {
             panic!("expected run step");
         };
@@ -3668,7 +3510,6 @@ run: echo ok
                 dest: None,
             },
             target: None,
-            uploads: vec![],
             run: None,
             timeout: None,
             shell: None,
@@ -3686,7 +3527,6 @@ run: echo ok
                 dest: None,
             },
             target: None,
-            uploads: vec![],
             run: None,
             timeout: None,
             shell: None,
@@ -3706,7 +3546,6 @@ run: echo ok
                 dest: None,
             },
             target: None,
-            uploads: vec![],
             run: None,
             timeout: None,
             shell: None,
@@ -3725,19 +3564,14 @@ run: echo ok
                 dest: None,
             },
             target: Some(StepTarget::Host),
-            uploads: vec![TestUpload {
-                src: PathBuf::from("src/file"),
-                dest: "/tmp/file".to_string(),
-            }],
             run: Some("echo hi".to_string()),
             timeout: Some(30),
             shell: Some("bash".to_string()),
         })];
         let err = validate_build_steps(&steps).unwrap_err();
-        // run/uploads/shell/timeout are still forbidden regardless of on: host.
+        // run/shell/timeout are still forbidden regardless of on: host.
         assert!(
             format!("{err:#}").contains("run")
-                || format!("{err:#}").contains("uploads")
                 || format!("{err:#}").contains("shell")
                 || format!("{err:#}").contains("timeout"),
             "error should mention a forbidden field: {err:#}"
@@ -3754,7 +3588,6 @@ run: echo ok
                 dest: None,
             },
             target: None,
-            uploads: vec![],
             run: None,
             timeout: None,
             shell: None,
@@ -3774,7 +3607,6 @@ run: echo ok
                 dest: None,
             },
             target: Some(StepTarget::Host),
-            uploads: vec![],
             run: None,
             timeout: None,
             shell: None,
@@ -3792,7 +3624,6 @@ run: echo ok
                 dest: Some("/var/lib/foo".to_string()),
             },
             target: Some(StepTarget::Guest),
-            uploads: vec![],
             run: None,
             timeout: None,
             shell: None,
@@ -3810,7 +3641,6 @@ run: echo ok
                 dest: None,
             },
             target: Some(StepTarget::Guest),
-            uploads: vec![],
             run: None,
             timeout: None,
             shell: None,
@@ -3834,7 +3664,6 @@ run: echo ok
                 dest: Some("relative/path".to_string()),
             },
             target: Some(StepTarget::Guest),
-            uploads: vec![],
             run: None,
             timeout: None,
             shell: None,
@@ -3859,7 +3688,6 @@ run: echo ok
                     dest: Some("/var/lib/foo".to_string()),
                 },
                 target,
-                uploads: vec![],
                 run: None,
                 timeout: None,
                 shell: None,
@@ -3943,266 +3771,5 @@ steps:
                 || msg.contains("unknown field"),
             "error should indicate archive/run field conflict: {msg}"
         );
-    }
-
-    // -------------------------------------------------------------------------
-    // upload step tests
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn test_build_step_deserialize_upload_shasset_src() {
-        let step: TestStep = serde_yaml::from_str(
-            r#"
-upload:
-  src: "@some-file"
-  dest: /etc/foo/thing
-"#,
-        )
-        .unwrap();
-        let TestStep::Upload(upload) = step else {
-            panic!("expected upload step");
-        };
-        assert_eq!(upload.upload.src, "@some-file");
-        assert_eq!(upload.upload.dest, "/etc/foo/thing");
-        assert!(upload.upload.name.is_none());
-        assert!(upload.upload.target.is_none());
-    }
-
-    #[test]
-    fn test_build_step_deserialize_upload_with_on_guest_and_name() {
-        let step: TestStep = serde_yaml::from_str(
-            r#"
-upload:
-  on: guest
-  src: "@some-file"
-  dest: /etc/foo/thing
-  name: install-config
-"#,
-        )
-        .unwrap();
-        let TestStep::Upload(upload) = step else {
-            panic!("expected upload step");
-        };
-        assert_eq!(upload.upload.src, "@some-file");
-        assert_eq!(upload.upload.dest, "/etc/foo/thing");
-        assert_eq!(upload.upload.name.as_deref(), Some("install-config"));
-        assert_eq!(upload.upload.target, Some(StepTarget::Guest));
-    }
-
-    #[test]
-    fn test_build_step_deserialize_upload_repo_relative_src() {
-        let step: TestStep = serde_yaml::from_str(
-            r#"
-upload:
-  src: scripts/setup.sh
-  dest: /usr/local/bin/setup.sh
-"#,
-        )
-        .unwrap();
-        let TestStep::Upload(upload) = step else {
-            panic!("expected upload step");
-        };
-        assert_eq!(upload.upload.src, "scripts/setup.sh");
-        assert_eq!(upload.upload.dest, "/usr/local/bin/setup.sh");
-    }
-
-    #[test]
-    fn test_build_step_deserialize_upload_display_name_uses_name_if_present() {
-        let step = TestStep::Upload(UploadStep {
-            upload: UploadStepSpec {
-                src: "@some-file".to_string(),
-                dest: "/tmp/file".to_string(),
-                name: Some("my-upload".to_string()),
-                target: None,
-            },
-        });
-        assert_eq!(step.display_name(), "my-upload");
-    }
-
-    #[test]
-    fn test_build_step_deserialize_upload_display_name_falls_back_to_src() {
-        let step = TestStep::Upload(UploadStep {
-            upload: UploadStepSpec {
-                src: "@some-file".to_string(),
-                dest: "/tmp/file".to_string(),
-                name: None,
-                target: None,
-            },
-        });
-        assert_eq!(step.display_name(), "@some-file");
-    }
-
-    #[test]
-    fn test_validate_build_steps_accepts_upload_shasset_src_absolute_dest() {
-        let steps = vec![TestStep::Upload(UploadStep {
-            upload: UploadStepSpec {
-                src: "@some-file".to_string(),
-                dest: "/etc/foo/thing".to_string(),
-                name: None,
-                target: None,
-            },
-        })];
-        assert!(validate_build_steps(&steps).is_ok());
-    }
-
-    #[test]
-    fn test_validate_build_steps_accepts_upload_with_explicit_on_guest() {
-        let steps = vec![TestStep::Upload(UploadStep {
-            upload: UploadStepSpec {
-                src: "@some-file".to_string(),
-                dest: "/etc/foo/thing".to_string(),
-                name: None,
-                target: Some(StepTarget::Guest),
-            },
-        })];
-        assert!(validate_build_steps(&steps).is_ok());
-    }
-
-    #[test]
-    fn test_validate_build_steps_accepts_upload_repo_relative_src() {
-        let steps = vec![TestStep::Upload(UploadStep {
-            upload: UploadStepSpec {
-                src: "scripts/setup.sh".to_string(),
-                dest: "/usr/local/bin/setup.sh".to_string(),
-                name: None,
-                target: None,
-            },
-        })];
-        assert!(validate_build_steps(&steps).is_ok());
-    }
-
-    #[test]
-    fn test_validate_build_steps_rejects_upload_empty_src() {
-        let steps = vec![TestStep::Upload(UploadStep {
-            upload: UploadStepSpec {
-                src: "   ".to_string(),
-                dest: "/tmp/file".to_string(),
-                name: Some("bad-upload".to_string()),
-                target: None,
-            },
-        })];
-        let err = validate_build_steps(&steps).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(msg.contains("src"), "error should mention 'src': {msg}");
-    }
-
-    #[test]
-    fn test_validate_build_steps_rejects_upload_src_traversal_scheme() {
-        let steps = vec![TestStep::Upload(UploadStep {
-            upload: UploadStepSpec {
-                src: "@://build/some-output".to_string(),
-                dest: "/tmp/file".to_string(),
-                name: Some("traversal".to_string()),
-                target: None,
-            },
-        })];
-        let err = validate_build_steps(&steps).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(msg.contains("@://"), "error should mention '@://': {msg}");
-    }
-
-    #[test]
-    fn test_validate_build_steps_rejects_upload_on_host() {
-        let steps = vec![TestStep::Upload(UploadStep {
-            upload: UploadStepSpec {
-                src: "@some-file".to_string(),
-                dest: "/tmp/file".to_string(),
-                name: Some("bad-host".to_string()),
-                target: Some(StepTarget::Host),
-            },
-        })];
-        let err = validate_build_steps(&steps).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("host") || msg.contains("guest"),
-            "error should mention 'host' or 'guest': {msg}"
-        );
-    }
-
-    #[test]
-    fn test_validate_build_steps_rejects_upload_empty_dest() {
-        let steps = vec![TestStep::Upload(UploadStep {
-            upload: UploadStepSpec {
-                src: "@some-file".to_string(),
-                dest: String::new(),
-                name: Some("bad-dest".to_string()),
-                target: None,
-            },
-        })];
-        let err = validate_build_steps(&steps).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(msg.contains("dest"), "error should mention 'dest': {msg}");
-    }
-
-    #[test]
-    fn test_validate_build_steps_rejects_upload_relative_dest() {
-        let steps = vec![TestStep::Upload(UploadStep {
-            upload: UploadStepSpec {
-                src: "@some-file".to_string(),
-                dest: "relative/path".to_string(),
-                name: Some("bad-dest".to_string()),
-                target: None,
-            },
-        })];
-        let err = validate_build_steps(&steps).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("absolute") || msg.contains("dest"),
-            "error should mention absolute path requirement: {msg}"
-        );
-    }
-
-    #[test]
-    fn test_validate_test_steps_rejects_upload_step() {
-        use crate::qemu::PortSpec;
-        let steps = vec![TestStep::Upload(UploadStep {
-            upload: UploadStepSpec {
-                src: "@some-file".to_string(),
-                dest: "/tmp/file".to_string(),
-                name: Some("my-upload".to_string()),
-                target: None,
-            },
-        })];
-        let err = validate_test_steps(
-            &steps,
-            &[PortSpec {
-                addr: "127.0.0.1".into(),
-                port: 8080,
-            }],
-        )
-        .unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("upload") || msg.contains("build"),
-            "error should mention upload/build restriction: {msg}"
-        );
-    }
-
-    #[test]
-    fn test_load_build_config_parses_upload_step() {
-        let repo = TempDir::new().unwrap();
-        write_build_config(
-            &repo,
-            "build.yaml",
-            r#"
-type: build
-image: "@debian-base"
-steps:
-  - upload:
-      on: guest
-      src: "@some-config"
-      dest: /etc/foo/thing
-      name: install-config
-"#,
-        );
-        let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
-        assert_eq!(config.steps.len(), 1);
-        let TestStep::Upload(upload) = &config.steps[0] else {
-            panic!("expected upload step");
-        };
-        assert_eq!(upload.upload.src, "@some-config");
-        assert_eq!(upload.upload.dest, "/etc/foo/thing");
-        assert_eq!(upload.upload.name.as_deref(), Some("install-config"));
-        assert_eq!(upload.upload.target, Some(StepTarget::Guest));
     }
 }
