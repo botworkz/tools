@@ -391,6 +391,27 @@ steps:
       print("token present:", bool(os.environ.get("GH_TOKEN")))
 ```
 
+#### `sudo:` field (optional)
+
+Guest `run:` steps also support an optional `sudo:` boolean. When set to `true`,
+botforge runs the resolved interpreter itself under `sudo -E`, so the entire
+`run:` body executes as root in one shot. When absent, it defaults to `false`.
+
+- only valid on `on: guest` steps
+- rejected at config load time on `on: host` steps
+- requires the guest SSH user to have passwordless sudo (the ephemeral
+  installer user already does)
+
+```yaml
+steps:
+  - on: guest
+    name: flip-spigot
+    sudo: true
+    run: |
+      cp /etc/envoy/rds/active.ingress.yaml /etc/envoy/rds/active.yaml
+      systemctl reload botwork-envoy
+```
+
 **Default (`bash`) applies `-e -o pipefail` everywhere.**
 When `shell:` is absent the default bash template is used on both `on: guest`
 and `on: host` steps. This means a failing command anywhere in a multi-line
@@ -404,6 +425,8 @@ currently are). If bash is unavailable the explicit `shell: sh` fallback
 > under `bash --noprofile --norc -e -o pipefail` by default. A mid-script
 > non-zero exit or a failing left side of a pipe now fails the step. If you need
 > the old lenient behaviour, set `shell: sh` and write your script accordingly.
+> If the entire guest script should run as root, set `sudo: true` instead of
+> prefixing each line with `sudo`.
 
 **Execution model (both targets):**
 
@@ -434,17 +457,19 @@ steps:
     run: goss -g /path/goss.yaml validate
   - on: guest
     name: flip-spigot-to-ingress
+    sudo: true
     run: |
-      sudo cp /etc/envoy/rds/active.ingress.yaml /etc/envoy/rds/active.yaml
-      sudo systemctl reload botwork-envoy
+      cp /etc/envoy/rds/active.ingress.yaml /etc/envoy/rds/active.yaml
+      systemctl reload botwork-envoy
   - on: host
     name: vm-narrative
     run: bash smoke/vm-narrative.sh 127.0.0.1
   - on: guest
     name: flip-spigot-back
+    sudo: true
     run: |
-      sudo cp /etc/envoy/rds/active.holding.yaml /etc/envoy/rds/active.yaml
-      sudo systemctl reload botwork-envoy
+      cp /etc/envoy/rds/active.holding.yaml /etc/envoy/rds/active.yaml
+      systemctl reload botwork-envoy
 ```
 
 ### `botforge build` spec format
@@ -474,7 +499,8 @@ uploads:                         # optional; guest-only pre-step staging
 steps:
   - on: guest
     name: provision
-    run: sudo bash /tmp/bake-staging/install.sh
+    sudo: true
+    run: bash /tmp/bake-staging/install.sh
   - on: host
     name: verify
     run: echo "build host check"
@@ -593,10 +619,12 @@ bootcmd:
 steps:
   - on: guest
     name: install-plugins
-    run: sudo bash /opt/install-plugins.sh
+    sudo: true
+    run: bash /opt/install-plugins.sh
   - on: guest
     name: unmask-app-stack
-    run: sudo systemctl unmask botwork-api.service botwork-envoy.service botwork-ui.service
+    sudo: true
+    run: systemctl unmask botwork-api.service botwork-envoy.service botwork-ui.service
 ```
 
 Absent or empty `bootcmd:` produces user-data byte-identical to the current
