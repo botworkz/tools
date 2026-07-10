@@ -681,6 +681,11 @@ don't want `qemu-img convert -c`.
   `qemu-nbd --discard=unmap` + mount with `-o discard` + `fstrim -v`.
   More robust, but requires `qemu-nbd`.
 
+For `reclaim: fstrim` and `reclaim: discard`, botforge also runs a pure-Rust
+qcow2 zero-cluster sparsify pass before commit/compression. It deallocates
+allocated-but-all-zero clusters (lossless) without introducing any external
+runtime dependency.
+
 When `enabled: true`, `botforge build` then runs:
 ```
 qemu-img convert -O qcow2 -c [-o cluster_size=<val>] <output>.partial <output>
@@ -688,6 +693,9 @@ qemu-img convert -O qcow2 -c [-o cluster_size=<val>] <output>.partial <output>
 then atomically renames the result into place and removes the `.partial` file.
 A non-zero exit from `qemu-img` is a hard error.  `qemu-img` is already
 required by `botforge build`, so no new dependency is introduced.
+At the end of capture, botforge logs final qcow2 stats
+(`virtual_size`, `disk_size`, `cluster_size`, `allocated_data_clusters`,
+`zero_clusters_deallocated`) to make image-size drift visible in CI.
 
 **Examples:**
 

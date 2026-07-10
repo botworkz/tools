@@ -2,6 +2,7 @@ mod cli;
 mod commands;
 mod iso;
 mod plan;
+mod qcow2;
 mod qemu;
 mod resolver;
 mod ssh;

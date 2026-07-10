@@ -26,6 +26,7 @@ use crate::plan::{
     load_build_config, preserve_failed_build_disk, print_log_tail, run_step_flow,
     shutdown_build_vm, validate_build_steps, vm::StepFlowPlan, vm::StepTimeoutPolicy,
 };
+use crate::qcow2::{read_qcow2_image_stats, sparsify_zero_clusters, ZeroClusterSparsifyStats};
 
 #[derive(Args, Debug)]
 pub(crate) struct BuildArgs {
@@ -346,13 +347,50 @@ pub(crate) fn cmd_build(config: &Path, args: BuildArgs) -> Result<()> {
         reclaim_host_discard_offline(&partial)?;
     }
 
+    let zero_cluster_stats = if should_run_zero_cluster_sparsify(reclaim_mode) {
+        let stats = sparsify_zero_clusters(&partial).with_context(|| {
+            format!("failed to sparsify zero clusters in {}", partial.display())
+        })?;
+        println!(
+            "qcow2 zero-cluster sparsify: scanned={} deallocated={} skipped_compressed={}",
+            stats.scanned_clusters, stats.deallocated_clusters, stats.skipped_compressed_clusters
+        );
+        Some(stats)
+    } else {
+        None
+    };
+
     // ---------------------------------------------------------------------------
     // Disk lifecycle step 8 (was 6): commit partial → output (plain rename or
     // compress-and-rename depending on the spec's `compress:` config).
     // ---------------------------------------------------------------------------
     commit_output(&partial, &output, build_config.compress.as_ref())?;
+    log_final_image_stats(&output, zero_cluster_stats)?;
 
     println!("built image at {}", output.display());
+    Ok(())
+}
+
+fn should_run_zero_cluster_sparsify(mode: ReclaimMode) -> bool {
+    !matches!(mode, ReclaimMode::None)
+}
+
+fn log_final_image_stats(
+    output: &Path,
+    zero_cluster_stats: Option<ZeroClusterSparsifyStats>,
+) -> Result<()> {
+    let stats = read_qcow2_image_stats(output)?;
+    let deallocated = zero_cluster_stats
+        .map(|s| s.deallocated_clusters)
+        .unwrap_or(0);
+    println!(
+        "final image stats: virtual_size={} disk_size={} cluster_size={} allocated_data_clusters={} zero_clusters_deallocated={}",
+        stats.virtual_size,
+        stats.disk_size,
+        stats.cluster_size,
+        stats.allocated_data_clusters,
+        deallocated
+    );
     Ok(())
 }
 
@@ -1164,9 +1202,11 @@ mod tests {
         archive_unpack_relative_path, failed_partial_path, fstrim_guest_command, fstrim_mount_args,
         guest_untar_command, installer_teardown_command, mount_discard_args, output_stem,
         parse_archive_asset_key, partial_path, qemu_convert_args, qemu_nbd_connect_args,
-        qemu_nbd_disconnect_args, resolve_base_image_with_transport, unpack_archive_to_dir,
+        qemu_nbd_disconnect_args, resolve_base_image_with_transport,
+        should_run_zero_cluster_sparsify, unpack_archive_to_dir,
     };
     use crate::cli::Cli;
+    use crate::plan::config::ReclaimMode;
     use clap::Parser;
     use shasset::fetch::{DownloadResponse, FetchError, Transport};
     use std::io::Cursor;
@@ -1600,5 +1640,12 @@ mod tests {
     fn fstrim_mount_args_match_expected_argv() {
         let args = fstrim_mount_args(Path::new("/tmp/mnt"));
         assert_eq!(args, vec!["-v", "/tmp/mnt"]);
+    }
+
+    #[test]
+    fn zero_cluster_sparsify_follows_reclaim_mode() {
+        assert!(!should_run_zero_cluster_sparsify(ReclaimMode::None));
+        assert!(should_run_zero_cluster_sparsify(ReclaimMode::Fstrim));
+        assert!(should_run_zero_cluster_sparsify(ReclaimMode::Discard));
     }
 }
