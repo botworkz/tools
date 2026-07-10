@@ -656,13 +656,14 @@ output — there is zero behaviour change for existing specs that omit the field
 before committing it.  When absent (the default), the disk is committed via a
 plain atomic rename — behaviour byte-identical to all prior botforge versions.
 
-`compress:` is a **map** with one required field (`enabled:`) and three optional
-fields (`compression_type:`, `cluster_size:`, `reclaim:`):
+`compress:` is a **map** with one required field (`enabled:`) and four optional
+fields (`compressor:`, `compressor_args:`, `cluster_size:`, `reclaim:`):
 
 | Field | Required | Type | Description |
 |---|---|---|---|
 | `enabled` | **yes** | bool | `true` ⇒ compress; `false` ⇒ plain rename (same as omitting the block) |
-| `compression_type` | no | enum | Compression codec passed to `qemu-img convert`: `zstd` (default when `enabled: true`) or `zlib`. |
+| `compressor` | no | enum | Compression codec passed to `qemu-img convert`: `zstd` (default when `enabled: true`) or `zlib`. |
+| `compressor_args` | no | list[string] | Additional `qemu-img convert` arguments passed verbatim before the source and destination paths. |
 | `cluster_size` | no | string | Passed verbatim as `-o cluster_size=<val>` to `qemu-img convert`. Omit ⇒ qemu default. |
 | `reclaim` | no | enum | Reclaim freed blocks before commit: `none` (default), `fstrim`, `discard`, or `sparsify`. |
 
@@ -714,17 +715,21 @@ external runtime dependency.
 
 When `enabled: true`, `botforge build` then runs:
 ```
-qemu-img convert -O qcow2 -c -o compression_type=<zstd|zlib>[,cluster_size=<val>] <output>.partial <output>
+qemu-img convert -O qcow2 -c -o compression_type=<zstd|zlib>[,cluster_size=<val>] <compressor_args...> <output>.partial <output>
 ```
 then atomically renames the result into place and removes the `.partial` file.
 A non-zero exit from `qemu-img` is a hard error.  `qemu-img` is already
 required by `botforge build`, so no new dependency is introduced.
 
-When compression is enabled and `compression_type:` is omitted, botforge now
+`compressor_args:` is passed through without interpretation or validation. Use
+it for `qemu-img convert` flags such as `-T0` or extra tuning options that your
+installed qemu understands.
+
+When compression is enabled and `compressor:` is omitted, botforge now
 defaults to `zstd`. `zstd`-compressed qcow2 images require qemu >= 5.1 both on
 the build host (`qemu-img convert`) and on any consumer that opens or boots the
 produced image. If you need compatibility with an older qemu stack, set
-`compression_type: zlib` explicitly.
+`compressor: zlib` explicitly.
 At the end of capture, botforge logs final qcow2 stats
 (`virtual_size`, `disk_size`, `cluster_size`, `allocated_data_clusters`,
 `zero_clusters_deallocated`) to make image-size drift visible in CI.
@@ -738,24 +743,31 @@ At the end of capture, botforge logs final qcow2 stats
 # on, qemu default cluster size
 compress:
   enabled: true
-  # compression_type defaults to zstd
+  # compressor defaults to zstd
 
 # on, explicit cluster size (e.g. to match space's bake output)
 compress:
   enabled: true
-  compression_type: zstd
+  compressor: zstd
   cluster_size: "1M"
 
 # on, opt back into qemu's historical zlib compression codec
 compress:
   enabled: true
-  compression_type: zlib
+  compressor: zlib
+
+# on, pass through extra qemu-img convert args verbatim
+compress:
+  enabled: true
+  compressor_args:
+    - -T0
+    - --threads=0
 
 # on, reclaim guest-freed blocks before convert -c
 # (useful when your build deletes large temporary payloads, e.g. docker image tars)
 compress:
   enabled: true
-  compression_type: zstd
+  compressor: zstd
   cluster_size: "1M"
   reclaim: fstrim
 
@@ -764,7 +776,7 @@ compress:
 # requires: libguestfs installed + KVM (already required) + readable appliance kernel
 compress:
   enabled: true
-  compression_type: zstd
+  compressor: zstd
   cluster_size: "1M"
   reclaim: sparsify
 
