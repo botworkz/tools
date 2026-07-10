@@ -689,6 +689,13 @@ don't want `qemu-img convert -c`.
   drops them, reclaiming the residual free-space slack (~100-180 MB
   pre-compression) beyond what `fstrim` achieves.
 
+  The offline libguestfs pass only zeroes real data/root filesystems
+  (`ext2`/`ext3`/`ext4`, `xfs`, `btrfs`, `f2fs`). Non-target partitions such as
+  the EFI System Partition (`vfat`/`fat`/`msdos`), `swap`, and
+  LVM/RAID/LUKS container members are intentionally skipped before any mount is
+  attempted. Seeing an informational `sparsify: skipping non-target filesystem`
+  line for an ESP is expected and is not an error.
+
   **Requirements for `reclaim: sparsify`:**
   - `libguestfs` must be installed on the build host (e.g.
     `apt install libguestfs-dev` / `dnf install libguestfs-devel`).

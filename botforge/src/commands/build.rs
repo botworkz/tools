@@ -402,6 +402,17 @@ fn should_run_guestfs_sparsify(mode: ReclaimMode) -> bool {
     matches!(mode, ReclaimMode::Sparsify)
 }
 
+/// Returns true if `zero_free_space` is meaningful for this filesystem type
+/// (i.e. a real mountable data/root filesystem we want to zero), false for
+/// non-target types (ESP/vfat, swap, LVM/RAID/LUKS containers, unknown, empty)
+/// that must be skipped without attempting a mount.
+fn is_zero_target_fstype(fstype: &str) -> bool {
+    matches!(
+        fstype.to_ascii_lowercase().as_str(),
+        "ext2" | "ext3" | "ext4" | "xfs" | "btrfs" | "f2fs"
+    )
+}
+
 fn log_final_image_stats(
     output: &Path,
     zero_cluster_stats: Option<ZeroClusterSparsifyStats>,
@@ -1293,14 +1304,19 @@ fn reclaim_guestfs_sparsify(partial: &Path) -> Result<()> {
         .list_filesystems()
         .map_err(|e| anyhow::anyhow!("libguestfs: failed to list filesystems: {e:?}"))?;
 
-    // Filter to block-device-backed filesystems only (skip swap, LVM metadata,
-    // etc.) and mount each writable at the device path.
-    let mut mounted_any = false;
+    // Deliberately zero only real data/root filesystems. Everything else
+    // (ESP/FAT boot partitions, swap, LVM/RAID/LUKS containers, unknown
+    // types, etc.) is an expected non-target skip and is never mounted.
+    let mut zeroed_any = false;
     for (device, fstype) in &fs_map {
-        if matches!(
-            fstype.as_str(),
-            "swap" | "LVM2_member" | "linux_raid_member" | "crypto_LUKS" | ""
-        ) {
+        let fstype_display = if fstype.is_empty() {
+            "unknown"
+        } else {
+            fstype.as_str()
+        };
+
+        if !is_zero_target_fstype(fstype) {
+            println!("sparsify: skipping non-target filesystem {device} (type {fstype_display})");
             continue;
         }
 
@@ -1322,19 +1338,17 @@ fn reclaim_guestfs_sparsify(partial: &Path) -> Result<()> {
                 }
 
                 zfs_result?;
-                mounted_any = true;
+                zeroed_any = true;
             }
             Err(err) => {
-                // Some devices in the map may not be directly mountable (e.g.
-                // /dev/sda vs /dev/sda1).  Log and skip rather than failing.
                 eprintln!(
-                    "libguestfs: skipping device {device} (type {fstype}): mount failed: {err:?}"
+                    "warning: libguestfs skipped target filesystem {device} (type {fstype_display}) after mount failed: {err:?}"
                 );
             }
         }
     }
 
-    if !mounted_any {
+    if !zeroed_any {
         eprintln!(
             "warning: libguestfs found no mountable filesystems in {} — zero_free_space skipped",
             partial.display()
@@ -1421,9 +1435,10 @@ mod tests {
     use super::{
         archive_unpack_relative_path, cloud_init_clean_guest_command, failed_partial_path,
         fstrim_guest_command, fstrim_mount_args, guest_untar_command, installer_teardown_command,
-        mount_discard_args, output_stem, parse_archive_asset_key, partial_path, qemu_convert_args,
-        qemu_nbd_connect_args, qemu_nbd_disconnect_args, resolve_base_image_with_transport,
-        should_run_guestfs_sparsify, should_run_zero_cluster_sparsify, unpack_archive_to_dir,
+        is_zero_target_fstype, mount_discard_args, output_stem, parse_archive_asset_key,
+        partial_path, qemu_convert_args, qemu_nbd_connect_args, qemu_nbd_disconnect_args,
+        resolve_base_image_with_transport, should_run_guestfs_sparsify,
+        should_run_zero_cluster_sparsify, unpack_archive_to_dir,
     };
     use crate::cli::Cli;
     use crate::plan::config::{CompressionType, ReclaimMode};
@@ -1935,5 +1950,32 @@ mod tests {
         assert!(!should_run_guestfs_sparsify(ReclaimMode::Fstrim));
         assert!(!should_run_guestfs_sparsify(ReclaimMode::Discard));
         assert!(should_run_guestfs_sparsify(ReclaimMode::Sparsify));
+    }
+
+    #[test]
+    fn zero_target_fstypes_are_recognized_case_insensitively() {
+        for fstype in ["ext4", "EXT4", "xfs", "btrfs", "f2fs", "ext2", "ext3"] {
+            assert!(is_zero_target_fstype(fstype), "{fstype} should be zeroed");
+        }
+    }
+
+    #[test]
+    fn non_target_fstypes_are_skipped() {
+        for fstype in [
+            "vfat",
+            "fat",
+            "msdos",
+            "swap",
+            "LVM2_member",
+            "linux_raid_member",
+            "crypto_LUKS",
+            "unknown",
+            "",
+        ] {
+            assert!(
+                !is_zero_target_fstype(fstype),
+                "{fstype:?} should be skipped"
+            );
+        }
     }
 }
