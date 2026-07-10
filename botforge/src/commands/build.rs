@@ -84,7 +84,7 @@ pub(crate) fn cmd_build(config: &Path, args: BuildArgs) -> Result<()> {
         .as_ref()
         .map(|c| c.reclaim)
         .unwrap_or_default();
-    let guest_reclaim_uses_discard = matches!(reclaim_mode, ReclaimMode::Fstrim);
+    let guest_reclaim_uses_discard = matches!(reclaim_mode, ReclaimMode::Fstrim | ReclaimMode::Sparsify);
     validate_build_steps(&build_config.steps)?;
     if build_config
         .steps
@@ -259,7 +259,7 @@ pub(crate) fn cmd_build(config: &Path, args: BuildArgs) -> Result<()> {
     // SSH. If botforge owns the installer account, that means reclaim must
     // happen before the detached teardown service is queued.
     // ---------------------------------------------------------------------------
-    if matches!(reclaim_mode, ReclaimMode::Fstrim) {
+    if matches!(reclaim_mode, ReclaimMode::Fstrim | ReclaimMode::Sparsify) {
         println!("running guest reclaim via fstrim -av (build drive discard=unmap enabled)");
         if let Err(err) = run_guest_reclaim_fstrim(&ssh_options, overall_deadline) {
             eprintln!("guest reclaim fstrim failed: {err:#}");
@@ -364,6 +364,11 @@ pub(crate) fn cmd_build(config: &Path, args: BuildArgs) -> Result<()> {
         reclaim_host_discard_offline(&partial)?;
     }
 
+    if should_run_guestfs_sparsify(reclaim_mode) {
+        println!("running offline guestfs zero_free_space reclaim (libguestfs in-process)");
+        reclaim_guestfs_sparsify(&partial)?;
+    }
+
     let zero_cluster_stats = if should_run_zero_cluster_sparsify(reclaim_mode) {
         let stats = sparsify_zero_clusters(&partial).with_context(|| {
             format!("failed to sparsify zero clusters in {}", partial.display())
@@ -390,6 +395,10 @@ pub(crate) fn cmd_build(config: &Path, args: BuildArgs) -> Result<()> {
 
 fn should_run_zero_cluster_sparsify(mode: ReclaimMode) -> bool {
     !matches!(mode, ReclaimMode::None)
+}
+
+fn should_run_guestfs_sparsify(mode: ReclaimMode) -> bool {
+    matches!(mode, ReclaimMode::Sparsify)
 }
 
 fn log_final_image_stats(
@@ -1200,6 +1209,146 @@ fn reclaim_host_discard_offline(partial: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Offline guestfs sparsify: boot a libguestfs appliance against the partial
+/// qcow2 (read-write, qcow2 format), mount all mountable filesystems, and call
+/// `zero_free_space` on each.  After this pass the subsequent zero-cluster
+/// sparsify + `qemu-img convert -c` will drop all the newly-zeroed free space,
+/// reclaiming the residual slack (~100-180 MB pre-compression) that `fstrim`
+/// alone cannot reach.
+///
+/// Uses the `guestfs` Rust crate (in-process FFI bindings to libguestfs).
+/// Does **not** invoke `virt-sparsify`, `guestfish`, or any external guestfs
+/// CLI binary.
+///
+/// Cleanup is guaranteed: the guestfs `Handle` implements `Drop` which calls
+/// `guestfs_close()`, shutting down the appliance and releasing all resources
+/// even on error.
+fn reclaim_guestfs_sparsify(partial: &Path) -> Result<()> {
+    use guestfs::{AddDriveOptArgs, Handle};
+
+    let path_str = partial
+        .to_str()
+        .with_context(|| format!("qcow2 path is not valid UTF-8: {}", partial.display()))?;
+
+    // Set LIBGUESTFS_BACKEND=direct to avoid supermin/appliance permission
+    // issues in environments where the appliance kernel (/boot/vmlinuz*) may
+    // not be world-readable.  The "direct" backend still requires KVM (already
+    // a hard dep of botforge build) but bypasses the supermin appliance-build
+    // step; the appliance is taken from the pre-built libguestfs appliance
+    // directory instead.
+    //
+    // If the environment already sets LIBGUESTFS_BACKEND, honour it.
+    if std::env::var_os("LIBGUESTFS_BACKEND").is_none() {
+        std::env::set_var("LIBGUESTFS_BACKEND", "direct");
+    }
+
+    let g = Handle::create().map_err(|e| {
+        anyhow::anyhow!(
+            "failed to create libguestfs handle: {e:?}\n\
+             Ensure libguestfs is installed and KVM is accessible (/dev/kvm readable)."
+        )
+    })?;
+
+    g.add_drive(
+        path_str,
+        AddDriveOptArgs {
+            readonly: Some(false),
+            format: Some("qcow2"),
+            iface: None,
+            name: None,
+            label: None,
+            protocol: None,
+            server: None,
+            username: None,
+            secret: None,
+            cachemode: None,
+            discard: None,
+            copyonread: None,
+        },
+    )
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "libguestfs: failed to add drive {} (format qcow2): {e:?}",
+            partial.display()
+        )
+    })?;
+
+    g.launch().map_err(|e| {
+        anyhow::anyhow!(
+            "libguestfs appliance launch failed: {e:?}\n\
+             Likely causes:\n\
+             - KVM device not accessible (ensure /dev/kvm is readable by the current user)\n\
+             - Appliance kernel unreadable (e.g. /boot/vmlinuz* mode 0600 root):\n\
+               run `sudo chmod a+r /boot/vmlinuz*` or set LIBGUESTFS_BACKEND=direct\n\
+             - libguestfs appliance not installed (install libguestfs-tools/supermin)\n\
+             Set LIBGUESTFS_DEBUG=1 and LIBGUESTFS_TRACE=1 for verbose diagnostics."
+        )
+    })?;
+
+    // Discover mountable filesystems.  Prefer inspect_os (which resolves /
+    // mount points correctly for OS images); fall back to list_filesystems for
+    // non-OS images that have bare filesystems.
+    let fs_map = g.list_filesystems().map_err(|e| {
+        anyhow::anyhow!("libguestfs: failed to list filesystems: {e:?}")
+    })?;
+
+    // Filter to block-device-backed filesystems only (skip swap, LVM metadata,
+    // etc.) and mount each writable at the device path.
+    let mut mounted_any = false;
+    for (device, fstype) in &fs_map {
+        if matches!(
+            fstype.as_str(),
+            "swap" | "LVM2_member" | "linux_raid_member" | "crypto_LUKS" | ""
+        ) {
+            continue;
+        }
+
+        let mount_result = g.mount(device, "/");
+        match mount_result {
+            Ok(()) => {
+                // zero_free_space operates on the guest mountpoint "/".
+                let zfs_result = g.zero_free_space("/").map_err(|e| {
+                    anyhow::anyhow!(
+                        "libguestfs: zero_free_space failed on device {device} (type {fstype}): {e:?}"
+                    )
+                });
+
+                // Always umount before propagating any error.
+                if let Err(umount_err) = g.umount_all() {
+                    eprintln!(
+                        "warning: libguestfs umount_all failed after zero_free_space: {umount_err:?}"
+                    );
+                }
+
+                zfs_result?;
+                mounted_any = true;
+            }
+            Err(err) => {
+                // Some devices in the map may not be directly mountable (e.g.
+                // /dev/sda vs /dev/sda1).  Log and skip rather than failing.
+                eprintln!(
+                    "libguestfs: skipping device {device} (type {fstype}): mount failed: {err:?}"
+                );
+            }
+        }
+    }
+
+    if !mounted_any {
+        eprintln!(
+            "warning: libguestfs found no mountable filesystems in {} — zero_free_space skipped",
+            partial.display()
+        );
+    }
+
+    // Shut down the appliance cleanly before the handle is dropped.
+    if let Err(err) = g.shutdown() {
+        eprintln!("warning: libguestfs shutdown failed: {err:?}");
+    }
+
+    // `g` is dropped here; guestfs_close() is called unconditionally by Drop.
+    Ok(())
+}
+
 /// Returns `<output>.partial` — the in-progress disk path during the build.
 fn partial_path(output: &Path) -> PathBuf {
     let mut name = output
@@ -1273,7 +1422,7 @@ mod tests {
         fstrim_guest_command, fstrim_mount_args, guest_untar_command, installer_teardown_command,
         mount_discard_args, output_stem, parse_archive_asset_key, partial_path, qemu_convert_args,
         qemu_nbd_connect_args, qemu_nbd_disconnect_args, resolve_base_image_with_transport,
-        should_run_zero_cluster_sparsify, unpack_archive_to_dir,
+        should_run_guestfs_sparsify, should_run_zero_cluster_sparsify, unpack_archive_to_dir,
     };
     use crate::cli::Cli;
     use crate::plan::config::{CompressionType, ReclaimMode};
@@ -1776,5 +1925,14 @@ mod tests {
         assert!(!should_run_zero_cluster_sparsify(ReclaimMode::None));
         assert!(should_run_zero_cluster_sparsify(ReclaimMode::Fstrim));
         assert!(should_run_zero_cluster_sparsify(ReclaimMode::Discard));
+        assert!(should_run_zero_cluster_sparsify(ReclaimMode::Sparsify));
+    }
+
+    #[test]
+    fn guestfs_sparsify_follows_reclaim_mode() {
+        assert!(!should_run_guestfs_sparsify(ReclaimMode::None));
+        assert!(!should_run_guestfs_sparsify(ReclaimMode::Fstrim));
+        assert!(!should_run_guestfs_sparsify(ReclaimMode::Discard));
+        assert!(should_run_guestfs_sparsify(ReclaimMode::Sparsify));
     }
 }
