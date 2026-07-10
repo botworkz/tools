@@ -8,9 +8,8 @@ use crate::iso::BootcmdEntry;
 use crate::qemu::PortSpec;
 use crate::util::resolve_under_root;
 
-use super::step::{
-    deserialize_optional_positive_seconds, resolve_shell, StepTarget, TestStep, TopLevelUpload,
-};
+use super::step::{deserialize_optional_positive_seconds, resolve_shell, StepTarget, TestStep};
+use super::upload::TopLevelUpload;
 
 const DEFAULT_SENTINEL: &str = "__default__";
 
@@ -1115,9 +1114,8 @@ mod tests {
         resolve_fragment_inputs, validate_build_steps, validate_test_ports, validate_test_steps,
         ImageRef, InputDeclaration, InputType, ReclaimMode, TestConfig, TestIso, MAX_INCLUDE_DEPTH,
     };
-    use crate::plan::step::{
-        ArchiveStep, ArchiveStepSpec, RunStep, StepTarget, TestStep, TopLevelUpload,
-    };
+    use crate::plan::step::{ArchiveStep, ArchiveStepSpec, RunStep, StepTarget, TestStep};
+    use crate::plan::upload::TopLevelUpload;
     use crate::qemu::PortSpec;
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
