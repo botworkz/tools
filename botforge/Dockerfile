@@ -43,7 +43,7 @@ FROM ${BINARY_SOURCE} AS binary-source
 # ── Stage 4: runtime (batteries-included) ────────────────────────────────────
 # botforge orchestrates external tools by shelling out; bake the full toolchain
 # so subcommands work reproducibly inside the container without host deps.
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 ARG BINARY_SOURCE=source
 
