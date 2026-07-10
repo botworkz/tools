@@ -664,7 +664,7 @@ fields (`compression_type:`, `cluster_size:`, `reclaim:`):
 | `enabled` | **yes** | bool | `true` ⇒ compress; `false` ⇒ plain rename (same as omitting the block) |
 | `compression_type` | no | enum | Compression codec passed to `qemu-img convert`: `zstd` (default when `enabled: true`) or `zlib`. |
 | `cluster_size` | no | string | Passed verbatim as `-o cluster_size=<val>` to `qemu-img convert`. Omit ⇒ qemu default. |
-| `reclaim` | no | enum | Reclaim freed blocks before commit: `none` (default), `fstrim`, or `discard`. |
+| `reclaim` | no | enum | Reclaim freed blocks before commit: `none` (default), `fstrim`, `discard`, or `sparsify`. |
 
 A `compress:` block **without** `enabled:` is a hard parse error.  Unknown
 fields inside the block (e.g. `clustersize`) are also hard errors
@@ -681,11 +681,36 @@ don't want `qemu-img convert -c`.
 - `reclaim: discard`: host-side offline reclaim after shutdown via
   `qemu-nbd --discard=unmap` + mount with `-o discard` + `fstrim -v`.
   More robust, but requires `qemu-nbd`.
+- `reclaim: sparsify`: **maximum reclaim** — runs in-guest `fstrim` first
+  (same as `fstrim` mode, with `discard=unmap`), then after VM shutdown runs an
+  offline libguestfs `zero_free_space` pass via the [`guestfs` Rust crate][guestfs-crate]
+  (in-process FFI bindings to libguestfs).  This writes zeros over filesystem
+  free space that `fstrim` alone cannot reach, so the subsequent compress pass
+  drops them, reclaiming the residual free-space slack (~100-180 MB
+  pre-compression) beyond what `fstrim` achieves.
 
-For `reclaim: fstrim` and `reclaim: discard`, botforge also runs a pure-Rust
-qcow2 zero-cluster sparsify pass before commit/compression. It deallocates
-allocated-but-all-zero clusters (lossless) without introducing any external
-runtime dependency.
+  **Requirements for `reclaim: sparsify`:**
+  - `libguestfs` must be installed on the build host (e.g.
+    `apt install libguestfs-dev` / `dnf install libguestfs-devel`).
+  - KVM is required (already a hard dependency of `botforge build`).
+  - The libguestfs appliance kernel must be readable.  If you see
+    `supermin exited with error status 1`, run
+    `sudo chmod a+r /boot/vmlinuz*` to fix appliance kernel permissions.
+    botforge automatically sets `LIBGUESTFS_BACKEND=direct` (if not already
+    set) to use the pre-built appliance and avoid the supermin appliance-build
+    step, which requires a readable kernel image.
+  - For verbose libguestfs diagnostics set `LIBGUESTFS_DEBUG=1` and
+    `LIBGUESTFS_TRACE=1` before running the build.
+
+  **Note:** No external `virt-sparsify` or `guestfish` binary is invoked;
+  the entire `zero_free_space` pass runs in-process via the `guestfs` Rust crate.
+
+[guestfs-crate]: https://docs.rs/guestfs/latest/guestfs/
+
+For `reclaim: fstrim`, `reclaim: discard`, and `reclaim: sparsify`, botforge
+also runs a pure-Rust qcow2 zero-cluster sparsify pass before commit/compression.
+It deallocates allocated-but-all-zero clusters (lossless) without introducing any
+external runtime dependency.
 
 When `enabled: true`, `botforge build` then runs:
 ```
@@ -733,6 +758,15 @@ compress:
   compression_type: zstd
   cluster_size: "1M"
   reclaim: fstrim
+
+# on, maximum reclaim: in-guest fstrim + offline libguestfs zero_free_space
+# reclaims the residual free-space slack (~100-180 MB) that fstrim alone leaves
+# requires: libguestfs installed + KVM (already required) + readable appliance kernel
+compress:
+  enabled: true
+  compression_type: zstd
+  cluster_size: "1M"
+  reclaim: sparsify
 
 # explicit off (equivalent to omitting the block)
 compress:
