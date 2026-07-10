@@ -385,6 +385,7 @@ fn require_stable_ssh_with_deadline(
     anyhow::bail!("SSH was not stable enough after {attempts} probes")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_ssh_step_with_step_log(
     name: &str,
     ssh: &SshOptions,
@@ -449,11 +450,11 @@ fn run_ssh_step_with_step_log(
                 // Remote command ran and exited non-zero — fail fast, no retry.
                 anyhow::bail!("ssh command failed (exit status: {code})");
             }
-            SshExecOutcome::TransportError(_) => {
+            SshExecOutcome::TransportError(e) => {
                 attempts += 1;
                 // Retry only on transport errors (equivalent to the old exit-code-255 gate).
                 if attempts >= retries {
-                    anyhow::bail!("ssh command failed (transport error, retries exhausted)");
+                    anyhow::bail!("ssh command failed (transport error, retries exhausted): {e:#}");
                 }
                 std::thread::sleep(retry_delay);
             }
@@ -560,7 +561,6 @@ fn run_host_step(
                         let _ = child.wait();
                         break Err(overall_timeout_error(budget.overall_timeout));
                     }
-                    Some(WaitResult::Exit(_)) => unreachable!(),
                     None => {}
                 }
                 std::thread::sleep(Duration::from_millis(200));
@@ -584,7 +584,6 @@ fn run_host_step(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WaitResult {
-    Exit(std::process::ExitStatus),
     StepTimeout,
     OverallTimeout,
 }

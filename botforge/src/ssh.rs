@@ -246,7 +246,7 @@ async fn exec_simple_async(
     connect_timeout: Duration,
     capture: bool,
 ) -> AttemptResult {
-    let mut session = match connect_async(ssh, connect_timeout).await {
+    let session = match connect_async(ssh, connect_timeout).await {
         Ok(s) => s,
         Err(e) => return AttemptResult::Transport(e),
     };
@@ -335,7 +335,7 @@ async fn exec_logged_async(
     // Connect within the connect_timeout, but also bounded by the overall deadline.
     let effective_connect_timeout =
         connect_timeout.min(overall_remaining);
-    let mut session = match connect_async(ssh, effective_connect_timeout).await {
+    let session = match connect_async(ssh, effective_connect_timeout).await {
         Ok(s) => s,
         Err(e) => {
             // If overall deadline expired during connect, report that.
