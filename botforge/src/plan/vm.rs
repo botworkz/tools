@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::ssh::{
-    journalctl_command, scp_with_retry, ssh_capture_stdout, ssh_command_args, ssh_with_retry,
-    wait_for_ssh, SshOptions,
+    journalctl_command, scp_with_retry, ssh_capture_stdout, ssh_exec_logged, ssh_with_retry,
+    wait_for_ssh, SshExecOutcome, SshOptions,
 };
 use crate::util::unique_suffix;
 
@@ -248,7 +248,9 @@ fn run_run_step(
                     build_guest_ssh_cmd(&template, &remote_script, step.sudo == Some(true));
                 run_ssh_step_with_step_log(
                     &step.name,
-                    ssh_command_args(context.ssh, &ssh_cmd, Duration::from_secs(300).as_secs()),
+                    context.ssh,
+                    &ssh_cmd,
+                    Duration::from_secs(300),
                     &step_log_path,
                     step_budget,
                     TEST_TRANSPORT_RETRIES,
@@ -383,9 +385,12 @@ fn require_stable_ssh_with_deadline(
     anyhow::bail!("SSH was not stable enough after {attempts} probes")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_ssh_step_with_step_log(
     name: &str,
-    args: Vec<String>,
+    ssh: &SshOptions,
+    remote_command: &str,
+    connect_timeout: Duration,
     log_path: &Path,
     budget: StepExecutionBudget,
     retries: usize,
@@ -394,65 +399,76 @@ fn run_ssh_step_with_step_log(
     let logger = Arc::new(StepLogWriter::create(log_path)?);
     let mut attempts = 0usize;
     loop {
-        let mut command = Command::new("ssh");
-        command.args(&args);
-        let (mut child, forwarders) =
-            spawn_logged_child(&mut command, Arc::clone(&logger), "failed to execute ssh")?;
+        // Per-attempt output buffers for line-oriented log writing.
+        let mut pending_out: Vec<u8> = Vec::new();
+        let mut pending_err: Vec<u8> = Vec::new();
 
-        // Poll with a bounded deadline; kill and surface a timeout error if
-        // the step does not exit within its own timeout or the overall run budget.
-        let step_deadline = Instant::now() + budget.step_timeout;
-        let wait_result: Result<WaitResult> = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break Ok(WaitResult::Exit(status)),
-                Ok(None) => {
-                    if let Some(timeout_result) =
-                        timeout_cause(step_deadline, budget.overall_deadline)
-                    {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        break Ok(timeout_result);
-                    }
-                    std::thread::sleep(Duration::from_millis(200));
-                }
-                Err(e) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    // Convert to anyhow and break; forwarders joined below.
-                    break Err(anyhow::Error::new(e).context("failed to wait for ssh"));
-                }
+        let logger_ref = Arc::clone(&logger);
+        let mut on_output = |is_stderr: bool, data: &[u8]| {
+            use std::io::Write;
+            if is_stderr {
+                let _ = std::io::stderr().write_all(data);
+                pending_err.extend_from_slice(data);
+                flush_log_lines(&logger_ref, &mut pending_err, StepOutputStream::Stderr);
+            } else {
+                let _ = std::io::stdout().write_all(data);
+                pending_out.extend_from_slice(data);
+                flush_log_lines(&logger_ref, &mut pending_out, StepOutputStream::Stdout);
             }
         };
 
-        // Always join forwarders so threads and pipes are cleaned up on every
-        // exit path. Forwarder errors are suppressed — the step result wins
-        // (see Bug 3 fix; WouldBlock is no longer an error after Bug 1 fix).
-        let _ = join_output_forwarders(forwarders);
+        let outcome = ssh_exec_logged(
+            ssh,
+            remote_command,
+            connect_timeout,
+            budget.step_timeout,
+            budget.overall_deadline,
+            &mut on_output,
+        );
 
-        let status = match wait_result? {
-            WaitResult::StepTimeout => {
+        // Flush any partial (no-newline) buffered lines to the log.
+        if !pending_out.is_empty() {
+            let _ = logger_ref.log_line(StepOutputStream::Stdout, &pending_out);
+        }
+        if !pending_err.is_empty() {
+            let _ = logger_ref.log_line(StepOutputStream::Stderr, &pending_err);
+        }
+
+        match outcome {
+            SshExecOutcome::Success => return Ok(()),
+            SshExecOutcome::StepTimeout => {
                 anyhow::bail!(
                     "guest step '{}' timed out after {}s",
                     name,
                     budget.step_timeout.as_secs()
                 );
             }
-            WaitResult::OverallTimeout => {
-                return Err(overall_timeout_error(budget.overall_timeout))
+            SshExecOutcome::OverallTimeout => {
+                return Err(overall_timeout_error(budget.overall_timeout));
             }
-            WaitResult::Exit(status) => status,
-        };
+            SshExecOutcome::RemoteFailure(code) => {
+                // Remote command ran and exited non-zero — fail fast, no retry.
+                anyhow::bail!("ssh command failed (exit status: {code})");
+            }
+            SshExecOutcome::TransportError(e) => {
+                attempts += 1;
+                // Retry only on transport errors (equivalent to the old exit-code-255 gate).
+                if attempts >= retries {
+                    anyhow::bail!("ssh command failed (transport error, retries exhausted): {e:#}");
+                }
+                std::thread::sleep(retry_delay);
+            }
+        }
+    }
+}
 
-        if status.success() {
-            return Ok(());
-        }
-        attempts += 1;
-        // Non-255 exit or retries exhausted → hard failure. Retry only on 255
-        // (SSH transport error) to match retry_transport_cmd semantics.
-        if status.code() != Some(255) || attempts >= retries {
-            anyhow::bail!("ssh command failed (exit status: {status})");
-        }
-        std::thread::sleep(retry_delay);
+/// Write complete newline-terminated lines from `pending` to the log.
+/// Bytes before the first newline are left in `pending` for the next chunk.
+fn flush_log_lines(logger: &Arc<StepLogWriter>, pending: &mut Vec<u8>, stream: StepOutputStream) {
+    while let Some(pos) = pending.iter().position(|&b| b == b'\n') {
+        let mut line: Vec<u8> = pending.drain(..=pos).collect();
+        line.pop(); // remove the '\n'
+        let _ = logger.log_line(stream, &line);
     }
 }
 
@@ -541,7 +557,6 @@ fn run_host_step(
                         let _ = child.wait();
                         break Err(overall_timeout_error(budget.overall_timeout));
                     }
-                    Some(WaitResult::Exit(_)) => unreachable!(),
                     None => {}
                 }
                 std::thread::sleep(Duration::from_millis(200));
@@ -565,7 +580,6 @@ fn run_host_step(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WaitResult {
-    Exit(std::process::ExitStatus),
     StepTimeout,
     OverallTimeout,
 }

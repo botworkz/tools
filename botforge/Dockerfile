@@ -43,10 +43,12 @@ ARG BINARY_SOURCE=source
 # Install orchestration toolchain:
 #   qemu-system-x86 / qemu-utils  — qemu-system-x86_64, qemu-img
 #   xorriso / genisoimage         — ISO building (cidata seed for `botforge test`)
-#   openssh-client                — ssh, scp, ssh-keygen
 #   libnss-wrapper                — uid/gid passthrough support in entrypoint
 #   ca-certificates               — TLS roots
 #   cloud-image-utils / curl / jq — ancillary runtime utilities
+#
+# openssh-client is intentionally absent: botforge uses a pure-Rust SSH/SFTP
+# implementation (russh + russh-sftp) and no longer shells out to ssh/scp/ssh-keygen.
 #
 # hadolint ignore=DL3008
 RUN apt-get update \
@@ -57,7 +59,6 @@ RUN apt-get update \
         genisoimage \
         jq \
         libnss-wrapper \
-        openssh-client \
         qemu-system-x86 \
         qemu-utils \
         xorriso \
