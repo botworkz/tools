@@ -20,7 +20,7 @@ use crate::util::{
     unique_suffix,
 };
 
-use crate::plan::config::{CompressConfig, ReclaimMode};
+use crate::plan::config::{CompressConfig, CompressionType, ReclaimMode};
 use crate::plan::step::{ArchiveStep, StepTarget, TestStep};
 use crate::plan::{
     load_build_config, preserve_failed_build_disk, print_log_tail, run_step_flow,
@@ -399,18 +399,26 @@ fn log_final_image_stats(
 /// Pure function — constructs the argv without invoking the process, enabling
 /// unit tests that mirror the existing `iso_args_*` test pattern.
 ///
-/// Produces: `["convert", "-O", "qcow2", "-c", <partial>, <out>]`
-/// or with cluster_size: `["convert", "-O", "qcow2", "-c", "-o", "cluster_size=<val>", <partial>, <out>]`
+/// Produces: `["convert", "-O", "qcow2", "-c", "-o", "compression_type=<val>[,cluster_size=<val>]", <partial>, <out>]`
 pub(crate) fn qemu_convert_args(
     partial: &Path,
     out: &Path,
+    compression_type: CompressionType,
     cluster_size: Option<&str>,
 ) -> Vec<String> {
     let mut args = vec!["convert".into(), "-O".into(), "qcow2".into(), "-c".into()];
+    let mut options = vec![format!(
+        "compression_type={}",
+        match compression_type {
+            CompressionType::Zstd => "zstd",
+            CompressionType::Zlib => "zlib",
+        }
+    )];
     if let Some(cs) = cluster_size {
-        args.push("-o".into());
-        args.push(format!("cluster_size={cs}"));
+        options.push(format!("cluster_size={cs}"));
     }
+    args.push("-o".into());
+    args.push(options.join(","));
     args.push(partial.display().to_string());
     args.push(out.display().to_string());
     args
@@ -420,8 +428,8 @@ pub(crate) fn qemu_convert_args(
 ///
 /// - `compress` is `None` or `Some { enabled: false, .. }` → plain atomic
 ///   rename (byte-identical to prior behaviour).
-/// - `compress` is `Some { enabled: true, cluster_size }` → runs
-///   `qemu-img convert -O qcow2 -c [-o cluster_size=<val>] <partial> <tmp>`
+/// - `compress` is `Some { enabled: true, compression_type, cluster_size }` →
+///   runs `qemu-img convert -O qcow2 -c -o compression_type=<val>[,cluster_size=<val>] <partial> <tmp>`
 ///   then atomically renames `<tmp>` to `output` and removes `partial`.
 fn commit_output(partial: &Path, output: &Path, compress: Option<&CompressConfig>) -> Result<()> {
     match compress {
@@ -429,13 +437,33 @@ fn commit_output(partial: &Path, output: &Path, compress: Option<&CompressConfig
             // Write to a temp path beside the output so the final rename is
             // atomic (same filesystem as the intended output location).
             let tmp = output.with_extension("partial.compress");
-            let args = qemu_convert_args(partial, &tmp, c.cluster_size.as_deref());
-            let status = Command::new("qemu-img")
+            let args =
+                qemu_convert_args(partial, &tmp, c.compression_type, c.cluster_size.as_deref());
+            let command_output = Command::new("qemu-img")
                 .args(&args)
-                .status()
+                .output()
                 .context("failed to execute qemu-img convert")?;
-            if !status.success() {
-                bail!("qemu-img convert failed (exit status: {status})");
+            if !command_output.status.success() {
+                let stderr = String::from_utf8_lossy(&command_output.stderr)
+                    .trim()
+                    .to_string();
+                let stderr_suffix = if stderr.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {stderr}")
+                };
+                if matches!(c.compression_type, CompressionType::Zstd) {
+                    bail!(
+                        "qemu-img convert failed (exit status: {}){}. zstd qcow2 compression requires qemu >= 5.1 on the build host and image consumers; retry with `compress.compression_type: zlib` if you must support an older qemu",
+                        command_output.status,
+                        stderr_suffix
+                    );
+                }
+                bail!(
+                    "qemu-img convert failed (exit status: {}){}",
+                    command_output.status,
+                    stderr_suffix
+                );
             }
             std::fs::rename(&tmp, output).with_context(|| {
                 format!(
@@ -1206,7 +1234,7 @@ mod tests {
         should_run_zero_cluster_sparsify, unpack_archive_to_dir,
     };
     use crate::cli::Cli;
-    use crate::plan::config::ReclaimMode;
+    use crate::plan::config::{CompressionType, ReclaimMode};
     use clap::Parser;
     use shasset::fetch::{DownloadResponse, FetchError, Transport};
     use std::io::Cursor;
@@ -1562,10 +1590,11 @@ mod tests {
     // -----------------------------------------------------------------
 
     #[test]
-    fn qemu_convert_args_no_cluster_size() {
+    fn qemu_convert_args_zstd_no_cluster_size() {
         let args = qemu_convert_args(
             Path::new("/build/out.qcow2.partial"),
             Path::new("/build/out.qcow2"),
+            CompressionType::Zstd,
             None,
         );
         assert_eq!(
@@ -1575,6 +1604,8 @@ mod tests {
                 "-O",
                 "qcow2",
                 "-c",
+                "-o",
+                "compression_type=zstd",
                 "/build/out.qcow2.partial",
                 "/build/out.qcow2",
             ]
@@ -1582,10 +1613,11 @@ mod tests {
     }
 
     #[test]
-    fn qemu_convert_args_with_cluster_size() {
+    fn qemu_convert_args_zstd_with_cluster_size() {
         let args = qemu_convert_args(
             Path::new("/build/out.qcow2.partial"),
             Path::new("/build/out.qcow2"),
+            CompressionType::Zstd,
             Some("1M"),
         );
         assert_eq!(
@@ -1596,7 +1628,53 @@ mod tests {
                 "qcow2",
                 "-c",
                 "-o",
-                "cluster_size=1M",
+                "compression_type=zstd,cluster_size=1M",
+                "/build/out.qcow2.partial",
+                "/build/out.qcow2",
+            ]
+        );
+    }
+
+    #[test]
+    fn qemu_convert_args_zlib_no_cluster_size() {
+        let args = qemu_convert_args(
+            Path::new("/build/out.qcow2.partial"),
+            Path::new("/build/out.qcow2"),
+            CompressionType::Zlib,
+            None,
+        );
+        assert_eq!(
+            args,
+            vec![
+                "convert",
+                "-O",
+                "qcow2",
+                "-c",
+                "-o",
+                "compression_type=zlib",
+                "/build/out.qcow2.partial",
+                "/build/out.qcow2",
+            ]
+        );
+    }
+
+    #[test]
+    fn qemu_convert_args_zlib_with_cluster_size() {
+        let args = qemu_convert_args(
+            Path::new("/build/out.qcow2.partial"),
+            Path::new("/build/out.qcow2"),
+            CompressionType::Zlib,
+            Some("1M"),
+        );
+        assert_eq!(
+            args,
+            vec![
+                "convert",
+                "-O",
+                "qcow2",
+                "-c",
+                "-o",
+                "compression_type=zlib,cluster_size=1M",
                 "/build/out.qcow2.partial",
                 "/build/out.qcow2",
             ]
