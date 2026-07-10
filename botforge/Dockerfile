@@ -75,6 +75,7 @@ RUN apt-get update \
         jq \
         libguestfs0 \
         libnss-wrapper \
+        linux-image-amd64 \
         qemu-system-x86 \
         qemu-utils \
         xorriso \
