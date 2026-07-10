@@ -510,7 +510,8 @@ bootcmd:                         # optional; merged into the first-boot cloud-in
   - echo "early boot hook"
 compress:                        # optional; absent = plain rename (no compression)
   enabled: true
-  cluster_size: "1M"             # optional; omit for qemu default
+  compressor_args:               # optional map of -o key=value options
+    cluster_size: "1M"           # e.g. cluster_size, compression_level
 uploads:                         # optional; guest-only pre-step staging
   - src: images/botspace/envoy/**/*.yaml
     dest: /tmp/bake-staging/envoy/
@@ -656,16 +657,15 @@ output — there is zero behaviour change for existing specs that omit the field
 before committing it.  When absent (the default), the disk is committed via a
 plain atomic rename — behaviour byte-identical to all prior botforge versions.
 
-`compress:` is a **map** with one required field (`enabled:`) and four optional
-fields (`compressor:`, `compressor_args:`, `cluster_size:`, `reclaim:`):
+`compress:` is a **map** with one required field (`enabled:`) and three optional
+fields (`compressor:`, `compressor_args:`, `reclaim:`):
 
 | Field | Required | Type | Description |
 |---|---|---|---|
 | `enabled` | **yes** | bool | `true` ⇒ compress; `false` ⇒ plain rename (same as omitting the block) |
 | `compressor` | no | enum | Compression codec passed to `qemu-img convert`: `zstd` (default when `enabled: true`) or `zlib`. |
-| `compressor_args` | no | list[string] | Additional `qemu-img convert` arguments passed verbatim before the source and destination paths. |
-| `cluster_size` | no | string | Passed verbatim as `-o cluster_size=<val>` to `qemu-img convert`. Omit ⇒ qemu default. |
-| `reclaim` | no | enum | Reclaim freed blocks before commit: `none` (default), `fstrim`, `discard`, or `sparsify`. |
+| `compressor_args` | no | map[string→string] | Extra `-o` key=value options merged into the `qemu-img convert` `-o` string alongside `compression_type`. Keys are sorted for determinism. Example: `{cluster_size: "1M", compression_level: "22"}`. |
+| `reclaim` | no | enum | Reclaim freed blocks before commit: `none` (default), `fstrim`, or `discard`. |
 
 A `compress:` block **without** `enabled:` is a hard parse error.  Unknown
 fields inside the block (e.g. `clustersize`) are also hard errors
@@ -682,48 +682,24 @@ don't want `qemu-img convert -c`.
 - `reclaim: discard`: host-side offline reclaim after shutdown via
   `qemu-nbd --discard=unmap` + mount with `-o discard` + `fstrim -v`.
   More robust, but requires `qemu-nbd`.
-- `reclaim: sparsify`: **maximum reclaim** — runs in-guest `fstrim` first
-  (same as `fstrim` mode, with `discard=unmap`), then after VM shutdown runs an
-  offline libguestfs `zero_free_space` pass via the [`guestfs` Rust crate][guestfs-crate]
-  (in-process FFI bindings to libguestfs).  This writes zeros over filesystem
-  free space that `fstrim` alone cannot reach, so the subsequent compress pass
-  drops them, reclaiming the residual free-space slack (~100-180 MB
-  pre-compression) beyond what `fstrim` achieves.
 
-  **Requirements for `reclaim: sparsify`:**
-  - `libguestfs` must be installed on the build host (e.g.
-    `apt install libguestfs-dev` / `dnf install libguestfs-devel`).
-  - KVM is required (already a hard dependency of `botforge build`).
-  - The libguestfs appliance kernel must be readable.  If you see
-    `supermin exited with error status 1`, run
-    `sudo chmod a+r /boot/vmlinuz*` to fix appliance kernel permissions.
-    botforge automatically sets `LIBGUESTFS_BACKEND=direct` (if not already
-    set) to use the pre-built appliance and avoid the supermin appliance-build
-    step, which requires a readable kernel image.
-  - For verbose libguestfs diagnostics set `LIBGUESTFS_DEBUG=1` and
-    `LIBGUESTFS_TRACE=1` before running the build.
-
-  **Note:** No external `virt-sparsify` or `guestfish` binary is invoked;
-  the entire `zero_free_space` pass runs in-process via the `guestfs` Rust crate.
-
-[guestfs-crate]: https://docs.rs/guestfs/latest/guestfs/
-
-For `reclaim: fstrim`, `reclaim: discard`, and `reclaim: sparsify`, botforge
+For `reclaim: fstrim` and `reclaim: discard`, botforge
 also runs a pure-Rust qcow2 zero-cluster sparsify pass before commit/compression.
 It deallocates allocated-but-all-zero clusters (lossless) without introducing any
 external runtime dependency.
 
 When `enabled: true`, `botforge build` then runs:
 ```
-qemu-img convert -O qcow2 -c -o compression_type=<zstd|zlib>[,cluster_size=<val>] <compressor_args...> <output>.partial <output>
+qemu-img convert -O qcow2 -c -o compression_type=<zstd|zlib>[,<key>=<val>...] <output>.partial <output>
 ```
 then atomically renames the result into place and removes the `.partial` file.
 A non-zero exit from `qemu-img` is a hard error.  `qemu-img` is already
 required by `botforge build`, so no new dependency is introduced.
 
-`compressor_args:` is passed through without interpretation or validation. Use
-it for `qemu-img convert` flags such as `-T0` or extra tuning options that your
-installed qemu understands.
+`compressor_args:` is a string map; each entry is appended as `key=value` to
+the `-o` option string after `compression_type`.  Keys are sorted (BTreeMap)
+so the command line is deterministic.  Use it for extra qemu-img options such
+as `cluster_size` or `compression_level` that your installed qemu understands.
 
 When compression is enabled and `compressor:` is omitted, botforge now
 defaults to `zstd`. `zstd`-compressed qcow2 images require qemu >= 5.1 both on
@@ -745,40 +721,27 @@ compress:
   enabled: true
   # compressor defaults to zstd
 
-# on, explicit cluster size (e.g. to match space's bake output)
+# on, explicit cluster size and compression level via compressor_args map
 compress:
   enabled: true
   compressor: zstd
-  cluster_size: "1M"
+  compressor_args:
+    compression_level: "22"
+    cluster_size: "1M"
 
 # on, opt back into qemu's historical zlib compression codec
 compress:
   enabled: true
   compressor: zlib
 
-# on, pass through extra qemu-img convert args verbatim
-compress:
-  enabled: true
-  compressor_args:
-    - -T0
-    - --threads=0
-
 # on, reclaim guest-freed blocks before convert -c
 # (useful when your build deletes large temporary payloads, e.g. docker image tars)
 compress:
   enabled: true
   compressor: zstd
-  cluster_size: "1M"
+  compressor_args:
+    cluster_size: "1M"
   reclaim: fstrim
-
-# on, maximum reclaim: in-guest fstrim + offline libguestfs zero_free_space
-# reclaims the residual free-space slack (~100-180 MB) that fstrim alone leaves
-# requires: libguestfs installed + KVM (already required) + readable appliance kernel
-compress:
-  enabled: true
-  compressor: zstd
-  cluster_size: "1M"
-  reclaim: sparsify
 
 # explicit off (equivalent to omitting the block)
 compress:
