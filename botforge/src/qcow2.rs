@@ -127,6 +127,7 @@ pub(crate) fn compress_qcow2_image(
         .open(dest)
         .with_context(|| format!("cannot create compressed qcow2: {}", dest.display()))?;
     let compressor = build_compressor(compression_type, compressor_opts)?;
+    let _compressor_id = compressor.id();
 
     let total_l2_entries = usize::try_from(
         l1_size
@@ -210,13 +211,15 @@ pub(crate) fn compress_qcow2_image(
 
     write_header(
         &mut output,
-        compression_type,
-        cluster_size,
-        virtual_size,
-        l1_size,
-        l1_table_offset,
-        refcount_table_offset,
-        refcount_table_clusters,
+        HeaderWriteSpec {
+            compression_type,
+            cluster_size,
+            virtual_size,
+            l1_size,
+            l1_table_offset,
+            refcount_table_offset,
+            refcount_table_clusters,
+        },
     )?;
     write_l1_table(
         &mut output,
@@ -415,6 +418,12 @@ impl SourceImage {
     }
 
     fn ensure_supported(&self) -> Result<()> {
+        if self.header.header_length < 104 {
+            bail!(
+                "native qcow2 compression requires qcow2 header_length >= 104, got {}",
+                self.header.header_length
+            );
+        }
         if self.header.backing_file_offset != 0 {
             bail!("native qcow2 compression does not yet support backing files");
         }
@@ -543,6 +552,17 @@ impl DataAllocator {
             .context("raw data offset overflow")?;
         Ok(offset)
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HeaderWriteSpec {
+    compression_type: CompressionType,
+    cluster_size: u64,
+    virtual_size: u64,
+    l1_size: u64,
+    l1_table_offset: u64,
+    refcount_table_offset: u64,
+    refcount_table_clusters: u64,
 }
 
 fn resolve_target_cluster_size(
@@ -678,43 +698,35 @@ fn increment_refcount_range(
     Ok(())
 }
 
-fn write_header(
-    file: &mut File,
-    compression_type: CompressionType,
-    cluster_size: u64,
-    virtual_size: u64,
-    l1_size: u64,
-    l1_table_offset: u64,
-    refcount_table_offset: u64,
-    refcount_table_clusters: u64,
-) -> Result<()> {
-    let mut header = vec![0u8; usize::try_from(cluster_size).context("cluster size too large")?];
-    let incompatible_features = if matches!(compression_type, CompressionType::Zstd) {
+fn write_header(file: &mut File, spec: HeaderWriteSpec) -> Result<()> {
+    let mut header =
+        vec![0u8; usize::try_from(spec.cluster_size).context("cluster size too large")?];
+    let incompatible_features = if matches!(spec.compression_type, CompressionType::Zstd) {
         QCOW2_INCOMPAT_COMPRESSION
     } else {
         0
     };
     write_be_u32(&mut header, 0, QCOW_MAGIC);
     write_be_u32(&mut header, 4, 3);
-    write_be_u32(&mut header, 20, cluster_size.trailing_zeros());
-    write_be_u64(&mut header, 24, virtual_size);
+    write_be_u32(&mut header, 20, spec.cluster_size.trailing_zeros());
+    write_be_u64(&mut header, 24, spec.virtual_size);
     write_be_u32(
         &mut header,
         36,
-        u32::try_from(l1_size).context("l1_size does not fit u32")?,
+        u32::try_from(spec.l1_size).context("l1_size does not fit u32")?,
     );
-    write_be_u64(&mut header, 40, l1_table_offset);
-    write_be_u64(&mut header, 48, refcount_table_offset);
+    write_be_u64(&mut header, 40, spec.l1_table_offset);
+    write_be_u64(&mut header, 48, spec.refcount_table_offset);
     write_be_u32(
         &mut header,
         56,
-        u32::try_from(refcount_table_clusters)
+        u32::try_from(spec.refcount_table_clusters)
             .context("refcount_table_clusters does not fit u32")?,
     );
     write_be_u64(&mut header, 72, incompatible_features);
     write_be_u32(&mut header, 96, DEFAULT_REFCOUNT_ORDER);
     write_be_u32(&mut header, 100, QCOW_HEADER_LENGTH_V3);
-    header[104] = match compression_type {
+    header[104] = match spec.compression_type {
         CompressionType::Zstd => QCOW2_COMPRESSION_TYPE_ZSTD,
         CompressionType::Zlib => QCOW2_COMPRESSION_TYPE_ZLIB,
     };
