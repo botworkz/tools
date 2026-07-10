@@ -674,8 +674,9 @@ fields inside the block (e.g. `clustersize`) are also hard errors
 don't want `qemu-img convert -c`.
 
 - `reclaim: none` (default): no reclaim step (current behaviour).
-- `reclaim: fstrim`: in-guest `sudo fstrim -av` as the last guest action before
-  shutdown. Light-weight, but requires guest discard support.
+- `reclaim: fstrim`: in-guest `sudo fstrim -av` before shutdown. botforge
+  automatically attaches the build qcow2 with `discard=unmap` for this mode so
+  the guest TRIM reaches the qcow2 layer without requiring an offline NBD pass.
 - `reclaim: discard`: host-side offline reclaim after shutdown via
   `qemu-nbd --discard=unmap` + mount with `-o discard` + `fstrim -v`.
   More robust, but requires `qemu-nbd`.

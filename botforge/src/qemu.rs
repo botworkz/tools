@@ -139,8 +139,13 @@ pub(crate) fn qemu_build_args(
     ssh_port: u16,
     memsize: u32,
     smp: u32,
+    enable_discard_unmap: bool,
 ) -> Vec<String> {
     let netdev = format!("user,id=net0,hostfwd=tcp:0.0.0.0:{ssh_port}-:22");
+    let mut primary_drive = format!("file={},if=virtio,format=qcow2", partial_image.display());
+    if enable_discard_unmap {
+        primary_drive.push_str(",discard=unmap");
+    }
     vec![
         "-accel".into(),
         "kvm".into(),
@@ -151,7 +156,7 @@ pub(crate) fn qemu_build_args(
         "-cpu".into(),
         "host".into(),
         "-drive".into(),
-        format!("file={},if=virtio,format=qcow2", partial_image.display()),
+        primary_drive,
         "-drive".into(),
         format!("file={},media=cdrom,readonly=on", seed_iso.display()),
         "-netdev".into(),
@@ -324,6 +329,7 @@ mod tests {
             2222,
             4096,
             4,
+            false,
         );
         assert_eq!(
             args,
@@ -360,6 +366,7 @@ mod tests {
             2222,
             4096,
             4,
+            false,
         );
         let drive_arg = args.iter().skip_while(|a| *a != "-drive").nth(1).unwrap();
         assert!(
@@ -370,6 +377,24 @@ mod tests {
         assert!(
             !drive_arg.contains("backing-file"),
             "build drive must not use a backing file: {drive_arg}"
+        );
+    }
+
+    #[test]
+    fn qemu_build_args_include_discard_unmap_when_requested() {
+        use super::qemu_build_args;
+        let args = qemu_build_args(
+            Path::new("/build/out.qcow2.partial"),
+            Path::new("/seed.iso"),
+            2222,
+            4096,
+            4,
+            true,
+        );
+        let drive_arg = args.iter().skip_while(|a| *a != "-drive").nth(1).unwrap();
+        assert_eq!(
+            drive_arg,
+            "file=/build/out.qcow2.partial,if=virtio,format=qcow2,discard=unmap"
         );
     }
 }
