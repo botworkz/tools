@@ -1,12 +1,24 @@
 use anyhow::{bail, Context, Result};
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
+use crate::compressor::{build_compressor, decompress_cluster};
+use crate::plan::config::CompressionType;
+
 const QCOW_MAGIC: u32 = 0x5146_49fb;
 const QCOW_OFLAG_COMPRESSED: u64 = 1u64 << 62;
+const QCOW_OFLAG_ZERO: u64 = 1;
 const QCOW_DATA_OFFSET_MASK: u64 = (1u64 << 62) - 1;
+const QCOW2_COMPRESSED_SECTOR_SIZE: u64 = 512;
+const QCOW2_INCOMPAT_DATA_FILE: u64 = 1u64 << 2;
+const QCOW2_INCOMPAT_COMPRESSION: u64 = 1u64 << 3;
+const QCOW2_INCOMPAT_EXTL2: u64 = 1u64 << 4;
+const QCOW2_COMPRESSION_TYPE_ZLIB: u8 = 0;
+const QCOW2_COMPRESSION_TYPE_ZSTD: u8 = 1;
 const DEFAULT_REFCOUNT_ORDER: u32 = 4;
+const QCOW_HEADER_LENGTH_V3: u32 = 112;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct ZeroClusterSparsifyStats {
@@ -25,19 +37,224 @@ pub(crate) struct Qcow2ImageStats {
 
 #[derive(Debug, Clone, Copy)]
 struct Qcow2Header {
+    backing_file_offset: u64,
     virtual_size: u64,
     cluster_bits: u32,
     l1_size: u32,
     l1_table_offset: u64,
     refcount_table_offset: u64,
     refcount_table_clusters: u32,
+    incompatible_features: u64,
     refcount_order: u32,
+    header_length: u32,
+    compression_type: u8,
 }
 
 impl Qcow2Header {
     fn cluster_size(self) -> u64 {
         1u64 << self.cluster_bits
     }
+
+    fn compression_type(self) -> Result<CompressionType> {
+        if (self.incompatible_features & QCOW2_INCOMPAT_COMPRESSION) == 0 {
+            return Ok(CompressionType::Zlib);
+        }
+        match self.compression_type {
+            QCOW2_COMPRESSION_TYPE_ZLIB => Ok(CompressionType::Zlib),
+            QCOW2_COMPRESSION_TYPE_ZSTD => Ok(CompressionType::Zstd),
+            other => bail!("unsupported qcow2 compression type {other}"),
+        }
+    }
+
+    fn csize_shift(self) -> u32 {
+        62 - (self.cluster_bits - 8)
+    }
+
+    fn csize_mask(self) -> u64 {
+        (1u64 << (self.cluster_bits - 8)) - 1
+    }
+
+    fn cluster_offset_mask(self) -> u64 {
+        (1u64 << self.csize_shift()) - 1
+    }
+}
+
+pub(crate) fn compress_qcow2_image(
+    source: &Path,
+    dest: &Path,
+    compression_type: CompressionType,
+    compressor_args: &BTreeMap<String, String>,
+    compressor_opts: &str,
+) -> Result<()> {
+    let mut source_image = SourceImage::open(source)?;
+    source_image.ensure_supported()?;
+
+    let cluster_size =
+        resolve_target_cluster_size(source_image.header.cluster_size(), compressor_args)?;
+    let virtual_size = source_image.header.virtual_size;
+    let l2_entries_per_table = cluster_size
+        .checked_div(8)
+        .context("invalid qcow2 cluster size for L2 tables")?;
+    let guest_cluster_count = div_ceil(virtual_size, cluster_size);
+    let l1_size = div_ceil(guest_cluster_count, l2_entries_per_table);
+    let l1_table_clusters = div_ceil(
+        l1_size
+            .checked_mul(8)
+            .context("l1 table byte length overflow")?,
+        cluster_size,
+    );
+    let l1_table_offset = cluster_size;
+    let first_l2_offset = l1_table_offset
+        .checked_add(
+            l1_table_clusters
+                .checked_mul(cluster_size)
+                .context("l1 table cluster span overflow")?,
+        )
+        .context("l2 table offset overflow")?;
+    let data_start = first_l2_offset
+        .checked_add(
+            l1_size
+                .checked_mul(cluster_size)
+                .context("l2 table span overflow")?,
+        )
+        .context("data area offset overflow")?;
+
+    let mut output = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .open(dest)
+        .with_context(|| format!("cannot create compressed qcow2: {}", dest.display()))?;
+    let compressor = build_compressor(compression_type, compressor_opts)?;
+    let _compressor_id = compressor.id();
+
+    let total_l2_entries = usize::try_from(
+        l1_size
+            .checked_mul(l2_entries_per_table)
+            .context("l2 entry count overflow")?,
+    )
+    .context("l2 entry count too large")?;
+    let mut l2_entries = vec![0u64; total_l2_entries];
+    let mut refcounts = BTreeMap::<u64, u64>::new();
+    let mut cluster_buf =
+        vec![0u8; usize::try_from(cluster_size).context("cluster size too large")?];
+    let mut allocator = DataAllocator::new(cluster_size, data_start);
+
+    for guest_cluster_index in 0..guest_cluster_count {
+        cluster_buf.fill(0);
+        let guest_offset = guest_cluster_index
+            .checked_mul(cluster_size)
+            .context("guest offset overflow")?;
+        let remaining = virtual_size.saturating_sub(guest_offset);
+        let to_read = remaining.min(cluster_size) as usize;
+        source_image.read_virtual_range(guest_offset, &mut cluster_buf[..to_read])?;
+        if cluster_buf.iter().all(|b| *b == 0) {
+            continue;
+        }
+
+        let compressed = compressor.compress_cluster(&cluster_buf)?;
+        let entry = if compressed.len() < cluster_buf.len() {
+            let host_offset = allocator.allocate_compressed(compressed.len() as u64)?;
+            write_exact_at(&mut output, host_offset, &compressed)?;
+            increment_refcount_range(
+                &mut refcounts,
+                host_offset,
+                compressed.len() as u64,
+                cluster_size,
+            )?;
+            encode_compressed_l2_entry(host_offset, compressed.len() as u64, cluster_size)?
+        } else {
+            let host_offset = allocator.allocate_raw()?;
+            write_exact_at(&mut output, host_offset, &cluster_buf)?;
+            increment_refcount_range(&mut refcounts, host_offset, cluster_size, cluster_size)?;
+            host_offset
+        };
+        l2_entries
+            [usize::try_from(guest_cluster_index).context("guest cluster index too large")?] =
+            entry;
+    }
+
+    let refcount_table_offset = align_up(allocator.next_offset, cluster_size);
+    let host_clusters_before_refcounts = refcount_table_offset / cluster_size;
+    let (refcount_table_clusters, refcount_block_clusters, total_clusters) =
+        compute_refcount_layout(host_clusters_before_refcounts, cluster_size)?;
+    let refcount_block_offset = refcount_table_offset
+        .checked_add(
+            refcount_table_clusters
+                .checked_mul(cluster_size)
+                .context("refcount table span overflow")?,
+        )
+        .context("refcount block offset overflow")?;
+    let file_len = refcount_block_offset
+        .checked_add(
+            refcount_block_clusters
+                .checked_mul(cluster_size)
+                .context("refcount block span overflow")?,
+        )
+        .context("qcow2 file length overflow")?;
+    output
+        .set_len(file_len)
+        .with_context(|| format!("cannot resize compressed qcow2: {}", dest.display()))?;
+
+    increment_refcount_range(&mut refcounts, 0, data_start, cluster_size)?;
+    increment_refcount_range(
+        &mut refcounts,
+        refcount_table_offset,
+        refcount_table_clusters
+            .checked_add(refcount_block_clusters)
+            .context("refcount metadata cluster count overflow")?
+            .checked_mul(cluster_size)
+            .context("refcount metadata size overflow")?,
+        cluster_size,
+    )?;
+
+    write_header(
+        &mut output,
+        HeaderWriteSpec {
+            compression_type,
+            cluster_size,
+            virtual_size,
+            l1_size,
+            l1_table_offset,
+            refcount_table_offset,
+            refcount_table_clusters,
+        },
+    )?;
+    write_l1_table(
+        &mut output,
+        l1_table_offset,
+        first_l2_offset,
+        l1_size,
+        cluster_size,
+    )?;
+    write_l2_tables(
+        &mut output,
+        first_l2_offset,
+        l1_size,
+        cluster_size,
+        &l2_entries,
+    )?;
+    write_refcount_table(
+        &mut output,
+        refcount_table_offset,
+        refcount_block_offset,
+        refcount_table_clusters,
+        refcount_block_clusters,
+        cluster_size,
+    )?;
+    write_refcount_blocks(
+        &mut output,
+        refcount_block_offset,
+        refcount_block_clusters,
+        cluster_size,
+        total_clusters,
+        &refcounts,
+    )?;
+    output
+        .sync_all()
+        .with_context(|| format!("cannot flush compressed qcow2: {}", dest.display()))?;
+    Ok(())
 }
 
 pub(crate) fn sparsify_zero_clusters(path: &Path) -> Result<ZeroClusterSparsifyStats> {
@@ -173,8 +390,460 @@ pub(crate) fn read_qcow2_image_stats(path: &Path) -> Result<Qcow2ImageStats> {
     })
 }
 
+struct SourceImage {
+    file: File,
+    header: Qcow2Header,
+    l1_entries: Vec<u64>,
+}
+
+impl SourceImage {
+    fn open(path: &Path) -> Result<Self> {
+        let mut file = File::open(path).with_context(|| {
+            format!(
+                "cannot open qcow2 for native compression: {}",
+                path.display()
+            )
+        })?;
+        let header = read_header(&mut file)?;
+        let l1_entries = read_u64_table(
+            &mut file,
+            header.l1_table_offset,
+            usize::try_from(header.l1_size).context("l1_size does not fit usize")?,
+        )?;
+        Ok(Self {
+            file,
+            header,
+            l1_entries,
+        })
+    }
+
+    fn ensure_supported(&self) -> Result<()> {
+        if self.header.header_length < 104 {
+            bail!(
+                "native qcow2 compression requires qcow2 header_length >= 104, got {}",
+                self.header.header_length
+            );
+        }
+        if self.header.backing_file_offset != 0 {
+            bail!("native qcow2 compression does not yet support backing files");
+        }
+        let unsupported = self.header.incompatible_features
+            & !(QCOW2_INCOMPAT_COMPRESSION | QCOW2_INCOMPAT_DATA_FILE);
+        if unsupported != 0 {
+            bail!(
+                "native qcow2 compression does not yet support incompatible qcow2 features: 0x{unsupported:x}"
+            );
+        }
+        if (self.header.incompatible_features & QCOW2_INCOMPAT_DATA_FILE) != 0 {
+            bail!("native qcow2 compression does not yet support external qcow2 data files");
+        }
+        if (self.header.incompatible_features & QCOW2_INCOMPAT_EXTL2) != 0 {
+            bail!("native qcow2 compression does not yet support extended L2 qcow2 images");
+        }
+        let _ = self.header.compression_type()?;
+        Ok(())
+    }
+
+    fn read_virtual_range(&mut self, guest_offset: u64, buf: &mut [u8]) -> Result<()> {
+        let mut cursor = 0usize;
+        let source_cluster_size = self.header.cluster_size();
+        while cursor < buf.len() {
+            let offset = guest_offset
+                .checked_add(u64::try_from(cursor).context("guest range cursor overflow")?)
+                .context("guest range offset overflow")?;
+            let cluster_index = offset / source_cluster_size;
+            let offset_in_cluster = usize::try_from(offset % source_cluster_size)
+                .context("cluster offset does not fit usize")?;
+            let source_cluster = self.read_guest_cluster(cluster_index)?;
+            let chunk =
+                (buf.len() - cursor).min(source_cluster.len().saturating_sub(offset_in_cluster));
+            buf[cursor..cursor + chunk]
+                .copy_from_slice(&source_cluster[offset_in_cluster..offset_in_cluster + chunk]);
+            cursor += chunk;
+        }
+        Ok(())
+    }
+
+    fn read_guest_cluster(&mut self, cluster_index: u64) -> Result<Vec<u8>> {
+        let cluster_size = self.header.cluster_size();
+        let mut zero_cluster =
+            vec![0u8; usize::try_from(cluster_size).context("cluster size too large")?];
+        let l2_entries_per_table = cluster_size
+            .checked_div(8)
+            .context("invalid qcow2 cluster size for L2 tables")?;
+        let l1_index = usize::try_from(cluster_index / l2_entries_per_table)
+            .context("l1 index does not fit usize")?;
+        let Some(&l1_entry) = self.l1_entries.get(l1_index) else {
+            return Ok(zero_cluster);
+        };
+        let l2_offset = aligned_data_offset(l1_entry, cluster_size);
+        if l2_offset == 0 {
+            return Ok(zero_cluster);
+        }
+        let l2_index = cluster_index % l2_entries_per_table;
+        let l2_entry = read_u64_at(
+            &mut self.file,
+            l2_offset
+                .checked_add(l2_index.checked_mul(8).context("l2 index overflow")?)
+                .context("l2 entry offset overflow")?,
+        )?;
+        if l2_entry == 0 || (l2_entry & QCOW_OFLAG_ZERO) != 0 {
+            return Ok(zero_cluster);
+        }
+        if (l2_entry & QCOW_OFLAG_COMPRESSED) != 0 {
+            let (compressed_offset, compressed_size) =
+                parse_compressed_l2_entry(self.header, l2_entry)?;
+            let mut compressed = vec![
+                0u8;
+                usize::try_from(compressed_size)
+                    .context("compressed cluster too large")?
+            ];
+            read_exact_at(&mut self.file, compressed_offset, &mut compressed)?;
+            return decompress_cluster(
+                self.header.compression_type()?,
+                &compressed,
+                usize::try_from(cluster_size).context("cluster size too large")?,
+            );
+        }
+        let data_offset = aligned_data_offset(l2_entry, cluster_size);
+        if data_offset == 0 {
+            return Ok(zero_cluster);
+        }
+        read_exact_at(&mut self.file, data_offset, &mut zero_cluster)?;
+        Ok(zero_cluster)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DataAllocator {
+    cluster_size: u64,
+    next_offset: u64,
+}
+
+impl DataAllocator {
+    fn new(cluster_size: u64, next_offset: u64) -> Self {
+        Self {
+            cluster_size,
+            next_offset,
+        }
+    }
+
+    fn allocate_compressed(&mut self, size: u64) -> Result<u64> {
+        if size == 0 || size > self.cluster_size {
+            bail!("compressed qcow2 cluster has invalid size {size}");
+        }
+        let cluster_start = align_down(self.next_offset, self.cluster_size);
+        let used = self.next_offset.saturating_sub(cluster_start);
+        let offset = if used != 0 && used + size <= self.cluster_size {
+            self.next_offset
+        } else {
+            align_up(self.next_offset, self.cluster_size)
+        };
+        self.next_offset = offset
+            .checked_add(size)
+            .context("compressed data offset overflow")?;
+        Ok(offset)
+    }
+
+    fn allocate_raw(&mut self) -> Result<u64> {
+        let offset = align_up(self.next_offset, self.cluster_size);
+        self.next_offset = offset
+            .checked_add(self.cluster_size)
+            .context("raw data offset overflow")?;
+        Ok(offset)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HeaderWriteSpec {
+    compression_type: CompressionType,
+    cluster_size: u64,
+    virtual_size: u64,
+    l1_size: u64,
+    l1_table_offset: u64,
+    refcount_table_offset: u64,
+    refcount_table_clusters: u64,
+}
+
+fn resolve_target_cluster_size(
+    source_cluster_size: u64,
+    compressor_args: &BTreeMap<String, String>,
+) -> Result<u64> {
+    let mut cluster_size = source_cluster_size;
+    for (key, value) in compressor_args {
+        match key.as_str() {
+            "cluster_size" => cluster_size = parse_cluster_size(value)?,
+            other => bail!("unsupported qcow2 structural compression option '{other}'"),
+        }
+    }
+    Ok(cluster_size)
+}
+
+fn parse_cluster_size(raw: &str) -> Result<u64> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        bail!("cluster_size cannot be empty");
+    }
+    let split_idx = raw.find(|c: char| !c.is_ascii_digit()).unwrap_or(raw.len());
+    let (digits, suffix) = raw.split_at(split_idx);
+    let mut value = digits
+        .parse::<u64>()
+        .with_context(|| format!("invalid qcow2 cluster_size '{raw}'"))?;
+    let suffix = suffix.to_ascii_lowercase();
+    value = match suffix.as_str() {
+        "" => value,
+        "k" => value.checked_mul(1024).context("cluster_size overflow")?,
+        "m" => value
+            .checked_mul(1024)
+            .and_then(|v| v.checked_mul(1024))
+            .context("cluster_size overflow")?,
+        "g" => value
+            .checked_mul(1024)
+            .and_then(|v| v.checked_mul(1024))
+            .and_then(|v| v.checked_mul(1024))
+            .context("cluster_size overflow")?,
+        _ => bail!("invalid qcow2 cluster_size suffix in '{raw}'"),
+    };
+    if !(512..=2 * 1024 * 1024).contains(&value) || !value.is_power_of_two() {
+        bail!("invalid qcow2 cluster_size '{raw}': expected a power of two between 512 and 2M");
+    }
+    Ok(value)
+}
+
+fn compute_refcount_layout(
+    host_clusters_before_refcounts: u64,
+    cluster_size: u64,
+) -> Result<(u64, u64, u64)> {
+    let entries_per_refcount_block = cluster_size
+        .checked_div(2)
+        .context("invalid refcount block entry size")?;
+    let entries_per_refcount_table_cluster = cluster_size
+        .checked_div(8)
+        .context("invalid refcount table entry size")?;
+    let mut refcount_block_clusters = 1u64;
+    let mut refcount_table_clusters = 1u64;
+    loop {
+        let total_clusters = host_clusters_before_refcounts
+            .checked_add(refcount_table_clusters)
+            .and_then(|v| v.checked_add(refcount_block_clusters))
+            .context("qcow2 cluster count overflow")?;
+        let needed_refcount_block_clusters = div_ceil(total_clusters, entries_per_refcount_block);
+        let needed_refcount_table_clusters = div_ceil(
+            needed_refcount_block_clusters,
+            entries_per_refcount_table_cluster,
+        );
+        if needed_refcount_block_clusters == refcount_block_clusters
+            && needed_refcount_table_clusters == refcount_table_clusters
+        {
+            return Ok((
+                refcount_table_clusters,
+                refcount_block_clusters,
+                total_clusters,
+            ));
+        }
+        refcount_block_clusters = needed_refcount_block_clusters;
+        refcount_table_clusters = needed_refcount_table_clusters;
+    }
+}
+
+fn encode_compressed_l2_entry(offset: u64, compressed_size: u64, cluster_size: u64) -> Result<u64> {
+    let header = Qcow2Header {
+        backing_file_offset: 0,
+        virtual_size: 0,
+        cluster_bits: cluster_size.trailing_zeros(),
+        l1_size: 0,
+        l1_table_offset: 0,
+        refcount_table_offset: 0,
+        refcount_table_clusters: 0,
+        incompatible_features: 0,
+        refcount_order: DEFAULT_REFCOUNT_ORDER,
+        header_length: QCOW_HEADER_LENGTH_V3,
+        compression_type: QCOW2_COMPRESSION_TYPE_ZLIB,
+    };
+    let nb_csectors = (offset + compressed_size - 1) / QCOW2_COMPRESSED_SECTOR_SIZE
+        - (offset / QCOW2_COMPRESSED_SECTOR_SIZE);
+    if (offset & !header.cluster_offset_mask()) != 0 {
+        bail!("compressed qcow2 cluster offset does not fit qcow2 L2 entry");
+    }
+    if (nb_csectors & !header.csize_mask()) != 0 {
+        bail!("compressed qcow2 cluster span does not fit qcow2 L2 entry");
+    }
+    Ok(offset | QCOW_OFLAG_COMPRESSED | (nb_csectors << header.csize_shift()))
+}
+
+fn parse_compressed_l2_entry(header: Qcow2Header, l2_entry: u64) -> Result<(u64, u64)> {
+    let offset = l2_entry & header.cluster_offset_mask();
+    let nb_csectors = ((l2_entry >> header.csize_shift()) & header.csize_mask()) + 1;
+    let compressed_size = nb_csectors
+        .checked_mul(QCOW2_COMPRESSED_SECTOR_SIZE)
+        .and_then(|v| v.checked_sub(offset & (QCOW2_COMPRESSED_SECTOR_SIZE - 1)))
+        .context("compressed qcow2 cluster size overflow")?;
+    Ok((offset, compressed_size))
+}
+
+fn increment_refcount_range(
+    refcounts: &mut BTreeMap<u64, u64>,
+    offset: u64,
+    len: u64,
+    cluster_size: u64,
+) -> Result<()> {
+    if len == 0 {
+        return Ok(());
+    }
+    let start = offset / cluster_size;
+    let end = (offset + len - 1) / cluster_size;
+    for cluster_index in start..=end {
+        *refcounts.entry(cluster_index).or_default() += 1;
+    }
+    Ok(())
+}
+
+fn write_header(file: &mut File, spec: HeaderWriteSpec) -> Result<()> {
+    let mut header =
+        vec![0u8; usize::try_from(spec.cluster_size).context("cluster size too large")?];
+    let incompatible_features = if matches!(spec.compression_type, CompressionType::Zstd) {
+        QCOW2_INCOMPAT_COMPRESSION
+    } else {
+        0
+    };
+    write_be_u32(&mut header, 0, QCOW_MAGIC);
+    write_be_u32(&mut header, 4, 3);
+    write_be_u32(&mut header, 20, spec.cluster_size.trailing_zeros());
+    write_be_u64(&mut header, 24, spec.virtual_size);
+    write_be_u32(
+        &mut header,
+        36,
+        u32::try_from(spec.l1_size).context("l1_size does not fit u32")?,
+    );
+    write_be_u64(&mut header, 40, spec.l1_table_offset);
+    write_be_u64(&mut header, 48, spec.refcount_table_offset);
+    write_be_u32(
+        &mut header,
+        56,
+        u32::try_from(spec.refcount_table_clusters)
+            .context("refcount_table_clusters does not fit u32")?,
+    );
+    write_be_u64(&mut header, 72, incompatible_features);
+    write_be_u32(&mut header, 96, DEFAULT_REFCOUNT_ORDER);
+    write_be_u32(&mut header, 100, QCOW_HEADER_LENGTH_V3);
+    header[104] = match spec.compression_type {
+        CompressionType::Zstd => QCOW2_COMPRESSION_TYPE_ZSTD,
+        CompressionType::Zlib => QCOW2_COMPRESSION_TYPE_ZLIB,
+    };
+    write_exact_at(file, 0, &header)
+}
+
+fn write_l1_table(
+    file: &mut File,
+    l1_table_offset: u64,
+    first_l2_offset: u64,
+    l1_size: u64,
+    cluster_size: u64,
+) -> Result<()> {
+    let mut raw = vec![
+        0u8;
+        usize::try_from(align_up(l1_size * 8, cluster_size))
+            .context("l1 table too large")?
+    ];
+    for idx in 0..usize::try_from(l1_size).context("l1_size too large")? {
+        let offset = first_l2_offset
+            .checked_add(u64::try_from(idx).context("l1 index overflow")? * cluster_size)
+            .context("l2 table offset overflow")?;
+        raw[idx * 8..(idx + 1) * 8].copy_from_slice(&offset.to_be_bytes());
+    }
+    write_exact_at(file, l1_table_offset, &raw)
+}
+
+fn write_l2_tables(
+    file: &mut File,
+    first_l2_offset: u64,
+    l1_size: u64,
+    cluster_size: u64,
+    l2_entries: &[u64],
+) -> Result<()> {
+    let entries_per_table = usize::try_from(cluster_size / 8).context("cluster size too large")?;
+    for table_idx in 0..usize::try_from(l1_size).context("l1_size too large")? {
+        let mut table = vec![0u8; usize::try_from(cluster_size).context("cluster size too large")?];
+        let range_start = table_idx
+            .checked_mul(entries_per_table)
+            .context("l2 range start overflow")?;
+        let range_end = range_start
+            .checked_add(entries_per_table)
+            .context("l2 range end overflow")?;
+        for (entry_idx, entry) in l2_entries[range_start..range_end].iter().enumerate() {
+            table[entry_idx * 8..(entry_idx + 1) * 8].copy_from_slice(&entry.to_be_bytes());
+        }
+        let offset = first_l2_offset
+            .checked_add(u64::try_from(table_idx).context("table index overflow")? * cluster_size)
+            .context("l2 table offset overflow")?;
+        write_exact_at(file, offset, &table)?;
+    }
+    Ok(())
+}
+
+fn write_refcount_table(
+    file: &mut File,
+    refcount_table_offset: u64,
+    refcount_block_offset: u64,
+    refcount_table_clusters: u64,
+    refcount_block_clusters: u64,
+    cluster_size: u64,
+) -> Result<()> {
+    let mut raw = vec![
+        0u8;
+        usize::try_from(refcount_table_clusters * cluster_size)
+            .context("refcount table too large")?
+    ];
+    for idx in 0..usize::try_from(refcount_block_clusters)
+        .context("refcount block cluster count too large")?
+    {
+        let offset = refcount_block_offset
+            .checked_add(
+                u64::try_from(idx).context("refcount block index overflow")? * cluster_size,
+            )
+            .context("refcount block table offset overflow")?;
+        raw[idx * 8..(idx + 1) * 8].copy_from_slice(&offset.to_be_bytes());
+    }
+    write_exact_at(file, refcount_table_offset, &raw)
+}
+
+fn write_refcount_blocks(
+    file: &mut File,
+    refcount_block_offset: u64,
+    refcount_block_clusters: u64,
+    cluster_size: u64,
+    total_clusters: u64,
+    refcounts: &BTreeMap<u64, u64>,
+) -> Result<()> {
+    let entries_per_block = cluster_size / 2;
+    let mut raw = vec![
+        0u8;
+        usize::try_from(refcount_block_clusters * cluster_size)
+            .context("refcount blocks too large")?
+    ];
+    for (&cluster_index, &count) in refcounts {
+        if cluster_index >= total_clusters {
+            bail!("refcount cluster index {cluster_index} exceeds qcow2 size");
+        }
+        if count > u64::from(u16::MAX) {
+            bail!("refcount {count} exceeds 16-bit qcow2 refcount capacity");
+        }
+        let block_index = cluster_index / entries_per_block;
+        let entry_index = cluster_index % entries_per_block;
+        let pos = usize::try_from(
+            block_index
+                .checked_mul(cluster_size)
+                .and_then(|v| v.checked_add(entry_index * 2))
+                .context("refcount block position overflow")?,
+        )
+        .context("refcount block position too large")?;
+        raw[pos..pos + 2].copy_from_slice(&(count as u16).to_be_bytes());
+    }
+    write_exact_at(file, refcount_block_offset, &raw)
+}
+
 fn read_header(file: &mut File) -> Result<Qcow2Header> {
-    let mut fixed = [0u8; 104];
+    let mut fixed = [0u8; QCOW_HEADER_LENGTH_V3 as usize];
     read_exact_at(file, 0, &mut fixed)?;
     let magic = u32::from_be_bytes(fixed[0..4].try_into().expect("slice length"));
     if magic != QCOW_MAGIC {
@@ -194,8 +863,19 @@ fn read_header(file: &mut File) -> Result<Qcow2Header> {
     } else {
         DEFAULT_REFCOUNT_ORDER
     };
+    let header_length = if version >= 3 {
+        u32::from_be_bytes(fixed[100..104].try_into().expect("slice length"))
+    } else {
+        72
+    };
+    let compression_type = if header_length > 104 {
+        fixed[104]
+    } else {
+        QCOW2_COMPRESSION_TYPE_ZLIB
+    };
 
     Ok(Qcow2Header {
+        backing_file_offset: u64::from_be_bytes(fixed[8..16].try_into().expect("slice length")),
         virtual_size: u64::from_be_bytes(fixed[24..32].try_into().expect("slice length")),
         cluster_bits,
         l1_size: u32::from_be_bytes(fixed[36..40].try_into().expect("slice length")),
@@ -204,7 +884,14 @@ fn read_header(file: &mut File) -> Result<Qcow2Header> {
         refcount_table_clusters: u32::from_be_bytes(
             fixed[56..60].try_into().expect("slice length"),
         ),
+        incompatible_features: if version >= 3 {
+            u64::from_be_bytes(fixed[72..80].try_into().expect("slice length"))
+        } else {
+            0
+        },
         refcount_order,
+        header_length,
+        compression_type,
     })
 }
 
@@ -301,6 +988,29 @@ fn write_be_uint(value: u64, width: usize) -> Vec<u8> {
     out
 }
 
+fn write_be_u32(buf: &mut [u8], offset: usize, value: u32) {
+    buf[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
+}
+
+fn write_be_u64(buf: &mut [u8], offset: usize, value: u64) {
+    buf[offset..offset + 8].copy_from_slice(&value.to_be_bytes());
+}
+
+fn div_ceil(value: u64, divisor: u64) -> u64 {
+    value.div_ceil(divisor)
+}
+
+fn align_up(value: u64, align: u64) -> u64 {
+    if value == 0 {
+        return 0;
+    }
+    value.div_ceil(align) * align
+}
+
+fn align_down(value: u64, align: u64) -> u64 {
+    value / align * align
+}
+
 fn read_exact_at(file: &mut File, offset: u64, buf: &mut [u8]) -> Result<()> {
     file.seek(SeekFrom::Start(offset))
         .with_context(|| format!("cannot seek to offset {offset}"))?;
@@ -372,39 +1082,74 @@ mod tests {
         assert!(after.disk_size >= 7 * 4096);
     }
 
+    #[test]
+    fn native_compress_writes_valid_zstd_qcow2() {
+        let tmp = tempdir().expect("tempdir");
+        let source = tmp.path().join("source.qcow2");
+        let dest = tmp.path().join("dest.qcow2");
+        write_test_image(&source).expect("write source qcow2");
+
+        compress_qcow2_image(
+            &source,
+            &dest,
+            CompressionType::Zstd,
+            &BTreeMap::new(),
+            "-19 -T0",
+        )
+        .expect("compress");
+
+        let mut file = File::open(&dest).expect("open dest");
+        let header = read_header(&mut file).expect("read header");
+        assert_eq!(header.header_length, QCOW_HEADER_LENGTH_V3);
+        assert_eq!(header.compression_type, QCOW2_COMPRESSION_TYPE_ZSTD);
+        assert_ne!(header.incompatible_features & QCOW2_INCOMPAT_COMPRESSION, 0);
+
+        let stats = read_qcow2_image_stats(&dest).expect("stats");
+        assert_eq!(stats.virtual_size, 8192);
+        assert_eq!(stats.cluster_size, 4096);
+        assert_eq!(stats.allocated_data_clusters, 1);
+
+        let mut image = SourceImage::open(&dest).expect("open image");
+        let mut cluster = vec![0u8; 4096];
+        image
+            .read_virtual_range(4096, &mut cluster)
+            .expect("read guest cluster");
+        assert_eq!(&cluster[..32], &[0x5a; 32]);
+        assert!(cluster[32..].iter().all(|b| *b == 0));
+
+        let l2_offset = aligned_data_offset(
+            read_u64_at(&mut file, header.l1_table_offset).expect("l1 entry"),
+            header.cluster_size(),
+        );
+        let l2_entry = read_u64_at(&mut file, l2_offset + 8).expect("l2 entry");
+        assert_ne!(l2_entry & QCOW_OFLAG_COMPRESSED, 0);
+    }
+
     fn write_test_image(path: &Path) -> Result<()> {
         let cluster_size = 4096u64;
         let mut file = File::create(path)?;
         file.set_len(cluster_size * 7)?;
 
-        // Header (v3, 104-byte header)
         write_exact_at(&mut file, 0, &QCOW_MAGIC.to_be_bytes())?;
         write_exact_at(&mut file, 4, &3u32.to_be_bytes())?;
         write_exact_at(&mut file, 20, &12u32.to_be_bytes())?;
         write_exact_at(&mut file, 24, &(cluster_size * 2).to_be_bytes())?;
         write_exact_at(&mut file, 36, &1u32.to_be_bytes())?;
-        write_exact_at(&mut file, 40, &cluster_size.to_be_bytes())?; // L1 @ cluster 1
-        write_exact_at(&mut file, 48, &(cluster_size * 3).to_be_bytes())?; // refcount table @ cluster 3
-        write_exact_at(&mut file, 56, &1u32.to_be_bytes())?; // one refcount table cluster
-        write_exact_at(&mut file, 96, &4u32.to_be_bytes())?; // 16-bit refcounts
+        write_exact_at(&mut file, 40, &cluster_size.to_be_bytes())?;
+        write_exact_at(&mut file, 48, &(cluster_size * 3).to_be_bytes())?;
+        write_exact_at(&mut file, 56, &1u32.to_be_bytes())?;
+        write_exact_at(&mut file, 96, &4u32.to_be_bytes())?;
         write_exact_at(&mut file, 100, &104u32.to_be_bytes())?;
 
-        // L1 table entry -> L2 table @ cluster 2
         write_u64_at(&mut file, cluster_size, cluster_size * 2)?;
-
-        // L2 entries: cluster 0 => zero data cluster @ cluster 5, cluster 1 => non-zero @ cluster 6
         write_u64_at(&mut file, cluster_size * 2, cluster_size * 5)?;
         write_u64_at(&mut file, cluster_size * 2 + 8, cluster_size * 6)?;
-
-        // Refcount table entry -> refcount block @ cluster 4
         write_u64_at(&mut file, cluster_size * 3, cluster_size * 4)?;
 
-        // Refcounts in refcount block (16-bit entries)
         for idx in 0u64..=6 {
             write_exact_at(&mut file, cluster_size * 4 + idx * 2, &1u16.to_be_bytes())?;
         }
 
-        // cluster 6 is non-zero
         write_exact_at(&mut file, cluster_size * 6, &[0x5a; 32])?;
         Ok(())
     }

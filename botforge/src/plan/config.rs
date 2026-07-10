@@ -243,9 +243,9 @@ pub(crate) enum CompressionType {
 /// Output-compression options for `botforge build`.
 ///
 /// `reclaim` is nested under `compress` because it is primarily used to make
-/// `qemu-img convert -c` effective by reclaiming freed guest blocks before
-/// commit.  `reclaim` still runs even when `enabled: false` (plain rename) so
-/// users can reclaim space without compression.
+/// qcow2 compression effective by reclaiming freed guest blocks before commit.
+/// `reclaim` still runs even when `enabled: false` (plain rename) so users can
+/// reclaim space without compression.
 ///
 /// ```yaml
 /// # default off — plain atomic rename (byte-identical to today)
@@ -261,8 +261,8 @@ pub(crate) enum CompressionType {
 ///   enabled: true
 ///   compressor: zstd
 ///   compressor_args:
-///     compression_level: "22"
 ///     cluster_size: "1M"
+///   compressor_opts: "-19 -T0"
 ///
 /// # reclaim freed blocks before commit/compress
 /// compress:
@@ -280,20 +280,23 @@ pub(crate) struct CompressConfig {
     /// `enabled:` is a hard parse error.
     pub(crate) enabled: bool,
     /// Compression algorithm passed as `-o compression_type=<val>` to
-    /// `qemu-img convert`.
+    /// the native qcow2 compression writer.
     ///
-    /// Defaults to `zstd`, which requires qemu >= 5.1 on the build host and
-    /// any consumer that opens the produced qcow2.
+    /// Defaults to `zstd`, which requires qemu >= 5.1 only on consumers that
+    /// open the produced qcow2.
     #[serde(default)]
     pub(crate) compressor: CompressionType,
-    /// Optional extra `-o` key=value options merged into the `qemu-img convert`
-    /// `-o` string alongside `compression_type`.  Keys are sorted (BTreeMap) so
-    /// the resulting command line is deterministic.
+    /// Optional qcow2-structural key=value options interpreted by botforge's
+    /// native qcow2 writer. Keys are sorted (BTreeMap) so the stored config is
+    /// deterministic.
     ///
-    /// Example: `{cluster_size: "1M", compression_level: "22"}` appends
-    /// `,cluster_size=1M,compression_level=22` to the `-o` option string.
+    /// Example: `{cluster_size: "1M"}` changes the target qcow2 cluster size.
     #[serde(default)]
     pub(crate) compressor_args: std::collections::BTreeMap<String, String>,
+    /// Optional raw codec options string passed to the selected in-process
+    /// compressor implementation, which parses and validates it.
+    #[serde(default)]
+    pub(crate) compressor_opts: String,
     /// Optional reclaim mode that runs before commit/compress.
     ///
     /// Defaults to `none`. Runs even when `enabled: false`.
@@ -3103,6 +3106,10 @@ bootcmd:
             compress.compressor_args.is_empty(),
             "compressor_args must default to empty"
         );
+        assert!(
+            compress.compressor_opts.is_empty(),
+            "compressor_opts must default to empty"
+        );
         assert_eq!(
             compress.reclaim,
             ReclaimMode::None,
@@ -3166,17 +3173,10 @@ bootcmd:
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nimage: \"@base\"\nsteps: []\ncompress:\n  enabled: true\n  compressor_args:\n    compression_level: \"22\"\n    cluster_size: \"1M\"\n",
+            "type: build\nimage: \"@base\"\nsteps: []\ncompress:\n  enabled: true\n  compressor_args:\n    cluster_size: \"1M\"\n",
         );
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
         let compress = config.compress.expect("compress should be Some");
-        assert_eq!(
-            compress
-                .compressor_args
-                .get("compression_level")
-                .map(String::as_str),
-            Some("22")
-        );
         assert_eq!(
             compress
                 .compressor_args
@@ -3184,7 +3184,20 @@ bootcmd:
                 .map(String::as_str),
             Some("1M")
         );
-        assert_eq!(compress.compressor_args.len(), 2);
+        assert_eq!(compress.compressor_args.len(), 1);
+    }
+
+    #[test]
+    fn test_load_build_config_compress_explicit_compressor_opts() {
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            "type: build\nimage: \"@base\"\nsteps: []\ncompress:\n  enabled: true\n  compressor_opts: \"-19 -T0\"\n",
+        );
+        let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
+        let compress = config.compress.expect("compress should be Some");
+        assert_eq!(compress.compressor_opts, "-19 -T0");
     }
 
     #[test]
