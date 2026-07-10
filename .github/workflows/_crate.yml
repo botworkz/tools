@@ -32,6 +32,16 @@ jobs:
         RUN rustup component add rustfmt clippy
         EOF
 
+    - name: Install botforge build deps in CI toolchain image (libguestfs-dev)
+      if: inputs.crate == 'botforge'
+      run: |
+        docker build -t ci-tools:local - <<'EOF'
+        FROM ci-tools:local
+        RUN apt-get update \
+            && apt-get install -y --no-install-recommends libguestfs-dev \
+            && rm -rf /var/lib/apt/lists/*
+        EOF
+
     - name: cargo fmt
       run: |
         set -euo pipefail

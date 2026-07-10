@@ -230,6 +230,10 @@ pub(crate) enum ReclaimMode {
     Fstrim,
     /// Run host-side offline reclaim via qemu-nbd discard+fstrim after shutdown.
     Discard,
+    /// Run in-guest `fstrim` then an offline libguestfs `zero_free_space` pass
+    /// after shutdown via the `guestfs` Rust crate (in-process FFI).  Reclaims
+    /// the residual free-space slack that `fstrim` alone cannot reach.
+    Sparsify,
 }
 
 /// Output-compression options for `botforge build`.
@@ -3150,6 +3154,20 @@ bootcmd:
         let compress = config.compress.expect("compress should be Some");
         assert!(compress.enabled);
         assert_eq!(compress.reclaim, ReclaimMode::None);
+    }
+
+    #[test]
+    fn test_load_build_config_compress_reclaim_sparsify() {
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            "type: build\nimage: \"@base\"\nsteps: []\ncompress:\n  enabled: true\n  reclaim: sparsify\n",
+        );
+        let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
+        let compress = config.compress.expect("compress should be Some");
+        assert!(compress.enabled);
+        assert_eq!(compress.reclaim, ReclaimMode::Sparsify);
     }
 
     #[test]

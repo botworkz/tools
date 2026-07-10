@@ -364,6 +364,7 @@ dependencies = [
  "anyhow",
  "clap",
  "glob",
+ "guestfs",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -826,6 +827,12 @@ dependencies = [
  "js-sys",
  "wasm-bindgen",
 ]
+
+[[package]]
+name = "guestfs"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e271498175f86e4f35c7243aba82f267d1e6c38d6c48822c0ab8fe9edddca4ff"
 
 [[package]]
 name = "hashbrown"
