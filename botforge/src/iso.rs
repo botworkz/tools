@@ -115,9 +115,10 @@ fn render_bootcmd_block(entries: &[BootcmdEntry]) -> String {
 pub(crate) fn write_seed_files(seed_dir: &Path, user_data: &str) -> Result<()> {
     std::fs::create_dir_all(seed_dir)
         .with_context(|| format!("cannot create seed dir: {}", seed_dir.display()))?;
+    let instance_id = format!("iid-{}", unique_suffix());
     std::fs::write(
         seed_dir.join("meta-data"),
-        "instance-id: iid-local01\nlocal-hostname: botforge\n",
+        format!("instance-id: {instance_id}\nlocal-hostname: botforge\n"),
     )
     .with_context(|| format!("cannot write seed meta-data in {}", seed_dir.display()))?;
     std::fs::write(seed_dir.join("user-data"), user_data)
@@ -199,8 +200,11 @@ pub(crate) fn iso_args(
 
 #[cfg(test)]
 mod tests {
-    use super::{generate_installer_username, iso_args, render_user_data, BootcmdEntry};
+    use super::{
+        generate_installer_username, iso_args, render_user_data, write_seed_files, BootcmdEntry,
+    };
     use std::path::Path;
+    use tempfile::TempDir;
 
     #[test]
     fn render_user_data_replaces_placeholder() {
@@ -583,6 +587,36 @@ mod tests {
         let a = generate_installer_username();
         let b = generate_installer_username();
         assert_ne!(a, b, "two calls produced identical installer usernames");
+    }
+
+    #[test]
+    fn write_seed_files_produces_unique_instance_ids() {
+        let first = TempDir::new().unwrap();
+        let second = TempDir::new().unwrap();
+
+        write_seed_files(first.path(), "#cloud-config\n").unwrap();
+        write_seed_files(second.path(), "#cloud-config\n").unwrap();
+
+        let first_meta = std::fs::read_to_string(first.path().join("meta-data")).unwrap();
+        let second_meta = std::fs::read_to_string(second.path().join("meta-data")).unwrap();
+
+        let first_instance_id = first_meta
+            .lines()
+            .find_map(|line| line.strip_prefix("instance-id: "))
+            .unwrap();
+        let second_instance_id = second_meta
+            .lines()
+            .find_map(|line| line.strip_prefix("instance-id: "))
+            .unwrap();
+
+        assert_ne!(
+            first_instance_id, second_instance_id,
+            "seed instance-id must be unique per write_seed_files call"
+        );
+        assert!(
+            first_meta.contains("local-hostname: botforge"),
+            "meta-data must preserve local-hostname"
+        );
     }
 
     #[test]

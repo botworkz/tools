@@ -285,6 +285,26 @@ pub(crate) fn cmd_build(config: &Path, args: BuildArgs) -> Result<()> {
         }
     }
 
+    if let Err(err) = run_guest_cloud_init_clean(&ssh_options, overall_deadline) {
+        eprintln!("guest cloud-init clean failed: {err:#}");
+        print_log_tail(&vm_log, 200);
+        if let Some(child) = vm_child.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        if let Err(preserve_err) = preserve_failed_build_disk(&partial, &failed_partial) {
+            return Err(err.context(format!(
+                "additionally failed to preserve tainted partial at {}: {preserve_err:#}",
+                failed_partial.display()
+            )));
+        }
+        eprintln!(
+            "tainted partial disk left at {} for post-mortem",
+            failed_partial.display()
+        );
+        return Err(err);
+    }
+
     // ---------------------------------------------------------------------------
     // Disk lifecycle step 6: installer teardown (botforge-owned identity only)
     //
@@ -897,6 +917,12 @@ fn fstrim_guest_command() -> &'static str {
     "sudo fstrim -av"
 }
 
+fn cloud_init_clean_guest_command() -> &'static str {
+    "if command -v cloud-init >/dev/null 2>&1; then \
+     sudo cloud-init clean --logs --seed || sudo cloud-init clean --logs; \
+     else echo 'cloud-init not installed; skipping clean'; fi"
+}
+
 fn run_guest_reclaim_fstrim(ssh: &SshOptions, overall_deadline: Instant) -> Result<()> {
     let timeout = overall_deadline
         .saturating_duration_since(Instant::now())
@@ -914,6 +940,25 @@ fn run_guest_reclaim_fstrim(ssh: &SshOptions, overall_deadline: Instant) -> Resu
         timeout,
     )
     .context("guest fstrim reclaim failed")
+}
+
+fn run_guest_cloud_init_clean(ssh: &SshOptions, overall_deadline: Instant) -> Result<()> {
+    let timeout = overall_deadline
+        .saturating_duration_since(Instant::now())
+        .min(Duration::from_secs(30));
+    let timeout = if timeout.is_zero() {
+        Duration::from_secs(1)
+    } else {
+        timeout
+    };
+    ssh_with_retry(
+        ssh,
+        cloud_init_clean_guest_command(),
+        1,
+        Duration::from_secs(0),
+        timeout,
+    )
+    .context("guest cloud-init clean failed")
 }
 
 fn qemu_nbd_connect_args(partial: &Path, nbd_device: &Path) -> Vec<String> {
@@ -1227,10 +1272,10 @@ fn resize_qcow2(disk: &Path, size: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        archive_unpack_relative_path, failed_partial_path, fstrim_guest_command, fstrim_mount_args,
-        guest_untar_command, installer_teardown_command, mount_discard_args, output_stem,
-        parse_archive_asset_key, partial_path, qemu_convert_args, qemu_nbd_connect_args,
-        qemu_nbd_disconnect_args, resolve_base_image_with_transport,
+        archive_unpack_relative_path, cloud_init_clean_guest_command, failed_partial_path,
+        fstrim_guest_command, fstrim_mount_args, guest_untar_command, installer_teardown_command,
+        mount_discard_args, output_stem, parse_archive_asset_key, partial_path, qemu_convert_args,
+        qemu_nbd_connect_args, qemu_nbd_disconnect_args, resolve_base_image_with_transport,
         should_run_zero_cluster_sparsify, unpack_archive_to_dir,
     };
     use crate::cli::Cli;
@@ -1296,6 +1341,15 @@ mod tests {
              rm -f /etc/sudoers.d/90-cloud-init-users; \
              systemctl poweroff'"
         );
+    }
+
+    #[test]
+    fn cloud_init_clean_guest_command_is_non_fatal_when_missing() {
+        let cmd = cloud_init_clean_guest_command();
+        assert!(cmd.contains("command -v cloud-init"));
+        assert!(cmd.contains("cloud-init clean --logs --seed"));
+        assert!(cmd.contains("cloud-init clean --logs"));
+        assert!(cmd.contains("cloud-init not installed; skipping clean"));
     }
 
     #[test]
