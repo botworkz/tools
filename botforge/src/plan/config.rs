@@ -258,12 +258,12 @@ pub(crate) enum CompressionType {
 /// # on, qemu default cluster size
 /// compress:
 ///   enabled: true
-///   # compression_type defaults to zstd
+///   # compressor defaults to zstd
 ///
 /// # on, explicit cluster size
 /// compress:
 ///   enabled: true
-///   compression_type: zlib
+///   compressor: zlib
 ///   cluster_size: "1M"
 ///
 /// # reclaim freed blocks before commit/compress
@@ -287,7 +287,11 @@ pub(crate) struct CompressConfig {
     /// Defaults to `zstd`, which requires qemu >= 5.1 on the build host and
     /// any consumer that opens the produced qcow2.
     #[serde(default)]
-    pub(crate) compression_type: CompressionType,
+    pub(crate) compressor: CompressionType,
+    /// Optional additional arguments passed verbatim to `qemu-img convert`
+    /// before the source and destination paths.
+    #[serde(default)]
+    pub(crate) compressor_args: Vec<String>,
     /// Optional cluster size passed verbatim as `-o cluster_size=<val>` to
     /// `qemu-img convert`.  Omitted ⇒ qemu default cluster size.
     #[serde(default)]
@@ -3093,9 +3097,13 @@ bootcmd:
         let compress = config.compress.expect("compress should be Some");
         assert!(compress.enabled, "enabled must be true");
         assert_eq!(
-            compress.compression_type,
+            compress.compressor,
             CompressionType::Zstd,
-            "compression_type must default to zstd"
+            "compressor must default to zstd"
+        );
+        assert!(
+            compress.compressor_args.is_empty(),
+            "compressor_args must default to empty"
         );
         assert!(
             compress.cluster_size.is_none(),
@@ -3119,37 +3127,51 @@ bootcmd:
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
         let compress = config.compress.expect("compress should be Some");
         assert!(compress.enabled);
-        assert_eq!(compress.compression_type, CompressionType::Zstd);
+        assert_eq!(compress.compressor, CompressionType::Zstd);
+        assert!(compress.compressor_args.is_empty());
         assert_eq!(compress.cluster_size.as_deref(), Some("1M"));
         assert_eq!(compress.reclaim, ReclaimMode::None);
     }
 
     #[test]
-    fn test_load_build_config_compress_explicit_compression_type_zstd() {
+    fn test_load_build_config_compress_explicit_compressor_zstd() {
         let repo = TempDir::new().unwrap();
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nimage: \"@base\"\nsteps: []\ncompress:\n  enabled: true\n  compression_type: zstd\n",
+            "type: build\nimage: \"@base\"\nsteps: []\ncompress:\n  enabled: true\n  compressor: zstd\n",
         );
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
         let compress = config.compress.expect("compress should be Some");
         assert!(compress.enabled);
-        assert_eq!(compress.compression_type, CompressionType::Zstd);
+        assert_eq!(compress.compressor, CompressionType::Zstd);
     }
 
     #[test]
-    fn test_load_build_config_compress_explicit_compression_type_zlib() {
+    fn test_load_build_config_compress_explicit_compressor_zlib() {
         let repo = TempDir::new().unwrap();
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nimage: \"@base\"\nsteps: []\ncompress:\n  enabled: true\n  compression_type: zlib\n",
+            "type: build\nimage: \"@base\"\nsteps: []\ncompress:\n  enabled: true\n  compressor: zlib\n",
         );
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
         let compress = config.compress.expect("compress should be Some");
         assert!(compress.enabled);
-        assert_eq!(compress.compression_type, CompressionType::Zlib);
+        assert_eq!(compress.compressor, CompressionType::Zlib);
+    }
+
+    #[test]
+    fn test_load_build_config_compress_explicit_compressor_args() {
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            "type: build\nimage: \"@base\"\nsteps: []\ncompress:\n  enabled: true\n  compressor_args:\n    - -T0\n    - --foo=bar\n",
+        );
+        let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
+        let compress = config.compress.expect("compress should be Some");
+        assert_eq!(compress.compressor_args, vec!["-T0", "--foo=bar"]);
     }
 
     #[test]
@@ -3163,7 +3185,7 @@ bootcmd:
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
         let compress = config.compress.expect("compress should be Some");
         assert!(!compress.enabled, "enabled must be false");
-        assert_eq!(compress.compression_type, CompressionType::Zstd);
+        assert_eq!(compress.compressor, CompressionType::Zstd);
         assert_eq!(compress.reclaim, ReclaimMode::None);
     }
 
@@ -3302,18 +3324,34 @@ bootcmd:
     }
 
     #[test]
-    fn test_load_build_config_compress_compression_type_unknown_value_is_error() {
+    fn test_load_build_config_compress_compressor_unknown_value_is_error() {
         let repo = TempDir::new().unwrap();
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nimage: \"@base\"\nsteps: []\ncompress:\n  enabled: true\n  compression_type: bogus\n",
+            "type: build\nimage: \"@base\"\nsteps: []\ncompress:\n  enabled: true\n  compressor: bogus\n",
         );
         let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("bogus") || msg.contains("unknown variant"),
-            "error should mention compression_type enum variant parse failure: {msg}"
+            "error should mention compressor enum variant parse failure: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_load_build_config_compress_compression_type_key_is_unknown_field() {
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            "type: build\nimage: \"@base\"\nsteps: []\ncompress:\n  enabled: true\n  compression_type: zstd\n",
+        );
+        let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("compression_type") || msg.contains("unknown field"),
+            "error should mention the removed compression_type key: {msg}"
         );
     }
 
