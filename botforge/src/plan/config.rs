@@ -230,10 +230,6 @@ pub(crate) enum ReclaimMode {
     Fstrim,
     /// Run host-side offline reclaim via qemu-nbd discard+fstrim after shutdown.
     Discard,
-    /// Run in-guest `fstrim` then an offline libguestfs `zero_free_space` pass
-    /// after shutdown via the `guestfs` Rust crate (in-process FFI).  Reclaims
-    /// the residual free-space slack that `fstrim` alone cannot reach.
-    Sparsify,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
@@ -258,13 +254,15 @@ pub(crate) enum CompressionType {
 /// # on, qemu default cluster size
 /// compress:
 ///   enabled: true
-///   # compression_type defaults to zstd
+///   # compressor defaults to zstd
 ///
-/// # on, explicit cluster size
+/// # on, explicit options via compressor_args map
 /// compress:
 ///   enabled: true
-///   compression_type: zlib
-///   cluster_size: "1M"
+///   compressor: zstd
+///   compressor_args:
+///     compression_level: "22"
+///     cluster_size: "1M"
 ///
 /// # reclaim freed blocks before commit/compress
 /// compress:
@@ -287,11 +285,15 @@ pub(crate) struct CompressConfig {
     /// Defaults to `zstd`, which requires qemu >= 5.1 on the build host and
     /// any consumer that opens the produced qcow2.
     #[serde(default)]
-    pub(crate) compression_type: CompressionType,
-    /// Optional cluster size passed verbatim as `-o cluster_size=<val>` to
-    /// `qemu-img convert`.  Omitted ⇒ qemu default cluster size.
+    pub(crate) compressor: CompressionType,
+    /// Optional extra `-o` key=value options merged into the `qemu-img convert`
+    /// `-o` string alongside `compression_type`.  Keys are sorted (BTreeMap) so
+    /// the resulting command line is deterministic.
+    ///
+    /// Example: `{cluster_size: "1M", compression_level: "22"}` appends
+    /// `,cluster_size=1M,compression_level=22` to the `-o` option string.
     #[serde(default)]
-    pub(crate) cluster_size: Option<String>,
+    pub(crate) compressor_args: std::collections::BTreeMap<String, String>,
     /// Optional reclaim mode that runs before commit/compress.
     ///
     /// Defaults to `none`. Runs even when `enabled: false`.
@@ -3093,13 +3095,13 @@ bootcmd:
         let compress = config.compress.expect("compress should be Some");
         assert!(compress.enabled, "enabled must be true");
         assert_eq!(
-            compress.compression_type,
+            compress.compressor,
             CompressionType::Zstd,
-            "compression_type must default to zstd"
+            "compressor must default to zstd"
         );
         assert!(
-            compress.cluster_size.is_none(),
-            "cluster_size must default to None"
+            compress.compressor_args.is_empty(),
+            "compressor_args must default to empty"
         );
         assert_eq!(
             compress.reclaim,
@@ -3109,47 +3111,80 @@ bootcmd:
     }
 
     #[test]
-    fn test_load_build_config_compress_enabled_true_with_cluster_size() {
+    fn test_load_build_config_compress_enabled_true_with_cluster_size_in_args() {
         let repo = TempDir::new().unwrap();
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nimage: \"@base\"\nsteps: []\ncompress:\n  enabled: true\n  cluster_size: \"1M\"\n",
+            "type: build\nimage: \"@base\"\nsteps: []\ncompress:\n  enabled: true\n  compressor_args:\n    cluster_size: \"1M\"\n",
         );
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
         let compress = config.compress.expect("compress should be Some");
         assert!(compress.enabled);
-        assert_eq!(compress.compression_type, CompressionType::Zstd);
-        assert_eq!(compress.cluster_size.as_deref(), Some("1M"));
+        assert_eq!(compress.compressor, CompressionType::Zstd);
+        assert_eq!(
+            compress
+                .compressor_args
+                .get("cluster_size")
+                .map(String::as_str),
+            Some("1M")
+        );
         assert_eq!(compress.reclaim, ReclaimMode::None);
     }
 
     #[test]
-    fn test_load_build_config_compress_explicit_compression_type_zstd() {
+    fn test_load_build_config_compress_explicit_compressor_zstd() {
         let repo = TempDir::new().unwrap();
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nimage: \"@base\"\nsteps: []\ncompress:\n  enabled: true\n  compression_type: zstd\n",
+            "type: build\nimage: \"@base\"\nsteps: []\ncompress:\n  enabled: true\n  compressor: zstd\n",
         );
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
         let compress = config.compress.expect("compress should be Some");
         assert!(compress.enabled);
-        assert_eq!(compress.compression_type, CompressionType::Zstd);
+        assert_eq!(compress.compressor, CompressionType::Zstd);
     }
 
     #[test]
-    fn test_load_build_config_compress_explicit_compression_type_zlib() {
+    fn test_load_build_config_compress_explicit_compressor_zlib() {
         let repo = TempDir::new().unwrap();
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nimage: \"@base\"\nsteps: []\ncompress:\n  enabled: true\n  compression_type: zlib\n",
+            "type: build\nimage: \"@base\"\nsteps: []\ncompress:\n  enabled: true\n  compressor: zlib\n",
         );
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
         let compress = config.compress.expect("compress should be Some");
         assert!(compress.enabled);
-        assert_eq!(compress.compression_type, CompressionType::Zlib);
+        assert_eq!(compress.compressor, CompressionType::Zlib);
+    }
+
+    #[test]
+    fn test_load_build_config_compress_explicit_compressor_args() {
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            "type: build\nimage: \"@base\"\nsteps: []\ncompress:\n  enabled: true\n  compressor_args:\n    compression_level: \"22\"\n    cluster_size: \"1M\"\n",
+        );
+        let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
+        let compress = config.compress.expect("compress should be Some");
+        assert_eq!(
+            compress
+                .compressor_args
+                .get("compression_level")
+                .map(String::as_str),
+            Some("22")
+        );
+        assert_eq!(
+            compress
+                .compressor_args
+                .get("cluster_size")
+                .map(String::as_str),
+            Some("1M")
+        );
+        assert_eq!(compress.compressor_args.len(), 2);
     }
 
     #[test]
@@ -3163,7 +3198,7 @@ bootcmd:
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
         let compress = config.compress.expect("compress should be Some");
         assert!(!compress.enabled, "enabled must be false");
-        assert_eq!(compress.compression_type, CompressionType::Zstd);
+        assert_eq!(compress.compressor, CompressionType::Zstd);
         assert_eq!(compress.reclaim, ReclaimMode::None);
     }
 
@@ -3210,17 +3245,19 @@ bootcmd:
     }
 
     #[test]
-    fn test_load_build_config_compress_reclaim_sparsify() {
+    fn test_load_build_config_compress_reclaim_sparsify_is_unknown_variant() {
         let repo = TempDir::new().unwrap();
         write_build_config(
             &repo,
             "build.yaml",
             "type: build\nimage: \"@base\"\nsteps: []\ncompress:\n  enabled: true\n  reclaim: sparsify\n",
         );
-        let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
-        let compress = config.compress.expect("compress should be Some");
-        assert!(compress.enabled);
-        assert_eq!(compress.reclaim, ReclaimMode::Sparsify);
+        let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("sparsify") || msg.contains("unknown variant"),
+            "sparsify reclaim mode should now be rejected as unknown variant: {msg}"
+        );
     }
 
     #[test]
@@ -3243,7 +3280,7 @@ bootcmd:
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nimage: \"@base\"\nsteps: []\ncompress:\n  cluster_size: \"1M\"\n",
+            "type: build\nimage: \"@base\"\nsteps: []\ncompress:\n  reclaim: fstrim\n",
         );
         let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
         let msg = format!("{err:#}");
@@ -3302,18 +3339,50 @@ bootcmd:
     }
 
     #[test]
-    fn test_load_build_config_compress_compression_type_unknown_value_is_error() {
+    fn test_load_build_config_compress_compressor_unknown_value_is_error() {
         let repo = TempDir::new().unwrap();
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nimage: \"@base\"\nsteps: []\ncompress:\n  enabled: true\n  compression_type: bogus\n",
+            "type: build\nimage: \"@base\"\nsteps: []\ncompress:\n  enabled: true\n  compressor: bogus\n",
         );
         let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("bogus") || msg.contains("unknown variant"),
-            "error should mention compression_type enum variant parse failure: {msg}"
+            "error should mention compressor enum variant parse failure: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_load_build_config_compress_compression_type_key_is_unknown_field() {
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            "type: build\nimage: \"@base\"\nsteps: []\ncompress:\n  enabled: true\n  compression_type: zstd\n",
+        );
+        let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("compression_type") || msg.contains("unknown field"),
+            "error should mention the removed compression_type key: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_load_build_config_compress_cluster_size_top_level_is_unknown_field() {
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            "type: build\nimage: \"@base\"\nsteps: []\ncompress:\n  enabled: true\n  cluster_size: \"1M\"\n",
+        );
+        let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("cluster_size") || msg.contains("unknown field"),
+            "cluster_size at top level should now be an unknown field error: {msg}"
         );
     }
 

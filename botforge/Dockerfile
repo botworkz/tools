@@ -5,13 +5,6 @@ FROM rust:1-slim-bookworm AS builder
 
 WORKDIR /build
 
-# Install build dependencies: libguestfs-dev provides -lguestfs required by the
-# guestfs crate (used by the reclaim: sparsify mode).
-# hadolint ignore=DL3008
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends libguestfs-dev \
-    && rm -rf /var/lib/apt/lists/*
-
 # Cache workspace dependency compilation separately from source changes.
 # All member Cargo.toml files are needed so cargo can resolve the workspace.
 COPY Cargo.toml Cargo.lock ./
@@ -53,14 +46,6 @@ ARG BINARY_SOURCE=source
 #   libnss-wrapper                — uid/gid passthrough support in entrypoint
 #   ca-certificates               — TLS roots
 #   cloud-image-utils / curl / jq — ancillary runtime utilities
-#   libguestfs0                   — guestfs runtime shared library (reclaim: sparsify)
-#   linux-image-amd64             — appliance kernel for supermin; libguestfs needs a
-#                                   bootable kernel to build/launch its supermin appliance.
-#                                   Without it, guestfs launch() fails. The kernel installed
-#                                   by apt is often mode 0600; we chmod it readable so
-#                                   supermin can access it when running as a non-root user
-#                                   (supermin exits with status 1 if /boot/vmlinuz* is
-#                                   unreadable).
 #
 # openssh-client is intentionally absent: botforge uses a pure-Rust SSH/SFTP
 # implementation (russh + russh-sftp) and no longer shells out to ssh/scp/ssh-keygen.
@@ -73,14 +58,11 @@ RUN apt-get update \
         curl \
         genisoimage \
         jq \
-        libguestfs0 \
         libnss-wrapper \
-        linux-image-amd64 \
         qemu-system-x86 \
         qemu-utils \
         xorriso \
-    && rm -rf /var/lib/apt/lists/* \
-    && chmod 0644 /boot/vmlinuz* 2>/dev/null || true
+    && rm -rf /var/lib/apt/lists/*
 
 COPY --from=binary-source /botforge /usr/local/bin/botforge
 COPY --chmod=0755 botforge/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
