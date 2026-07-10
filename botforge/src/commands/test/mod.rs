@@ -50,8 +50,6 @@ pub(crate) fn cmd_test(args: TestArgs) -> Result<()> {
     require_kvm()?;
     ensure_command("qemu-system-x86_64")?;
     ensure_command("qemu-img")?;
-    ensure_command("ssh")?;
-    ensure_command("scp")?;
     detect_iso_tool()?;
 
     let repo_root = std::fs::canonicalize(args.repo_root).context("failed to resolve repo root")?;
@@ -88,7 +86,6 @@ pub(crate) fn cmd_test(args: TestArgs) -> Result<()> {
     ) = match (args.ssh_user, args.ssh_key) {
         (Some(user), Some(key)) => {
             // Caller-supplied identity: user exists in the image with the given key.
-            ensure_command("ssh-keygen")?;
             let key_path = resolve_under_root(&repo_root, key);
             let pub_path = PathBuf::from(format!("{}.pub", key_path.display()));
             let pub_key = std::fs::read_to_string(&pub_path)
@@ -97,7 +94,6 @@ pub(crate) fn cmd_test(args: TestArgs) -> Result<()> {
         }
         (None, None) => {
             // Ephemeral installer: generate per-run keypair and installer account.
-            ensure_command("ssh-keygen")?;
             let kp = TemporarySshKeypair::generate("botforge-test-ssh")?;
             let pub_key = std::fs::read_to_string(kp.public_key()).with_context(|| {
                 format!(
