@@ -104,11 +104,18 @@ pub(crate) fn qemu_run_args(
         "-drive".into(),
         format!("file={},if=virtio,format=qcow2", overlay_image.display()),
         "-drive".into(),
-        format!("file={},media=cdrom,readonly=on", seed_iso.display()),
+        format!(
+            "file={},media=cdrom,readonly=on,index=0",
+            seed_iso.display()
+        ),
     ];
-    for iso in extra_isos {
+    for (index, iso) in extra_isos.iter().enumerate() {
         args.push("-drive".into());
-        args.push(format!("file={},media=cdrom,readonly=on", iso.display()));
+        args.push(format!(
+            "file={},media=cdrom,readonly=on,index={}",
+            iso.display(),
+            index + 1
+        ));
     }
     let mut netdev = format!("user,id=net0,hostfwd=tcp:0.0.0.0:{ssh_port}-:22");
     for spec in extra_ports {
@@ -244,9 +251,9 @@ mod tests {
                 "-drive",
                 "file=/overlay.qcow2,if=virtio,format=qcow2",
                 "-drive",
-                "file=/seed.iso,media=cdrom,readonly=on",
+                "file=/seed.iso,media=cdrom,readonly=on,index=0",
                 "-drive",
-                "file=/payload.iso,media=cdrom,readonly=on",
+                "file=/payload.iso,media=cdrom,readonly=on,index=1",
                 "-netdev",
                 "user,id=net0,hostfwd=tcp:0.0.0.0:2222-:22",
                 "-device",
@@ -285,6 +292,38 @@ mod tests {
         assert_eq!(
             args[netdev_index],
             "user,id=net0,hostfwd=tcp:0.0.0.0:2222-:22,hostfwd=tcp:127.0.0.1:80-:80"
+        );
+    }
+
+    #[test]
+    fn qemu_run_args_seed_cdrom_index_is_stable_with_extra_isos() {
+        let args = qemu_run_args(
+            Path::new("/overlay.qcow2"),
+            Path::new("/seed.iso"),
+            &[
+                PathBuf::from("/payload-a.iso"),
+                PathBuf::from("/payload-b.iso"),
+            ],
+            2222,
+            &[],
+        );
+        let cdrom_drives: Vec<&str> = args
+            .iter()
+            .filter_map(|arg| {
+                if arg.contains("media=cdrom") {
+                    Some(arg.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(
+            cdrom_drives,
+            vec![
+                "file=/seed.iso,media=cdrom,readonly=on,index=0",
+                "file=/payload-a.iso,media=cdrom,readonly=on,index=1",
+                "file=/payload-b.iso,media=cdrom,readonly=on,index=2",
+            ]
         );
     }
 
