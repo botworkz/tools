@@ -86,6 +86,7 @@ pub(crate) fn cmd_build(config: &Path, args: BuildArgs) -> Result<()> {
         .as_ref()
         .map(|c| c.reclaim)
         .unwrap_or_default();
+    let guest_reclaim_uses_discard = matches!(reclaim_mode, ReclaimMode::Fstrim);
     validate_build_steps(&build_config.steps)?;
     if build_config
         .steps
@@ -190,6 +191,7 @@ pub(crate) fn cmd_build(config: &Path, args: BuildArgs) -> Result<()> {
         args.ssh_port,
         build_config.memsize,
         build_config.smp,
+        guest_reclaim_uses_discard,
     );
     let mut vm_child = Some(spawn_qemu_with_log(&qemu_args, &vm_log)?);
     let ssh_options = SshOptions {
@@ -253,7 +255,37 @@ pub(crate) fn cmd_build(config: &Path, args: BuildArgs) -> Result<()> {
     };
 
     // ---------------------------------------------------------------------------
-    // Disk lifecycle step 5: installer teardown (botforge-owned identity only)
+    // Disk lifecycle step 5: guest reclaim (optional)
+    //
+    // `reclaim: fstrim` must run while the guest is still fully available for
+    // SSH. If botforge owns the installer account, that means reclaim must
+    // happen before the detached teardown service is queued.
+    // ---------------------------------------------------------------------------
+    if matches!(reclaim_mode, ReclaimMode::Fstrim) {
+        println!("running guest reclaim via fstrim -av (build drive discard=unmap enabled)");
+        if let Err(err) = run_guest_reclaim_fstrim(&ssh_options, overall_deadline) {
+            eprintln!("guest reclaim fstrim failed: {err:#}");
+            print_log_tail(&vm_log, 200);
+            if let Some(child) = vm_child.as_mut() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            if let Err(preserve_err) = preserve_failed_build_disk(&partial, &failed_partial) {
+                return Err(err.context(format!(
+                    "additionally failed to preserve tainted partial at {}: {preserve_err:#}",
+                    failed_partial.display()
+                )));
+            }
+            eprintln!(
+                "tainted partial disk left at {} for post-mortem",
+                failed_partial.display()
+            );
+            return Err(err);
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Disk lifecycle step 6: installer teardown (botforge-owned identity only)
     //
     // Remove the ephemeral installer account from the guest before committing the
     // image, so it never ships. This is botforge's last guest action: it queues a
@@ -261,9 +293,10 @@ pub(crate) fn cmd_build(config: &Path, args: BuildArgs) -> Result<()> {
     // deletes the installer, and only then powers off. A failure here is a hard
     // error: a shipped image must not contain the installer account.
     //
-    // On the failure path (step 4 or teardown error), the VM is killed and the
-    // tainted disk is preserved at <output>.partial.failed for post-mortem;
-    // leaving the installer present in that tainted disk is acceptable.
+    // On the failure path (step 4, reclaim, or teardown error), the VM is killed
+    // and the tainted disk is preserved at <output>.partial.failed for
+    // post-mortem; leaving the installer present in that tainted disk is
+    // acceptable.
     // ---------------------------------------------------------------------------
     if botforge_owned {
         let teardown_result =
@@ -291,14 +324,8 @@ pub(crate) fn cmd_build(config: &Path, args: BuildArgs) -> Result<()> {
         // only needs to wait for the VM to exit.
     }
 
-    if matches!(reclaim_mode, ReclaimMode::Fstrim) {
-        if let Err(err) = run_guest_reclaim_fstrim(&ssh_options, overall_deadline) {
-            eprintln!("warning: guest reclaim fstrim failed; continuing build: {err:#}");
-        }
-    }
-
     // ---------------------------------------------------------------------------
-    // Disk lifecycle step 6 (was 5): graceful shutdown
+    // Disk lifecycle step 7 (was 5): graceful shutdown
     // ---------------------------------------------------------------------------
     let shutdown_result = shutdown_build_vm(
         &mut vm_child,
@@ -320,7 +347,7 @@ pub(crate) fn cmd_build(config: &Path, args: BuildArgs) -> Result<()> {
     }
 
     // ---------------------------------------------------------------------------
-    // Disk lifecycle step 7 (was 6): commit partial → output (plain rename or
+    // Disk lifecycle step 8 (was 6): commit partial → output (plain rename or
     // compress-and-rename depending on the spec's `compress:` config).
     // ---------------------------------------------------------------------------
     commit_output(&partial, &output, build_config.compress.as_ref())?;
