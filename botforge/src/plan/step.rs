@@ -117,30 +117,6 @@ impl<'de> Deserialize<'de> for TestStep {
     }
 }
 
-#[derive(Debug, Deserialize, Clone, PartialEq, Eq, Default)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct TopLevelUpload {
-    pub(crate) src: String,
-    pub(crate) dest: String,
-    /// File permission mode (3–4 octal digits). Defaults to `"0644"` at install time.
-    #[serde(default)]
-    pub(crate) mode: Option<String>,
-    /// Owner (user name or numeric uid) to pass to `install -o`. Defaults to `root`.
-    #[serde(default)]
-    pub(crate) owner: Option<String>,
-    /// Group (group name or numeric gid) to pass to `install -g`. Defaults to `root`.
-    #[serde(default)]
-    pub(crate) group: Option<String>,
-    /// When `false`, the install fails with a hard error if `dest` already exists.
-    /// Defaults to `true` (overwrite is allowed).
-    #[serde(default)]
-    pub(crate) overwrite: Option<bool>,
-    /// When `true` (default), create intermediate destination directories (`install -D`).
-    /// When `false`, the parent directory must already exist.
-    #[serde(default)]
-    pub(crate) parents: Option<bool>,
-}
-
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum SecondsValue {
