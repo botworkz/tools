@@ -67,9 +67,6 @@ pub(crate) fn cmd_build(config: &Path, args: BuildArgs) -> Result<()> {
     require_kvm()?;
     ensure_command("qemu-system-x86_64")?;
     ensure_command("qemu-img")?;
-    ensure_command("ssh")?;
-    ensure_command("scp")?;
-    ensure_command("ssh-keygen")?;
     detect_iso_tool()?;
 
     let repo_root = std::fs::canonicalize(
