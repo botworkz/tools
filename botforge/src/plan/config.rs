@@ -232,6 +232,14 @@ pub(crate) enum ReclaimMode {
     Discard,
 }
 
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum CompressionType {
+    #[default]
+    Zstd,
+    Zlib,
+}
+
 /// Output-compression options for `botforge build`.
 ///
 /// `reclaim` is nested under `compress` because it is primarily used to make
@@ -246,10 +254,12 @@ pub(crate) enum ReclaimMode {
 /// # on, qemu default cluster size
 /// compress:
 ///   enabled: true
+///   # compression_type defaults to zstd
 ///
 /// # on, explicit cluster size
 /// compress:
 ///   enabled: true
+///   compression_type: zlib
 ///   cluster_size: "1M"
 ///
 /// # reclaim freed blocks before commit/compress
@@ -267,6 +277,13 @@ pub(crate) struct CompressConfig {
     /// Whether compression is enabled.  Required — a `compress:` block without
     /// `enabled:` is a hard parse error.
     pub(crate) enabled: bool,
+    /// Compression algorithm passed as `-o compression_type=<val>` to
+    /// `qemu-img convert`.
+    ///
+    /// Defaults to `zstd`, which requires qemu >= 5.1 on the build host and
+    /// any consumer that opens the produced qcow2.
+    #[serde(default)]
+    pub(crate) compression_type: CompressionType,
     /// Optional cluster size passed verbatim as `-o cluster_size=<val>` to
     /// `qemu-img convert`.  Omitted ⇒ qemu default cluster size.
     #[serde(default)]
@@ -1112,7 +1129,8 @@ mod tests {
     use super::{
         default_bootstrap_path, load_build_config, load_test_config, parse_image_ref,
         resolve_fragment_inputs, validate_build_steps, validate_test_ports, validate_test_steps,
-        ImageRef, InputDeclaration, InputType, ReclaimMode, TestConfig, TestIso, MAX_INCLUDE_DEPTH,
+        CompressionType, ImageRef, InputDeclaration, InputType, ReclaimMode, TestConfig, TestIso,
+        MAX_INCLUDE_DEPTH,
     };
     use crate::plan::step::{ArchiveStep, ArchiveStepSpec, RunStep, StepTarget, TestStep};
     use crate::plan::upload::TopLevelUpload;
@@ -3070,6 +3088,11 @@ bootcmd:
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
         let compress = config.compress.expect("compress should be Some");
         assert!(compress.enabled, "enabled must be true");
+        assert_eq!(
+            compress.compression_type,
+            CompressionType::Zstd,
+            "compression_type must default to zstd"
+        );
         assert!(
             compress.cluster_size.is_none(),
             "cluster_size must default to None"
@@ -3092,8 +3115,37 @@ bootcmd:
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
         let compress = config.compress.expect("compress should be Some");
         assert!(compress.enabled);
+        assert_eq!(compress.compression_type, CompressionType::Zstd);
         assert_eq!(compress.cluster_size.as_deref(), Some("1M"));
         assert_eq!(compress.reclaim, ReclaimMode::None);
+    }
+
+    #[test]
+    fn test_load_build_config_compress_explicit_compression_type_zstd() {
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            "type: build\nimage: \"@base\"\nsteps: []\ncompress:\n  enabled: true\n  compression_type: zstd\n",
+        );
+        let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
+        let compress = config.compress.expect("compress should be Some");
+        assert!(compress.enabled);
+        assert_eq!(compress.compression_type, CompressionType::Zstd);
+    }
+
+    #[test]
+    fn test_load_build_config_compress_explicit_compression_type_zlib() {
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            "type: build\nimage: \"@base\"\nsteps: []\ncompress:\n  enabled: true\n  compression_type: zlib\n",
+        );
+        let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
+        let compress = config.compress.expect("compress should be Some");
+        assert!(compress.enabled);
+        assert_eq!(compress.compression_type, CompressionType::Zlib);
     }
 
     #[test]
@@ -3107,6 +3159,7 @@ bootcmd:
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
         let compress = config.compress.expect("compress should be Some");
         assert!(!compress.enabled, "enabled must be false");
+        assert_eq!(compress.compression_type, CompressionType::Zstd);
         assert_eq!(compress.reclaim, ReclaimMode::None);
     }
 
@@ -3227,6 +3280,22 @@ bootcmd:
         assert!(
             msg.contains("bogus") || msg.contains("unknown variant"),
             "error should mention reclaim enum variant parse failure: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_load_build_config_compress_compression_type_unknown_value_is_error() {
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            "type: build\nimage: \"@base\"\nsteps: []\ncompress:\n  enabled: true\n  compression_type: bogus\n",
+        );
+        let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("bogus") || msg.contains("unknown variant"),
+            "error should mention compression_type enum variant parse failure: {msg}"
         );
     }
 
