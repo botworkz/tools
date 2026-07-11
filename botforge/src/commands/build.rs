@@ -4,6 +4,7 @@
 
 use anyhow::{bail, Context, Result};
 use clap::Args;
+use serde_yaml::Value;
 use shasset::fetch::{fetch_asset, FetchParams, MaterializeMode, Transport};
 use shasset::manifest::load;
 use std::path::{Path, PathBuf};
@@ -14,6 +15,7 @@ use crate::iso::{
     build_iso, detect_iso_tool, generate_installer_username, render_user_data, write_seed_files,
 };
 use crate::qemu::{qemu_build_args, require_kvm, spawn_qemu_with_log};
+use crate::resolver::ARTIFACT_DIR;
 use crate::ssh::{scp_with_retry, ssh_with_retry, SshOptions, TemporarySshKeypair};
 use crate::util::{
     botforge_debug_enabled, create_temp_dir, default_cache_dir, ensure_command, format_bytes_human,
@@ -79,10 +81,7 @@ pub(crate) struct BuildArgs {
     /// to <output>.partial before any modification.
     #[arg(long)]
     source: Option<PathBuf>,
-    /// Output qcow2 path. Materialized atomically from <output>.partial on success.
-    #[arg(long, required = true)]
-    output: PathBuf,
-    /// Repo root for resolving relative spec/source/output/step paths (default: current dir).
+    /// Repo root for resolving relative spec/source/step paths (default: current dir).
     #[arg(long)]
     repo_root: Option<PathBuf>,
     /// Cache directory for resolved shasset assets (default: ~/.cache/shasset).
@@ -124,9 +123,10 @@ pub(crate) fn cmd_build(config: &Path, args: BuildArgs) -> Result<()> {
     .context("failed to resolve repo root")?;
 
     let spec_path = resolve_under_root(&repo_root, args.spec.clone());
-    let output = resolve_under_root(&repo_root, args.output.clone());
 
     let build_config = load_build_config(&repo_root, &spec_path)?;
+    let output = derive_artifact_output_path(&repo_root, &spec_path, &build_config.output)?;
+    check_same_directory_output_filename_clash(&spec_path, &build_config.output)?;
     let reclaim_mode = build_config
         .compress
         .as_ref()
@@ -1252,6 +1252,83 @@ fn reclaim_host_discard_offline(partial: &Path) -> Result<()> {
     Ok(())
 }
 
+fn derive_artifact_output_path(
+    repo_root: &Path,
+    spec_path: &Path,
+    output_filename: &str,
+) -> Result<PathBuf> {
+    let spec_relative = spec_path.strip_prefix(repo_root).with_context(|| {
+        format!(
+            "spec path must be under repo root (spec: {}, repo_root: {})",
+            spec_path.display(),
+            repo_root.display()
+        )
+    })?;
+    let spec_relative_dir = spec_relative.parent().unwrap_or_else(|| Path::new(""));
+    Ok(repo_root
+        .join(ARTIFACT_DIR)
+        .join(spec_relative_dir)
+        .join(output_filename))
+}
+
+fn check_same_directory_output_filename_clash(
+    spec_path: &Path,
+    output_filename: &str,
+) -> Result<()> {
+    let spec_dir = spec_path.parent().unwrap_or_else(|| Path::new("."));
+    let spec_file_name = spec_path.file_name().map(|n| n.to_owned());
+    for entry in std::fs::read_dir(spec_dir).with_context(|| {
+        format!(
+            "cannot read spec directory for output clash check: {}",
+            spec_dir.display()
+        )
+    })? {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let sibling_path = entry.path();
+        if !sibling_path.is_file() {
+            continue;
+        }
+        let ext = sibling_path.extension().and_then(|s| s.to_str());
+        if !matches!(ext, Some("yaml" | "yml")) {
+            continue;
+        }
+        if spec_file_name
+            .as_ref()
+            .is_some_and(|name| sibling_path.file_name() == Some(name))
+        {
+            continue;
+        }
+        // Intentionally same-directory only; cross-directory coordination is out of scope
+        // until global output coordination is introduced.
+        let Some(sibling_output) = read_top_level_output_filename(&sibling_path) else {
+            continue;
+        };
+        if sibling_output == output_filename {
+            bail!(
+                "output filename clash in spec directory: '{}' is declared by both '{}' and '{}'",
+                output_filename,
+                spec_path.display(),
+                sibling_path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn read_top_level_output_filename(path: &Path) -> Option<String> {
+    let yaml = std::fs::read_to_string(path).ok()?;
+    let value: Value = serde_yaml::from_str(&yaml).ok()?;
+    let map = value.as_mapping()?;
+    let output_key = Value::String("output".to_string());
+    match map.get(&output_key) {
+        Some(Value::String(s)) => Some(s.clone()),
+        _ => None,
+    }
+}
+
 /// Returns `<output>.partial` — the in-progress disk path during the build.
 fn partial_path(output: &Path) -> PathBuf {
     let mut name = output
@@ -1321,7 +1398,8 @@ fn resize_qcow2(disk: &Path, size: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        archive_unpack_relative_path, cloud_init_clean_guest_command, failed_partial_path,
+        archive_unpack_relative_path, check_same_directory_output_filename_clash,
+        cloud_init_clean_guest_command, derive_artifact_output_path, failed_partial_path,
         fstrim_guest_command, fstrim_mount_args, guest_untar_command, installer_teardown_command,
         mount_discard_args, output_stem, parse_archive_asset_key, partial_path,
         qemu_nbd_connect_args, qemu_nbd_disconnect_args, resolve_base_image_with_transport,
@@ -1481,7 +1559,7 @@ mod tests {
     }
 
     #[test]
-    fn build_cli_shows_spec_source_output_repo_root() {
+    fn build_cli_shows_spec_source_repo_root() {
         // Verify --help includes all documented args.
         let help = Cli::try_parse_from(["botforge", "build", "--help"])
             .unwrap_err()
@@ -1490,10 +1568,6 @@ mod tests {
         assert!(
             help.contains("--source"),
             "--source missing from help: {help}"
-        );
-        assert!(
-            help.contains("--output"),
-            "--output missing from help: {help}"
         );
         assert!(
             help.contains("--repo-root"),
@@ -1566,17 +1640,13 @@ mod tests {
     }
 
     #[test]
-    fn build_cli_requires_spec_and_output() {
+    fn build_cli_requires_spec() {
         let err = Cli::try_parse_from(["botforge", "build"]).unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
         let err_text = err.to_string();
         assert!(
             err_text.contains("--spec"),
             "expected --spec in error: {err_text}"
-        );
-        assert!(
-            err_text.contains("--output"),
-            "expected --output in error: {err_text}"
         );
         // --source is now optional (overrides image: resolution); not required.
         assert!(
@@ -1591,19 +1661,100 @@ mod tests {
 
     #[test]
     fn build_cli_source_is_optional() {
-        // Parsing with only --spec and --output succeeds (source omitted).
-        let result = Cli::try_parse_from([
+        // Parsing with only --spec succeeds (source omitted).
+        let result = Cli::try_parse_from(["botforge", "build", "--spec", "build.yaml"]);
+        assert!(
+            result.is_ok(),
+            "build should parse without --source: {result:?}"
+        );
+    }
+
+    #[test]
+    fn build_cli_rejects_removed_output_flag() {
+        let err = Cli::try_parse_from([
             "botforge",
             "build",
             "--spec",
             "build.yaml",
             "--output",
             "out.qcow2",
-        ]);
+        ])
+        .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
         assert!(
-            result.is_ok(),
-            "build should parse without --source: {result:?}"
+            err.to_string().contains("--output"),
+            "error should mention removed --output flag: {err}"
         );
+    }
+
+    #[test]
+    fn derive_artifact_output_path_from_spec_relative_dir() {
+        let output = derive_artifact_output_path(
+            Path::new("/repo"),
+            Path::new("/repo/foo/bar/baz/build.yaml"),
+            "something.qcow2",
+        )
+        .unwrap();
+        assert_eq!(
+            output,
+            Path::new("/repo/build/artifact/foo/bar/baz/something.qcow2")
+        );
+    }
+
+    #[test]
+    fn output_filename_clash_check_allows_distinct_outputs() {
+        let tmp = TempDir::new().unwrap();
+        let spec = tmp.path().join("build.yaml");
+        std::fs::write(&spec, "type: build\noutput: one.qcow2\n").unwrap();
+        std::fs::write(
+            tmp.path().join("other.yaml"),
+            "type: build\noutput: two.qcow2\n",
+        )
+        .unwrap();
+
+        check_same_directory_output_filename_clash(&spec, "one.qcow2").unwrap();
+    }
+
+    #[test]
+    fn output_filename_clash_check_rejects_matching_sibling_output() {
+        let tmp = TempDir::new().unwrap();
+        let spec = tmp.path().join("build.yaml");
+        let sibling = tmp.path().join("other.yaml");
+        std::fs::write(&spec, "type: build\noutput: one.qcow2\n").unwrap();
+        std::fs::write(&sibling, "type: build\noutput: one.qcow2\n").unwrap();
+
+        let err = check_same_directory_output_filename_clash(&spec, "one.qcow2").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("one.qcow2"), "error should name output: {msg}");
+        assert!(
+            msg.contains(&spec.display().to_string())
+                && msg.contains(&sibling.display().to_string()),
+            "error should name both files: {msg}"
+        );
+    }
+
+    #[test]
+    fn output_filename_clash_check_ignores_sibling_without_output() {
+        let tmp = TempDir::new().unwrap();
+        let spec = tmp.path().join("build.yaml");
+        std::fs::write(&spec, "type: build\noutput: one.qcow2\n").unwrap();
+        std::fs::write(
+            tmp.path().join("other.yaml"),
+            "type: build\nimage: \"@base\"\n",
+        )
+        .unwrap();
+
+        check_same_directory_output_filename_clash(&spec, "one.qcow2").unwrap();
+    }
+
+    #[test]
+    fn output_filename_clash_check_ignores_invalid_yaml_sibling() {
+        let tmp = TempDir::new().unwrap();
+        let spec = tmp.path().join("build.yaml");
+        std::fs::write(&spec, "type: build\noutput: one.qcow2\n").unwrap();
+        std::fs::write(tmp.path().join("other.yaml"), "type: [\n").unwrap();
+
+        check_same_directory_output_filename_clash(&spec, "one.qcow2").unwrap();
     }
 
     #[test]

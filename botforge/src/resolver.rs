@@ -5,7 +5,7 @@
 //! ```text
 //! <ref>   ::= "@" <root> ("://" <path>)?
 //! <root>  ::= ""          -- this repo (checked-in source)
-//!           | "output"    -- reserved; repo build output directory
+//!           | "artifact"  -- reserved; repo artifact directory
 //!           | <name>      -- a pinned shasset asset name (everything else)
 //! <path>  ::= <non-empty repo-relative path with no "." or ".." segments>
 //! ```
@@ -18,11 +18,13 @@
 //! | `@://path`       | Repo   | repo root + path (file or dir)             |
 //! | `@foo`           | Asset  | manifest lookup → fetch + verify → blob   |
 //! | `@foo://path`    | Asset  | fetch → traverse into archive (deferred)  |
-//! | `@output`        | Output | `build/output/` directory                 |
-//! | `@output://path` | Output | `build/output/` + path, existence check   |
+//! | `@artifact`        | Artifact | `build/artifact/` directory                 |
+//! | `@artifact://path` | Artifact | `build/artifact/` + path, existence check   |
 
 use anyhow::{bail, Result};
 use std::path::{Component, Path, PathBuf};
+
+pub(crate) const ARTIFACT_DIR: &str = "build/artifact";
 
 // ── Reference ────────────────────────────────────────────────────────────────
 
@@ -40,11 +42,15 @@ pub(crate) enum Reference {
     /// shasset manifest; resolution errors out if that marker is absent.
     Asset { name: String, path: Option<PathBuf> },
 
-    /// `@output` or `@output://path` — the repo's build output directory.
+    /// `@artifact` or `@artifact://path` — the repo's build artifact directory.
     ///
     /// This root is position-addressed, not content-addressed.  Resolution
     /// performs an existence check only; it never fetches or verifies.
-    Output { path: Option<PathBuf> },
+    ///
+    /// `@artifact` is intentionally used as both:
+    /// - the deterministic output target for `botforge build`, and
+    /// - an input reference to prebuilt artifacts staged into `build/artifact/`.
+    Artifact { path: Option<PathBuf> },
 }
 
 impl Reference {
@@ -53,11 +59,11 @@ impl Reference {
     /// # Parsing rules (all hard/parse-time errors)
     ///
     /// - Must start with `@`; bare names without `@` are rejected.
-    /// - `output` is a reserved root keyword; every other non-empty token after
+    /// - `artifact` is a reserved root keyword; every other non-empty token after
     ///   `@` is treated as a shasset asset name.
     /// - Any `://path` segment must be repo-relative: non-empty, not absolute,
     ///   and free of `.` / `..` components.
-    /// - Bare `@` and bare `@output` are valid and resolve to their root
+    /// - Bare `@` and bare `@artifact` are valid and resolve to their root
     ///   **directories** (symmetric with the `://path` traversal form).
     pub(crate) fn parse(raw: &str) -> Result<Self> {
         let rest = raw.strip_prefix('@').ok_or_else(|| {
@@ -70,7 +76,7 @@ impl Reference {
             validate_ref_path(&path)?;
             match root_token {
                 "" => Ok(Reference::Repo { path: Some(path) }),
-                "output" => Ok(Reference::Output { path: Some(path) }),
+                "artifact" => Ok(Reference::Artifact { path: Some(path) }),
                 name => Ok(Reference::Asset {
                     name: name.to_string(),
                     path: Some(path),
@@ -80,7 +86,7 @@ impl Reference {
             // Simple form: @<root>
             match rest {
                 "" => Ok(Reference::Repo { path: None }),
-                "output" => Ok(Reference::Output { path: None }),
+                "artifact" => Ok(Reference::Artifact { path: None }),
                 name => Ok(Reference::Asset {
                     name: name.to_string(),
                     path: None,
@@ -165,19 +171,30 @@ mod tests {
     }
 
     #[test]
-    fn parse_output_bare() {
+    fn parse_artifact_bare() {
         assert_eq!(
-            Reference::parse("@output").unwrap(),
-            Reference::Output { path: None }
+            Reference::parse("@artifact").unwrap(),
+            Reference::Artifact { path: None }
         );
     }
 
     #[test]
-    fn parse_output_with_path() {
+    fn parse_artifact_with_path() {
         assert_eq!(
-            Reference::parse("@output://images/vm.qcow2").unwrap(),
-            Reference::Output {
+            Reference::parse("@artifact://images/vm.qcow2").unwrap(),
+            Reference::Artifact {
                 path: Some(PathBuf::from("images/vm.qcow2"))
+            }
+        );
+    }
+
+    #[test]
+    fn parse_output_is_not_reserved_keyword_anymore() {
+        assert_eq!(
+            Reference::parse("@output").unwrap(),
+            Reference::Asset {
+                name: "output".to_string(),
+                path: None
             }
         );
     }
@@ -202,7 +219,7 @@ mod tests {
 
     #[test]
     fn parse_empty_path_after_scheme_is_rejected() {
-        for raw in &["@://", "@foo://", "@output://"] {
+        for raw in &["@://", "@foo://", "@artifact://"] {
             let err = Reference::parse(raw).unwrap_err();
             assert!(
                 err.to_string().contains("must not be empty"),

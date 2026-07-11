@@ -178,7 +178,7 @@ pub(crate) enum ImageRef {
 /// Delegates to [`crate::resolver::Reference::parse`] for the grammar, then
 /// enforces the `image:`-specific policy:
 /// - Only `Reference::Asset { path: None }` is accepted (`@<name>` form).
-/// - `@` alone, `@output`, and all `://`-traversal forms are rejected.
+/// - `@` alone, `@artifact`, and all `://`-traversal forms are rejected.
 pub(crate) fn parse_image_ref(raw: &str) -> Result<ImageRef> {
     use crate::resolver::Reference;
     let reference = Reference::parse(raw).map_err(|_| {
@@ -197,7 +197,7 @@ pub(crate) fn parse_image_ref(raw: &str) -> Result<ImageRef> {
         }
         Reference::Asset { path: Some(_), .. }
         | Reference::Repo { path: Some(_) }
-        | Reference::Output { .. } => {
+        | Reference::Artifact { .. } => {
             anyhow::bail!(
                 "`@` scheme traversal (`@://…`) is not yet supported for image references; \
                  use `@<shasset-name>` to resolve a provider's default artifact \
@@ -301,6 +301,9 @@ pub(crate) struct CompressConfig {
 pub(crate) struct BuildConfig {
     /// Parsed `image:` reference naming the source qcow2 to boot from.
     pub(crate) image: ImageRef,
+    /// Declared artifact filename (no directories). The output directory is derived from
+    /// the build spec path under the repo root.
+    pub(crate) output: String,
     pub(crate) disk_size: String,
     pub(crate) steps: Vec<TestStep>,
     pub(crate) uploads: Vec<TopLevelUpload>,
@@ -326,6 +329,8 @@ struct RawBuildDocument {
     /// [`parse_image_ref`] into an [`ImageRef`] after deserialization.
     #[serde(rename = "image", default)]
     image: Option<String>,
+    #[serde(default)]
+    output: Option<String>,
     #[serde(default = "default_disk_size")]
     disk_size: String,
     #[serde(default)]
@@ -484,9 +489,30 @@ pub(crate) fn load_build_config(repo_root: &Path, path: &Path) -> Result<BuildCo
             format!("invalid 'image' value in build config ({})", path.display())
         })?,
     };
+    let output = match raw.output {
+        None => anyhow::bail!(
+            "'output' is required in a 'type: build' document ({}): \
+             set it to a bare artifact filename, e.g. `output: \"image.qcow2\"`",
+            path.display()
+        ),
+        Some(s) if s.trim().is_empty() => anyhow::bail!(
+            "'output' is required in a 'type: build' document ({}): \
+             set it to a bare artifact filename, e.g. `output: \"image.qcow2\"`",
+            path.display()
+        ),
+        Some(s) => validate_build_output_filename(&s)
+            .with_context(|| {
+                format!(
+                    "invalid 'output' value in build config ({})",
+                    path.display()
+                )
+            })?
+            .to_string(),
+    };
     let mut include_stack = vec![path.to_path_buf()];
     Ok(BuildConfig {
         image,
+        output,
         disk_size: raw.disk_size,
         steps: expand_test_steps(repo_root, path, raw.steps, &mut include_stack)?,
         uploads: {
@@ -500,6 +526,43 @@ pub(crate) fn load_build_config(repo_root: &Path, path: &Path) -> Result<BuildCo
         bootcmd: raw.bootcmd,
         compress: raw.compress,
     })
+}
+
+fn validate_build_output_filename(output: &str) -> Result<&str> {
+    use std::path::{Component, Path};
+
+    let path = Path::new(output);
+    if path.is_absolute() {
+        anyhow::bail!("output filename must be a bare filename, got absolute path");
+    }
+    let mut saw_normal = false;
+    for component in path.components() {
+        match component {
+            Component::Normal(_) => saw_normal = true,
+            Component::CurDir
+            | Component::ParentDir
+            | Component::RootDir
+            | Component::Prefix(_) => {
+                anyhow::bail!(
+                    "output filename must be a bare filename with no path segments, got '{}'",
+                    output
+                );
+            }
+        }
+    }
+    if !saw_normal || path.file_name().is_none() || output.contains(std::path::MAIN_SEPARATOR) {
+        anyhow::bail!(
+            "output filename must be a bare filename with no path segments, got '{}'",
+            output
+        );
+    }
+    if output.contains('/') || output.contains('\\') {
+        anyhow::bail!(
+            "output filename must be a bare filename with no path segments, got '{}'",
+            output
+        );
+    }
+    Ok(output)
 }
 
 fn expand_test_steps(
@@ -613,7 +676,7 @@ fn check_fragment_document_type(uses: &str, value: &Value) -> Result<()> {
 
 /// Reject entrypoint-only sections (`ports:`, `isos:`, `diagnostics_units:`,
 /// `disk_size:`, `memsize:`, `smp:`, `step_timeout:`, `timeout:`, `image:`,
-/// `compress:`) inside a `type: fragment` document.
+/// `output:`, `compress:`) inside a `type: fragment` document.
 /// Serde would silently ignore them; this turns a misplaced key into an explicit
 /// load-time error.
 fn check_no_entrypoint_sections_in_fragment(path: &Path, value: &Value) -> Result<()> {
@@ -631,6 +694,7 @@ fn check_no_entrypoint_sections_in_fragment(path: &Path, value: &Value) -> Resul
         "step_timeout",
         "timeout",
         "image",
+        "output",
         "compress",
         "uploads",
     ] {
@@ -645,7 +709,8 @@ fn check_no_entrypoint_sections_in_fragment(path: &Path, value: &Value) -> Resul
     Ok(())
 }
 
-/// Reject build-only sections (`disk_size:`, `memsize:`, `smp:`, `image:`) inside a
+/// Reject build-only sections (`disk_size:`, `memsize:`, `smp:`, `image:`,
+/// `output:`, `compress:`) inside a
 /// `type: test` document.  Serde would silently ignore them; this turns a
 /// misplaced key into an explicit load-time error.
 fn check_no_build_sections_in_test_doc(path: &Path, value: &Value) -> Result<()> {
@@ -653,7 +718,7 @@ fn check_no_build_sections_in_test_doc(path: &Path, value: &Value) -> Result<()>
         Value::Mapping(m) => m,
         _ => return Ok(()),
     };
-    for section in &["disk_size", "memsize", "smp", "image", "compress"] {
+    for section in &["disk_size", "memsize", "smp", "image", "output", "compress"] {
         if mapping.contains_key(Value::String(section.to_string())) {
             anyhow::bail!(
                 "{}: is not valid in a 'type: test' document ({})",
@@ -2598,6 +2663,7 @@ steps:
             r#"
 type: build
 image: "@debian-base"
+output: "built.qcow2"
 steps:
   - on: guest
     name: provision
@@ -2609,6 +2675,7 @@ steps:
             config.image,
             ImageRef::ShassetDefault("debian-base".to_string())
         );
+        assert_eq!(config.output, "built.qcow2");
         assert_eq!(config.disk_size, "10G");
         assert_eq!(config.step_timeout, 1800);
         assert_eq!(config.timeout, 7200);
@@ -2626,6 +2693,7 @@ steps:
             r#"
 type: build
 image: "@my-base"
+output: "out.qcow2"
 disk_size: "20G"
 step_timeout: 2400
 timeout: 9600
@@ -2682,7 +2750,7 @@ steps: []
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nimage: \"@base\"\nsteps: []\n",
+            "type: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\n",
         );
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
         assert!(config.uploads.is_empty(), "uploads should default to empty");
@@ -2697,6 +2765,7 @@ steps: []
             r#"
 type: build
 image: "@base"
+output: "out.qcow2"
 uploads:
   - src: images/botspace/envoy/**/*.yaml
     dest: /tmp/bake-staging/envoy/
@@ -2732,6 +2801,7 @@ steps: []
             r#"
 type: build
 image: "@base"
+output: "out.qcow2"
 uploads:
   - src: "@payload"
     dest: /tmp/payload
@@ -2753,6 +2823,7 @@ steps: []
             r#"
 type: build
 image: "@base"
+output: "out.qcow2"
 uploads:
   - src: payload/file.txt
     dest: relative/path
@@ -2776,6 +2847,7 @@ steps: []
             r#"
 type: build
 image: "@base"
+output: "out.qcow2"
 uploads:
   - src: payload/../secret.txt
     dest: /tmp/secret.txt
@@ -2796,6 +2868,7 @@ steps: []
             r#"
 type: build
 image: "@base"
+output: "out.qcow2"
 uploads:
   - src: payload/*.tar
     dest: /tmp/payload.tar
@@ -2819,6 +2892,7 @@ steps: []
             r#"
 type: build
 image: "@base"
+output: "out.qcow2"
 uploads:
   - src: payload/file.txt
     dest: /tmp/file.txt
@@ -2840,6 +2914,7 @@ steps: []
             r#"
 type: build
 image: "@base"
+output: "out.qcow2"
 uploads:
   - src: payload/file.txt
     dest: /usr/local/bin/file
@@ -2870,6 +2945,7 @@ steps: []
             r#"
 type: build
 image: "@base"
+output: "out.qcow2"
 uploads:
   - src: payload/file.txt
     dest: /tmp/file.txt
@@ -2894,6 +2970,7 @@ steps: []
             r#"
 type: build
 image: "@base"
+output: "out.qcow2"
 uploads:
   - src: payload/file.txt
     dest: /tmp/file.txt
@@ -2918,6 +2995,7 @@ steps: []
             r#"
 type: build
 image: "@base"
+output: "out.qcow2"
 uploads:
   - src: payload/file.txt
     dest: /tmp/file.txt
@@ -2940,7 +3018,7 @@ steps: []
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nimage: \"@base\"\nsteps: []\n",
+            "type: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\n",
         );
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
         assert!(
@@ -2959,6 +3037,7 @@ steps: []
             r#"
 type: build
 image: "@base"
+output: "out.qcow2"
 steps: []
 bootcmd:
   - echo hello
@@ -2987,6 +3066,7 @@ bootcmd:
             r#"
 type: build
 image: "@base"
+output: "out.qcow2"
 steps: []
 bootcmd:
   - [ cloud-init-per, once, mask-stack, sh, -c, "systemctl mask a.service" ]
@@ -3017,6 +3097,7 @@ bootcmd:
             r#"
 type: build
 image: "@base"
+output: "out.qcow2"
 steps: []
 bootcmd:
   - echo shell-entry
@@ -3049,6 +3130,7 @@ bootcmd:
             r#"
 type: build
 image: "@base"
+output: "out.qcow2"
 steps: []
 bootcmd:
   - echo hello
@@ -3069,7 +3151,7 @@ bootcmd:
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nimage: \"@base\"\nsteps: []\nbootcmd: []\n",
+            "type: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\nbootcmd: []\n",
         );
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
         assert!(
@@ -3088,7 +3170,7 @@ bootcmd:
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nimage: \"@base\"\nsteps: []\n",
+            "type: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\n",
         );
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
         assert!(
@@ -3103,7 +3185,7 @@ bootcmd:
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nimage: \"@base\"\nsteps: []\ncompress:\n  enabled: true\n",
+            "type: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\ncompress:\n  enabled: true\n",
         );
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
         let compress = config.compress.expect("compress should be Some");
@@ -3134,7 +3216,7 @@ bootcmd:
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nimage: \"@base\"\nsteps: []\ncompress:\n  enabled: true\n  compressor_args:\n    cluster_size: \"1M\"\n",
+            "type: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\ncompress:\n  enabled: true\n  compressor_args:\n    cluster_size: \"1M\"\n",
         );
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
         let compress = config.compress.expect("compress should be Some");
@@ -3156,7 +3238,7 @@ bootcmd:
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nimage: \"@base\"\nsteps: []\ncompress:\n  enabled: true\n  compressor: zstd\n",
+            "type: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\ncompress:\n  enabled: true\n  compressor: zstd\n",
         );
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
         let compress = config.compress.expect("compress should be Some");
@@ -3170,7 +3252,7 @@ bootcmd:
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nimage: \"@base\"\nsteps: []\ncompress:\n  enabled: true\n  compressor: zlib\n",
+            "type: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\ncompress:\n  enabled: true\n  compressor: zlib\n",
         );
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
         let compress = config.compress.expect("compress should be Some");
@@ -3184,7 +3266,7 @@ bootcmd:
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nimage: \"@base\"\nsteps: []\ncompress:\n  enabled: true\n  compressor_args:\n    cluster_size: \"1M\"\n",
+            "type: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\ncompress:\n  enabled: true\n  compressor_args:\n    cluster_size: \"1M\"\n",
         );
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
         let compress = config.compress.expect("compress should be Some");
@@ -3204,7 +3286,7 @@ bootcmd:
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nimage: \"@base\"\nsteps: []\ncompress:\n  enabled: true\n  compressor_opts: \"-19 -T0\"\n",
+            "type: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\ncompress:\n  enabled: true\n  compressor_opts: \"-19 -T0\"\n",
         );
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
         let compress = config.compress.expect("compress should be Some");
@@ -3217,7 +3299,7 @@ bootcmd:
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nimage: \"@base\"\nsteps: []\ncompress:\n  enabled: false\n",
+            "type: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\ncompress:\n  enabled: false\n",
         );
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
         let compress = config.compress.expect("compress should be Some");
@@ -3232,7 +3314,7 @@ bootcmd:
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nimage: \"@base\"\nsteps: []\ncompress:\n  enabled: true\n  reclaim: fstrim\n",
+            "type: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\ncompress:\n  enabled: true\n  reclaim: fstrim\n",
         );
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
         let compress = config.compress.expect("compress should be Some");
@@ -3246,7 +3328,7 @@ bootcmd:
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nimage: \"@base\"\nsteps: []\ncompress:\n  enabled: true\n  reclaim: discard\n",
+            "type: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\ncompress:\n  enabled: true\n  reclaim: discard\n",
         );
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
         let compress = config.compress.expect("compress should be Some");
@@ -3260,7 +3342,7 @@ bootcmd:
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nimage: \"@base\"\nsteps: []\ncompress:\n  enabled: true\n  reclaim: none\n",
+            "type: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\ncompress:\n  enabled: true\n  reclaim: none\n",
         );
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
         let compress = config.compress.expect("compress should be Some");
@@ -3274,7 +3356,7 @@ bootcmd:
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nimage: \"@base\"\nsteps: []\ncompress:\n  enabled: true\n  reclaim: sparsify\n",
+            "type: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\ncompress:\n  enabled: true\n  reclaim: sparsify\n",
         );
         let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
         let msg = format!("{err:#}");
@@ -3290,7 +3372,7 @@ bootcmd:
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nimage: \"@base\"\nsteps: []\ncompress:\n  enabled: false\n  reclaim: fstrim\n",
+            "type: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\ncompress:\n  enabled: false\n  reclaim: fstrim\n",
         );
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
         let compress = config.compress.expect("compress should be Some");
@@ -3304,7 +3386,7 @@ bootcmd:
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nimage: \"@base\"\nsteps: []\ncompress:\n  reclaim: fstrim\n",
+            "type: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\ncompress:\n  reclaim: fstrim\n",
         );
         let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
         let msg = format!("{err:#}");
@@ -3320,7 +3402,7 @@ bootcmd:
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nimage: \"@base\"\nsteps: []\ncompress:\n  reclaim: fstrim\n",
+            "type: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\ncompress:\n  reclaim: fstrim\n",
         );
         let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
         let msg = format!("{err:#}");
@@ -3336,7 +3418,7 @@ bootcmd:
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nimage: \"@base\"\nsteps: []\ncompress:\n  enabled: true\n  bogus: 1\n",
+            "type: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\ncompress:\n  enabled: true\n  bogus: 1\n",
         );
         let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
         let msg = format!("{err:#}");
@@ -3352,7 +3434,7 @@ bootcmd:
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nimage: \"@base\"\nsteps: []\ncompress:\n  enabled: true\n  reclaim: bogus\n",
+            "type: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\ncompress:\n  enabled: true\n  reclaim: bogus\n",
         );
         let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
         let msg = format!("{err:#}");
@@ -3368,7 +3450,7 @@ bootcmd:
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nimage: \"@base\"\nsteps: []\ncompress:\n  enabled: true\n  compressor: bogus\n",
+            "type: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\ncompress:\n  enabled: true\n  compressor: bogus\n",
         );
         let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
         let msg = format!("{err:#}");
@@ -3384,7 +3466,7 @@ bootcmd:
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nimage: \"@base\"\nsteps: []\ncompress:\n  enabled: true\n  compression_type: zstd\n",
+            "type: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\ncompress:\n  enabled: true\n  compression_type: zstd\n",
         );
         let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
         let msg = format!("{err:#}");
@@ -3400,7 +3482,7 @@ bootcmd:
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nimage: \"@base\"\nsteps: []\ncompress:\n  enabled: true\n  cluster_size: \"1M\"\n",
+            "type: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\ncompress:\n  enabled: true\n  cluster_size: \"1M\"\n",
         );
         let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
         let msg = format!("{err:#}");
@@ -3416,7 +3498,7 @@ bootcmd:
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nimage: \"@base\"\nsteps: []\ncompress:\n  enabled: true\n  recliam: fstrim\n",
+            "type: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\ncompress:\n  enabled: true\n  recliam: fstrim\n",
         );
         let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
         let msg = format!("{err:#}");
@@ -3603,7 +3685,11 @@ steps: []
     #[test]
     fn test_load_build_config_requires_image() {
         let repo = TempDir::new().unwrap();
-        write_build_config(&repo, "build.yaml", "type: build\nsteps: []\n");
+        write_build_config(
+            &repo,
+            "build.yaml",
+            "type: build\noutput: \"out.qcow2\"\nsteps: []\n",
+        );
         let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
@@ -3613,9 +3699,58 @@ steps: []
     }
 
     #[test]
+    fn test_load_build_config_requires_output() {
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            "type: build\nimage: \"@base\"\nsteps: []\n",
+        );
+        let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("'output'") && msg.contains("required"),
+            "error should mention missing output: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_load_build_config_rejects_non_filename_output() {
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            "type: build\nimage: \"@base\"\noutput: \"foo/bar.qcow2\"\nsteps: []\n",
+        );
+        let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("bare filename"),
+            "error should mention bare filename requirement: {msg}"
+        );
+
+        write_build_config(
+            &repo,
+            "build-dotdot.yaml",
+            "type: build\nimage: \"@base\"\noutput: \"../bar.qcow2\"\nsteps: []\n",
+        );
+        let err =
+            load_build_config(repo.path(), &repo.path().join("build-dotdot.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("bare filename"),
+            "error should mention bare filename requirement for dotdot: {msg}"
+        );
+    }
+
+    #[test]
     fn test_load_build_config_rejects_empty_image() {
         let repo = TempDir::new().unwrap();
-        write_build_config(&repo, "build.yaml", "type: build\nimage: \"\"\nsteps: []\n");
+        write_build_config(
+            &repo,
+            "build.yaml",
+            "type: build\nimage: \"\"\noutput: \"out.qcow2\"\nsteps: []\n",
+        );
         let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
@@ -3653,6 +3788,37 @@ steps: []
         let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("image"), "error should mention image: {msg}");
+    }
+
+    #[test]
+    fn test_load_test_config_rejects_output_section() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            "type: test\noutput: \"out.qcow2\"\nsteps: []\n",
+        )
+        .unwrap();
+        let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("output"), "error should mention output: {msg}");
+    }
+
+    #[test]
+    fn test_fragment_rejects_output() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("frag.yaml"),
+            "type: fragment\noutput: \"out.qcow2\"\nsteps: []\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            "type: test\nsteps:\n  - uses: \"@://frag.yaml\"\n",
+        )
+        .unwrap();
+        let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("output"), "error should mention output: {msg}");
     }
 
     #[test]
@@ -3801,6 +3967,7 @@ steps:
             r#"
 type: build
 image: "@debian-base"
+output: "out.qcow2"
 steps:
   - uses: "@://frag.yaml"
 "#,
@@ -3832,6 +3999,7 @@ steps:
             r#"
 type: build
 image: "@debian-base"
+output: "out.qcow2"
 steps:
   - uses: "@://frag.yaml"
 "#,
@@ -3867,6 +4035,7 @@ steps:
             r#"
 type: build
 image: "@debian-base"
+output: "out.qcow2"
 steps:
   - uses: "@://frag.yaml"
     with:

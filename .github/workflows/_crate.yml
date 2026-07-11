@@ -162,14 +162,14 @@ jobs:
           # parsing (reaches cmd_build) without needing /dev/kvm or a real qcow2.
           rm -rf .ci-build-smoke
           mkdir -p .ci-build-smoke
-          printf 'type: build\nimage: "@none"\ndisk_size: 1G\nsteps:\n  - ' \
-                 'on: guest\n    name: noop\n    run: "true"\n' \
+          printf 'type: build\nimage: "@none"\noutput: out.qcow2\ndisk_size: 1G\nsteps:\n  ' \
+            '- on: guest\n    name: noop\n    run: "true"\n' \
             > .ci-build-smoke/spec.yaml
           if docker run --rm \
             -v "$PWD/.ci-build-smoke:/work" \
             -w /work \
             "botwork/botforge:ci" \
-            build --spec spec.yaml --source missing.qcow2 --output out.qcow2 \
+            build --spec spec.yaml --source missing.qcow2 \
             2>&1 | tee /tmp/build-smoke.log
           then
             echo "expected botforge build to fail without /dev/kvm on CI runner" >&2

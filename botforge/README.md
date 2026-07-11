@@ -52,6 +52,7 @@ shasset manifest used to resolve `image:` assets.
 | Command | Summary |
 |---|---|
 | `botforge build --spec <file> --output <qcow2> [--source <qcow2>] [--cache-dir <dir>] [--repo-root <dir>] [--memory <MiB>] [--cpus <N\|auto>]` | Resolve `image:` from the shasset manifest (`--config`), fetch + verify + cache the qcow2, boot it under qemu, inject an ephemeral in-harness SSH keypair via cloud-init, run `type: build` plan steps, and commit the result on clean shutdown. `--source` is an optional local override that bypasses shasset resolution. `--memory` (default 4096 MiB) and `--cpus` (default 4, or `auto` for host core count) control the runner VM and do not affect the output image. |
+| `botforge build --spec <file> [--source <qcow2>] [--cache-dir <dir>] [--repo-root <dir>]` | Resolve `image:` from the shasset manifest (`--config`), fetch + verify + cache the qcow2, boot it under qemu, inject an ephemeral in-harness SSH keypair via cloud-init, run `type: build` plan steps, and commit the result on clean shutdown. `--source` is an optional local override that bypasses shasset resolution. Output is declared in the spec via top-level `output:` and materialized at `build/artifact/<spec-dir>/<output>`. |
 | `botforge deps --out <dir> [name ...]` | Fetch + stage shasset assets into a flat output directory. |
 | `botforge iso --src <dir> --out <file> [--volume-id <id>]` | Build an ISO image from a source tree. Also supports generating a cidata seed ISO with an injected SSH key. |
 | `botforge payload --out <file>` | Build a payload ISO from a config-driven staging plan. |
@@ -525,8 +526,16 @@ directory); all guest paths must be absolute.
 
 ```yaml
 type: build
+<<<<<<< HEAD
 image: "@debian-base"           # required: @<shasset-name> resolves to the provider's default artifact
 disk_size: "10G"                 # optional, default 10G — a build requirement (output image is resized to this size)
+=======
+image: "@debian-base"
+output: "foo.qcow2"           # required: @<shasset-name> resolves to the provider's default artifact
+disk_size: "10G"                 # optional, default 10G
+memsize: 4096                    # optional, default 4096 MiB
+smp: 4                           # optional, default 4 vCPUs
+>>>>>>> 66ee880 (botforge: derive artifact output path from spec and rename @artifact root)
 step_timeout: 1800               # optional, default 1800 s; applies to each step
 timeout: 7200                    # optional, default 7200 s; overall wall-clock budget
 bootcmd:                         # optional; merged into the first-boot cloud-init user-data
@@ -563,7 +572,7 @@ Example: `image: "@debian-base"` looks up the `debian-base` asset in the
 shasset manifest pointed to by the global `--config` flag (default
 `shasset.yaml`) and fetches its default file.
 
-**Reserved (not yet supported):** `@://…` — the URI traversal form (walking
+**Reserved (not yet supported for `image:`):** `@://…` — the URI traversal form (walking
 into repos/tarballs/paths within a provider).  The parser recognises this
 form and hard-errors with a clear message so the scheme stays intact for
 when traversal is implemented.  Do not use `://` in `image:` values today.
@@ -592,7 +601,27 @@ qcow2, or arch experiments. Neither `--source` nor a resolvable `image:`
 
 **`--cache-dir <dir>` controls the shasset cache.** Defaults to
 `~/.cache/shasset` (respecting `SHASSET_CACHE` / `XDG_CACHE_HOME` / `HOME`).
-The cache is independent of the build/output dir by design — it can be mounted
+#### `output:` (required)
+
+`output:` is required in every `type: build` document and must be a **bare filename**
+(no path segments, not absolute, and no `.` / `..` components).
+
+The build artifact path is deterministic from spec location:
+
+`<repo-root>/build/artifact/<spec-dir-relative-to-repo-root>/<output>`
+
+For example, `foo/bar/baz/build.yaml` with `output: "something.qcow2"` writes:
+
+`build/artifact/foo/bar/baz/something.qcow2`
+
+`@artifact` is the reserved root for this directory and is intentionally usable
+as both an output target (`botforge build`) and an input reference
+(`@artifact://something.qcow2`, including artifacts staged by CI).
+
+`output:` is a `type: build`-only field; it is rejected in `type: test` and
+`type: fragment` documents at load time.
+
+The cache is independent of the build/artifact dir by design — it can be mounted
 as a persistent volume or CI cache to avoid re-downloading the image on
 every build.
 
@@ -853,4 +882,3 @@ Compression matrix (runs in parallel):
 
 KVM is a **hard requirement** — the job fails immediately if `/dev/kvm` is
 unavailable; no TCG fallback.
-
