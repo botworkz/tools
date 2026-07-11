@@ -140,6 +140,26 @@ pub(super) fn print_step_title(step_idx: usize, step_name: &str, step_id: Option
     );
 }
 
+fn phase_title_line(label: &str, description: &str, color: bool) -> String {
+    if color {
+        format!("🤖 ({label}) \x1b[1m{description}\x1b[0m")
+    } else {
+        format!("🤖 ({label}) {description}")
+    }
+}
+
+/// Print a lifecycle phase title to stderr: `🤖 (<label>) <description>`.
+///
+/// Uses the same TTY-aware coloring (`stderr_color_enabled`, `NO_COLOR`-aware) as
+/// [`print_step_title`].  Use this for named build phases (e.g. `"setup"`,
+/// `"compress"`, `"output"`) rather than the numbered per-step titles.
+pub(crate) fn print_phase(label: &str, description: &str) {
+    eprintln!(
+        "{}",
+        phase_title_line(label, description, stderr_color_enabled())
+    );
+}
+
 pub(super) fn print_step_status(
     step_idx: usize,
     step_name: &str,
@@ -264,7 +284,9 @@ pub(super) fn join_output_forwarders(handles: Vec<JoinHandle<Result<()>>>) -> Re
 
 #[cfg(test)]
 mod tests {
-    use super::{step_log_path, step_status_marker, step_title_line, write_all_resilient};
+    use super::{
+        phase_title_line, step_log_path, step_status_marker, step_title_line, write_all_resilient,
+    };
     use std::path::PathBuf;
     use std::time::Duration;
 
@@ -464,6 +486,49 @@ mod tests {
         assert_eq!(
             received, data_for_check,
             "write_all_resilient must forward all bytes without loss or reordering"
+        );
+    }
+
+    // --- phase title line ---
+
+    #[test]
+    fn test_phase_title_line_no_color() {
+        assert_eq!(
+            phase_title_line("setup", "Preparing build environment (seed image)", false),
+            "🤖 (setup) Preparing build environment (seed image)"
+        );
+        assert_eq!(
+            phase_title_line(
+                "output",
+                "Final image written to /out.qcow2 (344.0 MiB)",
+                false
+            ),
+            "🤖 (output) Final image written to /out.qcow2 (344.0 MiB)"
+        );
+    }
+
+    #[test]
+    fn test_phase_title_line_color() {
+        let colored = phase_title_line(
+            "compress",
+            "Compressing image (reclaim, sparsify, compression)",
+            true,
+        );
+        assert!(
+            colored.contains("🤖 (compress) "),
+            "colored phase title should contain robot prefix: {colored:?}"
+        );
+        assert!(
+            colored.contains("\x1b[1m"),
+            "colored phase title should contain bold: {colored:?}"
+        );
+        assert!(
+            colored.contains("Compressing image (reclaim, sparsify, compression)"),
+            "colored phase title should contain description: {colored:?}"
+        );
+        assert!(
+            colored.contains("\x1b[0m"),
+            "colored phase title should contain reset: {colored:?}"
         );
     }
 }

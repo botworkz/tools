@@ -16,8 +16,8 @@ use crate::iso::{
 use crate::qemu::{qemu_build_args, require_kvm, spawn_qemu_with_log};
 use crate::ssh::{scp_with_retry, ssh_with_retry, SshOptions, TemporarySshKeypair};
 use crate::util::{
-    create_temp_dir, default_cache_dir, ensure_command, materialize_flat, resolve_under_root,
-    unique_suffix,
+    botforge_debug_enabled, create_temp_dir, default_cache_dir, ensure_command, format_bytes_human,
+    materialize_flat, resolve_under_root, unique_suffix,
 };
 
 use crate::plan::config::{CompressConfig, CompressionType, ReclaimMode};
@@ -26,9 +26,7 @@ use crate::plan::{
     load_build_config, preserve_failed_build_disk, print_log_tail, run_step_flow,
     shutdown_build_vm, validate_build_steps, vm::StepFlowPlan, vm::StepTimeoutPolicy,
 };
-use crate::qcow2::{
-    compress_qcow2_image, read_qcow2_image_stats, sparsify_zero_clusters, ZeroClusterSparsifyStats,
-};
+use crate::qcow2::{compress_qcow2_image, read_qcow2_image_stats, sparsify_zero_clusters};
 
 #[derive(Args, Debug)]
 pub(crate) struct BuildArgs {
@@ -180,6 +178,7 @@ pub(crate) fn cmd_build(config: &Path, args: BuildArgs) -> Result<()> {
     } else {
         render_user_data(None, ssh_public_key.trim(), None, &build_config.bootcmd)
     };
+    crate::plan::print_phase("setup", "Preparing build environment (seed image)");
     write_seed_files(&seed_dir, &user_data)?;
     build_iso(&seed_dir, &seed_iso, "cidata")?;
     std::fs::remove_dir_all(&seed_dir)
@@ -261,8 +260,15 @@ pub(crate) fn cmd_build(config: &Path, args: BuildArgs) -> Result<()> {
     // SSH. If botforge owns the installer account, that means reclaim must
     // happen before the detached teardown service is queued.
     // ---------------------------------------------------------------------------
+    let compress_phase_runs = !matches!(reclaim_mode, ReclaimMode::None)
+        || build_config.compress.as_ref().is_some_and(|c| c.enabled);
+    if compress_phase_runs {
+        crate::plan::print_phase(
+            "compress",
+            "Compressing image (reclaim, sparsify, compression)",
+        );
+    }
     if matches!(reclaim_mode, ReclaimMode::Fstrim) {
-        println!("running guest reclaim via fstrim -av (build drive discard=unmap enabled)");
         if let Err(err) = run_guest_reclaim_fstrim(&ssh_options, overall_deadline) {
             eprintln!("guest reclaim fstrim failed: {err:#}");
             print_log_tail(&vm_log, 200);
@@ -370,10 +376,14 @@ pub(crate) fn cmd_build(config: &Path, args: BuildArgs) -> Result<()> {
         let stats = sparsify_zero_clusters(&partial).with_context(|| {
             format!("failed to sparsify zero clusters in {}", partial.display())
         })?;
-        println!(
-            "qcow2 zero-cluster sparsify: scanned={} deallocated={} skipped_compressed={}",
-            stats.scanned_clusters, stats.deallocated_clusters, stats.skipped_compressed_clusters
-        );
+        if botforge_debug_enabled() {
+            eprintln!(
+                "qcow2 zero-cluster sparsify: scanned={} deallocated={} skipped_compressed={}",
+                stats.scanned_clusters,
+                stats.deallocated_clusters,
+                stats.skipped_compressed_clusters
+            );
+        }
         Some(stats)
     } else {
         None
@@ -384,33 +394,34 @@ pub(crate) fn cmd_build(config: &Path, args: BuildArgs) -> Result<()> {
     // compress-and-rename depending on the spec's `compress:` config).
     // ---------------------------------------------------------------------------
     commit_output(&partial, &output, build_config.compress.as_ref())?;
-    log_final_image_stats(&output, zero_cluster_stats)?;
 
-    println!("built image at {}", output.display());
+    let output_stats = read_qcow2_image_stats(&output)?;
+    if botforge_debug_enabled() {
+        let deallocated = zero_cluster_stats
+            .map(|s| s.deallocated_clusters)
+            .unwrap_or(0);
+        eprintln!(
+            "final image stats: virtual_size={} disk_size={} cluster_size={} allocated_data_clusters={} zero_clusters_deallocated={}",
+            output_stats.virtual_size,
+            output_stats.disk_size,
+            output_stats.cluster_size,
+            output_stats.allocated_data_clusters,
+            deallocated
+        );
+    }
+    crate::plan::print_phase(
+        "output",
+        &format!(
+            "Final image written to {} ({})",
+            output.display(),
+            format_bytes_human(output_stats.disk_size)
+        ),
+    );
     Ok(())
 }
 
 fn should_run_zero_cluster_sparsify(mode: ReclaimMode) -> bool {
     !matches!(mode, ReclaimMode::None)
-}
-
-fn log_final_image_stats(
-    output: &Path,
-    zero_cluster_stats: Option<ZeroClusterSparsifyStats>,
-) -> Result<()> {
-    let stats = read_qcow2_image_stats(output)?;
-    let deallocated = zero_cluster_stats
-        .map(|s| s.deallocated_clusters)
-        .unwrap_or(0);
-    println!(
-        "final image stats: virtual_size={} disk_size={} cluster_size={} allocated_data_clusters={} zero_clusters_deallocated={}",
-        stats.virtual_size,
-        stats.disk_size,
-        stats.cluster_size,
-        stats.allocated_data_clusters,
-        deallocated
-    );
-    Ok(())
 }
 
 /// Commit `partial` to `output`, optionally compressing via the native qcow2 writer.
