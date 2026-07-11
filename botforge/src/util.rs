@@ -51,6 +51,12 @@ pub(crate) fn botforge_debug_enabled() -> bool {
 ///
 /// When `BOTFORGE_DEBUG=1` the child process inherits stdout/stderr (identical to
 /// [`run_command`]) so the raw tool output is visible for troubleshooting.
+///
+/// The child's stdin is always redirected from `/dev/null`.  Tools such as `xorriso`
+/// enter an interactive dialog mode when their stdout is not a terminal; with an
+/// inherited stdin (an open pipe under CI, with no controlling TTY) they can block
+/// waiting for input, hanging the build.  Capturing callers here never send input, so
+/// nulling stdin is always correct and prevents the hang.
 pub(crate) fn run_command_capture(
     program: &str,
     args: &[String],
@@ -63,6 +69,7 @@ pub(crate) fn run_command_capture(
     let output = Command::new(program)
         .args(args)
         .envs(envs.iter().copied())
+        .stdin(Stdio::null())
         .output()
         .with_context(|| format!("failed to execute {program}"))?;
     if !output.status.success() {
@@ -338,6 +345,19 @@ mod tests {
         assert!(
             msg.contains("captured-stderr"),
             "error should include captured stderr: {msg}"
+        );
+    }
+
+    #[test]
+    fn run_command_capture_nulls_stdin_and_does_not_block() {
+        // A tool that reads stdin (`cat` with no args) must not hang waiting for
+        // input: stdin is redirected from /dev/null, so it sees immediate EOF and
+        // exits 0. Without the explicit null stdin this would block on an inherited
+        // stdin, reproducing the seed-ISO (xorriso) hang seen under CI.
+        let result = run_command_capture("cat", &[], &[], "cat failed");
+        assert!(
+            result.is_ok(),
+            "cat with null stdin should exit immediately, got: {result:?}"
         );
     }
 
