@@ -355,6 +355,24 @@ dimmed name on success, or red `✗ (<n>) <name>` on failure. The
 output is suppressed by default and restored under `BOTFORGE_DEBUG=1` /
 `BOTFORGE_SSH_VERBOSE=1`.
 
+In addition to the per-step numbered titles, `botforge build` emits several
+**lifecycle phase lines** that frame the build lifecycle phases:
+
+- `🤖 (setup) Preparing build environment (seed image)` — printed before the
+  cloud-init cidata seed ISO is built (this ISO injects the ephemeral installer
+  user and SSH key).  The raw `xorriso`/`genisoimage` banner is captured and
+  suppressed on success; it is only surfaced in the error if the ISO build
+  fails.  Set `BOTFORGE_DEBUG=1` to pass the raw tool output through to the
+  console.
+- `🤖 (compress) Compressing image (reclaim, sparsify, compression)` — printed
+  before the reclaim (`fstrim`/`discard`), zero-cluster sparsify, and/or qcow2
+  compression work.  Only emitted when at least one of those steps actually
+  runs (i.e. `reclaim != none` or `compress.enabled`).
+- `🤖 (output) Final image written to <path> (<size>)` — replaces the old
+  `built image at …` line and reports the output path and human-readable disk
+  size (KiB/MiB/GiB).  Set `BOTFORGE_DEBUG=1` to also print the detailed
+  `qcow2 zero-cluster sparsify: …` and `final image stats: …` diagnostic lines.
+
 #### `id:` field (optional)
 
 Every run step has an optional `id:` field. When set, the step counter in
