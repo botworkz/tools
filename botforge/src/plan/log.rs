@@ -5,7 +5,6 @@ use std::io::{BufWriter, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
@@ -178,47 +177,7 @@ pub(super) fn print_step_status(
     );
 }
 
-/// Write all bytes of `buf` to `writer`, retrying on non-blocking back-pressure.
-///
-/// Unlike the stdlib `write_all`, this handles:
-/// - Partial writes (advances past the written bytes and continues).
-/// - `WouldBlock` / `EAGAIN` (fd not ready): sleeps a short backoff and retries
-///   the **same remaining bytes** — no data is dropped or reordered.
-/// - `Interrupted` / `EINTR`: retries immediately.
-/// - Any other error: returned to the caller.
-///
-/// This is used for the live-console tee path, where botforge's own inherited
-/// stdout/stderr fd may be in non-blocking mode (common under PTYs, process
-/// supervisors, and some container runtimes).
-fn write_all_resilient<W: Write>(writer: &mut W, mut buf: &[u8]) -> std::io::Result<()> {
-    use std::io::ErrorKind;
-    let mut backoff = Duration::from_millis(1);
-    while !buf.is_empty() {
-        match writer.write(buf) {
-            Ok(0) => {
-                return Err(std::io::Error::new(
-                    ErrorKind::WriteZero,
-                    "write returned zero bytes",
-                ));
-            }
-            Ok(n) => {
-                buf = &buf[n..];
-                // Reset backoff after making forward progress.
-                backoff = Duration::from_millis(1);
-            }
-            Err(e) if e.kind() == ErrorKind::Interrupted => {
-                // EINTR: retry immediately with the same slice.
-            }
-            Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                // EAGAIN: fd not ready. Sleep briefly and retry the same bytes.
-                std::thread::sleep(backoff);
-                backoff = (backoff * 2).min(Duration::from_millis(10));
-            }
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(())
-}
+use crate::util::write_all_resilient;
 
 fn stream_child_output<R: Read, W: Write>(
     mut reader: R,
@@ -284,9 +243,8 @@ pub(super) fn join_output_forwarders(handles: Vec<JoinHandle<Result<()>>>) -> Re
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        phase_title_line, step_log_path, step_status_marker, step_title_line, write_all_resilient,
-    };
+    use super::{phase_title_line, step_log_path, step_status_marker, step_title_line};
+    use crate::util::write_all_resilient;
     use std::path::PathBuf;
     use std::time::Duration;
 

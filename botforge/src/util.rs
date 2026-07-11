@@ -1,8 +1,9 @@
 use anyhow::{bail, Context, Result};
 use std::ffi::OsString;
-use std::fs::File;
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::thread::JoinHandle;
 
 pub(crate) fn command_exists(program: &str) -> bool {
     Command::new(program)
@@ -50,70 +51,174 @@ pub(crate) fn botforge_debug_enabled() -> bool {
 /// On success returns `Ok(())` silently.  On failure the captured output is included in the
 /// returned error so failures remain debuggable.
 ///
-/// When `BOTFORGE_DEBUG=1` the child process inherits stdout/stderr (identical to
-/// [`run_command`]) so the raw tool output is visible for troubleshooting.
+/// When `BOTFORGE_DEBUG=1` the child's stdout and stderr are forwarded **live** to the
+/// console as they arrive (teed), in addition to being captured — matching how the step
+/// runner surfaces debug output.
 ///
-/// # Implementation note — why `Command::output()` must not be used
+/// # Why `Command::output()` must NOT be used here
 ///
-/// This function redirects the child's stdout and stderr to a **temporary file** and waits
-/// for the child to exit via [`Command::status()`].  `status()` waits on the *process* —
-/// it returns as soon as the child exits, regardless of any file descriptors the child (or
-/// its grandchildren) may still have open.
+/// `output()` creates OS pipes and blocks until every copy of the write-end fd is closed
+/// (i.e. until the read side sees EOF).  A tool such as `xorriso` may finish and exit
+/// while a forked background process still holds the pipe write-end open, so `output()`
+/// blocks indefinitely.  This is the classic pipe-drain deadlock.
 ///
-/// `Command::output()` must **not** be used here: it creates OS pipes and the parent blocks
-/// reading those pipes until every copy of the write-end fd is closed (i.e. EOF on the
-/// read end).  A tool such as `xorriso` may finish its work and print "completed
-/// successfully" yet still hold — or fork a background process that holds — the pipe
-/// write-end open, causing `output()` to block indefinitely.  This is the classic
-/// pipe-drain deadlock.  Redirecting to a file instead of a pipe sidesteps the issue
-/// entirely: there is nothing to drain, and `status()` returns as soon as the child exits.
+/// # The fix: drain-on-threads
+///
+/// Dedicated OS threads actively drain stdout and stderr as bytes arrive.  The pipe
+/// buffer can never fill and block the child, and `child.wait()` returns as soon as
+/// the **foreground child** exits regardless of any grandchildren that may still hold
+/// fds.  On a successful exit we detach the drain threads (they finish naturally when
+/// grandchildren eventually close their inherited fds) so we never block waiting for
+/// them.  On a failing exit we join the threads to collect the captured output for the
+/// error message — in the common case (tools that do not fork long-lived background
+/// processes) the threads have already reached EOF by the time the child has exited.
 pub(crate) fn run_command_capture(
     program: &str,
     args: &[String],
     envs: &[(&str, &str)],
     failure_context: &str,
 ) -> Result<()> {
-    if botforge_debug_enabled() {
-        return run_command(program, args, envs, failure_context);
-    }
+    let debug = botforge_debug_enabled();
 
-    // Redirect both stdout and stderr to a temp file so that the child's output is
-    // captured without creating any pipes.  We then wait on the process via status().
-    let tmp_path = std::env::temp_dir().join(format!("botforge-capture-{}.log", unique_suffix()));
-    let tmp_file = File::create(&tmp_path)
-        .with_context(|| format!("cannot create capture temp file: {}", tmp_path.display()))?;
-    let tmp_file_clone = tmp_file.try_clone().with_context(|| {
-        format!(
-            "cannot clone capture temp file handle: {}",
-            tmp_path.display()
-        )
-    })?;
-
-    let status = Command::new(program)
+    let mut child = Command::new(program)
         .args(args)
         .envs(envs.iter().copied())
         .stdin(Stdio::null())
-        .stdout(Stdio::from(tmp_file))
-        .stderr(Stdio::from(tmp_file_clone))
-        .status()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .with_context(|| format!("failed to execute {program}"))?;
 
+    let stdout_pipe = child
+        .stdout
+        .take()
+        .context("failed to capture child stdout")?;
+    let stderr_pipe = child
+        .stderr
+        .take()
+        .context("failed to capture child stderr")?;
+
+    let stdout_thread = spawn_drain_forwarder(stdout_pipe, debug, false);
+    let stderr_thread = spawn_drain_forwarder(stderr_pipe, debug, true);
+
+    let status = child
+        .wait()
+        .with_context(|| format!("failed to wait for {program}"))?;
+
     if status.success() {
-        let _ = std::fs::remove_file(&tmp_path);
+        // Detach the drain threads: we don't need their captured output.
+        // Dropping a JoinHandle detaches the thread; it will drain whatever
+        // remains (including data written by any grandchildren that inherited
+        // the pipe write-end) and exit naturally — we must not join here or
+        // we risk blocking indefinitely waiting for grandchildren.
+        drop(stdout_thread);
+        drop(stderr_thread);
         return Ok(());
     }
 
-    // On failure: read back the captured output and include it in the error.
-    let captured = std::fs::read_to_string(&tmp_path).unwrap_or_default();
-    let _ = std::fs::remove_file(&tmp_path);
+    // On failure: join to collect captured output for the error message.
+    // In the common case the tool exited without long-lived grandchildren, so
+    // the threads have already seen EOF and return promptly.
+    let stdout_captured = stdout_thread
+        .join()
+        .map_err(|_| anyhow::anyhow!("stdout drain thread panicked"))??;
+    let stderr_captured = stderr_thread
+        .join()
+        .map_err(|_| anyhow::anyhow!("stderr drain thread panicked"))??;
+
+    let mut combined = stdout_captured;
+    if !stderr_captured.is_empty() {
+        if !combined.is_empty() {
+            combined.push('\n');
+        }
+        combined.push_str(&stderr_captured);
+    }
 
     let mut msg = format!("{failure_context} (exit status: {status})");
-    let trimmed = captured.trim();
+    let trimmed = combined.trim();
     if !trimmed.is_empty() {
         msg.push_str("\noutput:\n");
         msg.push_str(trimmed);
     }
     bail!("{msg}");
+}
+
+/// Spawn a thread that actively drains `reader` to EOF, collecting all bytes into a
+/// `String`.  When `forward_to_console` is true the bytes are also written live to the
+/// process's own stdout (`is_stderr = false`) or stderr (`is_stderr = true`) using the
+/// resilient writer so non-blocking fds (e.g. under a PTY or container runtime) are
+/// handled gracefully.
+fn spawn_drain_forwarder<R: Read + Send + 'static>(
+    mut reader: R,
+    forward_to_console: bool,
+    is_stderr: bool,
+) -> JoinHandle<Result<String>> {
+    std::thread::spawn(move || {
+        let mut chunk = [0u8; 8192];
+        let mut captured: Vec<u8> = Vec::new();
+        loop {
+            let n = reader
+                .read(&mut chunk)
+                .context("failed to read child process output")?;
+            if n == 0 {
+                break;
+            }
+            let slice = &chunk[..n];
+            captured.extend_from_slice(slice);
+            if forward_to_console {
+                if is_stderr {
+                    write_all_resilient(&mut std::io::stderr().lock(), slice)
+                        .context("failed to forward child stderr to console")?;
+                } else {
+                    write_all_resilient(&mut std::io::stdout().lock(), slice)
+                        .context("failed to forward child stdout to console")?;
+                }
+            }
+        }
+        Ok(String::from_utf8_lossy(&captured).into_owned())
+    })
+}
+
+/// Write all bytes of `buf` to `writer`, retrying on non-blocking back-pressure.
+///
+/// Unlike the stdlib `write_all`, this handles:
+/// - Partial writes (advances past the written bytes and continues).
+/// - `WouldBlock` / `EAGAIN` (fd not ready): sleeps a short backoff and retries
+///   the **same remaining bytes** — no data is dropped or reordered.
+/// - `Interrupted` / `EINTR`: retries immediately.
+/// - Any other error: returned to the caller.
+///
+/// This is used for the live-console tee path, where botforge's own inherited
+/// stdout/stderr fd may be in non-blocking mode (common under PTYs, process
+/// supervisors, and some container runtimes).
+pub(crate) fn write_all_resilient<W: Write>(writer: &mut W, mut buf: &[u8]) -> std::io::Result<()> {
+    use std::io::ErrorKind;
+    let mut backoff = std::time::Duration::from_millis(1);
+    while !buf.is_empty() {
+        match writer.write(buf) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    ErrorKind::WriteZero,
+                    "write returned zero bytes",
+                ));
+            }
+            Ok(n) => {
+                buf = &buf[n..];
+                // Reset backoff after making forward progress.
+                backoff = std::time::Duration::from_millis(1);
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => {
+                // EINTR: retry immediately with the same slice.
+            }
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                // EAGAIN: fd not ready. Sleep briefly and retry the same bytes.
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(std::time::Duration::from_millis(10));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 /// Format a byte count as a human-readable string using binary prefixes (KiB, MiB, GiB).
@@ -388,19 +493,22 @@ mod tests {
 
     #[test]
     fn run_command_capture_does_not_hang_when_grandchild_holds_fd() {
-        // Regression guard for the output() pipe-drain deadlock that caused
-        // `botforge build` to hang after xorriso printed "completed successfully".
+        // Regression guard for the pipe-drain deadlock that caused `botforge build`
+        // to hang after xorriso printed "completed successfully".
         //
-        // output() creates OS pipes and blocks until every copy of the write-end fd
-        // is closed.  A tool like xorriso may finish and exit while a forked background
-        // process still holds the write-end open, so output() blocks indefinitely.
+        // Command::output() creates OS pipes and blocks until every copy of the
+        // write-end fd is closed.  A tool like xorriso may finish and exit while a
+        // forked background process still holds the write-end open, so output() blocks
+        // indefinitely.
         //
-        // With status()+file-redirect there are no pipes: status() returns as soon as
-        // the foreground child exits, regardless of any grandchildren.
+        // With the drain-threads approach: child.wait() returns as soon as the
+        // foreground child exits.  On success we detach the drain threads (drop the
+        // JoinHandles) so we never block waiting for grandchildren to close their
+        // inherited pipe fds — they finish on their own in the background.
         //
-        // The command below forks a background process that sleeps 30 s, then the
-        // foreground sh exits immediately.  With output() this would hang ~30 s;
-        // with our implementation it must complete well under that.
+        // The command below forks a background process (sleep 30) that holds the pipe
+        // write-end open, then the foreground sh exits immediately with status 0.
+        // The function must return well under the 30 s sleep duration.
         use std::time::Instant;
         let start = Instant::now();
         let args = vec!["-c".to_string(), "{ sleep 30 & }; echo done".to_string()];
@@ -410,7 +518,7 @@ mod tests {
         assert!(
             elapsed.as_secs() < 5,
             "run_command_capture blocked for {elapsed:?} — expected to return promptly \
-             (output() pipe-drain deadlock regression)"
+             (pipe-drain deadlock regression)"
         );
     }
 
