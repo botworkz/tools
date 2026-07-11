@@ -9,6 +9,7 @@ pub(crate) use config::{
     validate_test_steps, TestIso, TestIsoBootstrap,
 };
 pub(crate) use log::print_phase;
+pub(crate) use log::print_phase_status;
 pub(crate) use vm::{
     cleanup_test, collect_test_diagnostics, preserve_failed_build_disk, print_log_tail,
     run_step_flow, run_test_flow, shutdown_build_vm,
