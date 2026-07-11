@@ -1148,7 +1148,11 @@ mod tests {
                 .read_virtual_range(i * 4096, &mut cluster)
                 .expect("read guest cluster");
             let expected_byte = 0x41u8 + (i as u8); // 'A', 'B', 'C', 'D'
-            assert_eq!(cluster, vec![expected_byte; cluster_size], "cluster {i} data mismatch");
+            assert_eq!(
+                cluster,
+                vec![expected_byte; cluster_size],
+                "cluster {i} data mismatch"
+            );
         }
     }
 
@@ -1177,7 +1181,11 @@ mod tests {
                 .read_virtual_range(i * 4096, &mut cluster)
                 .expect("read guest cluster");
             let expected_byte = 0x41u8 + (i as u8);
-            assert_eq!(cluster, vec![expected_byte; 4096], "cluster {i} data mismatch");
+            assert_eq!(
+                cluster,
+                vec![expected_byte; 4096],
+                "cluster {i} data mismatch"
+            );
         }
     }
 
