@@ -159,6 +159,30 @@ pub(crate) fn print_phase(label: &str, description: &str) {
     );
 }
 
+fn phase_status_marker(label: &str, description: &str, success: bool, color: bool) -> String {
+    if color {
+        if success {
+            format!(" \x1b[32m✓\x1b[0m ({label}) \x1b[2m{description}\x1b[0m")
+        } else {
+            format!(" \x1b[31m✗\x1b[0m ({label}) {description}")
+        }
+    } else {
+        let tick = if success { '✓' } else { '✗' };
+        format!(" {tick} ({label}) {description}")
+    }
+}
+
+/// Print a lifecycle phase completion status to stderr: ` ✓ (<label>) <description>` or
+/// ` ✗ (<label>) <description>`.
+///
+/// Mirrors [`print_step_status`] but uses a plain string label instead of a step index.
+pub(crate) fn print_phase_status(label: &str, description: &str, success: bool) {
+    eprintln!(
+        "{}",
+        phase_status_marker(label, description, success, stderr_color_enabled())
+    );
+}
+
 pub(super) fn print_step_status(
     step_idx: usize,
     step_name: &str,
@@ -243,7 +267,9 @@ pub(super) fn join_output_forwarders(handles: Vec<JoinHandle<Result<()>>>) -> Re
 
 #[cfg(test)]
 mod tests {
-    use super::{phase_title_line, step_log_path, step_status_marker, step_title_line};
+    use super::{
+        phase_status_marker, phase_title_line, step_log_path, step_status_marker, step_title_line,
+    };
     use crate::util::write_all_resilient;
     use std::path::PathBuf;
     use std::time::Duration;
@@ -488,5 +514,54 @@ mod tests {
             colored.contains("\x1b[0m"),
             "colored phase title should contain reset: {colored:?}"
         );
+    }
+
+    // --- phase status marker ---
+
+    #[test]
+    fn test_phase_status_marker_no_color_success() {
+        assert_eq!(
+            phase_status_marker(
+                "setup",
+                "Preparing build environment (seed image)",
+                true,
+                false
+            ),
+            " ✓ (setup) Preparing build environment (seed image)"
+        );
+    }
+
+    #[test]
+    fn test_phase_status_marker_no_color_failure() {
+        assert_eq!(
+            phase_status_marker(
+                "setup",
+                "Preparing build environment (seed image)",
+                false,
+                false
+            ),
+            " ✗ (setup) Preparing build environment (seed image)"
+        );
+    }
+
+    #[test]
+    fn test_phase_status_marker_color_success() {
+        let s = phase_status_marker("vm", "Stopping vm", true, true);
+        assert!(s.starts_with(' '), "should start with space: {s:?}");
+        assert!(s.contains("\x1b[32m"), "should contain green: {s:?}");
+        assert!(s.contains('✓'), "should contain tick: {s:?}");
+        assert!(s.contains("(vm)"), "should contain label: {s:?}");
+        assert!(s.contains("\x1b[2m"), "should dim description: {s:?}");
+        assert!(s.contains("\x1b[0m"), "should reset: {s:?}");
+    }
+
+    #[test]
+    fn test_phase_status_marker_color_failure() {
+        let s = phase_status_marker("vm", "Stopping vm", false, true);
+        assert!(s.starts_with(' '), "should start with space: {s:?}");
+        assert!(s.contains("\x1b[31m"), "should contain red: {s:?}");
+        assert!(s.contains('✗'), "should contain cross: {s:?}");
+        assert!(s.contains("(vm)"), "should contain label: {s:?}");
+        assert!(!s.contains("\x1b[2m"), "failure should NOT dim name: {s:?}");
     }
 }
