@@ -1,0 +1,29 @@
+x-botforge-base: &botforge-base
+  image: ${BOTFORGE_IMAGE:?BOTFORGE_IMAGE must be set by the wrapper}
+  user: "${HOST_UID:?}:${HOST_GID:?}"
+  group_add:
+  - "${HOST_KVM_GID}"
+  working_dir: ${REPO_ROOT:?}
+  environment:
+    HOME: /tmp
+    XDG_CACHE_HOME: /tmp/.cache
+    HOST_UID: ${HOST_UID}
+    HOST_GID: ${HOST_GID}
+    HOST_KVM_GID: ${HOST_KVM_GID}
+    LIBGUESTFS_BACKEND: direct
+  volumes:
+  - ${REPO_ROOT}:${REPO_ROOT}
+
+services:
+  build:
+    <<: *botforge-base
+    devices:
+    - /dev/kvm:/dev/kvm
+
+  test:
+    <<: *botforge-base
+    devices:
+    - /dev/kvm:/dev/kvm
+
+  deps:
+    <<: *botforge-base

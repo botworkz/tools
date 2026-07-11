@@ -1,0 +1,6 @@
+assets:
+  debian-base:
+    uri: https://cloud.debian.org/images/cloud/trixie/${version}/debian-13-genericcloud-amd64-${version}.qcow2
+    version: "20260706-2531"
+    checksum: sha256:5113748eb1271fdd96b25182fee044a35c2434ac58a3e1e219a54ebc847795f9
+    filename: debian-13-genericcloud-amd64.qcow2

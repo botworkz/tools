@@ -1,0 +1,22 @@
+type: test
+image: >-
+  @://build/artifact/foo.qcow2
+disk_size: 10G
+steps:
+- on: host
+  name: Host hello
+  run: |
+    hostname
+    whoami
+- on: guest
+  name: Guest whoami
+  run: |
+    whoami | grep botforge
+- on: guest
+  name: Base install test
+  sudo: true
+  run: |
+    whoami | grep root
+
+    export DEBIAN_FRONTEND=noninteractive
+    apt show python3-virutalenv | grep "APT-Manual-Installed: yes"
