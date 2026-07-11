@@ -1,0 +1,39 @@
+name: Copilot setup steps
+
+on:
+  push:
+    branches:
+    - main
+    paths:
+    - .github/workflows/copilot-setup-steps.yml
+  pull_request:
+    branches:
+    - main
+    paths:
+    - .github/workflows/copilot-setup-steps.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  copilot-setup-steps:
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Enable KVM via udev
+      run: |
+        echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+          | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+        sudo udevadm control --reload-rules
+        sudo udevadm trigger --name-match=kvm
+
+    - name: Assert /dev/kvm is present (hard requirement — no TCG fallback)
+      run: |
+        set -euo pipefail
+        if [[ ! -e /dev/kvm ]]; then
+          echo "ERROR: /dev/kvm is unavailable." >&2
+          exit 1
+        fi
+        echo "KVM OK: $(ls -la /dev/kvm)"
