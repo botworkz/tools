@@ -26,7 +26,9 @@ use crate::plan::{
     load_build_config, preserve_failed_build_disk, print_log_tail, run_step_flow,
     shutdown_build_vm, validate_build_steps, vm::StepFlowPlan, vm::StepTimeoutPolicy,
 };
-use crate::qcow2::{compress_qcow2_image, read_qcow2_image_stats, sparsify_zero_clusters};
+use crate::qcow2::{
+    compress_qcow2_image, read_qcow2_image_stats, read_virtual_sector0, sparsify_zero_clusters,
+};
 
 /// Parsed `--cpus` value: either a specific positive count or `auto`.
 ///
@@ -489,6 +491,18 @@ fn should_run_zero_cluster_sparsify(mode: ReclaimMode) -> bool {
 fn commit_output(partial: &Path, output: &Path, compress: Option<&CompressConfig>) -> Result<()> {
     match compress {
         Some(c) if c.enabled => {
+            let pre_compress_sector0 = read_virtual_sector0(partial).with_context(|| {
+                format!(
+                    "failed to read guest sector 0 before compression from {}",
+                    partial.display()
+                )
+            })?;
+            if pre_compress_sector0.iter().all(|b| *b == 0) {
+                bail!(
+                    "refusing to compress qcow2: guest sector 0 is all-zero before compression ({})",
+                    partial.display()
+                );
+            }
             // Write to a temp path beside the output so the final rename is
             // atomic (same filesystem as the intended output location).
             let tmp = output.with_extension("partial.compress");
@@ -508,6 +522,18 @@ fn commit_output(partial: &Path, output: &Path, compress: Option<&CompressConfig
                     }
                 )
             })?;
+            let post_compress_sector0 = read_virtual_sector0(&tmp).with_context(|| {
+                format!(
+                    "failed to read guest sector 0 after compression from {}",
+                    tmp.display()
+                )
+            })?;
+            if post_compress_sector0.iter().all(|b| *b == 0) {
+                bail!(
+                    "refusing to publish compressed qcow2: guest sector 0 became all-zero after compression ({})",
+                    tmp.display()
+                );
+            }
             std::fs::rename(&tmp, output).with_context(|| {
                 format!(
                     "cannot atomically materialize compressed output from {} to {}",
