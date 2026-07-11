@@ -67,6 +67,36 @@ jobs:
     with:
       crate: ${{ matrix.crate }}
 
+  # udeps: workspace-wide unused-dependency audit.
+  #
+  # cargo-udeps requires the nightly compiler because it hooks into unstable
+  # Cargo internals to determine which listed dependencies are actually linked.
+  # This job therefore differs from the rest of CI in two ways:
+  #   1. It uses dtolnay/rust-toolchain@nightly directly on the host instead of
+  #      the stable bookworm container used by the crate jobs.
+  #   2. rust-cache uses prefix-key: "udeps" so its cache entries do not collide
+  #      with the stable-toolchain caches populated by the crate jobs.
+  #
+  # A finding here does not block publish — the job is intentionally independent
+  # so a false-positive or unfixed unused dep cannot prevent a release.
+  udeps:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@nightly
+    - uses: Swatinem/rust-cache@v2
+      with:
+        prefix-key: "udeps"
+    - name: Install cargo-udeps
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-udeps
+    - name: cargo udeps
+      run: cargo +nightly udeps --workspace --all-targets --locked
+
   publish:
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     needs: crate
