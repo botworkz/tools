@@ -720,6 +720,15 @@ example, `compressor_opts: "-19 -T0"` tells the native zstd compressor to use
 level 19 and all available worker threads. Unknown zstd flags are a hard error
 that names the offending token.
 
+> **Note — `-T0`/`-Tn` worker opts are accepted but not applied per-cluster.**
+> qemu's `qcow2_zstd_decompress` performs a single `ZSTD_decompressStream` pass
+> and requires each cluster to be exactly one self-contained zstd frame.
+> Multithreaded zstd compression (libzstd `NbWorkers > 0`) can emit a
+> worker-chunked multi-frame stream that qemu rejects with `-EIO`.  Per-cluster
+> payloads are at most `cluster_size` (≤ 2 MiB) so multithreading yields no
+> compression benefit anyway; botforge ignores the worker count for per-cluster
+> work and always produces a single deterministic frame.
+
 When compression is enabled and `compressor:` is omitted, botforge now
 defaults to `zstd`. `zstd`-compressed qcow2 images require qemu >= 5.1 on any
 consumer that opens or boots the produced image. If you need compatibility with
@@ -728,6 +737,23 @@ an older qemu stack, set
 At the end of capture, botforge logs final qcow2 stats
 (`virtual_size`, `disk_size`, `cluster_size`, `allocated_data_clusters`,
 `zero_clusters_deallocated`) to make image-size drift visible in CI.
+
+#### Codec correctness — correction and resolution
+
+Both native compressors had bugs that caused qemu boot failures while
+in-process round-trip tests passed.  The shared root cause: **in-process
+decoders accept output that qemu's stricter runtime decoder rejects**, so
+self-consistent encode→decode tests do not catch qemu-incompatible frames.
+
+| Codec | Bug | Fix |
+|---|---|---|
+| `zlib` | Used raw DEFLATE (`DeflateEncoder/Decoder`) instead of the zlib-wrapped format (`ZlibEncoder/Decoder`) that qcow2 and qemu require | Switched to `ZlibEncoder/ZlibDecoder` (PR #260) |
+| `zstd` | `multithread(workers)` with `workers > 0` (triggered by `-T0`/`-Tn`) can emit a worker-chunked multi-frame stream; qemu's `qcow2_zstd_decompress` expects exactly one frame per cluster and returns `-EIO` otherwise | Removed `multithread()` call; compression is always single-threaded per cluster (PR #261) |
+
+The blind spot in both cases: `DeflateDecoder` round-trips raw DEFLATE silently,
+and `zstd::stream::read::Decoder` transparently reassembles multi-frame streams —
+so encode→decode tests pass while a real qemu boot fails.  The test suite was
+strengthened after each fix to assert the exact frame structure qemu requires.
 
 **Examples:**
 
