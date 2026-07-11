@@ -28,20 +28,43 @@ pub(crate) fn decompress_cluster(
 ) -> Result<Vec<u8>> {
     match compression_type {
         CompressionType::Zstd => {
-            let mut decoder = zstd::stream::read::Decoder::with_buffer(compressed)
+            // Trim the input to exactly the first zstd frame, discarding any
+            // trailing sector-padding bytes.  The streaming decoder would
+            // otherwise try to parse padding zeros as a second frame and fail
+            // with "Unknown frame descriptor".
+            let frame_end = zstd::zstd_safe::find_frame_compressed_size(compressed)
+                .unwrap_or(compressed.len())
+                .min(compressed.len());
+            let mut decoder = zstd::stream::read::Decoder::with_buffer(&compressed[..frame_end])
                 .context("failed to initialize zstd decoder")?;
-            let mut out = vec![0u8; cluster_size];
+            let mut out = Vec::with_capacity(cluster_size);
             decoder
-                .read_exact(&mut out)
+                .read_to_end(&mut out)
                 .context("failed to decode zstd qcow2 cluster")?;
+            if out.len() > cluster_size {
+                bail!(
+                    "zstd qcow2 cluster decompressed to {} bytes, expected at most {}",
+                    out.len(),
+                    cluster_size
+                );
+            }
+            out.resize(cluster_size, 0);
             Ok(out)
         }
         CompressionType::Zlib => {
             let mut decoder = ZlibDecoder::new(compressed);
-            let mut out = vec![0u8; cluster_size];
+            let mut out = Vec::with_capacity(cluster_size);
             decoder
-                .read_exact(&mut out)
+                .read_to_end(&mut out)
                 .context("failed to decode zlib qcow2 cluster")?;
+            if out.len() > cluster_size {
+                bail!(
+                    "zlib qcow2 cluster decompressed to {} bytes, expected at most {}",
+                    out.len(),
+                    cluster_size
+                );
+            }
+            out.resize(cluster_size, 0);
             Ok(out)
         }
     }
@@ -253,5 +276,93 @@ mod tests {
                 "{opts}: compressed output must be exactly one zstd frame (no trailing bytes)"
             );
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Regression: decompress_cluster must zero-pad when the compressed payload
+    // inflates to fewer than cluster_size bytes (e.g. the last cluster of a
+    // qemu-produced image whose virtual_size is not a multiple of cluster_size).
+    // The old code used read_exact on a cluster_size buffer which returned
+    // "corrupt deflate stream" / "unexpected EOF" instead of padding with zeros.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn decompress_cluster_zlib_pads_short_inflate_to_cluster_size() {
+        let cluster_size = 4096usize;
+        let short_data = vec![0x42u8; 1024]; // fewer bytes than cluster_size
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&short_data).expect("encode");
+        let compressed = encoder.finish().expect("finish");
+
+        let result = decompress_cluster(CompressionType::Zlib, &compressed, cluster_size)
+            .expect("decompress must succeed even when inflated length < cluster_size");
+
+        assert_eq!(
+            result.len(),
+            cluster_size,
+            "output must be exactly cluster_size"
+        );
+        assert_eq!(
+            &result[..1024],
+            &short_data[..],
+            "inflated bytes must be preserved"
+        );
+        assert!(
+            result[1024..].iter().all(|&b| b == 0),
+            "tail bytes must be zero-padded"
+        );
+    }
+
+    #[test]
+    fn decompress_cluster_zstd_pads_short_inflate_to_cluster_size() {
+        let cluster_size = 4096usize;
+        let short_data = vec![0x42u8; 1024];
+        let mut compressor = zstd::bulk::Compressor::new(3).expect("init compressor");
+        compressor.include_contentsize(true).expect("contentsize");
+        let compressed = compressor.compress(&short_data).expect("compress");
+
+        let result = decompress_cluster(CompressionType::Zstd, &compressed, cluster_size)
+            .expect("decompress must succeed even when inflated length < cluster_size");
+
+        assert_eq!(
+            result.len(),
+            cluster_size,
+            "output must be exactly cluster_size"
+        );
+        assert_eq!(
+            &result[..1024],
+            &short_data[..],
+            "inflated bytes must be preserved"
+        );
+        assert!(
+            result[1024..].iter().all(|&b| b == 0),
+            "tail bytes must be zero-padded"
+        );
+    }
+
+    #[test]
+    fn decompress_cluster_zlib_full_size_round_trip() {
+        let cluster_size = 4096usize;
+        let data = vec![0x5au8; cluster_size];
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&data).expect("encode");
+        let compressed = encoder.finish().expect("finish");
+
+        let result = decompress_cluster(CompressionType::Zlib, &compressed, cluster_size)
+            .expect("decompress full-size cluster");
+        assert_eq!(result, data);
+    }
+
+    #[test]
+    fn decompress_cluster_zstd_full_size_round_trip() {
+        let cluster_size = 4096usize;
+        let data = vec![0x5au8; cluster_size];
+        let mut compressor = zstd::bulk::Compressor::new(3).expect("init compressor");
+        compressor.include_contentsize(true).expect("contentsize");
+        let compressed = compressor.compress(&data).expect("compress");
+
+        let result = decompress_cluster(CompressionType::Zstd, &compressed, cluster_size)
+            .expect("decompress full-size cluster");
+        assert_eq!(result, data);
     }
 }

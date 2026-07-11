@@ -2079,6 +2079,114 @@ mod tests {
         run_double_compress_test(CompressionType::Zlib, 1_048_576);
     }
 
+    // -------------------------------------------------------------------------
+    // Regression: compress a source whose virtual_size is NOT a multiple of
+    // cluster_size.  The last guest cluster contains fewer than cluster_size
+    // bytes of real data; after botforge compresses it (zero-padded), the
+    // resulting compressed cluster decompresses to exactly cluster_size bytes.
+    // When that compressed image is used as a SOURCE for a second pass, the
+    // decompress_cluster path must not fail.  Before the read_to_end fix,
+    // read_exact on a cluster_size buffer would error with "corrupt deflate
+    // stream" whenever the source cluster inflated to fewer than cluster_size
+    // bytes (e.g. from a qemu-produced image with a partial last cluster).
+    // -------------------------------------------------------------------------
+
+    fn run_partial_last_cluster_test(compression_type: CompressionType) {
+        let tmp = tempdir().expect("tempdir");
+        let cluster_size: u64 = 4096;
+        // virtual_size is NOT a multiple of cluster_size: last cluster is partial.
+        let partial_bytes: u64 = 1024;
+        let virtual_size = cluster_size + partial_bytes; // 2 clusters; second is partial
+
+        // Build a qcow2 by hand with a partial last cluster so we control the
+        // exact decompressed length of that cluster in the compressed output.
+        let source = tmp.path().join("partial-source.qcow2");
+        {
+            let cluster_count = 2u64;
+            let total_clusters = 5 + cluster_count;
+            let mut file = std::fs::File::create(&source).expect("create source");
+            file.set_len(cluster_size * total_clusters)
+                .expect("set_len");
+            write_exact_at(&mut file, 0, &QCOW_MAGIC.to_be_bytes()).expect("magic");
+            write_exact_at(&mut file, 4, &3u32.to_be_bytes()).expect("version");
+            write_exact_at(&mut file, 20, &12u32.to_be_bytes()).expect("cluster_bits");
+            write_exact_at(&mut file, 24, &virtual_size.to_be_bytes()).expect("virtual_size");
+            write_exact_at(&mut file, 36, &1u32.to_be_bytes()).expect("l1_size");
+            write_exact_at(&mut file, 40, &cluster_size.to_be_bytes()).expect("l1_offset");
+            write_exact_at(&mut file, 48, &(cluster_size * 3).to_be_bytes())
+                .expect("refcount_table_offset");
+            write_exact_at(&mut file, 56, &1u32.to_be_bytes()).expect("refcount_table_clusters");
+            write_exact_at(&mut file, 96, &4u32.to_be_bytes()).expect("refcount_order");
+            write_exact_at(&mut file, 100, &104u32.to_be_bytes()).expect("header_length");
+            // L1: one entry pointing to L2 at cluster 2
+            write_u64_at(&mut file, cluster_size, cluster_size * 2).expect("l1");
+            // L2: two entries pointing to data clusters 5 and 6
+            write_u64_at(&mut file, cluster_size * 2, cluster_size * 5).expect("l2[0]");
+            write_u64_at(&mut file, cluster_size * 2 + 8, cluster_size * 6).expect("l2[1]");
+            // Refcount table/block
+            write_u64_at(&mut file, cluster_size * 3, cluster_size * 4).expect("refcount tbl");
+            for idx in 0..total_clusters {
+                write_exact_at(&mut file, cluster_size * 4 + idx * 2, &1u16.to_be_bytes())
+                    .expect("refcount");
+            }
+            // Full first cluster
+            write_exact_at(
+                &mut file,
+                cluster_size * 5,
+                &vec![0x41u8; cluster_size as usize],
+            )
+            .expect("cluster 0 data");
+            // Partial second cluster: only partial_bytes bytes of real data, rest stays zero
+            write_exact_at(
+                &mut file,
+                cluster_size * 6,
+                &vec![0x42u8; partial_bytes as usize],
+            )
+            .expect("cluster 1 data");
+        }
+
+        let dest = tmp.path().join("compressed.qcow2");
+        let opts = if compression_type == CompressionType::Zstd {
+            "-19 -T0"
+        } else {
+            ""
+        };
+        compress_qcow2_image(&source, &dest, compression_type, &BTreeMap::new(), opts)
+            .expect("compress partial-last-cluster source");
+
+        // Re-compress the output (double-compress), exercising the decompress path
+        // on a source that has compressed clusters.
+        let dest2 = tmp.path().join("recompressed.qcow2");
+        compress_qcow2_image(&dest, &dest2, compression_type, &BTreeMap::new(), opts)
+            .expect("re-compress compressed output");
+
+        // Read back and verify both clusters.
+        let mut image = SourceImage::open(&dest2).expect("open recompressed");
+        let mut buf = vec![0u8; cluster_size as usize];
+        image
+            .read_virtual_range(0, &mut buf)
+            .expect("read cluster 0");
+        assert!(buf.iter().all(|&b| b == 0x41), "cluster 0 must be 0x41");
+
+        image
+            .read_virtual_range(cluster_size, &mut buf[..partial_bytes as usize])
+            .expect("read partial cluster 1");
+        assert!(
+            buf[..partial_bytes as usize].iter().all(|&b| b == 0x42),
+            "partial cluster 1 data must be 0x42"
+        );
+    }
+
+    #[test]
+    fn native_compress_partial_last_cluster_zlib() {
+        run_partial_last_cluster_test(CompressionType::Zlib);
+    }
+
+    #[test]
+    fn native_compress_partial_last_cluster_zstd() {
+        run_partial_last_cluster_test(CompressionType::Zstd);
+    }
+
     #[test]
     fn native_compress_sets_copied_flags_zstd_4k() {
         run_copied_flag_test(CompressionType::Zstd, 4096);
