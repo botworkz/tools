@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use crate::util::{command_exists, run_command, unique_suffix};
+use crate::util::{command_exists, run_command_capture, unique_suffix};
 
 /// A single entry in a cloud-init `bootcmd:` list.
 ///
@@ -156,7 +156,7 @@ pub(crate) fn build_iso(src_dir: &Path, out: &Path, volume_id: &str) -> Result<(
         .join(format!(".{file_name}.{}.tmp", unique_suffix()));
 
     let args = iso_args(tool, src_dir, &tmp_out, volume_id)?;
-    if let Err(err) = run_command(tool, &args, &[], &format!("{tool} failed")) {
+    if let Err(err) = run_command_capture(tool, &args, &[], &format!("{tool} failed")) {
         let _ = std::fs::remove_file(&tmp_out);
         return Err(err);
     }
