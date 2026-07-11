@@ -8,6 +8,7 @@ use crate::compressor::{build_compressor, decompress_cluster};
 use crate::plan::config::CompressionType;
 
 const QCOW_MAGIC: u32 = 0x5146_49fb;
+const QCOW_OFLAG_COPIED: u64 = 1u64 << 63;
 const QCOW_OFLAG_COMPRESSED: u64 = 1u64 << 62;
 const QCOW_OFLAG_ZERO: u64 = 1;
 const QCOW_DATA_OFFSET_MASK: u64 = (1u64 << 62) - 1;
@@ -168,7 +169,7 @@ pub(crate) fn compress_qcow2_image(
             let host_offset = allocator.allocate_raw()?;
             write_exact_at(&mut output, host_offset, &cluster_buf)?;
             increment_refcount_range(&mut refcounts, host_offset, cluster_size, cluster_size)?;
-            host_offset
+            host_offset | QCOW_OFLAG_COPIED
         };
         l2_entries
             [usize::try_from(guest_cluster_index).context("guest cluster index too large")?] =
@@ -758,7 +759,7 @@ fn write_l1_table(
         let offset = first_l2_offset
             .checked_add(u64::try_from(idx).context("l1 index overflow")? * cluster_size)
             .context("l2 table offset overflow")?;
-        raw[idx * 8..(idx + 1) * 8].copy_from_slice(&offset.to_be_bytes());
+        raw[idx * 8..(idx + 1) * 8].copy_from_slice(&(offset | QCOW_OFLAG_COPIED).to_be_bytes());
     }
     write_exact_at(file, l1_table_offset, &raw)
 }
@@ -1457,6 +1458,233 @@ mod tests {
         u16::from_be_bytes(raw)
     }
 
+    fn write_custom_test_image_with_cluster_size(
+        path: &Path,
+        cluster_contents: &[Vec<u8>],
+        cluster_size: u64,
+    ) -> Result<()> {
+        assert!(
+            cluster_size.is_power_of_two() && cluster_size >= 512,
+            "cluster_size must be a power of two >= 512"
+        );
+        assert!(
+            !cluster_contents.is_empty(),
+            "need at least one cluster to write a test image"
+        );
+        for (idx, cluster) in cluster_contents.iter().enumerate() {
+            assert_eq!(
+                cluster.len(),
+                usize::try_from(cluster_size).expect("cluster_size fits usize"),
+                "cluster {idx} length must match cluster_size"
+            );
+        }
+
+        let cluster_bits = cluster_size.trailing_zeros();
+        let cluster_count = u64::try_from(cluster_contents.len()).expect("cluster count fits u64");
+        let total_clusters = 5 + cluster_count;
+        let mut file = File::create(path)?;
+        file.set_len(cluster_size * total_clusters)?;
+
+        write_exact_at(&mut file, 0, &QCOW_MAGIC.to_be_bytes())?;
+        write_exact_at(&mut file, 4, &3u32.to_be_bytes())?;
+        write_exact_at(&mut file, 20, &cluster_bits.to_be_bytes())?;
+        write_exact_at(
+            &mut file,
+            24,
+            &(cluster_size
+                .checked_mul(cluster_count)
+                .context("virtual size overflow")?)
+            .to_be_bytes(),
+        )?;
+        write_exact_at(&mut file, 36, &1u32.to_be_bytes())?;
+        write_exact_at(&mut file, 40, &cluster_size.to_be_bytes())?;
+        write_exact_at(&mut file, 48, &(cluster_size * 3).to_be_bytes())?;
+        write_exact_at(&mut file, 56, &1u32.to_be_bytes())?;
+        write_exact_at(&mut file, 96, &4u32.to_be_bytes())?;
+        write_exact_at(&mut file, 100, &104u32.to_be_bytes())?;
+
+        write_u64_at(&mut file, cluster_size, cluster_size * 2)?;
+        for i in 0..cluster_count {
+            write_u64_at(&mut file, cluster_size * 2 + i * 8, cluster_size * (5 + i))?;
+        }
+        write_u64_at(&mut file, cluster_size * 3, cluster_size * 4)?;
+        for idx in 0..total_clusters {
+            write_exact_at(&mut file, cluster_size * 4 + idx * 2, &1u16.to_be_bytes())?;
+        }
+        for (idx, cluster) in cluster_contents.iter().enumerate() {
+            write_exact_at(
+                &mut file,
+                cluster_size * (5 + u64::try_from(idx).expect("cluster index fits u64")),
+                cluster,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    fn make_incompressible_cluster(cluster_size: usize) -> Vec<u8> {
+        let mut out = vec![0u8; cluster_size];
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        for byte in &mut out {
+            state ^= state << 7;
+            state ^= state >> 9;
+            state ^= state << 8;
+            *byte = (state >> 24) as u8;
+        }
+        out
+    }
+
+    fn qemu_img_available() -> bool {
+        std::process::Command::new("qemu-img")
+            .arg("--version")
+            .output()
+            .is_ok()
+    }
+
+    fn assert_qemu_img_check(path: &Path) {
+        let output = std::process::Command::new("qemu-img")
+            .args(["check", "-f", "qcow2"])
+            .arg(path)
+            .output()
+            .expect("run qemu-img check");
+        assert!(
+            output.status.success(),
+            "qemu-img check failed for {} (status: {}):\nstdout:\n{}\nstderr:\n{}",
+            path.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    fn assert_guest_clusters_match(path: &Path, cluster_contents: &[Vec<u8>], cluster_size: u64) {
+        let mut image = SourceImage::open(path).expect("open image for guest-cluster check");
+        let cluster_size = usize::try_from(cluster_size).expect("cluster_size fits usize");
+        for (idx, expected) in cluster_contents.iter().enumerate() {
+            let mut actual = vec![0u8; cluster_size];
+            image
+                .read_virtual_range(
+                    u64::try_from(idx).expect("cluster index fits u64")
+                        * u64::try_from(cluster_size).expect("cluster_size fits u64"),
+                    &mut actual,
+                )
+                .unwrap_or_else(|e| panic!("read_virtual_range cluster {idx}: {e:#}"));
+            assert_eq!(actual, *expected, "cluster {idx} data mismatch");
+        }
+    }
+
+    fn run_copied_flag_test(compression_type: CompressionType, cluster_size: u64) {
+        let tmp = tempdir().expect("tempdir");
+        let source = tmp.path().join("source.qcow2");
+        let dest = tmp.path().join("compressed.qcow2");
+        let cluster_size_usize = usize::try_from(cluster_size).expect("cluster_size fits usize");
+        let cluster_contents = vec![
+            vec![0u8; cluster_size_usize],
+            vec![0x41; cluster_size_usize],
+            make_incompressible_cluster(cluster_size_usize),
+            vec![0x5a; cluster_size_usize],
+        ];
+        write_custom_test_image_with_cluster_size(&source, &cluster_contents, cluster_size)
+            .expect("write source image");
+
+        let mut compressor_args = BTreeMap::new();
+        if cluster_size == 1_048_576 {
+            compressor_args.insert("cluster_size".to_owned(), "1M".to_owned());
+        }
+        let compressor_opts = if compression_type == CompressionType::Zstd {
+            "-19 -T0"
+        } else {
+            ""
+        };
+        compress_qcow2_image(
+            &source,
+            &dest,
+            compression_type,
+            &compressor_args,
+            compressor_opts,
+        )
+        .expect("compress mixed source");
+
+        let mut file = File::open(&dest).expect("open dest");
+        let header = read_header(&mut file).expect("read header");
+        let l1_entries = read_u64_table(
+            &mut file,
+            header.l1_table_offset,
+            usize::try_from(header.l1_size).expect("l1_size fits usize"),
+        )
+        .expect("read l1 table");
+        assert_eq!(
+            l1_entries.len(),
+            1,
+            "mixed fixture should use exactly one L1 entry"
+        );
+        assert_ne!(
+            l1_entries[0] & QCOW_OFLAG_COPIED,
+            0,
+            "L1 entry must set COPIED"
+        );
+
+        let l2_entries_per_table =
+            usize::try_from(cluster_size / 8).expect("l2 entries per table fits usize");
+        let l2_offset = aligned_data_offset(l1_entries[0], cluster_size);
+        let l2_entries =
+            read_u64_table(&mut file, l2_offset, l2_entries_per_table).expect("read l2");
+        assert_eq!(
+            l2_entries[0], 0,
+            "zero cluster entry should stay unallocated"
+        );
+        assert_eq!(l2_entries[4], 0, "unused L2 entry should stay zero");
+
+        for &compressed_idx in &[1usize, 3usize] {
+            let entry = l2_entries[compressed_idx];
+            assert_ne!(
+                entry & QCOW_OFLAG_COMPRESSED,
+                0,
+                "compressed cluster {compressed_idx} should set COMPRESSED"
+            );
+            assert_eq!(
+                entry & QCOW_OFLAG_COPIED,
+                0,
+                "compressed cluster {compressed_idx} must not set COPIED"
+            );
+        }
+
+        let raw_entry = l2_entries[2];
+        assert_eq!(
+            raw_entry & QCOW_OFLAG_COMPRESSED,
+            0,
+            "raw cluster should not set COMPRESSED"
+        );
+        assert_ne!(
+            raw_entry & QCOW_OFLAG_COPIED,
+            0,
+            "raw cluster should set COPIED"
+        );
+        assert_ne!(
+            aligned_data_offset(raw_entry, cluster_size),
+            0,
+            "raw cluster should point at allocated data"
+        );
+
+        let stats = read_qcow2_image_stats(&dest).expect("read stats");
+        assert_eq!(stats.cluster_size, cluster_size);
+        assert_eq!(stats.virtual_size, cluster_size * 4);
+        assert_eq!(stats.allocated_data_clusters, 3);
+
+        assert_guest_clusters_match(&dest, &cluster_contents, cluster_size);
+
+        let sparsify_stats = sparsify_zero_clusters(&dest).expect("sparsify mixed image");
+        assert_eq!(sparsify_stats.scanned_clusters, 1);
+        assert_eq!(sparsify_stats.deallocated_clusters, 0);
+        assert_eq!(sparsify_stats.skipped_compressed_clusters, 2);
+
+        assert_guest_clusters_match(&dest, &cluster_contents, cluster_size);
+
+        if qemu_img_available() {
+            assert_qemu_img_check(&dest);
+        }
+    }
+
     // -------------------------------------------------------------------------
     // Round-trip tests: compress a source, open the compressed output as a
     // SourceImage, and verify every guest cluster decodes byte-identically.
@@ -1600,6 +1828,26 @@ mod tests {
         run_double_compress_test(CompressionType::Zlib, 1_048_576);
     }
 
+    #[test]
+    fn native_compress_sets_copied_flags_zstd_4k() {
+        run_copied_flag_test(CompressionType::Zstd, 4096);
+    }
+
+    #[test]
+    fn native_compress_sets_copied_flags_zlib_4k() {
+        run_copied_flag_test(CompressionType::Zlib, 4096);
+    }
+
+    #[test]
+    fn native_compress_sets_copied_flags_zstd_1m() {
+        run_copied_flag_test(CompressionType::Zstd, 1_048_576);
+    }
+
+    #[test]
+    fn native_compress_sets_copied_flags_zlib_1m() {
+        run_copied_flag_test(CompressionType::Zlib, 1_048_576);
+    }
+
     // -------------------------------------------------------------------------
     // Optional qemu-img compatibility check.
     //
@@ -1611,11 +1859,7 @@ mod tests {
     #[test]
     fn native_compress_qemu_img_check_zstd_1m() {
         // Skip if qemu-img is not available.
-        if std::process::Command::new("qemu-img")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
+        if !qemu_img_available() {
             eprintln!("qemu-img not found — skipping qemu-img check test");
             return;
         }
@@ -1631,24 +1875,12 @@ mod tests {
         compress_qcow2_image(&source, &dest, CompressionType::Zstd, &args, "-19 -T0")
             .expect("compress");
 
-        let status = std::process::Command::new("qemu-img")
-            .args(["check", "-f", "qcow2"])
-            .arg(&dest)
-            .status()
-            .expect("run qemu-img check");
-        assert!(
-            status.success(),
-            "qemu-img check failed on 1M-cluster zstd output (exit status: {status})"
-        );
+        assert_qemu_img_check(&dest);
     }
 
     #[test]
     fn native_compress_qemu_img_check_double_compress_zstd_1m() {
-        if std::process::Command::new("qemu-img")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
+        if !qemu_img_available() {
             eprintln!("qemu-img not found — skipping qemu-img check test");
             return;
         }
@@ -1680,14 +1912,6 @@ mod tests {
         )
         .expect("compress B → C");
 
-        let status = std::process::Command::new("qemu-img")
-            .args(["check", "-f", "qcow2"])
-            .arg(&final_image)
-            .status()
-            .expect("run qemu-img check");
-        assert!(
-            status.success(),
-            "qemu-img check failed on double-compressed 1M-cluster zstd image (exit status: {status})"
-        );
+        assert_qemu_img_check(&final_image);
     }
 }
