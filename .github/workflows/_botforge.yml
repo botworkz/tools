@@ -133,8 +133,7 @@ jobs:
         export REPO_ROOT=$(realpath testrepo)
         docker compose -f botforge/test/compose.yml run build  \
           build \
-            --spec build.yaml \
-            --output build/artifact/foo.qcow2
+            --spec build.yaml
     - run: |
         export BOTFORGE_IMAGE=botworkz/botforge:ci
         export HOST_UID=$(id -u)

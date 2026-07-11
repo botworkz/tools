@@ -1,6 +1,6 @@
 type: test
 image: >-
-  @://build/artifact/foo.qcow2
+  @artifact://foo.qcow2
 disk_size: 10G
 steps:
 - on: host

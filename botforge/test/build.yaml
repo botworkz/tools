@@ -1,6 +1,7 @@
 type: build
 image: >-
   @debian-base
+output: foo.qcow2
 disk_size: 10G
 compress:
   reclaim: fstrim
