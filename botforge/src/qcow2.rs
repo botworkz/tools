@@ -1669,40 +1669,54 @@ mod tests {
                     // Assert qemu-compatible single-frame structure.
                     // zstd::stream::read::Decoder transparently accepts multi-frame /
                     // worker-chunked output, so the decode below would pass even for
-                    // broken frames.  These two assertions catch that blind spot:
-                    // (1) the frame header must pledge the content size, and
-                    // (2) the first frame must span exactly the full stored payload
-                    //     (no trailing bytes = no second frame).
-                    let content_size =
-                        zstd::zstd_safe::get_frame_content_size(&compressed)
-                            .unwrap_or_else(|_| {
-                                panic!("cluster {cluster_idx}: zstd frame header missing or corrupt")
-                            })
-                            .unwrap_or_else(|| {
-                                panic!(
-                                    "cluster {cluster_idx}: zstd frame does not pledge content \
+                    // broken frames.  These assertions catch that blind spot:
+                    //
+                    // (1) The frame header must pledge the content size (equals cluster_size).
+                    // (2) No second zstd frame may follow the first frame.  In qcow2 the stored
+                    //     payload is padded to a sector boundary, so the trailing bytes after the
+                    //     first frame are padding (zeros), not a second frame.  Worker-chunked
+                    //     multithreaded output would have a real second frame there.
+                    let content_size = zstd::zstd_safe::get_frame_content_size(&compressed)
+                        .unwrap_or_else(|_| {
+                            panic!("cluster {cluster_idx}: zstd frame header missing or corrupt")
+                        })
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "cluster {cluster_idx}: zstd frame does not pledge content \
                                      size (qemu requires single-frame with include_contentsize)"
-                                )
-                            });
+                            )
+                        });
                     assert_eq!(
                         content_size as usize, cluster_size,
                         "cluster {cluster_idx}: pledged content size must equal cluster_size"
                     );
-                    let first_frame_bytes =
-                        zstd::zstd_safe::find_frame_compressed_size(&compressed)
-                            .unwrap_or_else(|e| {
-                                panic!(
-                                    "cluster {cluster_idx}: cannot determine first frame size: \
+                    let first_frame_bytes = zstd::zstd_safe::find_frame_compressed_size(
+                        &compressed,
+                    )
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "cluster {cluster_idx}: cannot determine first frame size: \
                                      {e:?}"
-                                )
-                            });
-                    assert_eq!(
-                        first_frame_bytes,
-                        compressed.len(),
-                        "cluster {cluster_idx}: stored payload must be exactly one zstd frame \
-                         (trailing bytes indicate a multi-frame/worker-chunked stream that qemu \
-                         rejects)"
+                        )
+                    });
+                    assert!(
+                        first_frame_bytes <= compressed.len(),
+                        "cluster {cluster_idx}: first frame ({first_frame_bytes} B) exceeds \
+                         stored payload ({} B)",
+                        compressed.len()
                     );
+                    // The bytes after the first frame are sector padding.  Assert they are NOT a
+                    // second valid zstd frame — that would indicate a multi-frame stream.
+                    let trailing = &compressed[first_frame_bytes..];
+                    if !trailing.is_empty()
+                        && zstd::zstd_safe::find_frame_compressed_size(trailing).is_ok()
+                    {
+                        panic!(
+                            "cluster {cluster_idx}: a second valid zstd frame was found \
+                             after the first frame — multithreaded/worker-chunked output \
+                             detected (qemu rejects multi-frame clusters)"
+                        );
+                    }
 
                     let mut decoder =
                         zstd::stream::read::Decoder::with_buffer(compressed.as_slice())
@@ -2210,6 +2224,57 @@ mod tests {
             CompressionType::Zstd,
             &args,
             "-19 -T0",
+        )
+        .expect("compress B → C");
+
+        assert_qemu_img_check(&final_image);
+    }
+
+    #[test]
+    fn native_compress_qemu_img_check_zlib_1m() {
+        if !qemu_img_available() {
+            eprintln!("qemu-img not found — skipping qemu-img check test");
+            return;
+        }
+
+        let tmp = tempdir().expect("tempdir");
+        let source = tmp.path().join("source.qcow2");
+        let dest = tmp.path().join("compressed.qcow2");
+
+        write_test_image_with_cluster_size(&source, 4, 1_048_576).expect("write source");
+
+        let mut args = BTreeMap::new();
+        args.insert("cluster_size".to_owned(), "1M".to_owned());
+        compress_qcow2_image(&source, &dest, CompressionType::Zlib, &args, "").expect("compress");
+
+        assert_qemu_img_check(&dest);
+    }
+
+    #[test]
+    fn native_compress_qemu_img_check_double_compress_zlib_1m() {
+        if !qemu_img_available() {
+            eprintln!("qemu-img not found — skipping qemu-img check test");
+            return;
+        }
+
+        let tmp = tempdir().expect("tempdir");
+        let source = tmp.path().join("a.qcow2");
+        let intermediate = tmp.path().join("b.qcow2");
+        let final_image = tmp.path().join("c.qcow2");
+
+        write_test_image_with_cluster_size(&source, 4, 1_048_576).expect("write source A");
+
+        let mut args = BTreeMap::new();
+        args.insert("cluster_size".to_owned(), "1M".to_owned());
+
+        compress_qcow2_image(&source, &intermediate, CompressionType::Zlib, &args, "")
+            .expect("compress A → B");
+        compress_qcow2_image(
+            &intermediate,
+            &final_image,
+            CompressionType::Zlib,
+            &args,
+            "",
         )
         .expect("compress B → C");
 

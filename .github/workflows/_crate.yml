@@ -80,6 +80,33 @@ jobs:
           ci-tools:local \
           cargo build -p "$CRATE" --release --locked
 
+    - name: qcow2 compressor qemu-img check – zlib and zstd
+      if: env.CRATE == 'botforge'
+      run: |
+        set -euo pipefail
+        # Extend the CI toolchain image with qemu-img so the gated
+        # native_compress_qemu_img_check_* tests actually run instead of skip.
+        docker build -t ci-tools-qemu:local - <<'EOF'
+        FROM ci-tools:local
+        USER root
+        RUN apt-get update -qq && \
+            apt-get install -y --no-install-recommends qemu-utils && \
+            rm -rf /var/lib/apt/lists/*
+        EOF
+        # Run only the qemu-img-gated tests. The filter matches all four:
+        #   native_compress_qemu_img_check_zstd_1m
+        #   native_compress_qemu_img_check_double_compress_zstd_1m
+        #   native_compress_qemu_img_check_zlib_1m
+        #   native_compress_qemu_img_check_double_compress_zlib_1m
+        docker run --rm \
+          --user "$(id -u):$(id -g)" \
+          -v "$GITHUB_WORKSPACE:/workspace" \
+          -v "$HOME/.cargo:/cargo" \
+          -w /workspace \
+          -e CARGO_HOME=/cargo \
+          ci-tools-qemu:local \
+          cargo test -p botforge --locked -- native_compress_qemu_img_check
+
     - name: Install hadolint
       run: |
         set -euo pipefail

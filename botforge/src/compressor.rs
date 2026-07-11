@@ -223,22 +223,19 @@ mod tests {
     fn zstd_compress_cluster_is_single_frame_with_content_size() {
         // Test with both a default compressor and one configured with -T4 workers.
         for opts in &["-19 -T0", "--ultra -22 -T4", "-3"] {
-            let compressor = ZstdCompressor::from_opts(opts)
-                .unwrap_or_else(|e| panic!("parse {opts}: {e}"));
+            let compressor =
+                ZstdCompressor::from_opts(opts).unwrap_or_else(|e| panic!("parse {opts}: {e}"));
             let cluster = vec![0x42u8; 65_536];
             let compressed = compressor
                 .compress_cluster(&cluster)
                 .unwrap_or_else(|e| panic!("compress with {opts}: {e}"));
 
             // Content size must be pledged and must equal the cluster size.
-            let content_size =
-                zstd::zstd_safe::get_frame_content_size(&compressed)
-                    .unwrap_or_else(|_| {
-                        panic!("{opts}: zstd frame header missing or corrupt")
-                    })
-                    .unwrap_or_else(|| {
-                        panic!("{opts}: zstd frame must pledge content size (include_contentsize)")
-                    });
+            let content_size = zstd::zstd_safe::get_frame_content_size(&compressed)
+                .unwrap_or_else(|_| panic!("{opts}: zstd frame header missing or corrupt"))
+                .unwrap_or_else(|| {
+                    panic!("{opts}: zstd frame must pledge content size (include_contentsize)")
+                });
             assert_eq!(
                 content_size as usize,
                 cluster.len(),
@@ -248,11 +245,8 @@ mod tests {
             // The first frame must span exactly all stored bytes — i.e., exactly
             // one frame, no trailing bytes (which would indicate a multi-frame /
             // worker-chunked stream that qemu cannot decode).
-            let first_frame_size =
-                zstd::zstd_safe::find_frame_compressed_size(&compressed)
-                    .unwrap_or_else(|e| {
-                        panic!("{opts}: cannot determine first frame size: {e:?}")
-                    });
+            let first_frame_size = zstd::zstd_safe::find_frame_compressed_size(&compressed)
+                .unwrap_or_else(|e| panic!("{opts}: cannot determine first frame size: {e:?}"));
             assert_eq!(
                 first_frame_size,
                 compressed.len(),
