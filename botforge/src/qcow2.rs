@@ -258,6 +258,14 @@ pub(crate) fn compress_qcow2_image(
     Ok(())
 }
 
+pub(crate) fn read_virtual_sector0(path: &Path) -> Result<[u8; 512]> {
+    let mut image = SourceImage::open(path)?;
+    image.ensure_supported()?;
+    let mut sector = [0u8; 512];
+    image.read_virtual_range(0, &mut sector)?;
+    Ok(sector)
+}
+
 pub(crate) fn sparsify_zero_clusters(path: &Path) -> Result<ZeroClusterSparsifyStats> {
     let mut file = OpenOptions::new()
         .read(true)
@@ -1141,13 +1149,9 @@ mod tests {
                 .expect("read guest cluster");
             let expected_byte = 0x41u8 + (i as u8); // 'A', 'B', 'C', 'D'
             assert_eq!(
-                &cluster[..32],
-                &vec![expected_byte; 32][..],
+                cluster,
+                vec![expected_byte; cluster_size],
                 "cluster {i} data mismatch"
-            );
-            assert!(
-                cluster[32..].iter().all(|b| *b == 0),
-                "cluster {i} tail should be zero"
             );
         }
     }
@@ -1178,8 +1182,8 @@ mod tests {
                 .expect("read guest cluster");
             let expected_byte = 0x41u8 + (i as u8);
             assert_eq!(
-                &cluster[..32],
-                &vec![expected_byte; 32][..],
+                cluster,
+                vec![expected_byte; 4096],
                 "cluster {i} data mismatch"
             );
         }
@@ -1244,8 +1248,8 @@ mod tests {
     }
 
     /// Creates a plain (uncompressed) qcow2 with `cluster_count` non-zero guest
-    /// clusters.  Each cluster starts with 32 bytes of a distinct repeating byte
-    /// value ('A'=0x41 for cluster 0, 'B' for cluster 1, …) followed by zeros.
+    /// clusters. Each cluster is fully populated with a distinct repeating byte
+    /// value ('A'=0x41 for cluster 0, 'B' for cluster 1, …).
     /// The image uses 4 KiB clusters and 16-bit refcounts (refcount_order = 4).
     ///
     /// Layout (all offsets in units of `cluster_size = 4096`):
@@ -1285,10 +1289,14 @@ mod tests {
             write_exact_at(&mut file, cluster_size * 4 + idx * 2, &1u16.to_be_bytes())?;
         }
 
-        // 32 bytes of a distinct value per cluster, rest zeros
+        // Full cluster of a distinct value per cluster.
         for i in 0..cluster_count {
             let byte = 0x41u8 + (i as u8); // 'A', 'B', 'C', …
-            write_exact_at(&mut file, cluster_size * (5 + i), &[byte; 32])?;
+            write_exact_at(
+                &mut file,
+                cluster_size * (5 + i),
+                &vec![byte; cluster_size as usize],
+            )?;
         }
 
         Ok(())
@@ -1299,11 +1307,12 @@ mod tests {
     ///
     /// Each cluster is filled with a pattern that produces a compressed frame
     /// spanning multiple 512-byte sectors — important for testing the `nb_csectors`
-    /// read path at 1 MiB cluster size.  The first `sector_stride` bytes of each
+    /// read path at 1 MiB cluster size. The first `sector_stride` bytes of each
     /// cluster contain 512-byte blocks where block b of cluster c has value
     /// `((b as u8).wrapping_add(c as u8).wrapping_mul(7).wrapping_add(0x41))`.
     /// For cluster_size = 4096 this is 8 blocks = 4 KiB; for cluster_size = 1M
-    /// this is 512 blocks = 256 KiB.  The remainder is zeros.
+    /// this is 512 blocks = 256 KiB. The remainder is a non-zero, cluster-distinct
+    /// value so full-cluster round-trip assertions cover every byte.
     ///
     /// Layout (all offsets in units of `cluster_size`):
     ///   0  – header
@@ -1364,6 +1373,8 @@ mod tests {
         let sector_count = (cluster_size / 512).min(512);
         let sector = 512usize;
         let mut sector_buf = vec![0u8; sector];
+        let cluster_bytes = usize::try_from(cluster_size).expect("cluster_size fits usize");
+        let sector_bytes = usize::try_from(sector_count).expect("sector_count fits usize") * sector;
         for i in 0..cluster_count {
             let cluster_offset = cluster_size * (5 + i);
             for b in 0..sector_count {
@@ -1373,6 +1384,11 @@ mod tests {
                     .wrapping_add(0x41);
                 sector_buf.fill(value);
                 write_exact_at(&mut file, cluster_offset + b * 512, &sector_buf)?;
+            }
+            let tail_fill = 0x80u8.wrapping_add(i as u8);
+            if sector_bytes < cluster_bytes {
+                let tail = vec![tail_fill; cluster_bytes - sector_bytes];
+                write_exact_at(&mut file, cluster_offset + sector_bytes as u64, &tail)?;
             }
         }
 
@@ -1386,6 +1402,10 @@ mod tests {
             .wrapping_add(cluster_idx as u8)
             .wrapping_mul(7)
             .wrapping_add(0x41)
+    }
+
+    fn expected_tail_value(cluster_idx: u64) -> u8 {
+        0x80u8.wrapping_add(cluster_idx as u8)
     }
 
     /// Assert that every guest cluster read from `image_path` via `SourceImage`
@@ -1416,9 +1436,12 @@ mod tests {
                     sector_slice[0]
                 );
             }
+            let tail_expected = expected_tail_value(i);
             assert!(
-                buf[sector_count * 512..].iter().all(|&x| x == 0),
-                "cluster {i}: tail bytes should be zero"
+                buf[sector_count * 512..]
+                    .iter()
+                    .all(|&x| x == tail_expected),
+                "cluster {i}: tail bytes should be 0x{tail_expected:02x}"
             );
         }
     }
@@ -1532,6 +1555,234 @@ mod tests {
             *byte = (state >> 24) as u8;
         }
         out
+    }
+
+    fn make_mbr_like_cluster(cluster_size: usize) -> Vec<u8> {
+        let mut out = vec![0u8; cluster_size];
+        let mut state = 0x0123_4567_89ab_cdefu64;
+        for byte in &mut out {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            *byte = (state >> 16) as u8;
+        }
+        out[510] = 0x55;
+        out[511] = 0xAA;
+        out
+    }
+
+    fn make_dense_non_zero_compressible_cluster(cluster_size: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(cluster_size);
+        let pattern: [u8; 16] = [
+            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
+            0xf0, 0x0f,
+        ];
+        while out.len() < cluster_size {
+            let to_take = (cluster_size - out.len()).min(pattern.len());
+            out.extend_from_slice(&pattern[..to_take]);
+        }
+        out
+    }
+
+    fn make_realistic_cluster_contents(cluster_size: usize) -> Vec<Vec<u8>> {
+        vec![
+            make_mbr_like_cluster(cluster_size),
+            make_incompressible_cluster(cluster_size),
+            make_dense_non_zero_compressible_cluster(cluster_size),
+        ]
+    }
+
+    fn assert_roundtrip_guest_bytes(path: &Path, expected: &[u8], target_cluster_size: u64) {
+        let mut image = SourceImage::open(path).expect("open image for realistic round-trip");
+        let cluster_size = usize::try_from(target_cluster_size).expect("cluster_size fits usize");
+        assert_eq!(
+            image.header.cluster_size(),
+            target_cluster_size,
+            "cluster_size mismatch in compressed image header"
+        );
+        let guest_cluster_count = div_ceil(
+            u64::try_from(expected.len()).expect("expected bytes len fits u64"),
+            target_cluster_size,
+        );
+        for cluster_idx in 0..guest_cluster_count {
+            let mut actual = vec![0u8; cluster_size];
+            image
+                .read_virtual_range(cluster_idx * target_cluster_size, &mut actual)
+                .unwrap_or_else(|e| panic!("read_virtual_range cluster {cluster_idx}: {e:#}"));
+            let start = usize::try_from(cluster_idx * target_cluster_size).expect("start fits");
+            let end = start + cluster_size;
+            assert_eq!(
+                &actual[..],
+                &expected[start..end],
+                "cluster {cluster_idx} mismatch"
+            );
+        }
+    }
+
+    fn assert_compressed_entries_decode_with_declared_codec(
+        path: &Path,
+        expected: &[u8],
+        target_cluster_size: u64,
+        compression_type: CompressionType,
+    ) {
+        let mut file = File::open(path).expect("open compressed image");
+        let header = read_header(&mut file).expect("read header");
+        let l1_entries = read_u64_table(
+            &mut file,
+            header.l1_table_offset,
+            usize::try_from(header.l1_size).expect("l1_size fits usize"),
+        )
+        .expect("read l1 table");
+        let l2_entries_per_table =
+            usize::try_from(target_cluster_size / 8).expect("l2 entries fits usize");
+        let cluster_size = usize::try_from(target_cluster_size).expect("cluster_size fits usize");
+        let guest_cluster_count = div_ceil(
+            u64::try_from(expected.len()).expect("expected bytes len fits u64"),
+            target_cluster_size,
+        );
+
+        for cluster_idx in 0..guest_cluster_count {
+            let l1_index =
+                usize::try_from(cluster_idx / (target_cluster_size / 8)).expect("l1 idx fits");
+            let l2_index =
+                usize::try_from(cluster_idx % (target_cluster_size / 8)).expect("l2 idx fits");
+            let l2_table_offset = aligned_data_offset(
+                *l1_entries
+                    .get(l1_index)
+                    .unwrap_or_else(|| panic!("missing l1 entry for cluster {cluster_idx}")),
+                target_cluster_size,
+            );
+            let l2_entries =
+                read_u64_table(&mut file, l2_table_offset, l2_entries_per_table).expect("read l2");
+            let l2_entry = l2_entries[l2_index];
+            if (l2_entry & QCOW_OFLAG_COMPRESSED) == 0 {
+                continue;
+            }
+            let (compressed_offset, compressed_size) =
+                parse_compressed_l2_entry(header, l2_entry).expect("parse compressed l2");
+            let mut compressed =
+                vec![0u8; usize::try_from(compressed_size).expect("compressed size fits usize")];
+            read_exact_at(&mut file, compressed_offset, &mut compressed).expect("read compressed");
+
+            let decoded = match compression_type {
+                CompressionType::Zstd => {
+                    // Assert qemu-compatible single-frame structure.
+                    // zstd::stream::read::Decoder transparently accepts multi-frame /
+                    // worker-chunked output, so the decode below would pass even for
+                    // broken frames.  These assertions catch that blind spot:
+                    //
+                    // (1) The frame header must pledge the content size (equals cluster_size).
+                    // (2) No second zstd frame may follow the first frame.  In qcow2 the stored
+                    //     payload is padded to a sector boundary, so the trailing bytes after the
+                    //     first frame are padding (zeros), not a second frame.  Worker-chunked
+                    //     multithreaded output would have a real second frame there.
+                    let content_size = zstd::zstd_safe::get_frame_content_size(&compressed)
+                        .unwrap_or_else(|_| {
+                            panic!("cluster {cluster_idx}: zstd frame header missing or corrupt")
+                        })
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "cluster {cluster_idx}: zstd frame does not pledge content \
+                                     size (qemu requires single-frame with include_contentsize)"
+                            )
+                        });
+                    assert_eq!(
+                        content_size as usize, cluster_size,
+                        "cluster {cluster_idx}: pledged content size must equal cluster_size"
+                    );
+                    let first_frame_bytes = zstd::zstd_safe::find_frame_compressed_size(
+                        &compressed,
+                    )
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "cluster {cluster_idx}: cannot determine first frame size: \
+                                     {e:?}"
+                        )
+                    });
+                    assert!(
+                        first_frame_bytes <= compressed.len(),
+                        "cluster {cluster_idx}: first frame ({first_frame_bytes} B) exceeds \
+                         stored payload ({} B)",
+                        compressed.len()
+                    );
+                    // The bytes after the first frame are sector padding.  Assert they are NOT a
+                    // second valid zstd frame — that would indicate a multi-frame stream.
+                    let trailing = &compressed[first_frame_bytes..];
+                    if !trailing.is_empty()
+                        && zstd::zstd_safe::find_frame_compressed_size(trailing).is_ok()
+                    {
+                        panic!(
+                            "cluster {cluster_idx}: a second valid zstd frame was found \
+                             after the first frame — multithreaded/worker-chunked output \
+                             detected (qemu rejects multi-frame clusters)"
+                        );
+                    }
+
+                    let mut decoder =
+                        zstd::stream::read::Decoder::with_buffer(compressed.as_slice())
+                            .expect("init zstd decoder");
+                    let mut out = vec![0u8; cluster_size];
+                    use std::io::Read;
+                    decoder.read_exact(&mut out).expect("decode zstd");
+                    out
+                }
+                CompressionType::Zlib => {
+                    let mut decoder = flate2::read::ZlibDecoder::new(compressed.as_slice());
+                    let mut out = vec![0u8; cluster_size];
+                    use std::io::Read;
+                    decoder.read_exact(&mut out).expect("decode zlib");
+                    out
+                }
+            };
+
+            let start = usize::try_from(cluster_idx * target_cluster_size).expect("start fits");
+            let end = start + cluster_size;
+            assert_eq!(
+                &decoded[..],
+                &expected[start..end],
+                "strict codec decode mismatch at cluster {cluster_idx}"
+            );
+        }
+    }
+
+    fn run_realistic_round_trip_test(
+        compression_type: CompressionType,
+        source_cluster_size: u64,
+        target_cluster_size: Option<u64>,
+        compressor_opts: &str,
+    ) {
+        let tmp = tempdir().expect("tempdir");
+        let source = tmp.path().join("realistic-source.qcow2");
+        let dest = tmp.path().join("realistic-compressed.qcow2");
+        let source_cluster_size_usize =
+            usize::try_from(source_cluster_size).expect("source cluster size fits usize");
+        let cluster_contents = make_realistic_cluster_contents(source_cluster_size_usize);
+        write_custom_test_image_with_cluster_size(&source, &cluster_contents, source_cluster_size)
+            .expect("write realistic source image");
+
+        let mut compressor_args = BTreeMap::new();
+        if let Some(target) = target_cluster_size {
+            compressor_args.insert("cluster_size".to_owned(), target.to_string());
+        }
+
+        compress_qcow2_image(
+            &source,
+            &dest,
+            compression_type,
+            &compressor_args,
+            compressor_opts,
+        )
+        .expect("compress realistic source");
+
+        let expected: Vec<u8> = cluster_contents.into_iter().flatten().collect();
+        let target_size = target_cluster_size.unwrap_or(source_cluster_size);
+        assert_roundtrip_guest_bytes(&dest, &expected, target_size);
+        assert_compressed_entries_decode_with_declared_codec(
+            &dest,
+            &expected,
+            target_size,
+            compression_type,
+        );
     }
 
     fn qemu_img_available() -> bool {
@@ -1828,6 +2079,114 @@ mod tests {
         run_double_compress_test(CompressionType::Zlib, 1_048_576);
     }
 
+    // -------------------------------------------------------------------------
+    // Regression: compress a source whose virtual_size is NOT a multiple of
+    // cluster_size.  The last guest cluster contains fewer than cluster_size
+    // bytes of real data; after botforge compresses it (zero-padded), the
+    // resulting compressed cluster decompresses to exactly cluster_size bytes.
+    // When that compressed image is used as a SOURCE for a second pass, the
+    // decompress_cluster path must not fail.  Before the read_to_end fix,
+    // read_exact on a cluster_size buffer would error with "corrupt deflate
+    // stream" whenever the source cluster inflated to fewer than cluster_size
+    // bytes (e.g. from a qemu-produced image with a partial last cluster).
+    // -------------------------------------------------------------------------
+
+    fn run_partial_last_cluster_test(compression_type: CompressionType) {
+        let tmp = tempdir().expect("tempdir");
+        let cluster_size: u64 = 4096;
+        // virtual_size is NOT a multiple of cluster_size: last cluster is partial.
+        let partial_bytes: u64 = 1024;
+        let virtual_size = cluster_size + partial_bytes; // 2 clusters; second is partial
+
+        // Build a qcow2 by hand with a partial last cluster so we control the
+        // exact decompressed length of that cluster in the compressed output.
+        let source = tmp.path().join("partial-source.qcow2");
+        {
+            let cluster_count = 2u64;
+            let total_clusters = 5 + cluster_count;
+            let mut file = std::fs::File::create(&source).expect("create source");
+            file.set_len(cluster_size * total_clusters)
+                .expect("set_len");
+            write_exact_at(&mut file, 0, &QCOW_MAGIC.to_be_bytes()).expect("magic");
+            write_exact_at(&mut file, 4, &3u32.to_be_bytes()).expect("version");
+            write_exact_at(&mut file, 20, &12u32.to_be_bytes()).expect("cluster_bits");
+            write_exact_at(&mut file, 24, &virtual_size.to_be_bytes()).expect("virtual_size");
+            write_exact_at(&mut file, 36, &1u32.to_be_bytes()).expect("l1_size");
+            write_exact_at(&mut file, 40, &cluster_size.to_be_bytes()).expect("l1_offset");
+            write_exact_at(&mut file, 48, &(cluster_size * 3).to_be_bytes())
+                .expect("refcount_table_offset");
+            write_exact_at(&mut file, 56, &1u32.to_be_bytes()).expect("refcount_table_clusters");
+            write_exact_at(&mut file, 96, &4u32.to_be_bytes()).expect("refcount_order");
+            write_exact_at(&mut file, 100, &104u32.to_be_bytes()).expect("header_length");
+            // L1: one entry pointing to L2 at cluster 2
+            write_u64_at(&mut file, cluster_size, cluster_size * 2).expect("l1");
+            // L2: two entries pointing to data clusters 5 and 6
+            write_u64_at(&mut file, cluster_size * 2, cluster_size * 5).expect("l2[0]");
+            write_u64_at(&mut file, cluster_size * 2 + 8, cluster_size * 6).expect("l2[1]");
+            // Refcount table/block
+            write_u64_at(&mut file, cluster_size * 3, cluster_size * 4).expect("refcount tbl");
+            for idx in 0..total_clusters {
+                write_exact_at(&mut file, cluster_size * 4 + idx * 2, &1u16.to_be_bytes())
+                    .expect("refcount");
+            }
+            // Full first cluster
+            write_exact_at(
+                &mut file,
+                cluster_size * 5,
+                &vec![0x41u8; cluster_size as usize],
+            )
+            .expect("cluster 0 data");
+            // Partial second cluster: only partial_bytes bytes of real data, rest stays zero
+            write_exact_at(
+                &mut file,
+                cluster_size * 6,
+                &vec![0x42u8; partial_bytes as usize],
+            )
+            .expect("cluster 1 data");
+        }
+
+        let dest = tmp.path().join("compressed.qcow2");
+        let opts = if compression_type == CompressionType::Zstd {
+            "-19 -T0"
+        } else {
+            ""
+        };
+        compress_qcow2_image(&source, &dest, compression_type, &BTreeMap::new(), opts)
+            .expect("compress partial-last-cluster source");
+
+        // Re-compress the output (double-compress), exercising the decompress path
+        // on a source that has compressed clusters.
+        let dest2 = tmp.path().join("recompressed.qcow2");
+        compress_qcow2_image(&dest, &dest2, compression_type, &BTreeMap::new(), opts)
+            .expect("re-compress compressed output");
+
+        // Read back and verify both clusters.
+        let mut image = SourceImage::open(&dest2).expect("open recompressed");
+        let mut buf = vec![0u8; cluster_size as usize];
+        image
+            .read_virtual_range(0, &mut buf)
+            .expect("read cluster 0");
+        assert!(buf.iter().all(|&b| b == 0x41), "cluster 0 must be 0x41");
+
+        image
+            .read_virtual_range(cluster_size, &mut buf[..partial_bytes as usize])
+            .expect("read partial cluster 1");
+        assert!(
+            buf[..partial_bytes as usize].iter().all(|&b| b == 0x42),
+            "partial cluster 1 data must be 0x42"
+        );
+    }
+
+    #[test]
+    fn native_compress_partial_last_cluster_zlib() {
+        run_partial_last_cluster_test(CompressionType::Zlib);
+    }
+
+    #[test]
+    fn native_compress_partial_last_cluster_zstd() {
+        run_partial_last_cluster_test(CompressionType::Zstd);
+    }
+
     #[test]
     fn native_compress_sets_copied_flags_zstd_4k() {
         run_copied_flag_test(CompressionType::Zstd, 4096);
@@ -1846,6 +2205,70 @@ mod tests {
     #[test]
     fn native_compress_sets_copied_flags_zlib_1m() {
         run_copied_flag_test(CompressionType::Zlib, 1_048_576);
+    }
+
+    #[test]
+    fn native_compress_round_trip_realistic_zlib_default_cluster_size() {
+        run_realistic_round_trip_test(CompressionType::Zlib, 65_536, None, "");
+    }
+
+    #[test]
+    fn native_compress_round_trip_realistic_zstd_default_cluster_size() {
+        run_realistic_round_trip_test(CompressionType::Zstd, 65_536, None, "-19 -T0");
+    }
+
+    #[test]
+    fn native_compress_round_trip_realistic_zlib_small_target_cluster_size() {
+        run_realistic_round_trip_test(CompressionType::Zlib, 65_536, Some(4096), "");
+    }
+
+    #[test]
+    fn native_compress_round_trip_realistic_zstd_small_target_cluster_size() {
+        run_realistic_round_trip_test(CompressionType::Zstd, 65_536, Some(4096), "-19 -T0");
+    }
+
+    // -------------------------------------------------------------------------
+    // Regression: zstd -T0 must produce single-frame, content-sized clusters.
+    //
+    // Before the fix, ZstdCompressor::compress_cluster called multithread(workers)
+    // which could emit a worker-chunked multi-frame stream that qemu's
+    // qcow2_zstd_decompress (single ZSTD_decompressStream pass) rejects with
+    // -EIO.  The assert_compressed_entries_decode_with_declared_codec helper
+    // now catches this: it asserts each stored payload is exactly one zstd frame
+    // with a pledged content size.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn native_compress_zstd_t0_produces_single_frame_content_sized_clusters() {
+        let tmp = tempdir().expect("tempdir");
+        let source = tmp.path().join("source.qcow2");
+        let dest = tmp.path().join("dest.qcow2");
+
+        let cluster_size: u64 = 65_536;
+        let cluster_size_usize = usize::try_from(cluster_size).expect("fits usize");
+        let cluster_contents = make_realistic_cluster_contents(cluster_size_usize);
+        write_custom_test_image_with_cluster_size(&source, &cluster_contents, cluster_size)
+            .expect("write source");
+
+        compress_qcow2_image(
+            &source,
+            &dest,
+            CompressionType::Zstd,
+            &BTreeMap::new(),
+            "-19 -T0",
+        )
+        .expect("compress");
+
+        // assert_compressed_entries_decode_with_declared_codec now verifies:
+        //   (1) each zstd cluster has a pledged content size == cluster_size, and
+        //   (2) each stored payload is exactly one frame (no trailing bytes).
+        let expected: Vec<u8> = cluster_contents.into_iter().flatten().collect();
+        assert_compressed_entries_decode_with_declared_codec(
+            &dest,
+            &expected,
+            cluster_size,
+            CompressionType::Zstd,
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -1909,6 +2332,57 @@ mod tests {
             CompressionType::Zstd,
             &args,
             "-19 -T0",
+        )
+        .expect("compress B → C");
+
+        assert_qemu_img_check(&final_image);
+    }
+
+    #[test]
+    fn native_compress_qemu_img_check_zlib_1m() {
+        if !qemu_img_available() {
+            eprintln!("qemu-img not found — skipping qemu-img check test");
+            return;
+        }
+
+        let tmp = tempdir().expect("tempdir");
+        let source = tmp.path().join("source.qcow2");
+        let dest = tmp.path().join("compressed.qcow2");
+
+        write_test_image_with_cluster_size(&source, 4, 1_048_576).expect("write source");
+
+        let mut args = BTreeMap::new();
+        args.insert("cluster_size".to_owned(), "1M".to_owned());
+        compress_qcow2_image(&source, &dest, CompressionType::Zlib, &args, "").expect("compress");
+
+        assert_qemu_img_check(&dest);
+    }
+
+    #[test]
+    fn native_compress_qemu_img_check_double_compress_zlib_1m() {
+        if !qemu_img_available() {
+            eprintln!("qemu-img not found — skipping qemu-img check test");
+            return;
+        }
+
+        let tmp = tempdir().expect("tempdir");
+        let source = tmp.path().join("a.qcow2");
+        let intermediate = tmp.path().join("b.qcow2");
+        let final_image = tmp.path().join("c.qcow2");
+
+        write_test_image_with_cluster_size(&source, 4, 1_048_576).expect("write source A");
+
+        let mut args = BTreeMap::new();
+        args.insert("cluster_size".to_owned(), "1M".to_owned());
+
+        compress_qcow2_image(&source, &intermediate, CompressionType::Zlib, &args, "")
+            .expect("compress A → B");
+        compress_qcow2_image(
+            &intermediate,
+            &final_image,
+            CompressionType::Zlib,
+            &args,
+            "",
         )
         .expect("compress B → C");
 
