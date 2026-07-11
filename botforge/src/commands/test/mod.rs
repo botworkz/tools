@@ -2,6 +2,7 @@ use anyhow::{bail, Context, Result};
 use clap::Args;
 use std::path::PathBuf;
 
+use crate::commands::build::CpusArg;
 use crate::iso::{
     build_iso, detect_iso_tool, generate_installer_username, render_user_data, write_seed_files,
 };
@@ -44,6 +45,13 @@ pub(crate) struct TestArgs {
     /// Leave VM running and preserve overlay on exit.
     #[arg(long)]
     keep_running: bool,
+    /// Guest RAM in MiB. Controls the runner VM only; does not affect the output image.
+    #[arg(long, default_value_t = 4096)]
+    memory: u32,
+    /// Number of vCPUs for the runner VM, or 'auto' to use all available host CPUs.
+    /// Controls the runner VM only; does not affect the output image.
+    #[arg(long, default_value = "4")]
+    cpus: CpusArg,
 }
 
 pub(crate) fn cmd_test(args: TestArgs) -> Result<()> {
@@ -159,6 +167,8 @@ pub(crate) fn cmd_test(args: TestArgs) -> Result<()> {
         &extra_isos,
         args.ssh_port,
         &test_config.ports,
+        args.memory,
+        args.cpus.resolve(),
     );
 
     let mut vm_child = Some(spawn_qemu_with_log(&qemu_args, &vm_log)?);
@@ -227,6 +237,44 @@ mod tests {
             result.is_ok(),
             "CLI should parse without ssh-user/ssh-key: {}",
             result.unwrap_err()
+        );
+    }
+
+    #[test]
+    fn test_test_cli_memory_and_cpus_flags_accepted() {
+        let result = Cli::try_parse_from([
+            "botforge",
+            "test",
+            "--test-config",
+            "test.yaml",
+            "--base-image",
+            "base.qcow2",
+            "--repo-root",
+            "/repo",
+            "--memory",
+            "8192",
+            "--cpus",
+            "auto",
+        ]);
+        assert!(
+            result.is_ok(),
+            "CLI should accept --memory and --cpus auto: {}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
+    fn test_test_cli_shows_memory_and_cpus_in_help() {
+        let help = Cli::try_parse_from(["botforge", "test", "--help"])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            help.contains("--memory"),
+            "--memory missing from test help: {help}"
+        );
+        assert!(
+            help.contains("--cpus"),
+            "--cpus missing from test help: {help}"
         );
     }
 }
