@@ -28,6 +28,45 @@ use crate::plan::{
 };
 use crate::qcow2::{compress_qcow2_image, read_qcow2_image_stats, sparsify_zero_clusters};
 
+/// Parsed `--cpus` value: either a specific positive count or `auto`.
+///
+/// `auto` resolves at runtime to the host's available CPU count via
+/// [`std::thread::available_parallelism`], falling back to `1` on error.
+#[derive(Debug, Clone)]
+pub(crate) enum CpusArg {
+    Count(u32),
+    Auto,
+}
+
+impl CpusArg {
+    /// Resolve to a concrete vCPU count.
+    pub(crate) fn resolve(self) -> u32 {
+        match self {
+            CpusArg::Count(n) => n,
+            CpusArg::Auto => std::thread::available_parallelism()
+                .map(|n| n.get() as u32)
+                .unwrap_or(1),
+        }
+    }
+}
+
+impl std::str::FromStr for CpusArg {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        if s == "auto" {
+            return Ok(CpusArg::Auto);
+        }
+        match s.parse::<u32>() {
+            Ok(0) => Err("--cpus must be at least 1 (or 'auto')".to_string()),
+            Ok(n) => Ok(CpusArg::Count(n)),
+            Err(_) => Err(format!(
+                "invalid --cpus value {s:?}: expected a positive integer or 'auto'"
+            )),
+        }
+    }
+}
+
 #[derive(Args, Debug)]
 pub(crate) struct BuildArgs {
     /// Path to type-build YAML spec.
@@ -61,6 +100,13 @@ pub(crate) struct BuildArgs {
     /// responsible for ensuring the user exists in the base image and can accept connections).
     #[arg(long)]
     ssh_user: Option<String>,
+    /// Guest RAM in MiB. Controls the runner VM only; does not affect the output image.
+    #[arg(long, default_value_t = 4096)]
+    memory: u32,
+    /// Number of vCPUs for the runner VM, or 'auto' to use all available host CPUs.
+    /// Controls the runner VM only; does not affect the output image.
+    #[arg(long, default_value = "4")]
+    cpus: CpusArg,
 }
 
 pub(crate) fn cmd_build(config: &Path, args: BuildArgs) -> Result<()> {
@@ -189,8 +235,8 @@ pub(crate) fn cmd_build(config: &Path, args: BuildArgs) -> Result<()> {
         &partial,
         &seed_iso,
         args.ssh_port,
-        build_config.memsize,
-        build_config.smp,
+        args.memory,
+        args.cpus.resolve(),
         guest_reclaim_uses_discard,
     );
     let spec_display = repo_relative_display(&repo_root, &spec_path);
@@ -1446,6 +1492,50 @@ mod tests {
         assert!(
             !help.contains("--ssh-key"),
             "--ssh-key should not appear in help: {help}"
+        );
+        assert!(
+            help.contains("--memory"),
+            "--memory missing from help: {help}"
+        );
+        assert!(help.contains("--cpus"), "--cpus missing from help: {help}");
+    }
+
+    #[test]
+    fn cpus_arg_parses_positive_integer() {
+        use super::CpusArg;
+        use std::str::FromStr;
+        let cpus = CpusArg::from_str("8").unwrap();
+        assert_eq!(cpus.resolve(), 8);
+    }
+
+    #[test]
+    fn cpus_arg_parses_auto() {
+        use super::CpusArg;
+        use std::str::FromStr;
+        let cpus = CpusArg::from_str("auto").unwrap();
+        // auto resolves to available_parallelism() >= 1
+        assert!(cpus.resolve() >= 1);
+    }
+
+    #[test]
+    fn cpus_arg_rejects_zero() {
+        use super::CpusArg;
+        use std::str::FromStr;
+        let err = CpusArg::from_str("0").unwrap_err();
+        assert!(
+            err.contains("at least 1") || err.contains("auto"),
+            "error should reject 0: {err}"
+        );
+    }
+
+    #[test]
+    fn cpus_arg_rejects_invalid_string() {
+        use super::CpusArg;
+        use std::str::FromStr;
+        let err = CpusArg::from_str("bogus").unwrap_err();
+        assert!(
+            err.contains("invalid") || err.contains("bogus"),
+            "error should mention invalid value: {err}"
         );
     }
 

@@ -51,12 +51,12 @@ shasset manifest used to resolve `image:` assets.
 
 | Command | Summary |
 |---|---|
-| `botforge build --spec <file> --output <qcow2> [--source <qcow2>] [--cache-dir <dir>] [--repo-root <dir>]` | Resolve `image:` from the shasset manifest (`--config`), fetch + verify + cache the qcow2, boot it under qemu, inject an ephemeral in-harness SSH keypair via cloud-init, run `type: build` plan steps, and commit the result on clean shutdown. `--source` is an optional local override that bypasses shasset resolution. |
+| `botforge build --spec <file> --output <qcow2> [--source <qcow2>] [--cache-dir <dir>] [--repo-root <dir>] [--memory <MiB>] [--cpus <N\|auto>]` | Resolve `image:` from the shasset manifest (`--config`), fetch + verify + cache the qcow2, boot it under qemu, inject an ephemeral in-harness SSH keypair via cloud-init, run `type: build` plan steps, and commit the result on clean shutdown. `--source` is an optional local override that bypasses shasset resolution. `--memory` (default 4096 MiB) and `--cpus` (default 4, or `auto` for host core count) control the runner VM and do not affect the output image. |
 | `botforge deps --out <dir> [name ...]` | Fetch + stage shasset assets into a flat output directory. |
 | `botforge iso --src <dir> --out <file> [--volume-id <id>]` | Build an ISO image from a source tree. Also supports generating a cidata seed ISO with an injected SSH key. |
 | `botforge payload --out <file>` | Build a payload ISO from a config-driven staging plan. |
-| `botforge run …` | Launch a VM with qemu (KVM-only). |
-| `botforge test …` | Boot a packed qcow2 with a cloud-init cidata seed, SSH in, and execute the steps in a `test-packed.yaml` plan. |
+| `botforge run …` | Launch a VM with qemu (KVM-only). Accepts `--memory <MiB>` (default 4096) and `--cpus <N\|auto>` (default 4). |
+| `botforge test …` | Boot a packed qcow2 with a cloud-init cidata seed, SSH in, and execute the steps in a `test-packed.yaml` plan. Accepts `--memory <MiB>` (default 4096) and `--cpus <N\|auto>` (default 4) to control the runner VM. |
 
 ## Ephemeral installer identity
 
@@ -516,12 +516,17 @@ A `type: build` document tells `botforge build` how to provision a new qcow2
 image. All host paths are resolved relative to `--repo-root` (default: current
 directory); all guest paths must be absolute.
 
+> **Note on runner resources:** Guest RAM and vCPU count are **not** spec fields —
+> they are properties of the machine running the build, not the artifact being
+> produced.  Use `--memory <MiB>` (default 4096) and `--cpus <N|auto>` (default 4)
+> on the `botforge build` command line.  `memsize:` and `smp:` in a `type: build`
+> document are a hard load-time error.  `disk_size:` is the deliberate exception: it
+> is a genuine build requirement because the output image is resized to that size.
+
 ```yaml
 type: build
 image: "@debian-base"           # required: @<shasset-name> resolves to the provider's default artifact
-disk_size: "10G"                 # optional, default 10G
-memsize: 4096                    # optional, default 4096 MiB
-smp: 4                           # optional, default 4 vCPUs
+disk_size: "10G"                 # optional, default 10G — a build requirement (output image is resized to this size)
 step_timeout: 1800               # optional, default 1800 s; applies to each step
 timeout: 7200                    # optional, default 7200 s; overall wall-clock budget
 bootcmd:                         # optional; merged into the first-boot cloud-init user-data
