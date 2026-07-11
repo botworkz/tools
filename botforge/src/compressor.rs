@@ -100,11 +100,19 @@ impl Compressor for ZstdCompressor {
     }
 
     fn compress_cluster(&self, cluster: &[u8]) -> Result<Vec<u8>> {
+        // Per-cluster payloads are at most cluster_size (≤ 2 MiB).
+        // Multithreaded zstd compression (NbWorkers > 0) can split the output
+        // into a worker-chunked multi-frame stream.  qemu's qcow2_zstd_decompress
+        // performs a single ZSTD_decompressStream pass and requires exactly one
+        // self-contained frame per cluster — multi-frame output causes -EIO.
+        // We therefore intentionally do NOT apply self.workers here; the parsed
+        // worker count is preserved so existing specs with -T0/-Tn don't error,
+        // but per-cluster single-threaded compression is correct and deterministic.
         let mut compressor = zstd::bulk::Compressor::new(self.level)
             .context("failed to initialize zstd compressor")?;
         compressor
-            .multithread(self.workers)
-            .context("failed to configure zstd worker count")?;
+            .include_contentsize(true)
+            .context("failed to enable zstd content size")?;
         compressor
             .compress(cluster)
             .context("failed to encode zstd qcow2 cluster")
@@ -204,5 +212,52 @@ mod tests {
     fn compressor_factory_dispatches_zlib() {
         let compressor = build_compressor(CompressionType::Zlib, "").expect("factory");
         assert_eq!(compressor.id(), "zlib");
+    }
+
+    /// Regression: ZstdCompressor must produce a single self-contained frame with
+    /// the content size pledged in the frame header, even when worker opts are set.
+    /// qemu's qcow2_zstd_decompress does a single ZSTD_decompressStream pass and
+    /// requires exactly one frame per cluster; multi-frame output from multithreaded
+    /// compression causes -EIO at boot time.
+    #[test]
+    fn zstd_compress_cluster_is_single_frame_with_content_size() {
+        // Test with both a default compressor and one configured with -T4 workers.
+        for opts in &["-19 -T0", "--ultra -22 -T4", "-3"] {
+            let compressor = ZstdCompressor::from_opts(opts)
+                .unwrap_or_else(|e| panic!("parse {opts}: {e}"));
+            let cluster = vec![0x42u8; 65_536];
+            let compressed = compressor
+                .compress_cluster(&cluster)
+                .unwrap_or_else(|e| panic!("compress with {opts}: {e}"));
+
+            // Content size must be pledged and must equal the cluster size.
+            let content_size =
+                zstd::zstd_safe::get_frame_content_size(&compressed)
+                    .unwrap_or_else(|_| {
+                        panic!("{opts}: zstd frame header missing or corrupt")
+                    })
+                    .unwrap_or_else(|| {
+                        panic!("{opts}: zstd frame must pledge content size (include_contentsize)")
+                    });
+            assert_eq!(
+                content_size as usize,
+                cluster.len(),
+                "{opts}: pledged content size must equal cluster size"
+            );
+
+            // The first frame must span exactly all stored bytes — i.e., exactly
+            // one frame, no trailing bytes (which would indicate a multi-frame /
+            // worker-chunked stream that qemu cannot decode).
+            let first_frame_size =
+                zstd::zstd_safe::find_frame_compressed_size(&compressed)
+                    .unwrap_or_else(|e| {
+                        panic!("{opts}: cannot determine first frame size: {e:?}")
+                    });
+            assert_eq!(
+                first_frame_size,
+                compressed.len(),
+                "{opts}: compressed output must be exactly one zstd frame (no trailing bytes)"
+            );
+        }
     }
 }

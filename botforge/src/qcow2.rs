@@ -1666,6 +1666,44 @@ mod tests {
 
             let decoded = match compression_type {
                 CompressionType::Zstd => {
+                    // Assert qemu-compatible single-frame structure.
+                    // zstd::stream::read::Decoder transparently accepts multi-frame /
+                    // worker-chunked output, so the decode below would pass even for
+                    // broken frames.  These two assertions catch that blind spot:
+                    // (1) the frame header must pledge the content size, and
+                    // (2) the first frame must span exactly the full stored payload
+                    //     (no trailing bytes = no second frame).
+                    let content_size =
+                        zstd::zstd_safe::get_frame_content_size(&compressed)
+                            .unwrap_or_else(|_| {
+                                panic!("cluster {cluster_idx}: zstd frame header missing or corrupt")
+                            })
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "cluster {cluster_idx}: zstd frame does not pledge content \
+                                     size (qemu requires single-frame with include_contentsize)"
+                                )
+                            });
+                    assert_eq!(
+                        content_size as usize, cluster_size,
+                        "cluster {cluster_idx}: pledged content size must equal cluster_size"
+                    );
+                    let first_frame_bytes =
+                        zstd::zstd_safe::find_frame_compressed_size(&compressed)
+                            .unwrap_or_else(|e| {
+                                panic!(
+                                    "cluster {cluster_idx}: cannot determine first frame size: \
+                                     {e:?}"
+                                )
+                            });
+                    assert_eq!(
+                        first_frame_bytes,
+                        compressed.len(),
+                        "cluster {cluster_idx}: stored payload must be exactly one zstd frame \
+                         (trailing bytes indicate a multi-frame/worker-chunked stream that qemu \
+                         rejects)"
+                    );
+
                     let mut decoder =
                         zstd::stream::read::Decoder::with_buffer(compressed.as_slice())
                             .expect("init zstd decoder");
@@ -2065,6 +2103,50 @@ mod tests {
     #[test]
     fn native_compress_round_trip_realistic_zstd_small_target_cluster_size() {
         run_realistic_round_trip_test(CompressionType::Zstd, 65_536, Some(4096), "-19 -T0");
+    }
+
+    // -------------------------------------------------------------------------
+    // Regression: zstd -T0 must produce single-frame, content-sized clusters.
+    //
+    // Before the fix, ZstdCompressor::compress_cluster called multithread(workers)
+    // which could emit a worker-chunked multi-frame stream that qemu's
+    // qcow2_zstd_decompress (single ZSTD_decompressStream pass) rejects with
+    // -EIO.  The assert_compressed_entries_decode_with_declared_codec helper
+    // now catches this: it asserts each stored payload is exactly one zstd frame
+    // with a pledged content size.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn native_compress_zstd_t0_produces_single_frame_content_sized_clusters() {
+        let tmp = tempdir().expect("tempdir");
+        let source = tmp.path().join("source.qcow2");
+        let dest = tmp.path().join("dest.qcow2");
+
+        let cluster_size: u64 = 65_536;
+        let cluster_size_usize = usize::try_from(cluster_size).expect("fits usize");
+        let cluster_contents = make_realistic_cluster_contents(cluster_size_usize);
+        write_custom_test_image_with_cluster_size(&source, &cluster_contents, cluster_size)
+            .expect("write source");
+
+        compress_qcow2_image(
+            &source,
+            &dest,
+            CompressionType::Zstd,
+            &BTreeMap::new(),
+            "-19 -T0",
+        )
+        .expect("compress");
+
+        // assert_compressed_entries_decode_with_declared_codec now verifies:
+        //   (1) each zstd cluster has a pledged content size == cluster_size, and
+        //   (2) each stored payload is exactly one frame (no trailing bytes).
+        let expected: Vec<u8> = cluster_contents.into_iter().flatten().collect();
+        assert_compressed_entries_decode_with_declared_codec(
+            &dest,
+            &expected,
+            cluster_size,
+            CompressionType::Zstd,
+        );
     }
 
     // -------------------------------------------------------------------------
