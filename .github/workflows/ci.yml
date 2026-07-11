@@ -21,6 +21,7 @@ on:
     paths:
     - .github/workflows/ci.yml
     - .github/workflows/_crate.yml
+    - .github/workflows/_e2e-compress.yml
     - .dockerignore
     - Earthfile
     - VERSION
@@ -34,6 +35,7 @@ on:
     paths:
     - .github/workflows/ci.yml
     - .github/workflows/_crate.yml
+    - .github/workflows/_e2e-compress.yml
     - .dockerignore
     - Earthfile
     - VERSION
@@ -67,9 +69,19 @@ jobs:
     with:
       crate: ${{ matrix.crate }}
 
-  publish:
+  # KVM-backed end-to-end compression gate.  Builds a real VM image with the
+  # freshly-built botforge, runs a guestfish-equivalent full-cluster decode via
+  # qemu-img convert, and verifies the guest filesystem across a compression
+  # matrix (none, zstd-default, zstd-aggressive, zlib).  Must pass before the
+  # botforge publish job runs.  See .github/workflows/_e2e-compress.yml.
+  e2e-compress:
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     needs: crate
+    uses: ./.github/workflows/_e2e-compress.yml
+
+  publish:
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    needs: [crate, e2e-compress]
     runs-on: ubuntu-latest
     permissions:
       contents: write

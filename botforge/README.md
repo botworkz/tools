@@ -818,3 +818,34 @@ BOTFORGE_DEBUG=1         # broader debug flag; implies verbose ssh
 ```
 
 Accepted truthy values are `1`, `true`, and `yes` (case-insensitive).
+
+## CI gate — qcow2 compression e2e oracle
+
+Before botforge is published a **KVM-backed end-to-end compression gate** runs in
+`.github/workflows/_e2e-compress.yml`.  It is a required gate: publishing is
+blocked unless it passes.
+
+The gate builds a real VM image using the freshly-built botforge from the
+current branch, applies each compression variant via botforge's native qcow2
+writer, then runs the definitive oracle:
+
+1. **`qemu-img convert` full-cluster decode** — forces qemu to decode every
+   compressed cluster and re-encode to raw.  A corrupt or mis-compressed frame
+   (e.g. a zlib-wrapped raw deflate stream, or a zstd frame missing the required
+   content-size field) causes a hard failure here.  `qemu-img check` passes on
+   these corrupt images; this oracle does not.
+2. **Filesystem assertion** — mounts the decoded raw image and verifies that
+   `/etc/os-release` contains `ID=debian` and the root tree is intact.
+
+Compression matrix (runs in parallel):
+
+| Variant           | botforge build.yaml compress block                               |
+|-------------------|------------------------------------------------------------------|
+| `none`            | (absent — uncompressed control)                                  |
+| `zstd-default`    | `enabled: true, compressor: zstd`                                |
+| `zstd-aggressive` | `enabled: true, compressor: zstd, compressor_opts: "-19 -T0"`    |
+| `zlib`            | `enabled: true, compressor: zlib`                                |
+
+KVM is a **hard requirement** — the job fails immediately if `/dev/kvm` is
+unavailable; no TCG fallback.
+

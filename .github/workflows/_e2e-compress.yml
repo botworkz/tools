@@ -1,0 +1,302 @@
+# _e2e-compress.yml — KVM-backed end-to-end qcow2 compression gate.
+#
+# This is the definitive oracle that the in-process unit tests cannot provide.
+# It builds a real VM image with the freshly-built botforge from THIS branch,
+# applies each compression variant via botforge's native qcow2 writer, then
+# forces qemu to decode every compressed cluster (qemu-img convert to raw) and
+# verifies the guest filesystem is intact.  A corrupt/mis-compressed image (the
+# exact failure mode: "no operating system was found on this disk") fails loudly
+# here — qemu-img check passes on the corrupt image; this oracle does not.
+#
+# Matrix:
+#   none            — control: no compression, base build sanity check
+#   zstd-default    — zstd (default level, default opts)
+#   zstd-aggressive — zstd -19 -T0 (maximum compression, multi-threaded)
+#   zlib            — zlib (legacy compat)
+#
+# KVM is a hard requirement.  The /dev/kvm guard is strict: if the device is
+# absent the job fails immediately — no TCG fallback, no silent green skip.
+#
+# How botforge's image is injected:
+#   scripts/lib/tools.sh::run_botforge_compose() always calls botforge_image_ref(),
+#   which reads deps/container/botforge.Dockerfile, and exports BOTFORGE_IMAGE.
+#   We patch that Dockerfile in the botworkz/vm checkout so the harness picks up
+#   botwork/botforge:ci (this branch's build) transparently.
+#
+# How compression variants are driven:
+#   botforge build reads the compress: block from images/<name>/build.yaml.
+#   We append the block for each non-none variant before invoking pack.sh.
+
+name: E2E compression gate
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  compress-matrix:
+    name: compress/${{ matrix.variant.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        variant:
+        - name: none
+          compress_enabled: false
+          compressor: ''
+          compressor_opts: ''
+        - name: zstd-default
+          compress_enabled: true
+          compressor: zstd
+          compressor_opts: ''
+        - name: zstd-aggressive
+          compress_enabled: true
+          compressor: zstd
+          compressor_opts: '-19 -T0'
+        - name: zlib
+          compress_enabled: true
+          compressor: zlib
+          compressor_opts: ''
+
+    steps:
+    - uses: actions/checkout@v4
+
+    # ── Build botwork/botforge:ci from this branch's pre-built binary ───────────
+    # Re-use the binary already uploaded by the botforge crate job so we don't
+    # pay for a full cargo build in each matrix entry.
+
+    - uses: docker/setup-buildx-action@v3
+
+    - name: Download pre-built botforge binary
+      uses: actions/download-artifact@v4
+      with:
+        name: botforge-binary
+        path: .ci-prebuilt/botforge
+
+    - name: Make botforge binary executable
+      run: chmod +x .ci-prebuilt/botforge/botforge
+
+    - name: Build botwork/botforge:ci runtime image
+      run: |
+        set -euo pipefail
+        docker buildx build \
+          --platform linux/amd64 \
+          --load \
+          --build-arg BINARY_SOURCE=prebuilt \
+          -t botwork/botforge:ci \
+          -f botforge/Dockerfile \
+          .
+
+    # Verify the image is sane before running the heavy VM build
+    - name: Preflight botwork/botforge:ci
+      run: |
+        set -euo pipefail
+        docker run --rm botwork/botforge:ci --help
+        docker run --rm --entrypoint qemu-img botwork/botforge:ci --version
+        echo "botwork/botforge:ci preflight OK"
+
+    # ── Reclaim disk + enable KVM ────────────────────────────────────────────────
+    # Must happen after Docker image build (image lives on the overlay, not
+    # the reclaimed space).
+
+    - name: Reclaim runner disk space
+      uses: envoyproxy/toolshed/actions/diskspace@6a20085af231aba4c72d6866f94098343a8c5616
+
+    - name: Enable KVM via udev
+      run: |
+        echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+          | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+        sudo udevadm control --reload-rules
+        sudo udevadm trigger --name-match=kvm
+
+    - name: Assert /dev/kvm is present (hard requirement — no TCG fallback)
+      run: |
+        set -euo pipefail
+        if [[ ! -e /dev/kvm ]]; then
+          echo "ERROR: /dev/kvm is unavailable." >&2
+          echo "KVM is a hard requirement for this gate; no TCG fallback is accepted." >&2
+          exit 1
+        fi
+        echo "KVM OK: $(ls -la /dev/kvm)"
+
+    # ── Checkout botworkz/vm harness ─────────────────────────────────────────────
+    # Pinned to the commit used at gate-introduction time; bump this ref when
+    # botworkz/vm changes affect the pack/test-packed interface.
+
+    - name: Checkout botworkz/vm
+      uses: actions/checkout@v4
+      with:
+        repository: botworkz/vm
+        ref: 6d51782a98da560c324f22d5668e95595486abc5
+        path: vm
+
+    # Override the botforge image pin.  run_botforge_compose() in
+    # scripts/lib/tools.sh always calls botforge_image_ref() which reads
+    # deps/container/botforge.Dockerfile and exports BOTFORGE_IMAGE.
+    # Patching the Dockerfile is the correct and sufficient override mechanism.
+    - name: Override botforge image pin → botwork/botforge:ci
+      run: echo 'FROM botwork/botforge:ci' > vm/deps/container/botforge.Dockerfile
+
+    # ── Inject compression config for this matrix variant ───────────────────────
+    # botforge build reads the compress: block from images/botwork-base/build.yaml.
+    # The upstream build.yaml has no compress block; we append one for each
+    # non-none variant.  For the none control the file is left unmodified.
+    - name: Inject compression config into images/botwork-base/build.yaml
+      if: ${{ matrix.variant.compress_enabled }}
+      env:
+        COMPRESSOR: ${{ matrix.variant.compressor }}
+        COMPRESSOR_OPTS: ${{ matrix.variant.compressor_opts }}
+      run: |
+        set -euo pipefail
+        BUILD_YAML="vm/images/botwork-base/build.yaml"
+
+        # Remove any existing compress block (defensive — upstream has none)
+        awk '/^compress:/{exit} {print}' "${BUILD_YAML}" > /tmp/build.yaml.trimmed
+        mv /tmp/build.yaml.trimmed "${BUILD_YAML}"
+
+        # Append the new compress block
+        {
+          printf 'compress:\n'
+          printf '  enabled: true\n'
+          printf '  compressor: %s\n' "${COMPRESSOR}"
+          if [[ -n "${COMPRESSOR_OPTS}" ]]; then
+            printf '  compressor_opts: "%s"\n' "${COMPRESSOR_OPTS}"
+          fi
+        } >> "${BUILD_YAML}"
+
+        echo "--- images/botwork-base/build.yaml (tail) ---"
+        tail -10 "${BUILD_YAML}"
+
+    # ── Build the VM image ───────────────────────────────────────────────────────
+    # pack.sh resolves the parent chain from images/manifest.yaml, downloads the
+    # Debian cloud image (build/cache/), and drives `botforge build` for each
+    # layer.  With compress: in build.yaml, botforge's native qcow2 writer applies
+    # the selected codec; without it the output is uncompressed.
+
+    - name: Build botwork-base VM image (variant=${{ matrix.variant.name }})
+      working-directory: vm
+      run: ./scripts/pack.sh botwork-base
+
+    # ── Smoke boot test ──────────────────────────────────────────────────────────
+    # Boots the packed qcow2 under qemu-system-x86_64 (KVM-only) via botforge test.
+
+    - name: Smoke boot test (test-packed.sh botwork-base)
+      working-directory: vm
+      run: ./scripts/test-packed.sh botwork-base
+
+    # ── Locate produced artifact ─────────────────────────────────────────────────
+    # discover_image priority: build/botwork-base-compressed.qcow2 (pack.sh --compress
+    # post-process) > build/images/botwork-base.qcow2 (botforge native compress or
+    # uncompressed) > build/botwork-base.qcow2.
+
+    - name: Locate produced qcow2 artifact
+      id: artifact
+      working-directory: vm
+      run: |
+        set -euo pipefail
+        for candidate in \
+            "build/botwork-base-compressed.qcow2" \
+            "build/images/botwork-base.qcow2" \
+            "build/botwork-base.qcow2"; do
+          if [[ -f "${candidate}" ]]; then
+            echo "Artifact located: vm/${candidate}"
+            echo "path=${candidate}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+        done
+        echo "ERROR: no qcow2 artifact found under vm/build/ — pack.sh must have failed silently" >&2
+        exit 1
+
+    # ── Definitive cluster-decode oracle ─────────────────────────────────────────
+    # qemu-img check PASSES on a corrupt compressed image (the exact failure
+    # mode reported: "no operating system was found").  qemu-img convert forces
+    # qemu to decode EVERY compressed cluster and re-encode to raw.  Any cluster
+    # with an invalid compressed frame (e.g. zlib wrapper instead of raw deflate,
+    # or a zstd frame without a known content size) causes a hard error here.
+    #
+    # Runs via the botwork/botforge:ci container, which bakes qemu-utils.
+
+    - name: Cluster-decode oracle — qemu-img convert compressed qcow2 → raw
+      working-directory: vm
+      run: |
+        set -euo pipefail
+        ARTIFACT="${{ steps.artifact.outputs.path }}"
+        [[ -f "${ARTIFACT}" ]] \
+          || { echo "ERROR: artifact ${ARTIFACT} not found" >&2; exit 1; }
+
+        echo "Running qemu-img convert (full decode) on: ${ARTIFACT}"
+        docker run --rm \
+          --device /dev/kvm:/dev/kvm \
+          -v "${GITHUB_WORKSPACE}/vm:/work" \
+          -w /work \
+          --entrypoint qemu-img \
+          botwork/botforge:ci \
+          convert -f qcow2 -O raw "${ARTIFACT}" /work/e2e-raw.img
+
+        echo "qemu-img convert succeeded — every compressed cluster decoded without error"
+        ls -lh e2e-raw.img
+
+    # ── Guest filesystem assertion ───────────────────────────────────────────────
+    # Mount the raw image via losetup; verify:
+    #   - A Linux partition exists
+    #   - /etc/os-release is readable and contains ID=debian
+    #   - The root tree has the expected top-level directories
+    # A corrupt/mis-compressed image that qemu decoded to garbage would fail here.
+
+    - name: Guest filesystem assertion (os-release + root tree)
+      working-directory: vm
+      run: |
+        set -euo pipefail
+        [[ -f e2e-raw.img ]] \
+          || { echo "ERROR: e2e-raw.img missing; cluster-decode oracle step must succeed first" >&2; exit 1; }
+
+        # Partition-scan loop device
+        LOOP=$(sudo losetup -Pf --show e2e-raw.img)
+        echo "Loop device: ${LOOP}"
+        lsblk "${LOOP}" || true
+
+        # Locate the Linux root filesystem partition
+        ROOT_PART=$(lsblk -nrpo NAME,FSTYPE "${LOOP}" \
+          | awk '$2 ~ /^(ext4|xfs|btrfs)$/ {print $1; exit}')
+        if [[ -z "${ROOT_PART}" ]]; then
+          echo "ERROR: no Linux root partition (ext4/xfs/btrfs) found on ${LOOP}" >&2
+          sudo losetup -d "${LOOP}"
+          exit 1
+        fi
+        echo "Root partition: ${ROOT_PART}"
+
+        sudo mkdir -p /mnt/e2e-check
+        sudo mount -ro "${ROOT_PART}" /mnt/e2e-check
+
+        # Assert /etc/os-release is Debian
+        if ! grep -q 'ID=debian' /mnt/e2e-check/etc/os-release 2>/dev/null; then
+          echo "ERROR: /etc/os-release does not contain ID=debian" >&2
+          echo "Contents:" >&2
+          cat /mnt/e2e-check/etc/os-release >&2 || echo "(unreadable)" >&2
+          sudo umount /mnt/e2e-check
+          sudo losetup -d "${LOOP}"
+          exit 1
+        fi
+        echo "OS: $(grep '^PRETTY_NAME' /mnt/e2e-check/etc/os-release)"
+
+        # Assert a plausible root tree (catch a disk full of zeroes / garbage)
+        ROOT_LISTING=$(ls /mnt/e2e-check)
+        for dir in etc usr; do
+          if ! echo "${ROOT_LISTING}" | grep -q "^${dir}$"; then
+            echo "ERROR: /${dir} missing from guest root tree" >&2
+            echo "Root listing:" >&2
+            echo "${ROOT_LISTING}" >&2
+            sudo umount /mnt/e2e-check
+            sudo losetup -d "${LOOP}"
+            exit 1
+          fi
+        done
+        echo "Root tree looks plausible (contains: etc usr and more)"
+
+        echo "PASS: variant=${{ matrix.variant.name }} — Debian OS intact, root tree verified"
+
+        sudo umount /mnt/e2e-check
+        sudo losetup -d "${LOOP}"
+        rm -f e2e-raw.img
