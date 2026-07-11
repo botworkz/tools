@@ -1,5 +1,6 @@
 mod cli;
 mod commands;
+mod compressor;
 mod iso;
 mod plan;
 mod qcow2;

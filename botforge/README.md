@@ -510,8 +510,9 @@ bootcmd:                         # optional; merged into the first-boot cloud-in
   - echo "early boot hook"
 compress:                        # optional; absent = plain rename (no compression)
   enabled: true
-  compressor_args:               # optional map of -o key=value options
-    cluster_size: "1M"           # e.g. cluster_size, compression_level
+  compressor_args:               # optional qcow2 structural options
+    cluster_size: "1M"
+  compressor_opts: "-19 -T0"     # optional raw codec opts parsed by the compressor
 uploads:                         # optional; guest-only pre-step staging
   - src: images/botspace/envoy/**/*.yaml
     dest: /tmp/bake-staging/envoy/
@@ -657,14 +658,15 @@ output — there is zero behaviour change for existing specs that omit the field
 before committing it.  When absent (the default), the disk is committed via a
 plain atomic rename — behaviour byte-identical to all prior botforge versions.
 
-`compress:` is a **map** with one required field (`enabled:`) and three optional
-fields (`compressor:`, `compressor_args:`, `reclaim:`):
+`compress:` is a **map** with one required field (`enabled:`) and four optional
+fields (`compressor:`, `compressor_args:`, `compressor_opts:`, `reclaim:`):
 
 | Field | Required | Type | Description |
 |---|---|---|---|
 | `enabled` | **yes** | bool | `true` ⇒ compress; `false` ⇒ plain rename (same as omitting the block) |
-| `compressor` | no | enum | Compression codec passed to `qemu-img convert`: `zstd` (default when `enabled: true`) or `zlib`. |
-| `compressor_args` | no | map[string→string] | Extra `-o` key=value options merged into the `qemu-img convert` `-o` string alongside `compression_type`. Keys are sorted for determinism. Example: `{cluster_size: "1M", compression_level: "22"}`. |
+| `compressor` | no | enum | Native qcow2 compression codec: `zstd` (default when `enabled: true`) or `zlib`. |
+| `compressor_args` | no | map[string→string] | Qcow2 structural options interpreted by botforge's native writer. Keys are sorted for determinism. Today this is primarily `cluster_size` (for example `{cluster_size: "1M"}`). |
+| `compressor_opts` | no | string | Raw codec options string passed to the selected compressor implementation. For `zstd`, botforge currently supports compression level (`-19`, `-22`) and worker count (`-T0`, `-T4`), and hard-errors on unknown flags. |
 | `reclaim` | no | enum | Reclaim freed blocks before commit: `none` (default), `fstrim`, or `discard`. |
 
 A `compress:` block **without** `enabled:` is a hard parse error.  Unknown
@@ -673,7 +675,7 @@ fields inside the block (e.g. `clustersize`) are also hard errors
 
 `reclaim:` always runs **before** commit/compression, and it still runs when
 `enabled: false` (plain rename). This lets you reclaim space even when you
-don't want `qemu-img convert -c`.
+don't want compression.
 
 - `reclaim: none` (default): no reclaim step (current behaviour).
 - `reclaim: fstrim`: in-guest `sudo fstrim -av` before shutdown. botforge
@@ -688,23 +690,22 @@ also runs a pure-Rust qcow2 zero-cluster sparsify pass before commit/compression
 It deallocates allocated-but-all-zero clusters (lossless) without introducing any
 external runtime dependency.
 
-When `enabled: true`, `botforge build` then runs:
-```
-qemu-img convert -O qcow2 -c -o compression_type=<zstd|zlib>[,<key>=<val>...] <output>.partial <output>
-```
-then atomically renames the result into place and removes the `.partial` file.
-A non-zero exit from `qemu-img` is a hard error.  `qemu-img` is already
-required by `botforge build`, so no new dependency is introduced.
+When `enabled: true`, `botforge build` rewrites the qcow2 **in-process** and
+stores compressed clusters itself.  There is no `qemu-img convert -c` shell-out
+on the compression path.  The produced file remains a standard, bootable qcow2:
+`compressor: zstd` writes a native zstd-compressed qcow2 readable by qemu >= 5.1,
+and `compressor: zlib` continues to write the historical zlib-compressed format.
 
-`compressor_args:` is a string map; each entry is appended as `key=value` to
-the `-o` option string after `compression_type`.  Keys are sorted (BTreeMap)
-so the command line is deterministic.  Use it for extra qemu-img options such
-as `cluster_size` or `compression_level` that your installed qemu understands.
+`compressor_args:` remains the place for qcow2 **structural** settings such as
+`cluster_size`. `compressor_opts:` is the place for **codec** tuning. For
+example, `compressor_opts: "-19 -T0"` tells the native zstd compressor to use
+level 19 and all available worker threads. Unknown zstd flags are a hard error
+that names the offending token.
 
 When compression is enabled and `compressor:` is omitted, botforge now
-defaults to `zstd`. `zstd`-compressed qcow2 images require qemu >= 5.1 both on
-the build host (`qemu-img convert`) and on any consumer that opens or boots the
-produced image. If you need compatibility with an older qemu stack, set
+defaults to `zstd`. `zstd`-compressed qcow2 images require qemu >= 5.1 on any
+consumer that opens or boots the produced image. If you need compatibility with
+an older qemu stack, set
 `compressor: zlib` explicitly.
 At the end of capture, botforge logs final qcow2 stats
 (`virtual_size`, `disk_size`, `cluster_size`, `allocated_data_clusters`,
@@ -721,26 +722,27 @@ compress:
   enabled: true
   # compressor defaults to zstd
 
-# on, explicit cluster size and compression level via compressor_args map
+# on, explicit cluster size and native zstd tuning
 compress:
   enabled: true
   compressor: zstd
   compressor_args:
-    compression_level: "22"
     cluster_size: "1M"
+  compressor_opts: "-19 -T0"
 
 # on, opt back into qemu's historical zlib compression codec
 compress:
   enabled: true
   compressor: zlib
 
-# on, reclaim guest-freed blocks before convert -c
+# on, reclaim guest-freed blocks before native compression
 # (useful when your build deletes large temporary payloads, e.g. docker image tars)
 compress:
   enabled: true
   compressor: zstd
   compressor_args:
     cluster_size: "1M"
+  compressor_opts: "-19 -T0"
   reclaim: fstrim
 
 # explicit off (equivalent to omitting the block)
