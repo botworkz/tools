@@ -1718,19 +1718,36 @@ mod tests {
                         );
                     }
 
+                    let frame_end = zstd::zstd_safe::find_frame_compressed_size(&compressed)
+                        .unwrap_or(compressed.len())
+                        .min(compressed.len());
                     let mut decoder =
-                        zstd::stream::read::Decoder::with_buffer(compressed.as_slice())
+                        zstd::stream::read::Decoder::with_buffer(&compressed[..frame_end])
                             .expect("init zstd decoder");
-                    let mut out = vec![0u8; cluster_size];
                     use std::io::Read;
-                    decoder.read_exact(&mut out).expect("decode zstd");
+                    let mut out = Vec::with_capacity(cluster_size);
+                    decoder.read_to_end(&mut out).expect("decode zstd");
+                    assert!(
+                        out.len() <= cluster_size,
+                        "cluster {cluster_idx}: zstd decode produced {} bytes, expected <= {}",
+                        out.len(),
+                        cluster_size
+                    );
+                    out.resize(cluster_size, 0);
                     out
                 }
                 CompressionType::Zlib => {
-                    let mut decoder = flate2::read::ZlibDecoder::new(compressed.as_slice());
-                    let mut out = vec![0u8; cluster_size];
+                    let mut decoder = flate2::read::DeflateDecoder::new(compressed.as_slice());
                     use std::io::Read;
-                    decoder.read_exact(&mut out).expect("decode zlib");
+                    let mut out = Vec::with_capacity(cluster_size);
+                    decoder.read_to_end(&mut out).expect("decode zlib");
+                    assert!(
+                        out.len() <= cluster_size,
+                        "cluster {cluster_idx}: zlib decode produced {} bytes, expected <= {}",
+                        out.len(),
+                        cluster_size
+                    );
+                    out.resize(cluster_size, 0);
                     out
                 }
             };
@@ -2185,6 +2202,99 @@ mod tests {
     #[test]
     fn native_compress_partial_last_cluster_zstd() {
         run_partial_last_cluster_test(CompressionType::Zstd);
+    }
+
+    fn write_short_zlib_compressed_source_cluster(
+        path: &Path,
+        cluster_size: u64,
+        payload_len: usize,
+    ) -> Result<Vec<u8>> {
+        assert!(
+            payload_len < usize::try_from(cluster_size).expect("cluster_size fits usize"),
+            "payload_len must be strictly smaller than cluster_size"
+        );
+        let payload = vec![0x42u8; payload_len];
+        let mut encoder =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        use std::io::Write;
+        encoder.write_all(&payload)?;
+        let compressed = encoder.finish()?;
+
+        let mut expected =
+            vec![0u8; usize::try_from(cluster_size).context("cluster_size too large")?];
+        expected[..payload_len].copy_from_slice(&payload);
+
+        let total_clusters = 6u64;
+        let mut file = File::create(path)?;
+        file.set_len(cluster_size * total_clusters)?;
+
+        write_exact_at(&mut file, 0, &QCOW_MAGIC.to_be_bytes())?;
+        write_exact_at(&mut file, 4, &3u32.to_be_bytes())?;
+        write_exact_at(&mut file, 20, &cluster_size.trailing_zeros().to_be_bytes())?;
+        write_exact_at(
+            &mut file,
+            24,
+            &u64::try_from(payload_len)
+                .expect("payload len fits")
+                .to_be_bytes(),
+        )?;
+        write_exact_at(&mut file, 36, &1u32.to_be_bytes())?;
+        write_exact_at(&mut file, 40, &cluster_size.to_be_bytes())?;
+        write_exact_at(&mut file, 48, &(cluster_size * 3).to_be_bytes())?;
+        write_exact_at(&mut file, 56, &1u32.to_be_bytes())?;
+        write_exact_at(&mut file, 96, &4u32.to_be_bytes())?;
+        write_exact_at(&mut file, 100, &104u32.to_be_bytes())?;
+        write_exact_at(&mut file, 104, &[QCOW2_COMPRESSION_TYPE_ZLIB])?;
+
+        write_u64_at(&mut file, cluster_size, cluster_size * 2)?;
+        let data_offset = cluster_size * 5;
+        let l2_entry =
+            encode_compressed_l2_entry(data_offset, compressed.len() as u64, cluster_size)?;
+        write_u64_at(&mut file, cluster_size * 2, l2_entry)?;
+        write_u64_at(&mut file, cluster_size * 3, cluster_size * 4)?;
+        for idx in 0..total_clusters {
+            write_exact_at(&mut file, cluster_size * 4 + idx * 2, &1u16.to_be_bytes())?;
+        }
+        write_exact_at(&mut file, data_offset, &compressed)?;
+
+        Ok(expected)
+    }
+
+    fn run_short_zlib_source_recompress_test(target_compression: CompressionType) {
+        let tmp = tempdir().expect("tempdir");
+        let source = tmp.path().join("source-short-zlib.qcow2");
+        let dest = tmp.path().join("dest.qcow2");
+        let cluster_size = 4096u64;
+        let expected = write_short_zlib_compressed_source_cluster(&source, cluster_size, 1024)
+            .expect("write short-zlib source");
+        let opts = if target_compression == CompressionType::Zstd {
+            "-19 -T0"
+        } else {
+            ""
+        };
+
+        compress_qcow2_image(&source, &dest, target_compression, &BTreeMap::new(), opts)
+            .expect("compress short-zlib source");
+
+        let mut image = SourceImage::open(&dest).expect("open compressed image");
+        let mut actual = vec![0u8; cluster_size as usize];
+        image
+            .read_virtual_range(0, &mut actual)
+            .expect("read round-tripped cluster");
+        assert_eq!(
+            actual, expected,
+            "cluster data must round-trip with zero padding"
+        );
+    }
+
+    #[test]
+    fn native_compress_recompresses_short_zlib_source_cluster_to_zlib() {
+        run_short_zlib_source_recompress_test(CompressionType::Zlib);
+    }
+
+    #[test]
+    fn native_compress_recompresses_short_zlib_source_cluster_to_zstd() {
+        run_short_zlib_source_recompress_test(CompressionType::Zstd);
     }
 
     #[test]
