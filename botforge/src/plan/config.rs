@@ -137,14 +137,6 @@ fn default_disk_size() -> String {
     "10G".to_string()
 }
 
-fn default_memsize() -> u32 {
-    4096
-}
-
-fn default_smp() -> u32 {
-    4
-}
-
 fn default_test_step_timeout() -> u64 {
     300
 }
@@ -310,8 +302,6 @@ pub(crate) struct BuildConfig {
     /// Parsed `image:` reference naming the source qcow2 to boot from.
     pub(crate) image: ImageRef,
     pub(crate) disk_size: String,
-    pub(crate) memsize: u32,
-    pub(crate) smp: u32,
     pub(crate) steps: Vec<TestStep>,
     pub(crate) uploads: Vec<TopLevelUpload>,
     pub(crate) step_timeout: u64,
@@ -338,10 +328,6 @@ struct RawBuildDocument {
     image: Option<String>,
     #[serde(default = "default_disk_size")]
     disk_size: String,
-    #[serde(default = "default_memsize")]
-    memsize: u32,
-    #[serde(default = "default_smp")]
-    smp: u32,
     #[serde(default)]
     steps: Vec<RawTestStep>,
     #[serde(default)]
@@ -502,8 +488,6 @@ pub(crate) fn load_build_config(repo_root: &Path, path: &Path) -> Result<BuildCo
     Ok(BuildConfig {
         image,
         disk_size: raw.disk_size,
-        memsize: raw.memsize,
-        smp: raw.smp,
         steps: expand_test_steps(repo_root, path, raw.steps, &mut include_stack)?,
         uploads: {
             validate_top_level_uploads("build", &raw.uploads)
@@ -682,14 +666,15 @@ fn check_no_build_sections_in_test_doc(path: &Path, value: &Value) -> Result<()>
 }
 
 /// Reject test-entrypoint-only sections (`ports:`, `isos:`, `diagnostics_units:`)
-/// inside a `type: build` document.  Serde would silently ignore them; this turns a
-/// misplaced key into an explicit load-time error.
+/// and runner-resource keys (`memsize:`, `smp:`) inside a `type: build` document.
+/// Serde would silently ignore them; this turns a misplaced key into an explicit
+/// load-time error.
 fn check_no_test_entrypoint_sections_in_build_doc(path: &Path, value: &Value) -> Result<()> {
     let mapping = match value {
         Value::Mapping(m) => m,
         _ => return Ok(()),
     };
-    for section in &["ports", "isos", "diagnostics_units"] {
+    for section in &["ports", "isos", "diagnostics_units", "memsize", "smp"] {
         if mapping.contains_key(Value::String(section.to_string())) {
             anyhow::bail!(
                 "{}: is not valid in a 'type: build' document ({})",
@@ -2625,8 +2610,6 @@ steps:
             ImageRef::ShassetDefault("debian-base".to_string())
         );
         assert_eq!(config.disk_size, "10G");
-        assert_eq!(config.memsize, 4096);
-        assert_eq!(config.smp, 4);
         assert_eq!(config.step_timeout, 1800);
         assert_eq!(config.timeout, 7200);
         assert_eq!(config.cloud_init_timeout, 600);
@@ -2644,8 +2627,6 @@ steps:
 type: build
 image: "@my-base"
 disk_size: "20G"
-memsize: 8192
-smp: 8
 step_timeout: 2400
 timeout: 9600
 steps: []
@@ -2657,12 +2638,42 @@ steps: []
             ImageRef::ShassetDefault("my-base".to_string())
         );
         assert_eq!(config.disk_size, "20G");
-        assert_eq!(config.memsize, 8192);
-        assert_eq!(config.smp, 8);
         assert_eq!(config.step_timeout, 2400);
         assert_eq!(config.timeout, 9600);
         assert!(config.steps.is_empty());
         assert!(config.bootcmd.is_empty(), "bootcmd should default to empty");
+    }
+
+    #[test]
+    fn test_load_build_config_rejects_memsize_section() {
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            "type: build\nimage: \"@base\"\nmemsize: 8192\nsteps: []\n",
+        );
+        let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("memsize") && msg.contains("type: build"),
+            "error should mention memsize and document type: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_load_build_config_rejects_smp_section() {
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            "type: build\nimage: \"@base\"\nsmp: 8\nsteps: []\n",
+        );
+        let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("smp") && msg.contains("type: build"),
+            "error should mention smp and document type: {msg}"
+        );
     }
 
     #[test]

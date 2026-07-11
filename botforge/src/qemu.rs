@@ -91,14 +91,16 @@ pub(crate) fn qemu_run_args(
     extra_isos: &[PathBuf],
     ssh_port: u16,
     extra_ports: &[PortSpec],
+    memsize: u32,
+    smp: u32,
 ) -> Vec<String> {
     let mut args = vec![
         "-accel".into(),
         "kvm".into(),
         "-m".into(),
-        "2048".into(),
+        memsize.to_string(),
         "-smp".into(),
-        "2".into(),
+        smp.to_string(),
         "-cpu".into(),
         "host".into(),
         "-drive".into(),
@@ -225,6 +227,8 @@ mod tests {
             &[PathBuf::from("/payload.iso")],
             2222,
             &[],
+            4096,
+            4,
         );
         assert!(
             !args.iter().any(|a| a.contains("/base.qcow2")),
@@ -236,9 +240,9 @@ mod tests {
                 "-accel",
                 "kvm",
                 "-m",
-                "2048",
+                "4096",
                 "-smp",
-                "2",
+                "4",
                 "-cpu",
                 "host",
                 "-drive",
@@ -264,6 +268,8 @@ mod tests {
             &[],
             2222,
             &[],
+            4096,
+            4,
         );
         let netdev_index = args.iter().position(|arg| arg == "-netdev").unwrap() + 1;
         assert!(
@@ -280,6 +286,8 @@ mod tests {
             &[PathBuf::from("/payload.iso")],
             2222,
             &[loopback(80)],
+            4096,
+            4,
         );
         let netdev_index = args.iter().position(|arg| arg == "-netdev").unwrap() + 1;
         assert_eq!(
@@ -296,6 +304,8 @@ mod tests {
             &[],
             2222,
             &[allif(9901)],
+            4096,
+            4,
         );
         let netdev_index = args.iter().position(|arg| arg == "-netdev").unwrap() + 1;
         assert_eq!(
@@ -312,6 +322,8 @@ mod tests {
             &[],
             2222,
             &[loopback(80), allif(9901)],
+            4096,
+            4,
         );
         let netdev_index = args.iter().position(|arg| arg == "-netdev").unwrap() + 1;
         assert_eq!(
