@@ -1,0 +1,146 @@
+name: Botforge acceptance
+
+on:
+  workflow_call:
+    inputs:
+      compress_enabled:
+        type: boolean
+        required: true
+      compressor:
+        type: string
+        required: true
+      compressor_opts:
+        type: string
+        default:
+      name:
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  botforge:
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@v4
+    - uses: docker/setup-buildx-action@v3
+    - name: Reclaim runner disk space
+      uses: envoyproxy/toolshed/actions/diskspace@6a20085af231aba4c72d6866f94098343a8c5616
+    - name: Enable KVM via udev
+      run: |
+        echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+          | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+        sudo udevadm control --reload-rules
+        sudo udevadm trigger --name-match=kvm
+    - name: Assert /dev/kvm is present (hard requirement — no TCG fallback)
+      run: |
+        set -euo pipefail
+        if [[ ! -e /dev/kvm ]]; then
+          echo "ERROR: /dev/kvm is unavailable." >&2
+          echo "KVM is a hard requirement for this gate; no TCG fallback is accepted." >&2
+          exit 1
+        fi
+        echo "KVM OK: $(ls -la /dev/kvm)"
+
+    - name: Download pre-built botforge binary
+      uses: actions/download-artifact@v4
+      with:
+        name: botforge-binary
+        path: .ci-prebuilt/botforge
+    - name: Make botforge binary executable
+      run: chmod +x .ci-prebuilt/botforge/botforge
+    - name: Build botwork/botforge:ci runtime image
+      run: |
+        set -euo pipefail
+        docker buildx build \
+          --platform linux/amd64 \
+          --load \
+          --build-arg BINARY_SOURCE=prebuilt \
+          -t botworkz/botforge:ci \
+          -f botforge/Dockerfile \
+          .
+
+
+    - run: |
+        mkdir testrepo
+    - name: Create shasset
+      uses: envoyproxy/toolshed/actions/jq@6a20085af231aba4c72d6866f94098343a8c5616
+      with:
+        input-format: yaml-path
+        output-path: testrepo/shasset.yaml
+        input: botforge/test/shasset.yaml
+    - name: Create build config
+      uses: envoyproxy/toolshed/actions/jq@6a20085af231aba4c72d6866f94098343a8c5616
+      id: build-config
+      with:
+        input-format: yaml-path
+        options: -c
+        input: botforge/test/build.yaml
+    - name: Create build config
+      uses: envoyproxy/toolshed/actions/jq@6a20085af231aba4c72d6866f94098343a8c5616
+      with:
+        input-format: yaml
+        options: -c
+        output-path: testrepo/build.yaml
+        input: |
+          enabled: ${{ inputs.compress_enabled }}
+          compressor: ${{ inputs.compressor }}
+          compressor_opts: ${{ inputs.compressor_opts }}
+          reclaim: fstrim
+          config: ${{ steps.build-config.outputs.value }}
+        filter: |
+          . as $in
+          | $in.config
+          | .compress = (
+              (.compress // {})
+              + {
+                  enabled: $in.enabled,
+                  compressor: $in.compressor,
+                  compressor_opts: $in.compressor_opts,
+                  reclaim: $in.reclaim
+                }
+            )
+    - name: Slurp test config
+      uses: envoyproxy/toolshed/actions/jq@6a20085af231aba4c72d6866f94098343a8c5616
+      id: test-config
+      with:
+        input-format: yaml-path
+        output-path: testrepo/test.yaml
+        input: botforge/test/test.yaml
+
+
+    - name: Print build config
+      uses: envoyproxy/toolshed/actions/jq@6a20085af231aba4c72d6866f94098343a8c5616
+      with:
+        input-format: yaml-path
+        options: -C
+        input: testrepo/build.yaml
+        print-output: true
+    - name: Print test config
+      uses: envoyproxy/toolshed/actions/jq@6a20085af231aba4c72d6866f94098343a8c5616
+      with:
+        input-format: yaml-path
+        options: -C
+        input: testrepo/test.yaml
+        print-output: true
+
+    - run: |
+        export BOTFORGE_IMAGE=botworkz/botforge:ci
+        export HOST_UID=$(id -u)
+        export HOST_GID=$(id -g)
+        export HOST_KVM_GID=$(getent group kvm | cut -d: -f3)
+        export REPO_ROOT=$(realpath testrepo)
+        docker compose -f botforge/test/compose.yml run build  \
+          build \
+            --spec build.yaml \
+            --output build/artifact/foo.qcow2
+    - run: |
+        export BOTFORGE_IMAGE=botworkz/botforge:ci
+        export HOST_UID=$(id -u)
+        export HOST_GID=$(id -g)
+        export HOST_KVM_GID=$(getent group kvm | cut -d: -f3)
+        export REPO_ROOT=$(realpath testrepo)
+        docker compose -f botforge/test/compose.yml run build \
+          test \
+            --test-config test.yaml
