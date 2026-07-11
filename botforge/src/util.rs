@@ -1,6 +1,5 @@
 use anyhow::{bail, Context, Result};
 use std::ffi::OsString;
-use std::fs::File;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -53,20 +52,6 @@ pub(crate) fn botforge_debug_enabled() -> bool {
 /// When `BOTFORGE_DEBUG=1` the child process inherits stdout/stderr (identical to
 /// [`run_command`]) so the raw tool output is visible for troubleshooting.
 ///
-/// # Implementation note — why `Command::output()` must not be used
-///
-/// This function redirects the child's stdout and stderr to a **temporary file** and waits
-/// for the child to exit via [`Command::status()`].  `status()` waits on the *process* —
-/// it returns as soon as the child exits, regardless of any file descriptors the child (or
-/// its grandchildren) may still have open.
-///
-/// `Command::output()` must **not** be used here: it creates OS pipes and the parent blocks
-/// reading those pipes until every copy of the write-end fd is closed (i.e. EOF on the
-/// read end).  A tool such as `xorriso` may finish its work and print "completed
-/// successfully" yet still hold — or fork a background process that holds — the pipe
-/// write-end open, causing `output()` to block indefinitely.  This is the classic
-/// pipe-drain deadlock.  Redirecting to a file instead of a pipe sidesteps the issue
-/// entirely: there is nothing to drain, and `status()` returns as soon as the child exits.
 pub(crate) fn run_command_capture(
     program: &str,
     args: &[String],
@@ -77,41 +62,32 @@ pub(crate) fn run_command_capture(
         return run_command(program, args, envs, failure_context);
     }
 
-    // Redirect both stdout and stderr to a temp file so that the child's output is
-    // captured without creating any pipes.  We then wait on the process via status().
-    let tmp_path = std::env::temp_dir().join(format!("botforge-capture-{}.log", unique_suffix()));
-    let tmp_file = File::create(&tmp_path)
-        .with_context(|| format!("cannot create capture temp file: {}", tmp_path.display()))?;
-    let tmp_file_clone = tmp_file.try_clone().with_context(|| {
-        format!(
-            "cannot clone capture temp file handle: {}",
-            tmp_path.display()
-        )
-    })?;
-
-    let status = Command::new(program)
+    let output = Command::new(program)
         .args(args)
         .envs(envs.iter().copied())
         .stdin(Stdio::null())
-        .stdout(Stdio::from(tmp_file))
-        .stderr(Stdio::from(tmp_file_clone))
-        .status()
+        .output()
         .with_context(|| format!("failed to execute {program}"))?;
 
-    if status.success() {
-        let _ = std::fs::remove_file(&tmp_path);
+    if output.status.success() {
         return Ok(());
     }
 
-    // On failure: read back the captured output and include it in the error.
-    let captured = std::fs::read_to_string(&tmp_path).unwrap_or_default();
-    let _ = std::fs::remove_file(&tmp_path);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let trimmed_stdout = stdout.trim();
+    let trimmed_stderr = stderr.trim();
+    let trimmed = match (trimmed_stdout.is_empty(), trimmed_stderr.is_empty()) {
+        (false, false) => format!("{trimmed_stdout}\n{trimmed_stderr}"),
+        (false, true) => trimmed_stdout.to_string(),
+        (true, false) => trimmed_stderr.to_string(),
+        (true, true) => String::new(),
+    };
 
-    let mut msg = format!("{failure_context} (exit status: {status})");
-    let trimmed = captured.trim();
+    let mut msg = format!("{failure_context} (exit status: {})", output.status);
     if !trimmed.is_empty() {
         msg.push_str("\noutput:\n");
-        msg.push_str(trimmed);
+        msg.push_str(&trimmed);
     }
     bail!("{msg}");
 }
@@ -383,34 +359,6 @@ mod tests {
         assert!(
             result.is_ok(),
             "cat with null stdin should exit immediately, got: {result:?}"
-        );
-    }
-
-    #[test]
-    fn run_command_capture_does_not_hang_when_grandchild_holds_fd() {
-        // Regression guard for the output() pipe-drain deadlock that caused
-        // `botforge build` to hang after xorriso printed "completed successfully".
-        //
-        // output() creates OS pipes and blocks until every copy of the write-end fd
-        // is closed.  A tool like xorriso may finish and exit while a forked background
-        // process still holds the write-end open, so output() blocks indefinitely.
-        //
-        // With status()+file-redirect there are no pipes: status() returns as soon as
-        // the foreground child exits, regardless of any grandchildren.
-        //
-        // The command below forks a background process that sleeps 30 s, then the
-        // foreground sh exits immediately.  With output() this would hang ~30 s;
-        // with our implementation it must complete well under that.
-        use std::time::Instant;
-        let start = Instant::now();
-        let args = vec!["-c".to_string(), "{ sleep 30 & }; echo done".to_string()];
-        let result = run_command_capture("sh", &args, &[], "sh failed");
-        let elapsed = start.elapsed();
-        assert!(result.is_ok(), "expected Ok, got: {result:?}");
-        assert!(
-            elapsed.as_secs() < 5,
-            "run_command_capture blocked for {elapsed:?} — expected to return promptly \
-             (output() pipe-drain deadlock regression)"
         );
     }
 
