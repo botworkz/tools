@@ -26,6 +26,7 @@ pub(crate) struct ZeroClusterSparsifyStats {
     pub(crate) scanned_clusters: u64,
     pub(crate) deallocated_clusters: u64,
     pub(crate) skipped_compressed_clusters: u64,
+    pub(crate) skipped_zero_flag_clusters: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,7 +45,6 @@ struct Qcow2Header {
     l1_size: u32,
     l1_table_offset: u64,
     refcount_table_offset: u64,
-    refcount_table_clusters: u32,
     incompatible_features: u64,
     refcount_order: u32,
     header_length: u32,
@@ -288,15 +288,6 @@ pub(crate) fn sparsify_zero_clusters(path: &Path) -> Result<ZeroClusterSparsifyS
         header.l1_table_offset,
         usize::try_from(header.l1_size).context("l1_size does not fit usize")?,
     )?;
-    let refcount_table_entries = read_u64_table(
-        &mut file,
-        header.refcount_table_offset,
-        usize::try_from(header.refcount_table_clusters)
-            .context("refcount_table_clusters does not fit usize")?
-            .checked_mul(usize::try_from(l2_entries_per_table).context("cluster size too large")?)
-            .context("refcount table entry count overflow")?,
-    )?;
-
     let mut cluster_buf =
         vec![0u8; usize::try_from(cluster_size).context("cluster size too large")?];
     let mut stats = ZeroClusterSparsifyStats::default();
@@ -319,6 +310,14 @@ pub(crate) fn sparsify_zero_clusters(path: &Path) -> Result<ZeroClusterSparsifyS
                 stats.skipped_compressed_clusters += 1;
                 continue;
             }
+            // A cluster flagged QCOW_OFLAG_ZERO is logically zero regardless of any
+            // physical bytes still referenced (ZERO_ALLOC). Never read or deallocate its
+            // backing here: doing so both wastes I/O and risks decrementing a refcount for
+            // a host cluster whose bytes are not actually dead.
+            if (l2_entry & QCOW_OFLAG_ZERO) != 0 {
+                stats.skipped_zero_flag_clusters += 1;
+                continue;
+            }
             let data_offset = aligned_data_offset(l2_entry, cluster_size);
             if data_offset == 0 {
                 continue;
@@ -330,7 +329,7 @@ pub(crate) fn sparsify_zero_clusters(path: &Path) -> Result<ZeroClusterSparsifyS
             write_u64_at(&mut file, l2e_offset, 0)?;
             decrement_refcount(
                 &mut file,
-                &refcount_table_entries,
+                header.refcount_table_offset,
                 data_offset / cluster_size,
                 refcount_entries_per_block,
                 refcount_bytes,
@@ -340,6 +339,14 @@ pub(crate) fn sparsify_zero_clusters(path: &Path) -> Result<ZeroClusterSparsifyS
         }
     }
     Ok(stats)
+}
+
+pub(crate) fn read_virtual_sector0(path: &Path) -> Result<[u8; 512]> {
+    let mut image = SourceImage::open(path)?;
+    image.ensure_supported()?;
+    let mut sector0 = [0u8; 512];
+    image.read_virtual_range(0, &mut sector0)?;
+    Ok(sector0)
 }
 
 pub(crate) fn read_qcow2_image_stats(path: &Path) -> Result<Qcow2ImageStats> {
@@ -664,7 +671,6 @@ fn encode_compressed_l2_entry(offset: u64, compressed_size: u64, cluster_size: u
         l1_size: 0,
         l1_table_offset: 0,
         refcount_table_offset: 0,
-        refcount_table_clusters: 0,
         incompatible_features: 0,
         refcount_order: DEFAULT_REFCOUNT_ORDER,
         header_length: QCOW_HEADER_LENGTH_V3,
@@ -891,9 +897,6 @@ fn read_header(file: &mut File) -> Result<Qcow2Header> {
         l1_size: u32::from_be_bytes(fixed[36..40].try_into().expect("slice length")),
         l1_table_offset: u64::from_be_bytes(fixed[40..48].try_into().expect("slice length")),
         refcount_table_offset: u64::from_be_bytes(fixed[48..56].try_into().expect("slice length")),
-        refcount_table_clusters: u32::from_be_bytes(
-            fixed[56..60].try_into().expect("slice length"),
-        ),
         incompatible_features: if version >= 3 {
             u64::from_be_bytes(fixed[72..80].try_into().expect("slice length"))
         } else {
@@ -921,7 +924,7 @@ fn aligned_data_offset(entry: u64, cluster_size: u64) -> u64 {
 
 fn decrement_refcount(
     file: &mut File,
-    refcount_table_entries: &[u64],
+    refcount_table_offset: u64,
     cluster_index: u64,
     entries_per_block: u64,
     refcount_bytes: usize,
@@ -929,9 +932,14 @@ fn decrement_refcount(
 ) -> Result<()> {
     let block_index = usize::try_from(cluster_index / entries_per_block)
         .context("refcount block index does not fit usize")?;
-    let block_entry = *refcount_table_entries.get(block_index).with_context(|| {
-        format!("missing refcount table entry for cluster index {cluster_index}")
-    })?;
+    let block_entry = read_u64_at(
+        file,
+        refcount_table_offset
+            .checked_add(
+                u64::try_from(block_index).context("refcount block index does not fit u64")? * 8,
+            )
+            .context("refcount table entry offset overflow")?,
+    )?;
     let block_offset = aligned_data_offset(block_entry, cluster_size);
     if block_offset == 0 {
         bail!("missing refcount block for allocated cluster index {cluster_index}");
@@ -1050,6 +1058,7 @@ mod tests {
         assert_eq!(stats.scanned_clusters, 2);
         assert_eq!(stats.deallocated_clusters, 1);
         assert_eq!(stats.skipped_compressed_clusters, 0);
+        assert_eq!(stats.skipped_zero_flag_clusters, 0);
 
         let mut file = File::open(&image).expect("open image");
         let header = read_header(&mut file).expect("header");
@@ -1278,7 +1287,11 @@ mod tests {
 
         write_u64_at(&mut file, cluster_size, cluster_size * 2)?;
         for i in 0..cluster_count {
-            write_u64_at(&mut file, cluster_size * 2 + i * 8, cluster_size * (5 + i))?;
+            write_u64_at(
+                &mut file,
+                cluster_size * 2 + i * 8,
+                cluster_size * (5 + i) | QCOW_OFLAG_COPIED,
+            )?;
         }
         write_u64_at(&mut file, cluster_size * 3, cluster_size * 4)?;
         for idx in 0..total_clusters {
@@ -1347,7 +1360,11 @@ mod tests {
 
         // L2 table: cluster_count entries pointing to data clusters (5, 6, …)
         for i in 0..cluster_count {
-            write_u64_at(&mut file, cluster_size * 2 + i * 8, cluster_size * (5 + i))?;
+            write_u64_at(
+                &mut file,
+                cluster_size * 2 + i * 8,
+                cluster_size * (5 + i) | QCOW_OFLAG_COPIED,
+            )?;
         }
 
         // Refcount table: single entry pointing to refcount block at cluster 4
@@ -1440,8 +1457,16 @@ mod tests {
         write_exact_at(&mut file, 100, &104u32.to_be_bytes())?;
 
         write_u64_at(&mut file, cluster_size, cluster_size * 2)?;
-        write_u64_at(&mut file, cluster_size * 2, cluster_size * 5)?;
-        write_u64_at(&mut file, cluster_size * 2 + 8, cluster_size * 6)?;
+        write_u64_at(
+            &mut file,
+            cluster_size * 2,
+            cluster_size * 5 | QCOW_OFLAG_COPIED,
+        )?;
+        write_u64_at(
+            &mut file,
+            cluster_size * 2 + 8,
+            cluster_size * 6 | QCOW_OFLAG_COPIED,
+        )?;
         write_u64_at(&mut file, cluster_size * 3, cluster_size * 4)?;
 
         for idx in 0u64..=6 {
@@ -1456,6 +1481,223 @@ mod tests {
         let mut raw = [0u8; 2];
         read_exact_at(file, block_offset + (cluster_index * 2), &mut raw).expect("read refcount");
         u16::from_be_bytes(raw)
+    }
+
+    #[derive(Debug, Clone)]
+    struct ZeroFlagFixture {
+        expected_clusters: Vec<Vec<u8>>,
+        stale_zero_alloc_host_cluster_index: u64,
+        shared_zero_alloc_host_cluster_index: u64,
+    }
+
+    fn make_mbr_like_cluster(cluster_size: u64, fill: u8) -> Vec<u8> {
+        let mut cluster =
+            vec![fill; usize::try_from(cluster_size).expect("cluster_size fits usize")];
+        cluster[510] = 0x55;
+        cluster[511] = 0xaa;
+        cluster
+    }
+
+    fn make_filled_cluster(cluster_size: u64, fill: u8) -> Vec<u8> {
+        vec![fill; usize::try_from(cluster_size).expect("cluster_size fits usize")]
+    }
+
+    fn refcount_block_offset(file: &mut File, header: Qcow2Header) -> u64 {
+        aligned_data_offset(
+            read_u64_at(file, header.refcount_table_offset).expect("refcount table entry"),
+            header.cluster_size(),
+        )
+    }
+
+    fn assert_refcount16(path: &Path, cluster_index: u64, expected: u16) {
+        let mut file = File::open(path).expect("open image for refcount check");
+        let header = read_header(&mut file).expect("header");
+        let block_offset = refcount_block_offset(&mut file, header);
+        assert_eq!(
+            read_exact_refcount16(&mut file, block_offset, cluster_index),
+            expected,
+            "cluster {cluster_index} refcount mismatch"
+        );
+    }
+
+    fn write_zero_flag_mix_test_image(path: &Path, cluster_size: u64) -> Result<ZeroFlagFixture> {
+        let cluster_bits = cluster_size.trailing_zeros();
+        let guest_cluster_count = 6u64;
+        let copied_live_0 = make_mbr_like_cluster(cluster_size, 0x4d);
+        let copied_live_5 = make_filled_cluster(cluster_size, 0xa5);
+        let zero_cluster =
+            vec![0u8; usize::try_from(cluster_size).expect("cluster_size fits usize")];
+        let stale_zero_alloc_cluster = make_filled_cluster(cluster_size, 0x9c);
+
+        let copied_live_0_host_cluster_index = 5u64;
+        let stale_zero_alloc_host_cluster_index = 6u64;
+        let shared_zero_alloc_host_cluster_index = 7u64;
+        let copied_live_5_host_cluster_index = 8u64;
+        let total_clusters = copied_live_5_host_cluster_index + 1;
+
+        let mut file = File::create(path)?;
+        file.set_len(cluster_size * total_clusters)?;
+
+        write_exact_at(&mut file, 0, &QCOW_MAGIC.to_be_bytes())?;
+        write_exact_at(&mut file, 4, &3u32.to_be_bytes())?;
+        write_exact_at(&mut file, 20, &cluster_bits.to_be_bytes())?;
+        write_exact_at(
+            &mut file,
+            24,
+            &(cluster_size * guest_cluster_count).to_be_bytes(),
+        )?;
+        write_exact_at(&mut file, 36, &1u32.to_be_bytes())?;
+        write_exact_at(&mut file, 40, &cluster_size.to_be_bytes())?;
+        write_exact_at(&mut file, 48, &(cluster_size * 3).to_be_bytes())?;
+        write_exact_at(&mut file, 56, &1u32.to_be_bytes())?;
+        write_exact_at(&mut file, 96, &4u32.to_be_bytes())?;
+        write_exact_at(&mut file, 100, &104u32.to_be_bytes())?;
+
+        write_u64_at(&mut file, cluster_size, cluster_size * 2)?;
+        write_u64_at(
+            &mut file,
+            cluster_size * 2,
+            cluster_size * copied_live_0_host_cluster_index | QCOW_OFLAG_COPIED,
+        )?;
+        write_u64_at(&mut file, cluster_size * 2 + 8, QCOW_OFLAG_ZERO)?;
+        write_u64_at(
+            &mut file,
+            cluster_size * 2 + 16,
+            cluster_size * stale_zero_alloc_host_cluster_index | QCOW_OFLAG_ZERO,
+        )?;
+        write_u64_at(
+            &mut file,
+            cluster_size * 2 + 24,
+            cluster_size * shared_zero_alloc_host_cluster_index | QCOW_OFLAG_ZERO,
+        )?;
+        write_u64_at(
+            &mut file,
+            cluster_size * 2 + 32,
+            cluster_size * shared_zero_alloc_host_cluster_index | QCOW_OFLAG_ZERO,
+        )?;
+        write_u64_at(
+            &mut file,
+            cluster_size * 2 + 40,
+            cluster_size * copied_live_5_host_cluster_index | QCOW_OFLAG_COPIED,
+        )?;
+        write_u64_at(&mut file, cluster_size * 3, cluster_size * 4)?;
+
+        for idx in 0..=4u64 {
+            write_exact_at(&mut file, cluster_size * 4 + idx * 2, &1u16.to_be_bytes())?;
+        }
+        write_exact_at(
+            &mut file,
+            cluster_size * 4 + copied_live_0_host_cluster_index * 2,
+            &1u16.to_be_bytes(),
+        )?;
+        write_exact_at(
+            &mut file,
+            cluster_size * 4 + stale_zero_alloc_host_cluster_index * 2,
+            &1u16.to_be_bytes(),
+        )?;
+        write_exact_at(
+            &mut file,
+            cluster_size * 4 + shared_zero_alloc_host_cluster_index * 2,
+            &2u16.to_be_bytes(),
+        )?;
+        write_exact_at(
+            &mut file,
+            cluster_size * 4 + copied_live_5_host_cluster_index * 2,
+            &1u16.to_be_bytes(),
+        )?;
+
+        write_exact_at(
+            &mut file,
+            cluster_size * copied_live_0_host_cluster_index,
+            &copied_live_0,
+        )?;
+        write_exact_at(
+            &mut file,
+            cluster_size * stale_zero_alloc_host_cluster_index,
+            &stale_zero_alloc_cluster,
+        )?;
+        write_exact_at(
+            &mut file,
+            cluster_size * shared_zero_alloc_host_cluster_index,
+            &zero_cluster,
+        )?;
+        write_exact_at(
+            &mut file,
+            cluster_size * copied_live_5_host_cluster_index,
+            &copied_live_5,
+        )?;
+
+        Ok(ZeroFlagFixture {
+            expected_clusters: vec![
+                copied_live_0,
+                zero_cluster.clone(),
+                zero_cluster.clone(),
+                zero_cluster.clone(),
+                zero_cluster,
+                copied_live_5,
+            ],
+            stale_zero_alloc_host_cluster_index,
+            shared_zero_alloc_host_cluster_index,
+        })
+    }
+
+    fn write_shared_zero_cluster_test_image(path: &Path, cluster_size: u64) -> Result<u64> {
+        let cluster_bits = cluster_size.trailing_zeros();
+        let shared_zero_host_cluster_index = 5u64;
+        let live_host_cluster_index = 6u64;
+        let total_clusters = live_host_cluster_index + 1;
+        let mut file = File::create(path)?;
+        file.set_len(cluster_size * total_clusters)?;
+
+        write_exact_at(&mut file, 0, &QCOW_MAGIC.to_be_bytes())?;
+        write_exact_at(&mut file, 4, &3u32.to_be_bytes())?;
+        write_exact_at(&mut file, 20, &cluster_bits.to_be_bytes())?;
+        write_exact_at(&mut file, 24, &(cluster_size * 3).to_be_bytes())?;
+        write_exact_at(&mut file, 36, &1u32.to_be_bytes())?;
+        write_exact_at(&mut file, 40, &cluster_size.to_be_bytes())?;
+        write_exact_at(&mut file, 48, &(cluster_size * 3).to_be_bytes())?;
+        write_exact_at(&mut file, 56, &1u32.to_be_bytes())?;
+        write_exact_at(&mut file, 96, &4u32.to_be_bytes())?;
+        write_exact_at(&mut file, 100, &104u32.to_be_bytes())?;
+
+        write_u64_at(&mut file, cluster_size, cluster_size * 2)?;
+        write_u64_at(
+            &mut file,
+            cluster_size * 2,
+            cluster_size * shared_zero_host_cluster_index | QCOW_OFLAG_COPIED,
+        )?;
+        write_u64_at(
+            &mut file,
+            cluster_size * 2 + 8,
+            cluster_size * shared_zero_host_cluster_index | QCOW_OFLAG_COPIED,
+        )?;
+        write_u64_at(
+            &mut file,
+            cluster_size * 2 + 16,
+            cluster_size * live_host_cluster_index | QCOW_OFLAG_COPIED,
+        )?;
+        write_u64_at(&mut file, cluster_size * 3, cluster_size * 4)?;
+
+        for idx in 0..=4u64 {
+            write_exact_at(&mut file, cluster_size * 4 + idx * 2, &1u16.to_be_bytes())?;
+        }
+        write_exact_at(
+            &mut file,
+            cluster_size * 4 + shared_zero_host_cluster_index * 2,
+            &2u16.to_be_bytes(),
+        )?;
+        write_exact_at(
+            &mut file,
+            cluster_size * 4 + live_host_cluster_index * 2,
+            &1u16.to_be_bytes(),
+        )?;
+        write_exact_at(
+            &mut file,
+            cluster_size * live_host_cluster_index,
+            &make_filled_cluster(cluster_size, 0x3c),
+        )?;
+
+        Ok(shared_zero_host_cluster_index)
     }
 
     fn write_custom_test_image_with_cluster_size(
@@ -1505,7 +1747,11 @@ mod tests {
 
         write_u64_at(&mut file, cluster_size, cluster_size * 2)?;
         for i in 0..cluster_count {
-            write_u64_at(&mut file, cluster_size * 2 + i * 8, cluster_size * (5 + i))?;
+            write_u64_at(
+                &mut file,
+                cluster_size * 2 + i * 8,
+                cluster_size * (5 + i) | QCOW_OFLAG_COPIED,
+            )?;
         }
         write_u64_at(&mut file, cluster_size * 3, cluster_size * 4)?;
         for idx in 0..total_clusters {
@@ -1541,6 +1787,13 @@ mod tests {
             .is_ok()
     }
 
+    fn qemu_io_available() -> bool {
+        std::process::Command::new("qemu-io")
+            .arg("--version")
+            .output()
+            .is_ok()
+    }
+
     fn assert_qemu_img_check(path: &Path) {
         let output = std::process::Command::new("qemu-img")
             .args(["check", "-f", "qcow2"])
@@ -1571,6 +1824,176 @@ mod tests {
                 .unwrap_or_else(|e| panic!("read_virtual_range cluster {idx}: {e:#}"));
             assert_eq!(actual, *expected, "cluster {idx} data mismatch");
         }
+    }
+
+    fn run_zero_flag_round_trip_test(compression_type: CompressionType, cluster_size: u64) {
+        let tmp = tempdir().expect("tempdir");
+        let source = tmp.path().join("source.qcow2");
+        let dest = tmp.path().join("compressed.qcow2");
+        let fixture =
+            write_zero_flag_mix_test_image(&source, cluster_size).expect("write zero-flag source");
+
+        let sparsify_stats = sparsify_zero_clusters(&source).expect("sparsify zero-flag source");
+        assert_eq!(
+            sparsify_stats.scanned_clusters, 2,
+            "ZERO_PLAIN and ZERO_ALLOC entries must be skipped before physical scanning"
+        );
+        assert_eq!(
+            sparsify_stats.deallocated_clusters, 0,
+            "ZERO-flagged entries must not be deallocated by sparsify"
+        );
+        assert_eq!(sparsify_stats.skipped_zero_flag_clusters, 4);
+        assert_refcount16(&source, fixture.stale_zero_alloc_host_cluster_index, 1);
+        assert_refcount16(&source, fixture.shared_zero_alloc_host_cluster_index, 2);
+
+        let mut compressor_args = BTreeMap::new();
+        if cluster_size == 1_048_576 {
+            compressor_args.insert("cluster_size".to_owned(), "1M".to_owned());
+        }
+        let compressor_opts = if compression_type == CompressionType::Zstd {
+            "-19 -T0"
+        } else {
+            ""
+        };
+        compress_qcow2_image(
+            &source,
+            &dest,
+            compression_type,
+            &compressor_args,
+            compressor_opts,
+        )
+        .expect("compress zero-flag source");
+
+        assert_guest_clusters_match(&dest, &fixture.expected_clusters, cluster_size);
+    }
+
+    #[test]
+    fn zero_flag_source_round_trip_zstd_4k() {
+        run_zero_flag_round_trip_test(CompressionType::Zstd, 4096);
+    }
+
+    #[test]
+    fn zero_flag_source_round_trip_zlib_4k() {
+        run_zero_flag_round_trip_test(CompressionType::Zlib, 4096);
+    }
+
+    #[test]
+    fn zero_flag_source_round_trip_zstd_1m() {
+        run_zero_flag_round_trip_test(CompressionType::Zstd, 1_048_576);
+    }
+
+    #[test]
+    fn zero_flag_source_round_trip_zlib_1m() {
+        run_zero_flag_round_trip_test(CompressionType::Zlib, 1_048_576);
+    }
+
+    #[test]
+    fn shared_zero_plain_cluster_decrements_refcount_to_zero() {
+        let tmp = tempdir().expect("tempdir");
+        let source = tmp.path().join("shared-zero.qcow2");
+        let shared_zero_host_cluster_index =
+            write_shared_zero_cluster_test_image(&source, 4096).expect("write shared-zero source");
+
+        let stats = sparsify_zero_clusters(&source).expect("sparsify shared-zero source");
+        assert_eq!(stats.scanned_clusters, 3);
+        assert_eq!(stats.deallocated_clusters, 2);
+        assert_eq!(stats.skipped_zero_flag_clusters, 0);
+        assert_refcount16(&source, shared_zero_host_cluster_index, 0);
+    }
+
+    #[test]
+    fn qemu_generated_zero_flag_round_trip_zstd_1m() {
+        if !qemu_img_available() || !qemu_io_available() {
+            eprintln!("qemu-img/qemu-io not found — skipping qemu-generated zero-flag test");
+            return;
+        }
+
+        let tmp = tempdir().expect("tempdir");
+        let source = tmp.path().join("source.qcow2");
+        let dest = tmp.path().join("compressed.qcow2");
+        let cluster_size = 4096u64;
+        let live_tail_offset = cluster_size * 5;
+        let image_size = cluster_size * 6;
+
+        let create = std::process::Command::new("qemu-img")
+            .args(["create", "-f", "qcow2", "-o", "cluster_size=4096"])
+            .arg(&source)
+            .arg(image_size.to_string())
+            .output()
+            .expect("run qemu-img create");
+        assert!(
+            create.status.success(),
+            "qemu-img create failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&create.stdout),
+            String::from_utf8_lossy(&create.stderr),
+        );
+
+        let io = std::process::Command::new("qemu-io")
+            .args(["-f", "qcow2"])
+            .arg(&source)
+            .args([
+                "-c",
+                "write -P 0x4d 0 4k",
+                "-c",
+                &format!("write -P 0xa5 {live_tail_offset} 4k"),
+                "-c",
+                "discard 4096 16384",
+            ])
+            .output()
+            .expect("run qemu-io");
+        assert!(
+            io.status.success(),
+            "qemu-io failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&io.stdout),
+            String::from_utf8_lossy(&io.stderr),
+        );
+
+        let mut sector0 = [0u8; 512];
+        let mut tail = vec![0u8; usize::try_from(cluster_size).expect("cluster_size fits usize")];
+        let mut source_image = SourceImage::open(&source).expect("open qemu-generated source");
+        source_image
+            .read_virtual_range(0, &mut sector0)
+            .expect("read qemu-generated sector0");
+        source_image
+            .read_virtual_range(live_tail_offset, &mut tail)
+            .expect("read qemu-generated tail cluster");
+        let expected_sector0 = sector0;
+        let expected_tail = tail;
+
+        let stats = sparsify_zero_clusters(&source).expect("sparsify qemu-generated source");
+        assert!(
+            stats.scanned_clusters >= 2,
+            "expected to scan the two live clusters, got {:?}",
+            stats
+        );
+
+        let mut compressor_args = BTreeMap::new();
+        compressor_args.insert("cluster_size".to_owned(), "1M".to_owned());
+        compress_qcow2_image(
+            &source,
+            &dest,
+            CompressionType::Zstd,
+            &compressor_args,
+            "-19 -T0",
+        )
+        .expect("compress qemu-generated source");
+
+        let mut image = SourceImage::open(&dest).expect("open compressed qemu-generated image");
+        let mut actual_sector0 = [0u8; 512];
+        let mut actual_tail =
+            vec![0u8; usize::try_from(cluster_size).expect("cluster_size fits usize")];
+        image
+            .read_virtual_range(0, &mut actual_sector0)
+            .expect("read compressed sector0");
+        image
+            .read_virtual_range(live_tail_offset, &mut actual_tail)
+            .expect("read compressed tail cluster");
+
+        assert_eq!(actual_sector0, expected_sector0, "sector 0 data mismatch");
+        assert_eq!(
+            actual_tail, expected_tail,
+            "tail live cluster data mismatch"
+        );
     }
 
     fn run_copied_flag_test(compression_type: CompressionType, cluster_size: u64) {
@@ -1677,6 +2100,7 @@ mod tests {
         assert_eq!(sparsify_stats.scanned_clusters, 1);
         assert_eq!(sparsify_stats.deallocated_clusters, 0);
         assert_eq!(sparsify_stats.skipped_compressed_clusters, 2);
+        assert_eq!(sparsify_stats.skipped_zero_flag_clusters, 0);
 
         assert_guest_clusters_match(&dest, &cluster_contents, cluster_size);
 

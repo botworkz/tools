@@ -26,7 +26,9 @@ use crate::plan::{
     load_build_config, preserve_failed_build_disk, print_log_tail, run_step_flow,
     shutdown_build_vm, validate_build_steps, vm::StepFlowPlan, vm::StepTimeoutPolicy,
 };
-use crate::qcow2::{compress_qcow2_image, read_qcow2_image_stats, sparsify_zero_clusters};
+use crate::qcow2::{
+    compress_qcow2_image, read_qcow2_image_stats, read_virtual_sector0, sparsify_zero_clusters,
+};
 
 #[derive(Args, Debug)]
 pub(crate) struct BuildArgs {
@@ -381,16 +383,21 @@ pub(crate) fn cmd_build(config: &Path, args: BuildArgs) -> Result<()> {
         reclaim_host_discard_offline(&partial)?;
     }
 
+    if should_validate_partial_sector0(reclaim_mode, build_config.compress.as_ref()) {
+        validate_partial_sector0(&partial)?;
+    }
+
     let zero_cluster_stats = if should_run_zero_cluster_sparsify(reclaim_mode) {
         let stats = sparsify_zero_clusters(&partial).with_context(|| {
             format!("failed to sparsify zero clusters in {}", partial.display())
         })?;
         if botforge_debug_enabled() {
             eprintln!(
-                "qcow2 zero-cluster sparsify: scanned={} deallocated={} skipped_compressed={}",
+                "qcow2 zero-cluster sparsify: scanned={} deallocated={} skipped_compressed={} skipped_zero_flag={}",
                 stats.scanned_clusters,
                 stats.deallocated_clusters,
-                stats.skipped_compressed_clusters
+                stats.skipped_compressed_clusters,
+                stats.skipped_zero_flag_clusters
             );
         }
         Some(stats)
@@ -431,6 +438,25 @@ pub(crate) fn cmd_build(config: &Path, args: BuildArgs) -> Result<()> {
 
 fn should_run_zero_cluster_sparsify(mode: ReclaimMode) -> bool {
     !matches!(mode, ReclaimMode::None)
+}
+
+fn should_validate_partial_sector0(
+    reclaim_mode: ReclaimMode,
+    compress: Option<&CompressConfig>,
+) -> bool {
+    should_run_zero_cluster_sparsify(reclaim_mode) || compress.is_some_and(|c| c.enabled)
+}
+
+fn validate_partial_sector0(partial: &Path) -> Result<()> {
+    let sector0 = read_virtual_sector0(partial)
+        .with_context(|| format!("failed to read guest sector 0 from {}", partial.display()))?;
+    if sector0.iter().all(|byte| *byte == 0) {
+        bail!(
+            "refusing to sparsify or compress {}: guest sector 0 is all zero, indicating a corrupt or unpartitioned image",
+            partial.display()
+        );
+    }
+    Ok(())
 }
 
 /// Commit `partial` to `output`, optionally compressing via the native qcow2 writer.
