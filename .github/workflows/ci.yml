@@ -67,6 +67,24 @@ jobs:
     with:
       crate: ${{ matrix.crate }}
 
+  udeps:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@nightly
+    - uses: Swatinem/rust-cache@v2
+      with:
+        prefix-key: "udeps"
+    - name: Install cargo-udeps
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-udeps
+    - name: cargo udeps
+      run: cargo +nightly udeps --workspace --all-targets --locked
+
   publish:
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     needs: crate
