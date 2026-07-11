@@ -539,9 +539,18 @@ impl DataAllocator {
         } else {
             align_up(self.next_offset, self.cluster_size)
         };
-        self.next_offset = offset
-            .checked_add(size)
-            .context("compressed data offset overflow")?;
+        // Advance next_offset to the next 512-byte sector boundary so that no two
+        // compressed clusters share a sector.  qemu reads each compressed cluster by
+        // computing nb_csectors from the L2 entry and reading nb_csectors*512 bytes
+        // starting at the sector-aligned base; if adjacent clusters shared a sector,
+        // qemu's zstd decoder would receive trailing bytes from the next cluster's
+        // frame and return -EIO.
+        self.next_offset = align_up(
+            offset
+                .checked_add(size)
+                .context("compressed data offset overflow")?,
+            QCOW2_COMPRESSED_SECTOR_SIZE,
+        );
         Ok(offset)
     }
 
@@ -1082,12 +1091,15 @@ mod tests {
         assert!(after.disk_size >= 7 * 4096);
     }
 
+    // Verify header flags, sector-disjoint compressed clusters, and per-cluster
+    // data integrity using the sector-rounded read span that qemu uses.
     #[test]
     fn native_compress_writes_valid_zstd_qcow2() {
         let tmp = tempdir().expect("tempdir");
         let source = tmp.path().join("source.qcow2");
         let dest = tmp.path().join("dest.qcow2");
-        write_test_image(&source).expect("write source qcow2");
+        // Use a multi-cluster fixture so adjacent-cluster packing is exercised.
+        write_multi_cluster_test_image(&source, 4).expect("write source qcow2");
 
         compress_qcow2_image(
             &source,
@@ -1105,24 +1117,188 @@ mod tests {
         assert_ne!(header.incompatible_features & QCOW2_INCOMPAT_COMPRESSION, 0);
 
         let stats = read_qcow2_image_stats(&dest).expect("stats");
-        assert_eq!(stats.virtual_size, 8192);
+        assert_eq!(stats.virtual_size, 4 * 4096);
         assert_eq!(stats.cluster_size, 4096);
-        assert_eq!(stats.allocated_data_clusters, 1);
+        assert_eq!(stats.allocated_data_clusters, 4);
+
+        // Assert every compressed cluster occupies a sector range disjoint from
+        // every other: [offset/512, offset/512 + nb_csectors) must not overlap.
+        // This is what qemu requires; without the sector-alignment fix the old
+        // tight-packing allocator would cause adjacent entries to share sectors
+        // and qemu's zstd decoder would return -EIO.
+        assert_compressed_clusters_sector_disjoint(&dest, &header, &mut file);
+
+        // Verify each cluster decompresses correctly using only the sector-rounded
+        // span (nb_csectors * 512 bytes from the sector-aligned base) — the same
+        // byte range qemu hands to its decompressor.
+        let mut image = SourceImage::open(&dest).expect("open image");
+        let cluster_size = 4096usize;
+        for i in 0u64..4 {
+            let mut cluster = vec![0u8; cluster_size];
+            image
+                .read_virtual_range(i * 4096, &mut cluster)
+                .expect("read guest cluster");
+            let expected_byte = 0x41u8 + (i as u8); // 'A', 'B', 'C', 'D'
+            assert_eq!(
+                &cluster[..32],
+                &vec![expected_byte; 32][..],
+                "cluster {i} data mismatch"
+            );
+            assert!(
+                cluster[32..].iter().all(|b| *b == 0),
+                "cluster {i} tail should be zero"
+            );
+        }
+    }
+
+    // Confirm the zlib path still produces sector-disjoint compressed clusters
+    // and round-trips correctly.
+    #[test]
+    fn native_compress_writes_valid_zlib_qcow2() {
+        let tmp = tempdir().expect("tempdir");
+        let source = tmp.path().join("source.qcow2");
+        let dest = tmp.path().join("dest.qcow2");
+        write_multi_cluster_test_image(&source, 4).expect("write source qcow2");
+
+        compress_qcow2_image(&source, &dest, CompressionType::Zlib, &BTreeMap::new(), "")
+            .expect("compress");
+
+        let mut file = File::open(&dest).expect("open dest");
+        let header = read_header(&mut file).expect("read header");
+        assert_eq!(header.compression_type, QCOW2_COMPRESSION_TYPE_ZLIB);
+
+        assert_compressed_clusters_sector_disjoint(&dest, &header, &mut file);
 
         let mut image = SourceImage::open(&dest).expect("open image");
-        let mut cluster = vec![0u8; 4096];
-        image
-            .read_virtual_range(4096, &mut cluster)
-            .expect("read guest cluster");
-        assert_eq!(&cluster[..32], &[0x5a; 32]);
-        assert!(cluster[32..].iter().all(|b| *b == 0));
+        for i in 0u64..4 {
+            let mut cluster = vec![0u8; 4096];
+            image
+                .read_virtual_range(i * 4096, &mut cluster)
+                .expect("read guest cluster");
+            let expected_byte = 0x41u8 + (i as u8);
+            assert_eq!(
+                &cluster[..32],
+                &vec![expected_byte; 32][..],
+                "cluster {i} data mismatch"
+            );
+        }
+    }
 
-        let l2_offset = aligned_data_offset(
-            read_u64_at(&mut file, header.l1_table_offset).expect("l1 entry"),
-            header.cluster_size(),
+    /// Check that no two compressed L2 entries share a 512-byte sector.
+    /// This mirrors what qemu enforces: each compressed cluster occupies a
+    /// contiguous run of whole sectors starting at its own sector-aligned base,
+    /// and no neighbouring cluster's frame bytes fall in that span.
+    fn assert_compressed_clusters_sector_disjoint(
+        _dest: &Path,
+        header: &Qcow2Header,
+        file: &mut File,
+    ) {
+        let cluster_size = header.cluster_size();
+        let l2_entries_per_table = (cluster_size / 8) as usize;
+        let l1_size = header.l1_size as usize;
+
+        let l1_entries = read_u64_table(file, header.l1_table_offset, l1_size).expect("l1 table");
+
+        // Collect (base_sector, end_sector_exclusive, global_cluster_index).
+        let mut spans: Vec<(u64, u64, usize)> = Vec::new();
+        for (l1_idx, &l1_entry) in l1_entries.iter().enumerate() {
+            if l1_entry == 0 {
+                continue;
+            }
+            let l2_offset = aligned_data_offset(l1_entry, cluster_size);
+            let l2_table = read_u64_table(file, l2_offset, l2_entries_per_table).expect("l2 table");
+            for (l2_idx, &l2_entry) in l2_table.iter().enumerate() {
+                if l2_entry & QCOW_OFLAG_COMPRESSED == 0 {
+                    continue;
+                }
+                let (offset, _) =
+                    parse_compressed_l2_entry(*header, l2_entry).expect("parse l2 entry");
+                // nb_csectors is stored as (value - 1) in the L2 entry field.
+                let nb_csectors = ((l2_entry >> header.csize_shift()) & header.csize_mask()) + 1;
+                let base_sector = offset / QCOW2_COMPRESSED_SECTOR_SIZE;
+                let end_sector = base_sector + nb_csectors;
+                let global = l1_idx * l2_entries_per_table + l2_idx;
+                spans.push((base_sector, end_sector, global));
+            }
+        }
+
+        assert!(
+            spans.len() >= 2,
+            "fixture must produce at least 2 compressed clusters to test packing"
         );
-        let l2_entry = read_u64_at(&mut file, l2_offset + 8).expect("l2 entry");
-        assert_ne!(l2_entry & QCOW_OFLAG_COMPRESSED, 0);
+
+        // Pairwise overlap check.
+        for i in 0..spans.len() {
+            for j in (i + 1)..spans.len() {
+                let (base_i, end_i, idx_i) = spans[i];
+                let (base_j, end_j, idx_j) = spans[j];
+                // Disjoint iff end_i <= base_j or end_j <= base_i.
+                assert!(
+                    end_i <= base_j || end_j <= base_i,
+                    "compressed clusters {idx_i} and {idx_j} share sectors: \
+                     [{base_i},{end_i}) overlaps [{base_j},{end_j})"
+                );
+            }
+        }
+    }
+
+    /// Creates a plain (uncompressed) qcow2 with `cluster_count` non-zero guest
+    /// clusters.  Each cluster starts with 32 bytes of a distinct repeating byte
+    /// value ('A'=0x41 for cluster 0, 'B' for cluster 1, …) followed by zeros.
+    /// The image uses 4 KiB clusters and 16-bit refcounts (refcount_order = 4).
+    ///
+    /// Layout (all offsets in units of `cluster_size = 4096`):
+    ///   0  – header
+    ///   1  – L1 table  (1 entry → L2 at cluster 2)
+    ///   2  – L2 table  (cluster_count entries → data clusters 5…)
+    ///   3  – refcount table (1 entry → refcount block at cluster 4)
+    ///   4  – refcount block
+    ///   5…5+cluster_count-1 – data clusters
+    fn write_multi_cluster_test_image(path: &Path, cluster_count: u64) -> Result<()> {
+        assert!(
+            cluster_count >= 2,
+            "need at least 2 clusters to exercise packing"
+        );
+        let cluster_size = 4096u64;
+        let total_clusters = 5 + cluster_count;
+        let mut file = File::create(path)?;
+        file.set_len(cluster_size * total_clusters)?;
+
+        // Header
+        write_exact_at(&mut file, 0, &QCOW_MAGIC.to_be_bytes())?;
+        write_exact_at(&mut file, 4, &3u32.to_be_bytes())?;
+        write_exact_at(&mut file, 20, &12u32.to_be_bytes())?; // cluster_bits = 12
+        write_exact_at(&mut file, 24, &(cluster_size * cluster_count).to_be_bytes())?; // virtual_size
+        write_exact_at(&mut file, 36, &1u32.to_be_bytes())?; // l1_size = 1
+        write_exact_at(&mut file, 40, &cluster_size.to_be_bytes())?; // l1_table_offset
+        write_exact_at(&mut file, 48, &(cluster_size * 3).to_be_bytes())?; // refcount_table_offset
+        write_exact_at(&mut file, 56, &1u32.to_be_bytes())?; // refcount_table_clusters
+        write_exact_at(&mut file, 96, &4u32.to_be_bytes())?; // refcount_order = 4 (16-bit)
+        write_exact_at(&mut file, 100, &104u32.to_be_bytes())?; // header_length
+
+        // L1 table: single entry pointing to L2 at cluster 2
+        write_u64_at(&mut file, cluster_size, cluster_size * 2)?;
+
+        // L2 table: cluster_count entries pointing to data clusters (5, 6, …)
+        for i in 0..cluster_count {
+            write_u64_at(&mut file, cluster_size * 2 + i * 8, cluster_size * (5 + i))?;
+        }
+
+        // Refcount table: single entry pointing to refcount block at cluster 4
+        write_u64_at(&mut file, cluster_size * 3, cluster_size * 4)?;
+
+        // Refcount block: every cluster has refcount 1
+        for idx in 0..total_clusters {
+            write_exact_at(&mut file, cluster_size * 4 + idx * 2, &1u16.to_be_bytes())?;
+        }
+
+        // Data clusters: 32 bytes of a distinct value, rest zeros
+        for i in 0..cluster_count {
+            let byte = 0x41u8 + (i as u8); // 'A', 'B', 'C', …
+            write_exact_at(&mut file, cluster_size * (5 + i), &[byte; 32])?;
+        }
+
+        Ok(())
     }
 
     fn write_test_image(path: &Path) -> Result<()> {
