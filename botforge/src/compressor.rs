@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
-use flate2::read::DeflateDecoder;
-use flate2::write::DeflateEncoder;
+use flate2::read::ZlibDecoder;
+use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use std::io::{Read, Write};
 
@@ -37,7 +37,7 @@ pub(crate) fn decompress_cluster(
             Ok(out)
         }
         CompressionType::Zlib => {
-            let mut decoder = DeflateDecoder::new(compressed);
+            let mut decoder = ZlibDecoder::new(compressed);
             let mut out = vec![0u8; cluster_size];
             decoder
                 .read_exact(&mut out)
@@ -134,7 +134,7 @@ impl Compressor for ZlibCompressor {
     }
 
     fn compress_cluster(&self, cluster: &[u8]) -> Result<Vec<u8>> {
-        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
         encoder
             .write_all(cluster)
             .context("failed to encode zlib qcow2 cluster")?;
