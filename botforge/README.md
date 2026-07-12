@@ -210,7 +210,8 @@ Semantics:
 
 ### `botforge test` step model
 
-Each entry in `steps:` has a required `on:` field that selects where it runs:
+Each entry in `steps:` has an optional `on:` field that selects where it runs.
+When omitted, `on:` defaults to `guest`:
 
 - **`on: guest`** — runs inside the VM via SSH. `run:` executes inside the
   guest. This is the traditional test step.
@@ -321,7 +322,7 @@ string instead, emit `""` from the expression.
 For this first iteration, `@://` is the only supported `uses:` scheme. Plain
 filesystem paths, `../` traversal, and other schemes are rejected.
 
-Config errors are reported at load time for: missing or invalid `on:`; any `on: host` step present when `ports:` is empty;
+Config errors are reported at load time for: invalid `on:`; any `on: host` step present when `ports:` is empty;
 invalid `shell:` value; invalid `uses:` scheme/path; `with:` key not declared
 by the fragment (`unexpected input '<name>' not declared by fragment <path>`);
 missing required input (`missing required input '<name>'`); type mismatch
@@ -434,12 +435,14 @@ steps:
 
 Guest `run:` steps also support an optional `sudo:` boolean. When set to `true`,
 botforge runs the resolved interpreter itself under `sudo -E`, so the entire
-`run:` body executes as root in one shot. When absent, it defaults to `false`.
+`run:` body executes as root in one shot. When absent, it defaults to `true`.
 
 - only valid on `on: guest` steps
-- rejected at config load time on `on: host` steps
+- rejected at config load time when explicitly set to `true` on `on: host` steps
 - requires the guest SSH user to have passwordless sudo (the ephemeral
   installer user already does)
+
+Set `sudo: false` to run a guest step as the non-root SSH user.
 
 ```yaml
 steps:
@@ -464,7 +467,9 @@ currently are). If bash is unavailable the explicit `shell: sh` fallback
 > under `bash --noprofile --norc -e -o pipefail` by default. A mid-script
 > non-zero exit or a failing left side of a pipe now fails the step. If you need
 > the old lenient behaviour, set `shell: sh` and write your script accordingly.
-> If the entire guest script should run as root, set `sudo: true` instead of
+> Guest steps now default to `sudo: true`. Set `sudo: false` to keep guest
+> execution as the non-root SSH user. If the entire guest script should run as
+> root, keep the default or set `sudo: true` explicitly instead of
 > prefixing each line with `sudo`.
 
 **Execution model (both targets):**
@@ -630,8 +635,9 @@ every build.
 
 #### Steps in `type: build`
 
-Steps use the same `on: guest` / `on: host` vocabulary as `type: test`. Guest
-steps run inside the qemu VM via SSH; host steps run in the botforge container.
+Steps use the same `on: guest` / `on: host` vocabulary as `type: test`, with
+`on:` optional and defaulting to `guest`. Guest steps run inside the qemu VM
+via SSH; host steps run in the botforge container.
 `on: host` steps in `type: build` do **not** require `ports:` (unlike
 `type: test`).
 

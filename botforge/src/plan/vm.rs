@@ -258,8 +258,7 @@ fn run_run_step(
             .with_context(|| format!("test step '{}' script upload failed", step.name));
 
             let step_result = if scp_result.is_ok() {
-                let ssh_cmd =
-                    build_guest_ssh_cmd(&template, &remote_script, step.sudo == Some(true));
+                let ssh_cmd = build_guest_ssh_cmd(&template, &remote_script, step.sudo_enabled());
                 run_ssh_step_with_step_log(
                     &step.name,
                     context.ssh,
@@ -1389,6 +1388,23 @@ mod tests {
         let tmpl = resolve_shell(Some("sh")).unwrap();
         let cmd = build_guest_ssh_cmd(&tmpl, "/tmp/botforge-step.sh", false);
         assert_eq!(cmd, "sh -e '/tmp/botforge-step.sh'");
+    }
+
+    #[test]
+    fn test_guest_step_omitted_sudo_defaults_to_sudo_prefix() {
+        let step: RunStep = serde_yaml::from_str(
+            r#"
+name: default-root
+run: echo ok
+"#,
+        )
+        .unwrap();
+        let tmpl = resolve_shell(None).unwrap();
+        let cmd = build_guest_ssh_cmd(&tmpl, "/tmp/botforge-step.sh", step.sudo_enabled());
+        assert_eq!(
+            cmd,
+            "sudo -E bash --noprofile --norc -e -o pipefail '/tmp/botforge-step.sh'"
+        );
     }
 
     // --- host step timeout ---

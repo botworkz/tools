@@ -1436,15 +1436,17 @@ steps:
     }
 
     #[test]
-    fn test_step_rejects_missing_on_field() {
-        let result: Result<TestConfig, _> = serde_yaml::from_str(
+    fn test_step_parses_missing_on_field_as_guest() {
+        let config: TestConfig = serde_yaml::from_str(
             r#"
 steps:
   - name: no-on-field
     run: echo hello
 "#,
-        );
-        assert!(result.is_err());
+        )
+        .unwrap();
+        assert_eq!(config.steps.len(), 1);
+        assert_eq!(run_ref(&config.steps[0]).target, StepTarget::Guest);
     }
 
     #[test]
@@ -1692,6 +1694,16 @@ steps:
         );
         assert!(msg.contains("sudo"), "error should mention sudo: {msg}");
         assert!(msg.contains("guest"), "error should mention guest: {msg}");
+    }
+
+    #[test]
+    fn test_validate_steps_accepts_host_step_with_explicit_sudo_false() {
+        let mut step = make_step(StepTarget::Host, "host-unprivileged");
+        let TestStep::Run(run) = &mut step else {
+            panic!("expected run step");
+        };
+        run.sudo = Some(false);
+        assert!(validate_test_steps(&[step], &[loopback(80)]).is_ok());
     }
 
     #[test]
@@ -4098,6 +4110,16 @@ steps:
         );
         assert!(msg.contains("sudo"), "error should mention sudo: {msg}");
         assert!(msg.contains("guest"), "error should mention guest: {msg}");
+    }
+
+    #[test]
+    fn test_validate_build_steps_accepts_host_step_with_explicit_sudo_false() {
+        let mut step = make_step(StepTarget::Host, "host-unprivileged");
+        let TestStep::Run(run) = &mut step else {
+            panic!("expected run step");
+        };
+        run.sudo = Some(false);
+        assert!(validate_build_steps(&[step]).is_ok());
     }
 
     #[test]

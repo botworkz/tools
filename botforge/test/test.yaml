@@ -3,18 +3,8 @@ ports:
 - 80
 
 steps:
-- on: host
-  name: Host hello
-  run: |
-    hostname
-    whoami
-- on: guest
-  name: Guest whoami
-  run: |
-    whoami | grep botforge
-- on: guest
-  name: Base install test
-  sudo: true
+- uses: "@://hello.steps.yaml"
+- name: Base install test
   run: |
     whoami | grep root
 

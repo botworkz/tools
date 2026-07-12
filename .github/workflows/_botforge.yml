@@ -67,6 +67,7 @@ jobs:
 
     - run: |
         mkdir testrepo
+        cp -a botforge/test/hello.steps.yaml testrepo/
     - name: Set runtime environment
       run: |
         {
