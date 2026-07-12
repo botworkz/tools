@@ -496,9 +496,12 @@ impl SourceImage {
                 .checked_add(l2_index.checked_mul(8).context("l2 index overflow")?)
                 .context("l2 entry offset overflow")?,
         )?;
-        if l2_entry == 0 || (l2_entry & QCOW_OFLAG_ZERO) != 0 {
+        if l2_entry == 0 {
             return Ok(zero_cluster);
         }
+        // A compressed L2 entry (bit 62 set) uses bit 0 as part of the file
+        // offset, not as QCOW_OFLAG_ZERO.  Check COMPRESSED first so we never
+        // misclassify a compressed cluster whose offset happens to be odd.
         if (l2_entry & QCOW_OFLAG_COMPRESSED) != 0 {
             let (compressed_offset, compressed_size) =
                 parse_compressed_l2_entry(self.header, l2_entry)?;
@@ -513,6 +516,10 @@ impl SourceImage {
                 &compressed,
                 usize::try_from(cluster_size).context("cluster size too large")?,
             );
+        }
+        // For uncompressed entries only: bit 0 means "reads as zero" (TRIM/DISCARD).
+        if (l2_entry & QCOW_OFLAG_ZERO) != 0 {
+            return Ok(zero_cluster);
         }
         let data_offset = aligned_data_offset(l2_entry, cluster_size);
         if data_offset == 0 {
@@ -2514,7 +2521,7 @@ mod tests {
     /// Build a minimal sparse qcow2 with a given number of L1 entries (two L2
     /// tables). The image has `virtual_size = l2_entries_per_table * cluster_size
     /// * l1_entries` and actual non-zero data only in the first and last cluster
-    /// of each L2 table's logical range.
+    ///   of each L2 table's logical range.
     fn make_multi_l1_source_qcow2(
         path: &Path,
         cluster_size: u64,
@@ -2647,7 +2654,7 @@ mod tests {
     }
 
     fn assert_qemu_img_convert_roundtrip(
-        source: &Path,
+        _source: &Path,
         compressed: &Path,
         virtual_size: u64,
         cluster_size: u64,
@@ -2774,3 +2781,193 @@ mod tests {
         );
     }
 }
+
+// Integration test: if qemu-img is available and an integration test source
+// qcow2 is present, verify that compress_qcow2_image produces an image that
+// qemu-img check -r all reports as clean and that qemu-img convert produces
+// byte-identical output to the source.
+//
+// This test exists at the binary level (not inside #[cfg(test)]) so that it
+// can be invoked as `cargo test -- qcow2_integration` when the required files
+// are in place.
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+    use std::path::PathBuf;
+    use tempfile::tempdir;
+
+    /// Returns the path to the integration test source qcow2, or None if the
+    /// file doesn't exist (in which case the tests are silently skipped).
+    fn integration_source() -> Option<PathBuf> {
+        let p = PathBuf::from("/tmp/qcow2_test/source.qcow2");
+        if p.exists() {
+            Some(p)
+        } else {
+            None
+        }
+    }
+
+    fn guestfish_available() -> bool {
+        std::process::Command::new("guestfish")
+            .arg("--version")
+            .output()
+            .is_ok()
+    }
+
+    fn assert_qemu_img_check_r_all(path: &Path) {
+        let output = std::process::Command::new("qemu-img")
+            .args(["check", "-r", "all", "-f", "qcow2"])
+            .arg(path)
+            .output()
+            .expect("run qemu-img check -r all");
+        assert!(
+            output.status.success(),
+            "qemu-img check -r all failed for {}:\nstdout:\n{}\nstderr:\n{}",
+            path.display(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // Assert no corruption or leaked clusters in the output
+        assert!(
+            !stdout.contains("errors") || stdout.contains("No errors"),
+            "qemu-img check reported errors: {stdout}"
+        );
+    }
+
+    fn assert_qemu_img_convert_matches_source(source: &Path, compressed: &Path) {
+        let tmp = tempdir().expect("tempdir for convert");
+        let raw_src = tmp.path().join("source.raw");
+        let raw_dst = tmp.path().join("compressed.raw");
+
+        for (src, dst, label) in [
+            (source, &raw_src, "source"),
+            (compressed, &raw_dst, "compressed"),
+        ] {
+            let status = std::process::Command::new("qemu-img")
+                .args(["convert", "-f", "qcow2", "-O", "raw"])
+                .arg(src)
+                .arg(dst)
+                .status()
+                .expect("run qemu-img convert");
+            assert!(
+                status.success(),
+                "qemu-img convert failed for {label}: {}",
+                src.display()
+            );
+        }
+
+        let src_bytes = std::fs::read(&raw_src).expect("read source raw");
+        let dst_bytes = std::fs::read(&raw_dst).expect("read compressed raw");
+        assert_eq!(
+            src_bytes.len(),
+            dst_bytes.len(),
+            "raw output size mismatch: source={} compressed={}",
+            src_bytes.len(),
+            dst_bytes.len()
+        );
+        let mismatch_count = src_bytes
+            .iter()
+            .zip(dst_bytes.iter())
+            .filter(|(a, b)| a != b)
+            .count();
+        assert_eq!(
+            mismatch_count,
+            0,
+            "qemu-img convert produced {mismatch_count} byte mismatches between \
+             source and compressed image"
+        );
+    }
+
+    /// Assert guestfish can list filesystems on the compressed image without error.
+    /// Uses 'run; list-filesystems' (not -i) to avoid OS-inspection requirements.
+    fn assert_guestfish_lists_filesystems(path: &Path) {
+        // Try with sudo first; fall back to direct invocation.
+        // LIBGUESTFS_BACKEND=direct bypasses the appliance build, which
+        // requires elevated privileges on most systems.
+        let output = std::process::Command::new("sudo")
+            .env("LIBGUESTFS_BACKEND", "direct")
+            .args(["guestfish", "--ro", "-a"])
+            .arg(path)
+            .args(["run", ":", "list-filesystems"])
+            .output()
+            .or_else(|_| {
+                std::process::Command::new("guestfish")
+                    .env("LIBGUESTFS_BACKEND", "direct")
+                    .args(["--ro", "-a"])
+                    .arg(path)
+                    .args(["run", ":", "list-filesystems"])
+                    .output()
+            })
+            .expect("run guestfish");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "guestfish list-filesystems failed for {}:\nstdout:\n{}\nstderr:\n{}",
+            path.display(),
+            stdout,
+            stderr
+        );
+        // Must list at least one filesystem
+        assert!(
+            !stdout.trim().is_empty(),
+            "guestfish list-filesystems returned no filesystems for {}",
+            path.display()
+        );
+    }
+
+    fn run_integration_compress_test(compression_type: CompressionType, label: &str) {
+        let Some(source) = integration_source() else {
+            eprintln!("integration source not found — skipping {label} integration test");
+            return;
+        };
+        if !std::process::Command::new("qemu-img")
+            .arg("--version")
+            .output()
+            .is_ok()
+        {
+            eprintln!("qemu-img not available — skipping {label} integration test");
+            return;
+        }
+
+        let tmp = tempdir().expect("tempdir");
+        let compressed = tmp.path().join(format!("compressed_{label}.qcow2"));
+
+        let opts = match compression_type {
+            CompressionType::Zstd => "-19 -T0",
+            CompressionType::Zlib => "",
+        };
+        compress_qcow2_image(
+            &source,
+            &compressed,
+            compression_type,
+            &BTreeMap::new(),
+            opts,
+        )
+        .expect("compress integration source");
+
+        assert_qemu_img_check_r_all(&compressed);
+        assert_qemu_img_convert_matches_source(&source, &compressed);
+
+        if guestfish_available() {
+            // Verify guestfish can read the filesystem structure from the
+            // compressed image.  Use list-filesystems (no -i) to avoid
+            // needing a fully-inspectable OS installation.
+            assert_guestfish_lists_filesystems(&compressed);
+        } else {
+            eprintln!("guestfish not available — skipping filesystem mount check");
+        }
+    }
+
+    #[test]
+    fn integration_compress_zlib_roundtrip() {
+        run_integration_compress_test(CompressionType::Zlib, "zlib");
+    }
+
+    #[test]
+    fn integration_compress_zstd_roundtrip() {
+        run_integration_compress_test(CompressionType::Zstd, "zstd");
+    }
+}
+

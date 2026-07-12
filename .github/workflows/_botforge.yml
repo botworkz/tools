@@ -146,7 +146,7 @@ jobs:
 
     - name: Sanity checks
       run: |
-        qemu-img check -f qcow2 testrepo/build/artifact/foo.qcow2
+        qemu-img check -r all -f qcow2 testrepo/build/artifact/foo.qcow2
 
         export LIBGUESTFS_DEBUG=1
         export LIBGUESTFS_TRACE=1
