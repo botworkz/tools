@@ -2498,4 +2498,279 @@ mod tests {
 
         assert_qemu_img_check(&final_image);
     }
+
+    // -----------------------------------------------------------------------
+    // Multi-L1 data integrity: create a source qcow2 with l1_size > 1, compress
+    // it with botforge, then use qemu-img to convert both the source and the
+    // compressed output to raw, and compare them byte-for-byte.
+    //
+    // This test is the primary regression gate for the class of bugs that
+    // SourceImage-based round-trip tests are blind to: a systematic offset
+    // or L2-mapping error in the second (and later) L2 table would cause the
+    // compressed image to silently decompress to zeros for all clusters mapped
+    // by L1[1..], which passes SourceImage (same code path) but fails qemu.
+    // -----------------------------------------------------------------------
+
+    /// Build a minimal sparse qcow2 with a given number of L1 entries (two L2
+    /// tables). The image has `virtual_size = l2_entries_per_table * cluster_size
+    /// * l1_entries` and actual non-zero data only in the first and last cluster
+    /// of each L2 table's logical range.
+    fn make_multi_l1_source_qcow2(
+        path: &Path,
+        cluster_size: u64,
+        l1_count: u64,
+    ) -> (Vec<(u64, Vec<u8>)>, u64) {
+        // Returns (cluster_idx → data, virtual_size)
+        assert!(l1_count >= 2, "need at least 2 L1 entries for this test");
+        let cluster_bits = cluster_size.trailing_zeros();
+        let l2_entries = cluster_size / 8;
+        let guest_clusters = l1_count * l2_entries;
+        let virtual_size = guest_clusters * cluster_size;
+
+        // Physical layout:
+        //  0          : header
+        //  1          : L1 table (l1_count entries, fits in 1 cluster)
+        //  2..2+l1_count-1 : L2 tables
+        //  2+l1_count : refcount table
+        //  3+l1_count : refcount block
+        //  4+l1_count : data clusters (sparse - only those we write)
+        let l1_table_cluster = 1u64;
+        let first_l2_cluster = 2u64;
+        let refcount_table_cluster = 2 + l1_count;
+        let refcount_block_cluster = 3 + l1_count;
+        let first_data_cluster = 4 + l1_count;
+
+        // For each L1 table, put non-zero data in its first cluster
+        let mut written_clusters: Vec<(u64, Vec<u8>)> = Vec::new(); // (guest_cluster, data)
+        for l1_idx in 0..l1_count {
+            let guest_cluster_in_table = l1_idx * l2_entries; // first cluster in this L2 range
+            let mut data = vec![0u8; cluster_size as usize];
+            // unique pattern per l1_idx
+            for (i, b) in data.iter_mut().enumerate() {
+                *b = ((l1_idx as u8).wrapping_mul(37)).wrapping_add((i % 256) as u8);
+            }
+            written_clusters.push((guest_cluster_in_table, data));
+        }
+
+        let data_cluster_count = written_clusters.len() as u64;
+        let total_clusters = first_data_cluster + data_cluster_count;
+        let entries_per_refcount_block = cluster_size / 2;
+
+        let mut file = File::create(path).expect("create multi-l1 test image");
+        file.set_len(cluster_size * total_clusters)
+            .expect("set_len multi-l1");
+
+        // Header
+        write_exact_at(&mut file, 0, &QCOW_MAGIC.to_be_bytes()).unwrap();
+        write_exact_at(&mut file, 4, &3u32.to_be_bytes()).unwrap();
+        write_exact_at(&mut file, 20, &cluster_bits.to_be_bytes()).unwrap();
+        write_exact_at(&mut file, 24, &virtual_size.to_be_bytes()).unwrap();
+        write_exact_at(&mut file, 36, &(l1_count as u32).to_be_bytes()).unwrap();
+        write_exact_at(
+            &mut file,
+            40,
+            &(l1_table_cluster * cluster_size).to_be_bytes(),
+        )
+        .unwrap();
+        write_exact_at(
+            &mut file,
+            48,
+            &(refcount_table_cluster * cluster_size).to_be_bytes(),
+        )
+        .unwrap();
+        write_exact_at(&mut file, 56, &1u32.to_be_bytes()).unwrap();
+        write_exact_at(&mut file, 96, &4u32.to_be_bytes()).unwrap();
+        write_exact_at(&mut file, 100, &104u32.to_be_bytes()).unwrap();
+
+        // L1 table: each entry points to the corresponding L2 cluster
+        for l1_idx in 0..l1_count {
+            let l2_cluster = (first_l2_cluster + l1_idx) * cluster_size;
+            write_u64_at(
+                &mut file,
+                l1_table_cluster * cluster_size + l1_idx * 8,
+                l2_cluster | QCOW_OFLAG_COPIED,
+            )
+            .unwrap();
+        }
+
+        // L2 tables: only fill entries for clusters we actually wrote
+        for (guest_cluster, _) in &written_clusters {
+            let l1_idx = guest_cluster / l2_entries;
+            let l2_idx = guest_cluster % l2_entries;
+            let data_cluster_no = first_data_cluster
+                + written_clusters
+                    .iter()
+                    .position(|(gc, _)| gc == guest_cluster)
+                    .expect("cluster in list") as u64;
+            let data_offset = data_cluster_no * cluster_size;
+            let l2_table_base = (first_l2_cluster + l1_idx) * cluster_size;
+            write_u64_at(
+                &mut file,
+                l2_table_base + l2_idx * 8,
+                data_offset | QCOW_OFLAG_COPIED,
+            )
+            .unwrap();
+        }
+
+        // Refcount table: one entry pointing to refcount block
+        write_u64_at(
+            &mut file,
+            refcount_table_cluster * cluster_size,
+            refcount_block_cluster * cluster_size,
+        )
+        .unwrap();
+
+        // Refcount block: all allocated clusters get refcount 1
+        for cluster_idx in 0..total_clusters {
+            let block_idx = cluster_idx / entries_per_refcount_block;
+            let entry_idx = cluster_idx % entries_per_refcount_block;
+            assert_eq!(block_idx, 0, "all clusters fit in one refcount block");
+            write_exact_at(
+                &mut file,
+                refcount_block_cluster * cluster_size + entry_idx * 2,
+                &1u16.to_be_bytes(),
+            )
+            .unwrap();
+        }
+
+        // Data clusters
+        for (guest_cluster, data) in &written_clusters {
+            let data_cluster_no = first_data_cluster
+                + written_clusters
+                    .iter()
+                    .position(|(gc, _)| gc == guest_cluster)
+                    .expect("cluster in list") as u64;
+            write_exact_at(&mut file, data_cluster_no * cluster_size, data).unwrap();
+        }
+
+        (written_clusters, virtual_size)
+    }
+
+    fn assert_qemu_img_convert_roundtrip(
+        source: &Path,
+        compressed: &Path,
+        virtual_size: u64,
+        cluster_size: u64,
+        written_clusters: &[(u64, Vec<u8>)],
+    ) {
+        if !qemu_img_available() {
+            eprintln!("qemu-img not available — skipping roundtrip check");
+            return;
+        }
+        let tmp = tempdir().expect("tempdir for convert-roundtrip");
+        let raw_out = tmp.path().join("out.raw");
+        let status = std::process::Command::new("qemu-img")
+            .args([
+                "convert",
+                "-f",
+                "qcow2",
+                "-O",
+                "raw",
+                compressed.to_str().unwrap(),
+                raw_out.to_str().unwrap(),
+            ])
+            .status()
+            .expect("run qemu-img convert");
+        assert!(
+            status.success(),
+            "qemu-img convert failed for {}",
+            compressed.display()
+        );
+
+        let raw = std::fs::read(&raw_out).expect("read raw output");
+        assert_eq!(
+            raw.len() as u64,
+            virtual_size,
+            "raw output size mismatch: expected {virtual_size} got {}",
+            raw.len()
+        );
+
+        // Check each written cluster is correct, all others are zero
+        let cluster_usize = cluster_size as usize;
+        let total_guest_clusters = virtual_size / cluster_size;
+        let zero_cluster = vec![0u8; cluster_usize];
+        for gc_idx in 0..total_guest_clusters {
+            let start = (gc_idx * cluster_size) as usize;
+            let end = start + cluster_usize;
+            let actual = &raw[start..end];
+            let expected: &[u8] = written_clusters
+                .iter()
+                .find(|(gc, _)| *gc == gc_idx)
+                .map(|(_, data)| data.as_slice())
+                .unwrap_or(&zero_cluster);
+            assert_eq!(
+                actual,
+                expected,
+                "cluster {gc_idx} (byte offset {start}): data mismatch\n\
+                 first 16 bytes actual: {:02x?}\n\
+                 first 16 bytes expected: {:02x?}",
+                &actual[..16.min(actual.len())],
+                &expected[..16.min(expected.len())],
+            );
+        }
+    }
+
+    /// Data integrity: multi-L1 zlib compression round-trips correctly via qemu-img.
+    /// This is the key regression gate for bugs that are invisible to SourceImage
+    /// round-trips but cause real qemu/guestfish failures.
+    #[test]
+    fn native_compress_multi_l1_data_integrity_zlib() {
+        if !qemu_img_available() {
+            eprintln!("qemu-img not available — skipping multi-L1 data integrity test");
+            return;
+        }
+        let cluster_size = 65536u64;
+        let tmp = tempdir().expect("tempdir");
+        let source = tmp.path().join("multi_l1_source.qcow2");
+        let compressed = tmp.path().join("multi_l1_zlib.qcow2");
+        let (written_clusters, virtual_size) = make_multi_l1_source_qcow2(&source, cluster_size, 3);
+        assert_qemu_img_check(&source);
+        compress_qcow2_image(
+            &source,
+            &compressed,
+            CompressionType::Zlib,
+            &BTreeMap::new(),
+            "",
+        )
+        .expect("compress multi-L1 source (zlib)");
+        assert_qemu_img_check(&compressed);
+        assert_qemu_img_convert_roundtrip(
+            &source,
+            &compressed,
+            virtual_size,
+            cluster_size,
+            &written_clusters,
+        );
+    }
+
+    /// Data integrity: multi-L1 zstd compression round-trips correctly via qemu-img.
+    #[test]
+    fn native_compress_multi_l1_data_integrity_zstd() {
+        if !qemu_img_available() {
+            eprintln!("qemu-img not available — skipping multi-L1 data integrity test");
+            return;
+        }
+        let cluster_size = 65536u64;
+        let tmp = tempdir().expect("tempdir");
+        let source = tmp.path().join("multi_l1_source.qcow2");
+        let compressed = tmp.path().join("multi_l1_zstd.qcow2");
+        let (written_clusters, virtual_size) = make_multi_l1_source_qcow2(&source, cluster_size, 3);
+        assert_qemu_img_check(&source);
+        compress_qcow2_image(
+            &source,
+            &compressed,
+            CompressionType::Zstd,
+            &BTreeMap::new(),
+            "",
+        )
+        .expect("compress multi-L1 source (zstd)");
+        assert_qemu_img_check(&compressed);
+        assert_qemu_img_convert_roundtrip(
+            &source,
+            &compressed,
+            virtual_size,
+            cluster_size,
+            &written_clusters,
+        );
+    }
 }
