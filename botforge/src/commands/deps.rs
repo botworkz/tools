@@ -236,6 +236,7 @@ mod tests {
             auth: None,
             platform: None,
             archive: false,
+            labels: Default::default(),
         };
         assert_eq!(
             oci_or_default_filename("session-broker", &asset).unwrap(),
@@ -254,6 +255,7 @@ mod tests {
             auth: None,
             platform: None,
             archive: false,
+            labels: Default::default(),
         };
         assert_eq!(
             oci_or_default_filename("session-broker", &asset).unwrap(),
@@ -272,6 +274,7 @@ mod tests {
             auth: None,
             platform: None,
             archive: false,
+            labels: Default::default(),
         };
         assert!(oci_or_default_filename("session-broker", &asset).is_err());
     }

@@ -7,7 +7,7 @@ use crate::iso::{
     build_iso, detect_iso_tool, generate_installer_username, render_user_data, write_seed_files,
 };
 use crate::qemu::{create_overlay_image, qemu_run_args, require_kvm, spawn_qemu_with_log};
-use crate::resolver::{Reference, ResolveFileContext};
+use crate::resolver::{AssetKind, Reference, ResolveFileContext, ResolveSpec};
 use crate::ssh::{SshOptions, TemporarySshKeypair};
 use crate::util::{create_temp_dir, ensure_command, resolve_under_root};
 
@@ -216,6 +216,10 @@ fn resolve_test_base_image(
     base_image_arg: Option<PathBuf>,
     config_image: Option<&Reference>,
 ) -> Result<PathBuf> {
+    let base_image_spec = ResolveSpec {
+        deny_kinds: vec![AssetKind::OciImage],
+        ..Default::default()
+    };
     let resolve_context = ResolveFileContext {
         repo_root,
         manifest_path,
@@ -226,7 +230,7 @@ fn resolve_test_base_image(
         if let Some(raw) = base_image.to_str().filter(|raw| raw.starts_with('@')) {
             let reference = Reference::parse(raw)
                 .with_context(|| format!("invalid --base-image reference: {raw:?}"))?;
-            return reference.resolve_base_image_to_file(&resolve_context);
+            return reference.resolve_one_validated(&resolve_context, &base_image_spec);
         }
         return Ok(resolve_under_root(repo_root, base_image));
     }
@@ -234,7 +238,7 @@ fn resolve_test_base_image(
     let image = config_image.context(
         "no base image provided: set `image:` in the test config or pass `--base-image`",
     )?;
-    image.resolve_base_image_to_file(&resolve_context)
+    image.resolve_one_validated(&resolve_context, &base_image_spec)
 }
 
 #[cfg(test)]

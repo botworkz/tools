@@ -15,7 +15,7 @@ use crate::iso::{
     build_iso, detect_iso_tool, generate_installer_username, render_user_data, write_seed_files,
 };
 use crate::qemu::{qemu_build_args, require_kvm, spawn_qemu_with_log};
-use crate::resolver::{ResolveFileContext, ARTIFACT_DIR};
+use crate::resolver::{AssetKind, ResolveFileContext, ResolveSpec, ARTIFACT_DIR};
 use crate::ssh::{scp_with_retry, ssh_with_retry, SshOptions, TemporarySshKeypair};
 use crate::util::{
     botforge_debug_enabled, create_temp_dir, default_cache_dir, ensure_command, format_bytes_human,
@@ -149,13 +149,17 @@ pub(crate) fn cmd_build(config: &Path, args: BuildArgs) -> Result<()> {
     let source = if let Some(src) = args.source {
         resolve_under_root(&repo_root, src)
     } else {
-        build_config
-            .image
-            .resolve_base_image_to_file(&ResolveFileContext {
+        build_config.image.resolve_one_validated(
+            &ResolveFileContext {
                 repo_root: &repo_root,
                 manifest_path: config,
                 cache_dir_override: args.cache_dir.as_deref(),
-            })?
+            },
+            &ResolveSpec {
+                deny_kinds: vec![AssetKind::OciImage],
+                ..Default::default()
+            },
+        )?
     };
 
     if !source.is_file() {
