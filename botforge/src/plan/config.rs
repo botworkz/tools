@@ -3174,7 +3174,7 @@ cloud_init:
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
         let ci = config.cloud_init.expect("cloud_init must be Some");
         let bootcmd = ci
-            .get(&serde_yaml::Value::String("bootcmd".to_string()))
+            .get(serde_yaml::Value::String("bootcmd".to_string()))
             .expect("bootcmd must be present in cloud_init");
         let entries = bootcmd.as_sequence().expect("bootcmd must be a sequence");
         assert_eq!(entries.len(), 2);
@@ -3201,7 +3201,7 @@ cloud_init:
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
         let ci = config.cloud_init.expect("cloud_init must be Some");
         let bootcmd = ci
-            .get(&serde_yaml::Value::String("bootcmd".to_string()))
+            .get(serde_yaml::Value::String("bootcmd".to_string()))
             .expect("bootcmd must be present");
         let entries = bootcmd.as_sequence().expect("bootcmd must be a sequence");
         assert_eq!(entries.len(), 1);
@@ -3282,7 +3282,7 @@ cloud_init:
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
         let ci = config.cloud_init.expect("cloud_init must be Some");
         let pkgs = ci
-            .get(&serde_yaml::Value::String("packages".to_string()))
+            .get(serde_yaml::Value::String("packages".to_string()))
             .expect("packages must be present")
             .as_sequence()
             .expect("packages must be a sequence");
@@ -3309,7 +3309,7 @@ cloud_init:
         let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
         let ci = config.cloud_init.expect("cloud_init must be Some");
         let mounts = ci
-            .get(&serde_yaml::Value::String("mounts".to_string()))
+            .get(serde_yaml::Value::String("mounts".to_string()))
             .expect("mounts must be present")
             .as_sequence()
             .expect("mounts must be a sequence");
