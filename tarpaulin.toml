@@ -1,0 +1,16 @@
+# cargo-tarpaulin configuration.
+#
+# `[default]` is the profile invoked by a bare `cargo tarpaulin`.
+# CI and the Makefile call `cargo tarpaulin` with no flags, so all knobs
+# live here.
+#
+# See CONTRIBUTING.md "Coverage exclusions" for the invariants this file
+# preserves.
+
+[default]
+engine = "Llvm"
+workspace = true
+timeout = "180s"
+out = ["Xml", "Html"]
+output-dir = "target/tarpaulin"
+skip-clean = true
