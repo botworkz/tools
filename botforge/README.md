@@ -725,14 +725,18 @@ example, `compressor_opts: "-19 -T0"` tells the native zstd compressor to use
 level 19 and all available worker threads. Unknown zstd flags are a hard error
 that names the offending token.
 
-> **Note — `-T0`/`-Tn` worker opts are accepted but not applied per-cluster.**
+> **Note — `-T0`/`-Tn` worker opts control cluster-level parallelism, not
+> per-frame libzstd workers.**
 > qemu's `qcow2_zstd_decompress` performs a single `ZSTD_decompressStream` pass
 > and requires each cluster to be exactly one self-contained zstd frame.
 > Multithreaded zstd compression (libzstd `NbWorkers > 0`) can emit a
 > worker-chunked multi-frame stream that qemu rejects with `-EIO`.  Per-cluster
-> payloads are at most `cluster_size` (≤ 2 MiB) so multithreading yields no
-> compression benefit anyway; botforge ignores the worker count for per-cluster
-> work and always produces a single deterministic frame.
+> payloads are at most `cluster_size` (≤ 2 MiB), so botforge keeps each cluster
+> as one deterministic frame and parallelizes across guest clusters instead.
+> Work is batched in groups of `COMPRESSION_BATCH = 64`, so peak compression RSS
+> scales with `64 × cluster_size` (for example `64 × 2 MiB = 128 MiB` at the
+> maximum cluster size). `-Tn` changes worker count only; it does not change the
+> 64-cluster batch size.
 
 When compression is enabled and `compressor:` is omitted, botforge now
 defaults to `zstd`. `zstd`-compressed qcow2 images require qemu >= 5.1 on any
@@ -853,4 +857,3 @@ Compression matrix (runs in parallel):
 
 KVM is a **hard requirement** — the job fails immediately if `/dev/kvm` is
 unavailable; no TCG fallback.
-
