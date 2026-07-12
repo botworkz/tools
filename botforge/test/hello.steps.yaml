@@ -1,0 +1,16 @@
+type: fragment
+steps:
+- on: host
+  name: Host hello
+  id: hello-host
+  run: |
+    me=$(whoami | grep botforge)
+    host_name=$(hostname)
+    echo "Hello from ${me} on ${host_name}"
+- name: Guest hello
+  sudo: false
+  id: hello-guest
+  run: |
+    me=$(whoami | grep botforge)
+    host_name=$(hostname)
+    echo "Hello from ${me} on ${host_name}"

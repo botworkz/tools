@@ -4,10 +4,11 @@ use serde::Deserialize;
 use serde_yaml::Value;
 
 /// Where a test step executes: inside the guest (SSH) or on the harness host (local).
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum StepTarget {
     /// Run via SSH inside the guest VM.
+    #[default]
     Guest,
     /// Run locally in the botforge container (harness), reaching the guest only via forwarded
     /// `ports:`. This is the botforge container / harness where botforge itself runs — not the
@@ -18,8 +19,8 @@ pub(crate) enum StepTarget {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RunStep {
-    /// Where this step executes. Required; must be `guest` or `host`.
-    #[serde(rename = "on")]
+    /// Where this step executes. Optional; defaults to `guest`.
+    #[serde(rename = "on", default)]
     pub(crate) target: StepTarget,
     pub(crate) name: String,
     pub(crate) run: String,
@@ -35,7 +36,7 @@ pub(crate) struct RunStep {
     pub(crate) shell: Option<String>,
     /// When `true`, run the step's interpreter under `sudo -E` so the entire
     /// `run:` body executes as root. Only valid on `on: guest` steps (host steps
-    /// run in the botforge container as the harness user). Defaults to `false`.
+    /// run in the botforge container as the harness user). Defaults to `true`.
     #[serde(default)]
     pub(crate) sudo: Option<bool>,
     /// Optional identifier for the step. When set, it is shown in the step's
@@ -43,6 +44,12 @@ pub(crate) struct RunStep {
     /// not required to be unique and is not addressable by other steps.
     #[serde(default)]
     pub(crate) id: Option<String>,
+}
+
+impl RunStep {
+    pub(crate) fn sudo_enabled(&self) -> bool {
+        self.sudo.unwrap_or(true)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -199,7 +206,7 @@ pub(crate) fn resolve_shell(shell: Option<&str>) -> Result<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_shell, RunStep};
+    use super::{resolve_shell, RunStep, StepTarget};
 
     #[test]
     fn test_resolve_shell_absent_returns_bash_template() {
@@ -358,6 +365,50 @@ run: echo ok
         )
         .unwrap();
         assert_eq!(step.sudo, None);
+    }
+
+    #[test]
+    fn test_run_step_parses_without_on_defaults_to_guest() {
+        let step: RunStep = serde_yaml::from_str(
+            r#"
+name: no-target
+run: echo ok
+"#,
+        )
+        .unwrap();
+        assert_eq!(step.target, StepTarget::Guest);
+    }
+
+    #[test]
+    fn test_run_step_sudo_enabled_uses_default_true() {
+        let omitted: RunStep = serde_yaml::from_str(
+            r#"
+name: sudo-default
+run: echo ok
+"#,
+        )
+        .unwrap();
+        assert!(omitted.sudo_enabled());
+
+        let explicit_false: RunStep = serde_yaml::from_str(
+            r#"
+name: sudo-false
+sudo: false
+run: echo ok
+"#,
+        )
+        .unwrap();
+        assert!(!explicit_false.sudo_enabled());
+
+        let explicit_true: RunStep = serde_yaml::from_str(
+            r#"
+name: sudo-true
+sudo: true
+run: echo ok
+"#,
+        )
+        .unwrap();
+        assert!(explicit_true.sudo_enabled());
     }
 
     #[test]
