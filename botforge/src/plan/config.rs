@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use serde::{de, Deserialize};
 use serde_yaml::Value;
 use std::collections::{BTreeMap, HashSet};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use crate::iso::BootcmdEntry;
 use crate::qemu::PortSpec;
@@ -841,25 +841,6 @@ fn resolve_uses_path(repo_root: &Path, uses: &str) -> Result<PathBuf> {
     }
 }
 
-fn validate_uses_repo_path(path: &Path) -> Result<()> {
-    if path.as_os_str().is_empty() {
-        anyhow::bail!("uses path must not be empty");
-    }
-    if path.is_absolute() {
-        anyhow::bail!("uses path must be repo-relative, got: {}", path.display());
-    }
-    for component in path.components() {
-        match component {
-            Component::Normal(_) => {}
-            _ => anyhow::bail!(
-                "uses path must contain no '.' or '..' segments: {}",
-                path.display()
-            ),
-        }
-    }
-    Ok(())
-}
-
 fn validate_top_level_uploads(kind: &str, uploads: &[TopLevelUpload]) -> Result<()> {
     for upload in uploads {
         validate_top_level_upload(kind, upload)?;
@@ -905,14 +886,15 @@ fn validate_top_level_upload(kind: &str, upload: &TopLevelUpload) -> Result<()> 
     if src.is_empty() {
         anyhow::bail!("{kind} uploads entry: `src` is required and must be non-empty");
     }
-    if src.starts_with('@') {
+    if !src.starts_with('@') {
         anyhow::bail!(
-            "{kind} uploads entry '{src}': top-level `uploads:` only supports repo-relative files/globs; use an `archive:` step for shasset assets"
+            "{kind} uploads entry '{src}': `src` must be an `@`-reference \
+             (e.g. `@foo`, `@://<glob>`, `@artifact://<glob>`); bare paths are not supported"
         );
     }
-    validate_uses_repo_path(Path::new(src)).with_context(|| {
-        format!("{kind} uploads entry '{src}': `src` must be repo-relative and contain no '.' or '..' segments")
-    })?;
+    // Validate the reference syntax at config-load time so bad references are caught early.
+    Reference::parse(src)
+        .with_context(|| format!("{kind} uploads entry '{src}': invalid `@`-reference in `src`"))?;
     if dest.is_empty() {
         anyhow::bail!(
             "{kind} uploads entry '{src}': `dest` is required and must be a non-empty absolute path"
@@ -2729,9 +2711,9 @@ type: build
 image: "@base"
 output: "out.qcow2"
 uploads:
-  - src: images/botspace/envoy/**/*.yaml
+  - src: "@://images/botspace/envoy/**/*.yaml"
     dest: /tmp/bake-staging/envoy/
-  - src: build/images/payload/*.tar
+  - src: "@artifact://build/images/payload/*.tar"
     dest: /usr/share/botwork/images/
 steps: []
 "#,
@@ -2741,12 +2723,12 @@ steps: []
             config.uploads,
             vec![
                 TopLevelUpload {
-                    src: "images/botspace/envoy/**/*.yaml".to_string(),
+                    src: "@://images/botspace/envoy/**/*.yaml".to_string(),
                     dest: "/tmp/bake-staging/envoy/".to_string(),
                     ..Default::default()
                 },
                 TopLevelUpload {
-                    src: "build/images/payload/*.tar".to_string(),
+                    src: "@artifact://build/images/payload/*.tar".to_string(),
                     dest: "/usr/share/botwork/images/".to_string(),
                     ..Default::default()
                 },
@@ -2755,7 +2737,7 @@ steps: []
     }
 
     #[test]
-    fn test_load_build_config_rejects_top_level_upload_at_prefixed_src() {
+    fn test_load_build_config_rejects_top_level_upload_bare_path_src() {
         let repo = TempDir::new().unwrap();
         write_build_config(
             &repo,
@@ -2765,15 +2747,17 @@ type: build
 image: "@base"
 output: "out.qcow2"
 uploads:
-  - src: "@payload"
+  - src: payload/file.txt
     dest: /tmp/payload
 steps: []
 "#,
         );
         let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("archive:"));
-        assert!(msg.contains("@payload"));
+        assert!(
+            msg.contains("@-reference") || msg.contains("`@`-reference"),
+            "error should mention @-reference: {msg}"
+        );
     }
 
     #[test]
@@ -2787,7 +2771,7 @@ type: build
 image: "@base"
 output: "out.qcow2"
 uploads:
-  - src: payload/file.txt
+  - src: "@://payload/file.txt"
     dest: relative/path
 steps: []
 "#,
@@ -2801,7 +2785,7 @@ steps: []
     }
 
     #[test]
-    fn test_load_build_config_rejects_top_level_upload_src_traversal() {
+    fn test_load_build_config_rejects_top_level_upload_src_invalid_ref() {
         let repo = TempDir::new().unwrap();
         write_build_config(
             &repo,
@@ -2811,14 +2795,17 @@ type: build
 image: "@base"
 output: "out.qcow2"
 uploads:
-  - src: payload/../secret.txt
+  - src: "@://secret/../etc/passwd"
     dest: /tmp/secret.txt
 steps: []
 "#,
         );
         let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains(".."), "error should mention traversal: {msg}");
+        assert!(
+            msg.contains("..") || msg.contains("invalid"),
+            "error should mention traversal or invalid ref: {msg}"
+        );
     }
 
     #[test]
@@ -2832,7 +2819,7 @@ type: build
 image: "@base"
 output: "out.qcow2"
 uploads:
-  - src: payload/*.tar
+  - src: "@artifact://payload/*.tar"
     dest: /tmp/payload.tar
 steps: []
 "#,
@@ -2856,7 +2843,7 @@ type: build
 image: "@base"
 output: "out.qcow2"
 uploads:
-  - src: payload/file.txt
+  - src: "@://payload/file.txt"
     dest: /tmp/file.txt
     bogus: 1
 steps: []
@@ -2878,7 +2865,7 @@ type: build
 image: "@base"
 output: "out.qcow2"
 uploads:
-  - src: payload/file.txt
+  - src: "@payload"
     dest: /usr/local/bin/file
     mode: "0755"
     owner: root
@@ -2909,7 +2896,7 @@ type: build
 image: "@base"
 output: "out.qcow2"
 uploads:
-  - src: payload/file.txt
+  - src: "@payload"
     dest: /tmp/file.txt
     mode: "abc"
 steps: []
@@ -2934,7 +2921,7 @@ type: build
 image: "@base"
 output: "out.qcow2"
 uploads:
-  - src: payload/file.txt
+  - src: "@payload"
     dest: /tmp/file.txt
     owner: "root/admin"
 steps: []
@@ -2959,7 +2946,7 @@ type: build
 image: "@base"
 output: "out.qcow2"
 uploads:
-  - src: payload/file.txt
+  - src: "@payload"
     dest: /tmp/file.txt
     group: "adm;in"
 steps: []
@@ -3544,7 +3531,7 @@ bootcmd:
             r#"
 type: test
 uploads:
-  - src: fixtures/envoy/**/*.yaml
+  - src: "@://fixtures/envoy/**/*.yaml"
     dest: /tmp/envoy/
 steps: []
 "#,
@@ -3554,7 +3541,7 @@ steps: []
         assert_eq!(
             config.uploads,
             vec![TopLevelUpload {
-                src: "fixtures/envoy/**/*.yaml".to_string(),
+                src: "@://fixtures/envoy/**/*.yaml".to_string(),
                 dest: "/tmp/envoy/".to_string(),
                 ..Default::default()
             }]

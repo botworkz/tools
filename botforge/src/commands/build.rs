@@ -277,6 +277,8 @@ pub(crate) fn cmd_build(config: &Path, args: BuildArgs) -> Result<()> {
             top_level_uploads: &build_config.uploads,
             steps: &build_config.steps,
             bootstraps: &[],
+            manifest_path: config,
+            cache_dir_override: args.cache_dir.as_deref(),
         },
         &ssh_options,
         StepTimeoutPolicy {

@@ -185,7 +185,14 @@ pub(crate) fn cmd_test(config: &Path, args: TestArgs) -> Result<()> {
         key: ssh_key_path,
     };
 
-    let test_result = run_test_flow(&repo_root, &test_config, &ssh_options, &bootstraps);
+    let test_result = run_test_flow(
+        &repo_root,
+        &test_config,
+        &ssh_options,
+        &bootstraps,
+        config,
+        None,
+    );
     if let Err(err) = test_result {
         eprintln!("test failed: {err:#}");
         collect_test_diagnostics(&ssh_options, &test_config.diagnostics_units);

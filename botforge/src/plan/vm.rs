@@ -6,6 +6,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::resolver::ResolveFileContext;
 use crate::ssh::{
     journalctl_command, scp_with_retry, ssh_capture_stdout, ssh_exec_logged, ssh_with_retry,
     wait_for_ssh, SshExecOutcome, SshOptions,
@@ -31,6 +32,10 @@ pub(crate) struct StepFlowPlan<'a> {
     pub(crate) top_level_uploads: &'a [TopLevelUpload],
     pub(crate) steps: &'a [TestStep],
     pub(crate) bootstraps: &'a [TestIsoBootstrap],
+    /// Shasset manifest path, forwarded to the resolver for `@`-reference srcs in uploads.
+    pub(crate) manifest_path: &'a Path,
+    /// Optional cache directory override, forwarded to the resolver.
+    pub(crate) cache_dir_override: Option<&'a Path>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -65,6 +70,8 @@ pub(crate) fn run_test_flow(
     config: &TestConfig,
     ssh: &SshOptions,
     bootstraps: &[TestIsoBootstrap],
+    manifest_path: &Path,
+    cache_dir_override: Option<&Path>,
 ) -> Result<()> {
     run_step_flow(
         repo_root,
@@ -72,6 +79,8 @@ pub(crate) fn run_test_flow(
             top_level_uploads: &config.uploads,
             steps: &config.steps,
             bootstraps,
+            manifest_path,
+            cache_dir_override,
         },
         ssh,
         StepTimeoutPolicy {
@@ -153,7 +162,12 @@ pub(crate) fn run_step_flow(
 
     if !plan.top_level_uploads.is_empty() {
         ensure_overall_budget(overall_deadline, timeouts.overall_timeout)?;
-        stage_top_level_uploads(repo_root, plan.top_level_uploads, ssh)?;
+        let resolve_context = ResolveFileContext {
+            repo_root,
+            manifest_path: plan.manifest_path,
+            cache_dir_override: plan.cache_dir_override,
+        };
+        stage_top_level_uploads(plan.top_level_uploads, &resolve_context, ssh)?;
     }
 
     // Shared ordered env map threaded across all steps (both guest and host).
