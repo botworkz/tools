@@ -940,18 +940,26 @@ fn write_refcount_blocks(
 fn read_header(file: &mut File) -> Result<Qcow2Header> {
     let mut fixed = [0u8; QCOW_HEADER_LENGTH_V3 as usize];
     read_exact_at(file, 0, &mut fixed)?;
-    let magic = u32::from_be_bytes(fixed[HDR_MAGIC..HDR_MAGIC + 4].try_into().unwrap());
+    let magic = u32::from_be_bytes(
+        fixed[HDR_MAGIC..HDR_MAGIC + 4]
+            .try_into()
+            .expect("slice length"),
+    );
     if magic != QCOW_MAGIC {
         bail!("not a qcow2 image (bad magic)");
     }
-    let version = u32::from_be_bytes(fixed[HDR_VERSION..HDR_VERSION + 4].try_into().unwrap());
+    let version = u32::from_be_bytes(
+        fixed[HDR_VERSION..HDR_VERSION + 4]
+            .try_into()
+            .expect("slice length"),
+    );
     if version != 2 && version != 3 {
         bail!("unsupported qcow2 version {version}");
     }
     let cluster_bits = u32::from_be_bytes(
         fixed[HDR_CLUSTER_BITS..HDR_CLUSTER_BITS + 4]
             .try_into()
-            .unwrap(),
+            .expect("slice length"),
     );
     if !(9..=21).contains(&cluster_bits) {
         bail!("unsupported qcow2 cluster_bits {cluster_bits}");
@@ -961,7 +969,7 @@ fn read_header(file: &mut File) -> Result<Qcow2Header> {
         u32::from_be_bytes(
             fixed[HDR_REFCOUNT_ORDER..HDR_REFCOUNT_ORDER + 4]
                 .try_into()
-                .unwrap(),
+                .expect("slice length"),
         )
     } else {
         DEFAULT_REFCOUNT_ORDER
@@ -970,7 +978,7 @@ fn read_header(file: &mut File) -> Result<Qcow2Header> {
         u32::from_be_bytes(
             fixed[HDR_HEADER_LENGTH..HDR_HEADER_LENGTH + 4]
                 .try_into()
-                .unwrap(),
+                .expect("slice length"),
         )
     } else {
         72
@@ -985,33 +993,39 @@ fn read_header(file: &mut File) -> Result<Qcow2Header> {
         backing_file_offset: u64::from_be_bytes(
             fixed[HDR_BACKING_FILE_OFFSET..HDR_BACKING_FILE_OFFSET + 8]
                 .try_into()
-                .unwrap(),
+                .expect("slice length"),
         ),
         virtual_size: u64::from_be_bytes(
-            fixed[HDR_DISK_SIZE..HDR_DISK_SIZE + 8].try_into().unwrap(),
+            fixed[HDR_DISK_SIZE..HDR_DISK_SIZE + 8]
+                .try_into()
+                .expect("slice length"),
         ),
         cluster_bits,
-        l1_size: u32::from_be_bytes(fixed[HDR_L1_SIZE..HDR_L1_SIZE + 4].try_into().unwrap()),
+        l1_size: u32::from_be_bytes(
+            fixed[HDR_L1_SIZE..HDR_L1_SIZE + 4]
+                .try_into()
+                .expect("slice length"),
+        ),
         l1_table_offset: u64::from_be_bytes(
             fixed[HDR_L1_TABLE_OFFSET..HDR_L1_TABLE_OFFSET + 8]
                 .try_into()
-                .unwrap(),
+                .expect("slice length"),
         ),
         refcount_table_offset: u64::from_be_bytes(
             fixed[HDR_REFCOUNT_TABLE_OFFSET..HDR_REFCOUNT_TABLE_OFFSET + 8]
                 .try_into()
-                .unwrap(),
+                .expect("slice length"),
         ),
         refcount_table_clusters: u32::from_be_bytes(
             fixed[HDR_REFCOUNT_TABLE_CLUSTERS..HDR_REFCOUNT_TABLE_CLUSTERS + 4]
                 .try_into()
-                .unwrap(),
+                .expect("slice length"),
         ),
         incompatible_features: if version >= 3 {
             u64::from_be_bytes(
                 fixed[HDR_INCOMPAT_FEATURES..HDR_INCOMPAT_FEATURES + 8]
                     .try_into()
-                    .unwrap(),
+                    .expect("slice length"),
             )
         } else {
             0
@@ -1163,6 +1177,7 @@ mod tests {
         l1_size: u32,
         l1_table_offset: u64,
         refcount_table_offset: u64,
+        refcount_table_clusters: u32,
     ) -> Result<()> {
         write_exact_at(file, HDR_MAGIC as u64, &QCOW_MAGIC.to_be_bytes())?;
         write_exact_at(file, HDR_VERSION as u64, &3u32.to_be_bytes())?;
@@ -1182,7 +1197,7 @@ mod tests {
         write_exact_at(
             file,
             HDR_REFCOUNT_TABLE_CLUSTERS as u64,
-            &1u32.to_be_bytes(),
+            &refcount_table_clusters.to_be_bytes(),
         )?;
         write_exact_at(
             file,
@@ -1192,10 +1207,35 @@ mod tests {
         write_exact_at(
             file,
             HDR_HEADER_LENGTH as u64,
+            // Include the compression-type byte itself so read_header() will
+            // honor any fixture-written value at HDR_COMPRESSION_TYPE, matching
+            // the v3 header length written by write_header() for real images.
             &(HDR_COMPRESSION_TYPE as u32 + 1).to_be_bytes(),
         )?;
         Ok(())
     }
+
+    #[test]
+    fn test_header_helper_includes_compression_type_byte_in_header_length() {
+        let tmp = tempdir().expect("tempdir");
+        let image = tmp.path().join("header.qcow2");
+        let cluster_size = 4096u64;
+        let mut file = File::create(&image).expect("create image");
+        file.set_len(cluster_size).expect("set_len");
+        write_qcow2_test_header(&mut file, 12, cluster_size, 0, 0, 0, 1).expect("write header");
+        write_exact_at(
+            &mut file,
+            HDR_COMPRESSION_TYPE as u64,
+            &[QCOW2_COMPRESSION_TYPE_ZSTD],
+        )
+        .expect("write compression type");
+
+        let mut file = File::open(&image).expect("open image");
+        let header = read_header(&mut file).expect("read header");
+        assert_eq!(header.header_length, HDR_COMPRESSION_TYPE as u32 + 1);
+        assert_eq!(header.compression_type, QCOW2_COMPRESSION_TYPE_ZSTD);
+    }
+
     #[test]
     fn deallocates_zero_clusters_and_preserves_non_zero_clusters() {
         let tmp = tempdir().expect("tempdir");
@@ -1490,6 +1530,7 @@ mod tests {
             1,
             cluster_size,
             cluster_size * 3,
+            1,
         )?;
 
         write_u64_at(&mut file, cluster_size, cluster_size * 2)?;
@@ -1559,6 +1600,7 @@ mod tests {
             1,
             cluster_size,
             cluster_size * 3,
+            1,
         )?;
 
         // L1 table: single entry pointing to L2 at cluster 2
@@ -1668,6 +1710,7 @@ mod tests {
             1,
             cluster_size,
             cluster_size * 3,
+            1,
         )?;
 
         write_u64_at(&mut file, cluster_size, cluster_size * 2)?;
@@ -1725,6 +1768,7 @@ mod tests {
             1,
             cluster_size,
             cluster_size * 3,
+            1,
         )?;
 
         write_u64_at(&mut file, cluster_size, cluster_size * 2)?;
@@ -2330,6 +2374,7 @@ mod tests {
                 1,
                 cluster_size,
                 cluster_size * 3,
+                1,
             )
             .expect("write header");
             // L1: one entry pointing to L2 at cluster 2
@@ -2432,6 +2477,7 @@ mod tests {
             1,
             cluster_size,
             cluster_size * 3,
+            1,
         )?;
         write_exact_at(
             &mut file,
@@ -2763,6 +2809,7 @@ mod tests {
             l1_count as u32,
             l1_table_cluster * cluster_size,
             refcount_table_cluster * cluster_size,
+            1,
         )
         .unwrap();
 
