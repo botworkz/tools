@@ -1,9 +1,9 @@
 x-botforge-base: &botforge-base
-  image: ${BOTFORGE_IMAGE:?BOTFORGE_IMAGE must be set by the wrapper}
+  image: "${BOTFORGE_IMAGE:-ghcr.io/botworkz/tools/botforge}"
   user: "${HOST_UID:?}:${HOST_GID:?}"
   group_add:
   - "${HOST_KVM_GID}"
-  working_dir: ${REPO_ROOT:?}
+  working_dir: ${REPO_ROOT:-${PWD}}
   environment:
     HOME: /tmp
     XDG_CACHE_HOME: /tmp/.cache
@@ -12,7 +12,7 @@ x-botforge-base: &botforge-base
     HOST_KVM_GID: ${HOST_KVM_GID}
     LIBGUESTFS_BACKEND: direct
   volumes:
-  - ${REPO_ROOT}:${REPO_ROOT}
+  - ${REPO_ROOT:-${PWD}}:${REPO_ROOT:-${PWD}}
 
 services:
   build:
