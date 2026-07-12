@@ -29,6 +29,6 @@ fn run() -> Result<()> {
         Commands::Iso(args) => commands::iso::cmd_iso(args),
         Commands::Payload(args) => commands::payload::cmd_payload(&cli.config, args),
         Commands::Run(args) => commands::run::cmd_run(args),
-        Commands::Test(args) => commands::test::cmd_test(args),
+        Commands::Test(args) => commands::test::cmd_test(&cli.config, args),
     }
 }

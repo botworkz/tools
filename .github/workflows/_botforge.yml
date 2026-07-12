@@ -110,11 +110,12 @@ jobs:
                  then {reclaim: $in.reclaim}
                  else {} end)
             )
-    - name: Slurp test config
+    - name: Create test config
       uses: envoyproxy/toolshed/actions/jq@6a20085af231aba4c72d6866f94098343a8c5616
       id: test-config
       with:
         input-format: yaml-path
+        filter: '. + {image: "@artifact://foo.qcow2"}'
         output-path: testrepo/test.yaml
         input: botforge/test/test.yaml
 
@@ -150,6 +151,41 @@ jobs:
         export LIBGUESTFS_TRACE=1
         sudo guestfish --ro -a testrepo/build/artifact/foo.qcow2 -i sh 'file /boot/vmlinuz*; ls -l /boot'
 
+    - name: Create chained build configs
+      run: |
+        cat > testrepo/chained-repo.yaml <<'EOF'
+        type: build
+        image: "@://build/artifact/foo.qcow2"
+        output: "foo-chained-repo.qcow2"
+        steps: []
+        EOF
+
+        cat > testrepo/chained-artifact.yaml <<'EOF'
+        type: build
+        image: "@artifact://foo.qcow2"
+        output: "foo-chained-artifact.qcow2"
+        steps: []
+        EOF
+
+    - name: Run chained builds
+      run: |
+        export BOTFORGE_IMAGE=botworkz/botforge:ci
+        export HOST_UID=$(id -u)
+        export HOST_GID=$(id -g)
+        export HOST_KVM_GID=$(getent group kvm | cut -d: -f3)
+        export REPO_ROOT=$(realpath testrepo)
+        docker compose -f botforge/test/compose.yml run build \
+          build \
+            --spec chained-repo.yaml
+        docker compose -f botforge/test/compose.yml run build \
+          build \
+            --spec chained-artifact.yaml
+
+    - name: Sanity check chained outputs
+      run: |
+        qemu-img check -r all -f qcow2 testrepo/build/artifact/foo-chained-repo.qcow2
+        qemu-img check -r all -f qcow2 testrepo/build/artifact/foo-chained-artifact.qcow2
+
     - run: |
         export BOTFORGE_IMAGE=botworkz/botforge:ci
         export HOST_UID=$(id -u)
@@ -159,5 +195,4 @@ jobs:
         docker compose -f botforge/test/compose.yml run build \
           test \
             --test-config test.yaml \
-            --repo-root "$REPO_ROOT" \
-            --base-image build/artifact/foo.qcow2
+            --repo-root "$REPO_ROOT"
