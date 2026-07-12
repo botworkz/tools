@@ -2921,10 +2921,10 @@ mod integration_tests {
             eprintln!("integration source not found — skipping {label} integration test");
             return;
         };
-        if !std::process::Command::new("qemu-img")
+        if std::process::Command::new("qemu-img")
             .arg("--version")
             .output()
-            .is_ok()
+            .is_err()
         {
             eprintln!("qemu-img not available — skipping {label} integration test");
             return;
