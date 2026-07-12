@@ -24,6 +24,22 @@ const QCOW_HEADER_LENGTH_V3: u32 = 112;
 const COMPRESSION_BATCH: usize = 64;
 const MAX_EXPLICIT_COMPRESSION_THREADS: usize = 64;
 
+// Byte offsets of fields within the fixed qcow2 v3 header (112 bytes).
+// These match the layout in qemu's include/block/qcow2.h.
+const HDR_MAGIC: usize = 0;
+const HDR_VERSION: usize = 4;
+const HDR_BACKING_FILE_OFFSET: usize = 8;
+const HDR_CLUSTER_BITS: usize = 20;
+const HDR_DISK_SIZE: usize = 24;
+const HDR_L1_SIZE: usize = 36;
+const HDR_L1_TABLE_OFFSET: usize = 40;
+const HDR_REFCOUNT_TABLE_OFFSET: usize = 48;
+const HDR_REFCOUNT_TABLE_CLUSTERS: usize = 56;
+const HDR_INCOMPAT_FEATURES: usize = 72;
+const HDR_REFCOUNT_ORDER: usize = 96;
+const HDR_HEADER_LENGTH: usize = 100;
+const HDR_COMPRESSION_TYPE: usize = 104;
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct ZeroClusterSparsifyStats {
     pub(crate) scanned_clusters: u64,
@@ -69,18 +85,22 @@ impl Qcow2Header {
             other => bail!("unsupported qcow2 compression type {other}"),
         }
     }
+}
 
-    fn csize_shift(self) -> u32 {
-        62 - (self.cluster_bits - 8)
-    }
+/// `62 - (cluster_bits - 8)`: the bit position of the compressed-sector-count
+/// field within a compressed L2 entry.  Matches qemu's QCOW2_COMPRESSED_SECTOR_OFFSET.
+fn csize_shift(cluster_bits: u32) -> u32 {
+    62 - (cluster_bits - 8)
+}
 
-    fn csize_mask(self) -> u64 {
-        (1u64 << (self.cluster_bits - 8)) - 1
-    }
+/// Mask for the nb_csectors field of a compressed L2 entry (stored as value-1).
+fn csize_mask(cluster_bits: u32) -> u64 {
+    (1u64 << (cluster_bits - 8)) - 1
+}
 
-    fn cluster_offset_mask(self) -> u64 {
-        (1u64 << self.csize_shift()) - 1
-    }
+/// Mask for the host-file-offset bits of a compressed L2 entry.
+fn cluster_offset_mask(cluster_bits: u32) -> u64 {
+    (1u64 << csize_shift(cluster_bits)) - 1
 }
 
 pub(crate) fn compress_qcow2_image(
@@ -99,14 +119,12 @@ pub(crate) fn compress_qcow2_image(
     let l2_entries_per_table = cluster_size
         .checked_div(8)
         .context("invalid qcow2 cluster size for L2 tables")?;
-    let guest_cluster_count = div_ceil(virtual_size, cluster_size);
-    let l1_size = div_ceil(guest_cluster_count, l2_entries_per_table);
-    let l1_table_clusters = div_ceil(
-        l1_size
-            .checked_mul(8)
-            .context("l1 table byte length overflow")?,
-        cluster_size,
-    );
+    let guest_cluster_count = virtual_size.div_ceil(cluster_size);
+    let l1_size = guest_cluster_count.div_ceil(l2_entries_per_table);
+    let l1_table_clusters = l1_size
+        .checked_mul(8)
+        .context("l1 table byte length overflow")?
+        .div_ceil(cluster_size);
     let l1_table_offset = cluster_size;
     let first_l2_offset = l1_table_offset
         .checked_add(
@@ -709,11 +727,9 @@ fn compute_refcount_layout(
             .checked_add(refcount_table_clusters)
             .and_then(|v| v.checked_add(refcount_block_clusters))
             .context("qcow2 cluster count overflow")?;
-        let needed_refcount_block_clusters = div_ceil(total_clusters, entries_per_refcount_block);
-        let needed_refcount_table_clusters = div_ceil(
-            needed_refcount_block_clusters,
-            entries_per_refcount_table_cluster,
-        );
+        let needed_refcount_block_clusters = total_clusters.div_ceil(entries_per_refcount_block);
+        let needed_refcount_table_clusters =
+            needed_refcount_block_clusters.div_ceil(entries_per_refcount_table_cluster);
         if needed_refcount_block_clusters == refcount_block_clusters
             && needed_refcount_table_clusters == refcount_table_clusters
         {
@@ -729,33 +745,22 @@ fn compute_refcount_layout(
 }
 
 fn encode_compressed_l2_entry(offset: u64, compressed_size: u64, cluster_size: u64) -> Result<u64> {
-    let header = Qcow2Header {
-        backing_file_offset: 0,
-        virtual_size: 0,
-        cluster_bits: cluster_size.trailing_zeros(),
-        l1_size: 0,
-        l1_table_offset: 0,
-        refcount_table_offset: 0,
-        refcount_table_clusters: 0,
-        incompatible_features: 0,
-        refcount_order: DEFAULT_REFCOUNT_ORDER,
-        header_length: QCOW_HEADER_LENGTH_V3,
-        compression_type: QCOW2_COMPRESSION_TYPE_ZLIB,
-    };
+    let cluster_bits = cluster_size.trailing_zeros();
     let nb_csectors = (offset + compressed_size - 1) / QCOW2_COMPRESSED_SECTOR_SIZE
         - (offset / QCOW2_COMPRESSED_SECTOR_SIZE);
-    if (offset & !header.cluster_offset_mask()) != 0 {
+    if (offset & !cluster_offset_mask(cluster_bits)) != 0 {
         bail!("compressed qcow2 cluster offset does not fit qcow2 L2 entry");
     }
-    if (nb_csectors & !header.csize_mask()) != 0 {
+    if (nb_csectors & !csize_mask(cluster_bits)) != 0 {
         bail!("compressed qcow2 cluster span does not fit qcow2 L2 entry");
     }
-    Ok(offset | QCOW_OFLAG_COMPRESSED | (nb_csectors << header.csize_shift()))
+    Ok(offset | QCOW_OFLAG_COMPRESSED | (nb_csectors << csize_shift(cluster_bits)))
 }
 
 fn parse_compressed_l2_entry(header: Qcow2Header, l2_entry: u64) -> Result<(u64, u64)> {
-    let offset = l2_entry & header.cluster_offset_mask();
-    let nb_csectors = ((l2_entry >> header.csize_shift()) & header.csize_mask()) + 1;
+    let cluster_bits = header.cluster_bits;
+    let offset = l2_entry & cluster_offset_mask(cluster_bits);
+    let nb_csectors = ((l2_entry >> csize_shift(cluster_bits)) & csize_mask(cluster_bits)) + 1;
     let compressed_size = nb_csectors
         .checked_mul(QCOW2_COMPRESSED_SECTOR_SIZE)
         .and_then(|v| v.checked_sub(offset & (QCOW2_COMPRESSED_SECTOR_SIZE - 1)))
@@ -788,27 +793,35 @@ fn write_header(file: &mut File, spec: HeaderWriteSpec) -> Result<()> {
     } else {
         0
     };
-    write_be_u32(&mut header, 0, QCOW_MAGIC);
-    write_be_u32(&mut header, 4, 3);
-    write_be_u32(&mut header, 20, spec.cluster_size.trailing_zeros());
-    write_be_u64(&mut header, 24, spec.virtual_size);
+    write_be_u32(&mut header, HDR_MAGIC, QCOW_MAGIC);
+    write_be_u32(&mut header, HDR_VERSION, 3);
     write_be_u32(
         &mut header,
-        36,
+        HDR_CLUSTER_BITS,
+        spec.cluster_size.trailing_zeros(),
+    );
+    write_be_u64(&mut header, HDR_DISK_SIZE, spec.virtual_size);
+    write_be_u32(
+        &mut header,
+        HDR_L1_SIZE,
         u32::try_from(spec.l1_size).context("l1_size does not fit u32")?,
     );
-    write_be_u64(&mut header, 40, spec.l1_table_offset);
-    write_be_u64(&mut header, 48, spec.refcount_table_offset);
+    write_be_u64(&mut header, HDR_L1_TABLE_OFFSET, spec.l1_table_offset);
+    write_be_u64(
+        &mut header,
+        HDR_REFCOUNT_TABLE_OFFSET,
+        spec.refcount_table_offset,
+    );
     write_be_u32(
         &mut header,
-        56,
+        HDR_REFCOUNT_TABLE_CLUSTERS,
         u32::try_from(spec.refcount_table_clusters)
             .context("refcount_table_clusters does not fit u32")?,
     );
-    write_be_u64(&mut header, 72, incompatible_features);
-    write_be_u32(&mut header, 96, DEFAULT_REFCOUNT_ORDER);
-    write_be_u32(&mut header, 100, QCOW_HEADER_LENGTH_V3);
-    header[104] = match spec.compression_type {
+    write_be_u64(&mut header, HDR_INCOMPAT_FEATURES, incompatible_features);
+    write_be_u32(&mut header, HDR_REFCOUNT_ORDER, DEFAULT_REFCOUNT_ORDER);
+    write_be_u32(&mut header, HDR_HEADER_LENGTH, QCOW_HEADER_LENGTH_V3);
+    header[HDR_COMPRESSION_TYPE] = match spec.compression_type {
         CompressionType::Zstd => QCOW2_COMPRESSION_TYPE_ZSTD,
         CompressionType::Zlib => QCOW2_COMPRESSION_TYPE_ZLIB,
     };
@@ -927,47 +940,93 @@ fn write_refcount_blocks(
 fn read_header(file: &mut File) -> Result<Qcow2Header> {
     let mut fixed = [0u8; QCOW_HEADER_LENGTH_V3 as usize];
     read_exact_at(file, 0, &mut fixed)?;
-    let magic = u32::from_be_bytes(fixed[0..4].try_into().expect("slice length"));
+    let magic = u32::from_be_bytes(
+        fixed[HDR_MAGIC..HDR_MAGIC + 4]
+            .try_into()
+            .expect("slice length"),
+    );
     if magic != QCOW_MAGIC {
         bail!("not a qcow2 image (bad magic)");
     }
-    let version = u32::from_be_bytes(fixed[4..8].try_into().expect("slice length"));
+    let version = u32::from_be_bytes(
+        fixed[HDR_VERSION..HDR_VERSION + 4]
+            .try_into()
+            .expect("slice length"),
+    );
     if version != 2 && version != 3 {
         bail!("unsupported qcow2 version {version}");
     }
-    let cluster_bits = u32::from_be_bytes(fixed[20..24].try_into().expect("slice length"));
+    let cluster_bits = u32::from_be_bytes(
+        fixed[HDR_CLUSTER_BITS..HDR_CLUSTER_BITS + 4]
+            .try_into()
+            .expect("slice length"),
+    );
     if !(9..=21).contains(&cluster_bits) {
         bail!("unsupported qcow2 cluster_bits {cluster_bits}");
     }
 
     let refcount_order = if version >= 3 {
-        u32::from_be_bytes(fixed[96..100].try_into().expect("slice length"))
+        u32::from_be_bytes(
+            fixed[HDR_REFCOUNT_ORDER..HDR_REFCOUNT_ORDER + 4]
+                .try_into()
+                .expect("slice length"),
+        )
     } else {
         DEFAULT_REFCOUNT_ORDER
     };
     let header_length = if version >= 3 {
-        u32::from_be_bytes(fixed[100..104].try_into().expect("slice length"))
+        u32::from_be_bytes(
+            fixed[HDR_HEADER_LENGTH..HDR_HEADER_LENGTH + 4]
+                .try_into()
+                .expect("slice length"),
+        )
     } else {
         72
     };
-    let compression_type = if header_length > 104 {
-        fixed[104]
+    let compression_type = if header_length > HDR_COMPRESSION_TYPE as u32 {
+        fixed[HDR_COMPRESSION_TYPE]
     } else {
         QCOW2_COMPRESSION_TYPE_ZLIB
     };
 
     Ok(Qcow2Header {
-        backing_file_offset: u64::from_be_bytes(fixed[8..16].try_into().expect("slice length")),
-        virtual_size: u64::from_be_bytes(fixed[24..32].try_into().expect("slice length")),
+        backing_file_offset: u64::from_be_bytes(
+            fixed[HDR_BACKING_FILE_OFFSET..HDR_BACKING_FILE_OFFSET + 8]
+                .try_into()
+                .expect("slice length"),
+        ),
+        virtual_size: u64::from_be_bytes(
+            fixed[HDR_DISK_SIZE..HDR_DISK_SIZE + 8]
+                .try_into()
+                .expect("slice length"),
+        ),
         cluster_bits,
-        l1_size: u32::from_be_bytes(fixed[36..40].try_into().expect("slice length")),
-        l1_table_offset: u64::from_be_bytes(fixed[40..48].try_into().expect("slice length")),
-        refcount_table_offset: u64::from_be_bytes(fixed[48..56].try_into().expect("slice length")),
+        l1_size: u32::from_be_bytes(
+            fixed[HDR_L1_SIZE..HDR_L1_SIZE + 4]
+                .try_into()
+                .expect("slice length"),
+        ),
+        l1_table_offset: u64::from_be_bytes(
+            fixed[HDR_L1_TABLE_OFFSET..HDR_L1_TABLE_OFFSET + 8]
+                .try_into()
+                .expect("slice length"),
+        ),
+        refcount_table_offset: u64::from_be_bytes(
+            fixed[HDR_REFCOUNT_TABLE_OFFSET..HDR_REFCOUNT_TABLE_OFFSET + 8]
+                .try_into()
+                .expect("slice length"),
+        ),
         refcount_table_clusters: u32::from_be_bytes(
-            fixed[56..60].try_into().expect("slice length"),
+            fixed[HDR_REFCOUNT_TABLE_CLUSTERS..HDR_REFCOUNT_TABLE_CLUSTERS + 4]
+                .try_into()
+                .expect("slice length"),
         ),
         incompatible_features: if version >= 3 {
-            u64::from_be_bytes(fixed[72..80].try_into().expect("slice length"))
+            u64::from_be_bytes(
+                fixed[HDR_INCOMPAT_FEATURES..HDR_INCOMPAT_FEATURES + 8]
+                    .try_into()
+                    .expect("slice length"),
+            )
         } else {
             0
         },
@@ -1078,10 +1137,6 @@ fn write_be_u64(buf: &mut [u8], offset: usize, value: u64) {
     buf[offset..offset + 8].copy_from_slice(&value.to_be_bytes());
 }
 
-fn div_ceil(value: u64, divisor: u64) -> u64 {
-    value.div_ceil(divisor)
-}
-
 fn align_up(value: u64, align: u64) -> u64 {
     if value == 0 {
         return 0;
@@ -1111,6 +1166,75 @@ fn write_exact_at(file: &mut File, offset: u64, buf: &[u8]) -> Result<()> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    /// Writes the minimal qcow2 v3 header fields common to all test fixtures.
+    /// The caller is responsible for writing L1/L2 tables, refcount structures,
+    /// and data clusters at offsets consistent with these header values.
+    fn write_qcow2_test_header(
+        file: &mut File,
+        cluster_bits: u32,
+        virtual_size: u64,
+        l1_size: u32,
+        l1_table_offset: u64,
+        refcount_table_offset: u64,
+        refcount_table_clusters: u32,
+    ) -> Result<()> {
+        write_exact_at(file, HDR_MAGIC as u64, &QCOW_MAGIC.to_be_bytes())?;
+        write_exact_at(file, HDR_VERSION as u64, &3u32.to_be_bytes())?;
+        write_exact_at(file, HDR_CLUSTER_BITS as u64, &cluster_bits.to_be_bytes())?;
+        write_exact_at(file, HDR_DISK_SIZE as u64, &virtual_size.to_be_bytes())?;
+        write_exact_at(file, HDR_L1_SIZE as u64, &l1_size.to_be_bytes())?;
+        write_exact_at(
+            file,
+            HDR_L1_TABLE_OFFSET as u64,
+            &l1_table_offset.to_be_bytes(),
+        )?;
+        write_exact_at(
+            file,
+            HDR_REFCOUNT_TABLE_OFFSET as u64,
+            &refcount_table_offset.to_be_bytes(),
+        )?;
+        write_exact_at(
+            file,
+            HDR_REFCOUNT_TABLE_CLUSTERS as u64,
+            &refcount_table_clusters.to_be_bytes(),
+        )?;
+        write_exact_at(
+            file,
+            HDR_REFCOUNT_ORDER as u64,
+            &DEFAULT_REFCOUNT_ORDER.to_be_bytes(),
+        )?;
+        write_exact_at(
+            file,
+            HDR_HEADER_LENGTH as u64,
+            // Include the compression-type byte itself so read_header() will
+            // honor any fixture-written value at HDR_COMPRESSION_TYPE, matching
+            // the v3 header length written by write_header() for real images.
+            &(HDR_COMPRESSION_TYPE as u32 + 1).to_be_bytes(),
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_header_helper_includes_compression_type_byte_in_header_length() {
+        let tmp = tempdir().expect("tempdir");
+        let image = tmp.path().join("header.qcow2");
+        let cluster_size = 4096u64;
+        let mut file = File::create(&image).expect("create image");
+        file.set_len(cluster_size).expect("set_len");
+        write_qcow2_test_header(&mut file, 12, cluster_size, 0, 0, 0, 1).expect("write header");
+        write_exact_at(
+            &mut file,
+            HDR_COMPRESSION_TYPE as u64,
+            &[QCOW2_COMPRESSION_TYPE_ZSTD],
+        )
+        .expect("write compression type");
+
+        let mut file = File::open(&image).expect("open image");
+        let header = read_header(&mut file).expect("read header");
+        assert_eq!(header.header_length, HDR_COMPRESSION_TYPE as u32 + 1);
+        assert_eq!(header.compression_type, QCOW2_COMPRESSION_TYPE_ZSTD);
+    }
 
     #[test]
     fn deallocates_zero_clusters_and_preserves_non_zero_clusters() {
@@ -1347,7 +1471,9 @@ mod tests {
                 let (offset, _) =
                     parse_compressed_l2_entry(*header, l2_entry).expect("parse l2 entry");
                 // nb_csectors is stored as (value - 1) in the L2 entry field.
-                let nb_csectors = ((l2_entry >> header.csize_shift()) & header.csize_mask()) + 1;
+                let nb_csectors = ((l2_entry >> csize_shift(header.cluster_bits))
+                    & csize_mask(header.cluster_bits))
+                    + 1;
                 let base_sector = offset / QCOW2_COMPRESSED_SECTOR_SIZE;
                 let end_sector = base_sector + nb_csectors;
                 let global = l1_idx * l2_entries_per_table + l2_idx;
@@ -1397,16 +1523,15 @@ mod tests {
         let mut file = File::create(path)?;
         file.set_len(cluster_size * total_clusters)?;
 
-        write_exact_at(&mut file, 0, &QCOW_MAGIC.to_be_bytes())?;
-        write_exact_at(&mut file, 4, &3u32.to_be_bytes())?;
-        write_exact_at(&mut file, 20, &12u32.to_be_bytes())?; // cluster_bits = 12
-        write_exact_at(&mut file, 24, &(cluster_size * cluster_count).to_be_bytes())?;
-        write_exact_at(&mut file, 36, &1u32.to_be_bytes())?; // l1_size = 1
-        write_exact_at(&mut file, 40, &cluster_size.to_be_bytes())?; // l1_table_offset
-        write_exact_at(&mut file, 48, &(cluster_size * 3).to_be_bytes())?; // refcount_table_offset
-        write_exact_at(&mut file, 56, &1u32.to_be_bytes())?; // refcount_table_clusters
-        write_exact_at(&mut file, 96, &4u32.to_be_bytes())?; // refcount_order = 4 (16-bit)
-        write_exact_at(&mut file, 100, &104u32.to_be_bytes())?; // header_length
+        write_qcow2_test_header(
+            &mut file,
+            12,
+            cluster_size * cluster_count,
+            1,
+            cluster_size,
+            cluster_size * 3,
+            1,
+        )?;
 
         write_u64_at(&mut file, cluster_size, cluster_size * 2)?;
         for i in 0..cluster_count {
@@ -1468,16 +1593,15 @@ mod tests {
         file.set_len(cluster_size * total_clusters)?;
 
         // Header
-        write_exact_at(&mut file, 0, &QCOW_MAGIC.to_be_bytes())?;
-        write_exact_at(&mut file, 4, &3u32.to_be_bytes())?;
-        write_exact_at(&mut file, 20, &cluster_bits.to_be_bytes())?;
-        write_exact_at(&mut file, 24, &(cluster_size * cluster_count).to_be_bytes())?;
-        write_exact_at(&mut file, 36, &1u32.to_be_bytes())?; // l1_size = 1
-        write_exact_at(&mut file, 40, &cluster_size.to_be_bytes())?; // l1_table_offset
-        write_exact_at(&mut file, 48, &(cluster_size * 3).to_be_bytes())?; // refcount_table_offset
-        write_exact_at(&mut file, 56, &1u32.to_be_bytes())?; // refcount_table_clusters
-        write_exact_at(&mut file, 96, &4u32.to_be_bytes())?; // refcount_order = 4 (16-bit)
-        write_exact_at(&mut file, 100, &104u32.to_be_bytes())?; // header_length
+        write_qcow2_test_header(
+            &mut file,
+            cluster_bits,
+            cluster_size * cluster_count,
+            1,
+            cluster_size,
+            cluster_size * 3,
+            1,
+        )?;
 
         // L1 table: single entry pointing to L2 at cluster 2
         write_u64_at(&mut file, cluster_size, cluster_size * 2)?;
@@ -1579,16 +1703,15 @@ mod tests {
         let mut file = File::create(path)?;
         file.set_len(cluster_size * 7)?;
 
-        write_exact_at(&mut file, 0, &QCOW_MAGIC.to_be_bytes())?;
-        write_exact_at(&mut file, 4, &3u32.to_be_bytes())?;
-        write_exact_at(&mut file, 20, &12u32.to_be_bytes())?;
-        write_exact_at(&mut file, 24, &(cluster_size * 2).to_be_bytes())?;
-        write_exact_at(&mut file, 36, &1u32.to_be_bytes())?;
-        write_exact_at(&mut file, 40, &cluster_size.to_be_bytes())?;
-        write_exact_at(&mut file, 48, &(cluster_size * 3).to_be_bytes())?;
-        write_exact_at(&mut file, 56, &1u32.to_be_bytes())?;
-        write_exact_at(&mut file, 96, &4u32.to_be_bytes())?;
-        write_exact_at(&mut file, 100, &104u32.to_be_bytes())?;
+        write_qcow2_test_header(
+            &mut file,
+            12,
+            cluster_size * 2,
+            1,
+            cluster_size,
+            cluster_size * 3,
+            1,
+        )?;
 
         write_u64_at(&mut file, cluster_size, cluster_size * 2)?;
         write_u64_at(&mut file, cluster_size * 2, cluster_size * 5)?;
@@ -1636,23 +1759,17 @@ mod tests {
         let mut file = File::create(path)?;
         file.set_len(cluster_size * total_clusters)?;
 
-        write_exact_at(&mut file, 0, &QCOW_MAGIC.to_be_bytes())?;
-        write_exact_at(&mut file, 4, &3u32.to_be_bytes())?;
-        write_exact_at(&mut file, 20, &cluster_bits.to_be_bytes())?;
-        write_exact_at(
+        write_qcow2_test_header(
             &mut file,
-            24,
-            &(cluster_size
+            cluster_bits,
+            cluster_size
                 .checked_mul(cluster_count)
-                .context("virtual size overflow")?)
-            .to_be_bytes(),
+                .context("virtual size overflow")?,
+            1,
+            cluster_size,
+            cluster_size * 3,
+            1,
         )?;
-        write_exact_at(&mut file, 36, &1u32.to_be_bytes())?;
-        write_exact_at(&mut file, 40, &cluster_size.to_be_bytes())?;
-        write_exact_at(&mut file, 48, &(cluster_size * 3).to_be_bytes())?;
-        write_exact_at(&mut file, 56, &1u32.to_be_bytes())?;
-        write_exact_at(&mut file, 96, &4u32.to_be_bytes())?;
-        write_exact_at(&mut file, 100, &104u32.to_be_bytes())?;
 
         write_u64_at(&mut file, cluster_size, cluster_size * 2)?;
         for i in 0..cluster_count {
@@ -1728,10 +1845,9 @@ mod tests {
             target_cluster_size,
             "cluster_size mismatch in compressed image header"
         );
-        let guest_cluster_count = div_ceil(
-            u64::try_from(expected.len()).expect("expected bytes len fits u64"),
-            target_cluster_size,
-        );
+        let guest_cluster_count = u64::try_from(expected.len())
+            .expect("expected bytes len fits u64")
+            .div_ceil(target_cluster_size);
         for cluster_idx in 0..guest_cluster_count {
             let mut actual = vec![0u8; cluster_size];
             image
@@ -1764,10 +1880,9 @@ mod tests {
         let l2_entries_per_table =
             usize::try_from(target_cluster_size / 8).expect("l2 entries fits usize");
         let cluster_size = usize::try_from(target_cluster_size).expect("cluster_size fits usize");
-        let guest_cluster_count = div_ceil(
-            u64::try_from(expected.len()).expect("expected bytes len fits u64"),
-            target_cluster_size,
-        );
+        let guest_cluster_count = u64::try_from(expected.len())
+            .expect("expected bytes len fits u64")
+            .div_ceil(target_cluster_size);
 
         for cluster_idx in 0..guest_cluster_count {
             let l1_index =
@@ -2252,17 +2367,16 @@ mod tests {
             let mut file = std::fs::File::create(&source).expect("create source");
             file.set_len(cluster_size * total_clusters)
                 .expect("set_len");
-            write_exact_at(&mut file, 0, &QCOW_MAGIC.to_be_bytes()).expect("magic");
-            write_exact_at(&mut file, 4, &3u32.to_be_bytes()).expect("version");
-            write_exact_at(&mut file, 20, &12u32.to_be_bytes()).expect("cluster_bits");
-            write_exact_at(&mut file, 24, &virtual_size.to_be_bytes()).expect("virtual_size");
-            write_exact_at(&mut file, 36, &1u32.to_be_bytes()).expect("l1_size");
-            write_exact_at(&mut file, 40, &cluster_size.to_be_bytes()).expect("l1_offset");
-            write_exact_at(&mut file, 48, &(cluster_size * 3).to_be_bytes())
-                .expect("refcount_table_offset");
-            write_exact_at(&mut file, 56, &1u32.to_be_bytes()).expect("refcount_table_clusters");
-            write_exact_at(&mut file, 96, &4u32.to_be_bytes()).expect("refcount_order");
-            write_exact_at(&mut file, 100, &104u32.to_be_bytes()).expect("header_length");
+            write_qcow2_test_header(
+                &mut file,
+                12,
+                virtual_size,
+                1,
+                cluster_size,
+                cluster_size * 3,
+                1,
+            )
+            .expect("write header");
             // L1: one entry pointing to L2 at cluster 2
             write_u64_at(&mut file, cluster_size, cluster_size * 2).expect("l1");
             // L2: two entries pointing to data clusters 5 and 6
@@ -2356,23 +2470,20 @@ mod tests {
         let mut file = File::create(path)?;
         file.set_len(cluster_size * total_clusters)?;
 
-        write_exact_at(&mut file, 0, &QCOW_MAGIC.to_be_bytes())?;
-        write_exact_at(&mut file, 4, &3u32.to_be_bytes())?;
-        write_exact_at(&mut file, 20, &cluster_size.trailing_zeros().to_be_bytes())?;
+        write_qcow2_test_header(
+            &mut file,
+            cluster_size.trailing_zeros(),
+            u64::try_from(payload_len).expect("payload len fits"),
+            1,
+            cluster_size,
+            cluster_size * 3,
+            1,
+        )?;
         write_exact_at(
             &mut file,
-            24,
-            &u64::try_from(payload_len)
-                .expect("payload len fits")
-                .to_be_bytes(),
+            HDR_COMPRESSION_TYPE as u64,
+            &[QCOW2_COMPRESSION_TYPE_ZLIB],
         )?;
-        write_exact_at(&mut file, 36, &1u32.to_be_bytes())?;
-        write_exact_at(&mut file, 40, &cluster_size.to_be_bytes())?;
-        write_exact_at(&mut file, 48, &(cluster_size * 3).to_be_bytes())?;
-        write_exact_at(&mut file, 56, &1u32.to_be_bytes())?;
-        write_exact_at(&mut file, 96, &4u32.to_be_bytes())?;
-        write_exact_at(&mut file, 100, &104u32.to_be_bytes())?;
-        write_exact_at(&mut file, 104, &[QCOW2_COMPRESSION_TYPE_ZLIB])?;
 
         write_u64_at(&mut file, cluster_size, cluster_size * 2)?;
         let data_offset = cluster_size * 5;
@@ -2691,26 +2802,16 @@ mod tests {
             .expect("set_len multi-l1");
 
         // Header
-        write_exact_at(&mut file, 0, &QCOW_MAGIC.to_be_bytes()).unwrap();
-        write_exact_at(&mut file, 4, &3u32.to_be_bytes()).unwrap();
-        write_exact_at(&mut file, 20, &cluster_bits.to_be_bytes()).unwrap();
-        write_exact_at(&mut file, 24, &virtual_size.to_be_bytes()).unwrap();
-        write_exact_at(&mut file, 36, &(l1_count as u32).to_be_bytes()).unwrap();
-        write_exact_at(
+        write_qcow2_test_header(
             &mut file,
-            40,
-            &(l1_table_cluster * cluster_size).to_be_bytes(),
+            cluster_bits,
+            virtual_size,
+            l1_count as u32,
+            l1_table_cluster * cluster_size,
+            refcount_table_cluster * cluster_size,
+            1,
         )
         .unwrap();
-        write_exact_at(
-            &mut file,
-            48,
-            &(refcount_table_cluster * cluster_size).to_be_bytes(),
-        )
-        .unwrap();
-        write_exact_at(&mut file, 56, &1u32.to_be_bytes()).unwrap();
-        write_exact_at(&mut file, 96, &4u32.to_be_bytes()).unwrap();
-        write_exact_at(&mut file, 100, &104u32.to_be_bytes()).unwrap();
 
         // L1 table: each entry points to the corresponding L2 cluster
         for l1_idx in 0..l1_count {
@@ -2777,7 +2878,6 @@ mod tests {
     }
 
     fn assert_qemu_img_convert_roundtrip(
-        _source: &Path,
         compressed: &Path,
         virtual_size: u64,
         cluster_size: u64,
@@ -2865,7 +2965,6 @@ mod tests {
         .expect("compress multi-L1 source (zlib)");
         assert_qemu_img_check(&compressed);
         assert_qemu_img_convert_roundtrip(
-            &source,
             &compressed,
             virtual_size,
             cluster_size,
@@ -2896,7 +2995,6 @@ mod tests {
         .expect("compress multi-L1 source (zstd)");
         assert_qemu_img_check(&compressed);
         assert_qemu_img_convert_roundtrip(
-            &source,
             &compressed,
             virtual_size,
             cluster_size,

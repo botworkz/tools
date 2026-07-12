@@ -46,15 +46,7 @@ pub(crate) fn decompress_cluster(
             decoder
                 .read_to_end(&mut out)
                 .context("failed to decode zstd qcow2 cluster")?;
-            if out.len() > cluster_size {
-                bail!(
-                    "zstd qcow2 cluster decompressed to {} bytes, expected at most {}",
-                    out.len(),
-                    cluster_size
-                );
-            }
-            out.resize(cluster_size, 0);
-            Ok(out)
+            pad_decompressed(out, cluster_size, "zstd")
         }
         CompressionType::Zlib => {
             let mut decoder = DeflateDecoder::new(compressed);
@@ -62,17 +54,23 @@ pub(crate) fn decompress_cluster(
             decoder
                 .read_to_end(&mut out)
                 .context("failed to decode zlib qcow2 cluster")?;
-            if out.len() > cluster_size {
-                bail!(
-                    "zlib qcow2 cluster decompressed to {} bytes, expected at most {}",
-                    out.len(),
-                    cluster_size
-                );
-            }
-            out.resize(cluster_size, 0);
-            Ok(out)
+            pad_decompressed(out, cluster_size, "zlib")
         }
     }
+}
+
+/// Validates that `decoded` is no larger than `cluster_size`, then zero-pads
+/// it to exactly `cluster_size` bytes.  Shared by both codec arms of
+/// `decompress_cluster`.
+fn pad_decompressed(mut decoded: Vec<u8>, cluster_size: usize, codec: &str) -> Result<Vec<u8>> {
+    if decoded.len() > cluster_size {
+        bail!(
+            "{codec} qcow2 cluster decompressed to {} bytes, expected at most {cluster_size}",
+            decoded.len(),
+        );
+    }
+    decoded.resize(cluster_size, 0);
+    Ok(decoded)
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
