@@ -67,6 +67,15 @@ jobs:
 
     - run: |
         mkdir testrepo
+    - name: Set runtime environment
+      run: |
+        {
+          echo "BOTFORGE_IMAGE=botworkz/botforge:ci"
+          echo "HOST_UID=$(id -u)"
+          echo "HOST_GID=$(id -g)"
+          echo "HOST_KVM_GID=$(getent group kvm | cut -d: -f3)"
+          echo "REPO_ROOT=$(realpath testrepo)"
+        } >> "$GITHUB_ENV"
     - name: Create shasset
       uses: envoyproxy/toolshed/actions/jq@6a20085af231aba4c72d6866f94098343a8c5616
       with:
@@ -110,11 +119,12 @@ jobs:
                  then {reclaim: $in.reclaim}
                  else {} end)
             )
-    - name: Slurp test config
+    - name: Create test config
       uses: envoyproxy/toolshed/actions/jq@6a20085af231aba4c72d6866f94098343a8c5616
       id: test-config
       with:
         input-format: yaml-path
+        filter: '. + {image: "@artifact://foo.qcow2"}'
         output-path: testrepo/test.yaml
         input: botforge/test/test.yaml
 
@@ -133,11 +143,6 @@ jobs:
         input: testrepo/test.yaml
         print-output: true
     - run: |
-        export BOTFORGE_IMAGE=botworkz/botforge:ci
-        export HOST_UID=$(id -u)
-        export HOST_GID=$(id -g)
-        export HOST_KVM_GID=$(getent group kvm | cut -d: -f3)
-        export REPO_ROOT=$(realpath testrepo)
         docker compose -f botforge/test/compose.yml run build  \
           build \
             --spec build.yaml
@@ -150,14 +155,29 @@ jobs:
         export LIBGUESTFS_TRACE=1
         sudo guestfish --ro -a testrepo/build/artifact/foo.qcow2 -i sh 'file /boot/vmlinuz*; ls -l /boot'
 
+    - name: Create chained build config
+      uses: envoyproxy/toolshed/actions/jq@6a20085af231aba4c72d6866f94098343a8c5616
+      with:
+        input-format: yaml
+        output-path: testrepo/chained.yaml
+        input: |
+          type: build
+          image: "@artifact://foo.qcow2"
+          output: "foo-chained.qcow2"
+          steps: []
+
+    - name: Run chained build
+      run: |
+        docker compose -f botforge/test/compose.yml run build \
+          build \
+            --spec chained.yaml
+
+    - name: Sanity check chained output
+      run: |
+        qemu-img check -r all -f qcow2 testrepo/build/artifact/foo-chained.qcow2
+
     - run: |
-        export BOTFORGE_IMAGE=botworkz/botforge:ci
-        export HOST_UID=$(id -u)
-        export HOST_GID=$(id -g)
-        export HOST_KVM_GID=$(getent group kvm | cut -d: -f3)
-        export REPO_ROOT=$(realpath testrepo)
         docker compose -f botforge/test/compose.yml run build \
           test \
             --test-config test.yaml \
-            --repo-root "$REPO_ROOT" \
-            --base-image build/artifact/foo.qcow2
+            --repo-root "$REPO_ROOT"
