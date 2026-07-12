@@ -19,7 +19,7 @@ pub(crate) trait Compressor: Sync {
 pub(crate) fn build_compressor(
     compression_type: CompressionType,
     raw_opts: &str,
-) -> Result<Box<dyn Compressor + Sync>> {
+) -> Result<Box<dyn Compressor + Sync + Send>> {
     match compression_type {
         CompressionType::Zstd => Ok(Box::new(ZstdCompressor::from_opts(raw_opts)?)),
         CompressionType::Zlib => Ok(Box::new(ZlibCompressor::from_opts(raw_opts)?)),
