@@ -144,16 +144,12 @@ jobs:
         input: testrepo/test.yaml
         print-output: true
     - run: |
-        docker compose -f botforge/test/compose.yml run build  \
-          build \
-            --spec build.yaml
+        . .botforge.env
+        botforge build --spec build.yaml
 
     - name: Sanity checks
       run: |
         qemu-img check -r all -f qcow2 testrepo/build/artifact/foo.qcow2
-
-        export LIBGUESTFS_DEBUG=1
-        export LIBGUESTFS_TRACE=1
         sudo guestfish --ro -a testrepo/build/artifact/foo.qcow2 -i sh 'file /boot/vmlinuz*; ls -l /boot'
 
     - name: Create chained build config
@@ -166,19 +162,18 @@ jobs:
           image: "@artifact://foo.qcow2"
           output: "foo-chained.qcow2"
           steps: []
-
     - name: Run chained build
       run: |
-        docker compose -f botforge/test/compose.yml run build \
-          build \
-            --spec chained.yaml
+        . .botforge.env
+        botforge build --spec chained.yaml
 
     - name: Sanity check chained output
       run: |
         qemu-img check -r all -f qcow2 testrepo/build/artifact/foo-chained.qcow2
+        sudo guestfish --ro -a testrepo/build/artifact/foo.qcow2 -i sh 'file /boot/vmlinuz*; ls -l /boot'
 
     - run: |
-        docker compose -f botforge/test/compose.yml run build \
-          test \
-            --test-config test.yaml \
-            --repo-root "$REPO_ROOT"
+        . .botforge.env
+        botforge test \
+          --test-config test.yaml \
+          --repo-root "$REPO_ROOT"
