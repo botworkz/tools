@@ -24,6 +24,8 @@ on:
     - .github/workflows/_botforge.yml
     - .dockerignore
     - Earthfile
+    - Makefile
+    - tarpaulin.toml
     - VERSION
     - '**/Cargo.toml'
     - Cargo.lock
@@ -38,6 +40,8 @@ on:
     - .github/workflows/_botforge.yml
     - .dockerignore
     - Earthfile
+    - Makefile
+    - tarpaulin.toml
     - VERSION
     - '**/Cargo.toml'
     - Cargo.lock
@@ -84,6 +88,33 @@ jobs:
         tool: cargo-udeps
     - name: cargo udeps
       run: cargo +nightly udeps --workspace --all-targets --locked
+
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+    - uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: coverage
+    - name: Install cargo-tarpaulin
+      id: tarpaulin_install
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-tarpaulin
+      continue-on-error: true
+    - name: Fallback install cargo-tarpaulin
+      if: steps.tarpaulin_install.outcome != 'success'
+      run: cargo install cargo-tarpaulin --locked
+    - name: Run unit test coverage
+      run: cargo tarpaulin
+    - name: Upload coverage report
+      uses: actions/upload-artifact@v4
+      with:
+        name: coverage-report
+        path: target/tarpaulin/
+        retention-days: 14
+        if-no-files-found: error
 
   botforge:
     needs: crate
