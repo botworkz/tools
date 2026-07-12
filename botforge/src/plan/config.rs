@@ -4,7 +4,6 @@ use serde_yaml::Value;
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use crate::iso::BootcmdEntry;
 use crate::qemu::PortSpec;
 use crate::resolver::Reference;
 use crate::util::resolve_under_root;
@@ -105,6 +104,9 @@ pub(crate) struct TestConfig {
     pub(crate) timeout: u64,
     #[serde(skip, default = "default_test_cloud_init_timeout")]
     pub(crate) cloud_init_timeout: u64,
+    /// Merged cloud-config fragment for the runner VM seed.  Accumulated from
+    /// the root document and any `uses:` fragment includes.
+    pub(crate) cloud_init: Option<serde_yaml::Mapping>,
 }
 
 /// Raw deserialization target for a top-level `botforge test` document.
@@ -136,6 +138,9 @@ struct RawTestDocument {
         deserialize_with = "deserialize_positive_seconds"
     )]
     timeout: u64,
+    /// Optional cloud-config fragment to merge into the runner VM seed.
+    #[serde(default)]
+    cloud_init: Option<serde_yaml::Mapping>,
 }
 
 fn default_disk_size() -> String {
@@ -273,10 +278,9 @@ pub(crate) struct BuildConfig {
     pub(crate) step_timeout: u64,
     pub(crate) timeout: u64,
     pub(crate) cloud_init_timeout: u64,
-    /// Optional cloud-init `bootcmd:` entries to merge into the first-boot
-    /// user-data.  Absent/empty ⇒ no `bootcmd:` key emitted (zero change to
-    /// existing behaviour).
-    pub(crate) bootcmd: Vec<BootcmdEntry>,
+    /// Optional cloud-config fragment to merge into the runner VM seed.
+    /// Accumulated from the root document and any `uses:` fragment includes.
+    pub(crate) cloud_init: Option<serde_yaml::Mapping>,
     /// Optional output compression.  `None` (or `Some { enabled: false }`) ⇒
     /// plain atomic rename, byte-identical to existing behaviour.
     pub(crate) compress: Option<CompressConfig>,
@@ -309,11 +313,11 @@ struct RawBuildDocument {
         deserialize_with = "deserialize_positive_seconds"
     )]
     timeout: u64,
-    /// Optional cloud-init `bootcmd:` entries.  Each item is either a plain
-    /// shell string or a sequence of strings (exec/argv form).  Absent or
-    /// empty ⇒ no `bootcmd:` key in the generated user-data.
+    /// Optional cloud-config fragment to merge into the runner VM seed.
+    /// The value is an arbitrary cloud-config mapping; unknown keys are passed
+    /// through to cloud-init.
     #[serde(default)]
-    bootcmd: Vec<BootcmdEntry>,
+    cloud_init: Option<serde_yaml::Mapping>,
     /// Optional output-compression config.  Absent ⇒ plain atomic rename.
     #[serde(default)]
     compress: Option<CompressConfig>,
@@ -323,6 +327,10 @@ struct RawBuildDocument {
 struct RawTestStepFragment {
     #[serde(default)]
     steps: Vec<RawTestStep>,
+    /// Optional cloud-config fragment contributed by this `type: fragment` document.
+    /// Deep-merged with the parent's cloud_init under the same precedence rules.
+    #[serde(default)]
+    cloud_init: Option<serde_yaml::Mapping>,
 }
 
 fn deserialize_positive_seconds<'de, D>(deserializer: D) -> std::result::Result<u64, D::Error>
@@ -395,6 +403,7 @@ pub(crate) fn load_test_config(repo_root: &Path, path: &Path) -> Result<TestConf
     let value: Value = serde_yaml::from_str(&yaml)
         .with_context(|| format!("invalid test config: {}", path.display()))?;
     check_no_build_sections_in_test_doc(path, &value)?;
+    check_no_top_level_bootcmd(path, &value)?;
     let raw: RawTestDocument = serde_yaml::from_value(value)
         .with_context(|| format!("invalid test config: {}", path.display()))?;
     if !raw.doc_type.is_test_entrypoint() {
@@ -403,9 +412,13 @@ pub(crate) fn load_test_config(repo_root: &Path, path: &Path) -> Result<TestConf
             raw.doc_type.as_str()
         );
     }
+    if let Some(ref ci) = raw.cloud_init {
+        validate_cloud_init_fragment(ci, path)?;
+    }
     // Seed the stack with the root document so that a fragment including the root
     // is caught by the cycle check (A → B → A).
     let mut include_stack = vec![path.to_path_buf()];
+    let mut cloud_init_acc = raw.cloud_init;
     Ok(TestConfig {
         image: match raw.image {
             None => None,
@@ -419,7 +432,13 @@ pub(crate) fn load_test_config(repo_root: &Path, path: &Path) -> Result<TestConf
         },
         isos: raw.isos,
         ports: raw.ports,
-        steps: expand_test_steps(repo_root, path, raw.steps, &mut include_stack)?,
+        steps: expand_test_steps(
+            repo_root,
+            path,
+            raw.steps,
+            &mut include_stack,
+            &mut cloud_init_acc,
+        )?,
         uploads: {
             validate_top_level_uploads("test", &raw.uploads)
                 .with_context(|| format!("invalid test config: {}", path.display()))?;
@@ -429,6 +448,7 @@ pub(crate) fn load_test_config(repo_root: &Path, path: &Path) -> Result<TestConf
         step_timeout: raw.step_timeout,
         timeout: raw.timeout,
         cloud_init_timeout: default_test_cloud_init_timeout(),
+        cloud_init: cloud_init_acc,
     })
 }
 
@@ -438,6 +458,7 @@ pub(crate) fn load_build_config(repo_root: &Path, path: &Path) -> Result<BuildCo
     let value: Value = serde_yaml::from_str(&yaml)
         .with_context(|| format!("invalid build config: {}", path.display()))?;
     check_no_test_entrypoint_sections_in_build_doc(path, &value)?;
+    check_no_top_level_bootcmd(path, &value)?;
     let raw: RawBuildDocument = serde_yaml::from_value(value)
         .with_context(|| format!("invalid build config: {}", path.display()))?;
     if !raw.doc_type.is_build_entrypoint() {
@@ -481,12 +502,22 @@ pub(crate) fn load_build_config(repo_root: &Path, path: &Path) -> Result<BuildCo
             })?
             .to_string(),
     };
+    if let Some(ref ci) = raw.cloud_init {
+        validate_cloud_init_fragment(ci, path)?;
+    }
     let mut include_stack = vec![path.to_path_buf()];
+    let mut cloud_init_acc = raw.cloud_init;
     Ok(BuildConfig {
         image,
         output,
         disk_size: raw.disk_size,
-        steps: expand_test_steps(repo_root, path, raw.steps, &mut include_stack)?,
+        steps: expand_test_steps(
+            repo_root,
+            path,
+            raw.steps,
+            &mut include_stack,
+            &mut cloud_init_acc,
+        )?,
         uploads: {
             validate_top_level_uploads("build", &raw.uploads)
                 .with_context(|| format!("invalid build config: {}", path.display()))?;
@@ -495,7 +526,7 @@ pub(crate) fn load_build_config(repo_root: &Path, path: &Path) -> Result<BuildCo
         step_timeout: raw.step_timeout,
         timeout: raw.timeout,
         cloud_init_timeout: default_build_cloud_init_timeout(),
-        bootcmd: raw.bootcmd,
+        cloud_init: cloud_init_acc,
         compress: raw.compress,
     })
 }
@@ -542,6 +573,7 @@ fn expand_test_steps(
     current_file: &Path,
     steps: Vec<RawTestStep>,
     include_stack: &mut Vec<PathBuf>,
+    cloud_init_acc: &mut Option<serde_yaml::Mapping>,
 ) -> Result<Vec<TestStep>> {
     let mut expanded = Vec::new();
     for step in steps {
@@ -573,12 +605,28 @@ fn expand_test_steps(
                     );
                 }
                 include_stack.push(include_path.clone());
-                let nested = load_test_steps_fragment(&include_path, &include.uses, &include.with)
-                    .and_then(|steps| {
-                        expand_test_steps(repo_root, &include_path, steps, include_stack)
+                let result = load_test_steps_fragment(&include_path, &include.uses, &include.with)
+                    .and_then(|(steps, ci)| {
+                        let mut ci_acc = ci;
+                        let expanded_steps = expand_test_steps(
+                            repo_root,
+                            &include_path,
+                            steps,
+                            include_stack,
+                            &mut ci_acc,
+                        )?;
+                        Ok((expanded_steps, ci_acc))
                     });
                 include_stack.pop();
-                expanded.extend(nested?);
+                let (fragment_steps, fragment_cloud_init) = result?;
+                expanded.extend(fragment_steps);
+                // Merge fragment's cloud_init into accumulator.
+                if let Some(fci) = fragment_cloud_init {
+                    *cloud_init_acc = Some(match cloud_init_acc.take() {
+                        None => fci,
+                        Some(base) => merge_cloud_init_mappings(base, fci),
+                    });
+                }
             }
         }
     }
@@ -589,7 +637,7 @@ fn load_test_steps_fragment(
     path: &Path,
     uses: &str,
     with: &BTreeMap<String, String>,
-) -> Result<Vec<RawTestStep>> {
+) -> Result<(Vec<RawTestStep>, Option<serde_yaml::Mapping>)> {
     let yaml = std::fs::read_to_string(path)
         .with_context(|| format!("cannot read test step include: {}", path.display()))?;
     let mut value: Value = serde_yaml::from_str(&yaml)
@@ -612,7 +660,10 @@ fn load_test_steps_fragment(
         .with_context(|| format!("invalid test step include: {}", path.display()))?;
     let fragment: RawTestStepFragment = serde_yaml::from_value(value)
         .with_context(|| format!("invalid test step include: {}", path.display()))?;
-    Ok(fragment.steps)
+    if let Some(ref ci) = fragment.cloud_init {
+        validate_cloud_init_fragment(ci, path)?;
+    }
+    Ok((fragment.steps, fragment.cloud_init))
 }
 
 /// Verify that a `uses:` target is a `type: fragment` document.
@@ -721,6 +772,114 @@ fn check_no_test_entrypoint_sections_in_build_doc(path: &Path, value: &Value) ->
         }
     }
     Ok(())
+}
+
+/// Hard-reject a top-level `bootcmd:` key and emit a clear migration error
+/// pointing at `cloud_init.bootcmd`.
+///
+/// `bootcmd:` was removed as a top-level key; callers must migrate:
+///
+/// ```yaml
+/// # before
+/// bootcmd:
+///   - echo hello
+///
+/// # after
+/// cloud_init:
+///   bootcmd:
+///     - echo hello
+/// ```
+fn check_no_top_level_bootcmd(path: &Path, value: &Value) -> Result<()> {
+    let mapping = match value {
+        Value::Mapping(m) => m,
+        _ => return Ok(()),
+    };
+    if mapping.contains_key(Value::String("bootcmd".to_string())) {
+        anyhow::bail!(
+            "top-level 'bootcmd:' is no longer supported ({}): \
+             migrate to 'cloud_init:\\n  bootcmd:' instead",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+/// Validate a `cloud_init:` mapping at config-load time.
+///
+/// Two classes of violation are hard-rejected:
+///
+/// **Ingress protection** — `cloud_init:` must not name host sources.  A
+/// `write_files:` entry with a `source:` field would instruct cloud-init to pull
+/// content from a URL or local path; that is an ingress vector outside the
+/// shasset-only host→build boundary and is therefore rejected.  Inline
+/// `content:` fields (which carry values, not paths) are allowed.
+///
+/// **Harness protection** — settings that would lock botforge out of the runner
+/// VM are rejected.  Currently this guards against `ssh_pwauth: false`, which
+/// (when combined with certain sshd configurations) could break key-based login.
+pub(crate) fn validate_cloud_init_fragment(
+    cloud_init: &serde_yaml::Mapping,
+    path: &Path,
+) -> Result<()> {
+    // Ingress guard: write_files entries must not have a source: field.
+    let write_files_key = Value::String("write_files".to_string());
+    if let Some(Value::Sequence(entries)) = cloud_init.get(&write_files_key) {
+        for entry in entries {
+            if let Value::Mapping(entry_map) = entry {
+                if entry_map.contains_key(Value::String("source".to_string())) {
+                    anyhow::bail!(
+                        "cloud_init.write_files: 'source:' is not allowed in {} \
+                         (ingress guard: use 'uploads:' for host→guest file transfer; \
+                         inline 'content:' is allowed)",
+                        path.display()
+                    );
+                }
+            }
+        }
+    }
+    // Harness guard: reject ssh_pwauth: false which can break key-based login
+    // in combination with certain sshd configurations.
+    let ssh_pwauth_key = Value::String("ssh_pwauth".to_string());
+    if let Some(Value::Bool(false)) = cloud_init.get(&ssh_pwauth_key) {
+        anyhow::bail!(
+            "cloud_init.ssh_pwauth: false is not allowed in {} \
+             (harness guard: setting ssh_pwauth false may break botforge's key-based \
+             SSH access to the runner VM)",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+/// Deep-merge two cloud-config mappings under botforge's merge semantics:
+///
+/// - **Sequences**: base first, then overlay (botforge-first concatenation).
+/// - **Mappings**: recurse.
+/// - **Scalars**: overlay wins.
+pub(crate) fn merge_cloud_init_mappings(
+    base: serde_yaml::Mapping,
+    overlay: serde_yaml::Mapping,
+) -> serde_yaml::Mapping {
+    let mut result = base;
+    for (key, overlay_val) in overlay {
+        match result.get_mut(&key) {
+            None => {
+                result.insert(key, overlay_val);
+            }
+            Some(base_val) => match (base_val, overlay_val) {
+                (Value::Sequence(base_seq), Value::Sequence(overlay_seq)) => {
+                    base_seq.extend(overlay_seq);
+                }
+                (Value::Mapping(base_map), Value::Mapping(overlay_map)) => {
+                    *base_map = merge_cloud_init_mappings(base_map.clone(), overlay_map);
+                }
+                (base_val, overlay_val) => {
+                    *base_val = overlay_val;
+                }
+            },
+        }
+    }
+    result
 }
 
 fn extract_fragment_input_declarations(
@@ -2570,6 +2729,10 @@ steps:
         std::fs::write(repo.path().join(name), content).unwrap();
     }
 
+    fn write_test_config(repo: &TempDir, name: &str, content: &str) {
+        std::fs::write(repo.path().join(name), content).unwrap();
+    }
+
     #[test]
     fn test_load_build_config_minimal() {
         let repo = TempDir::new().unwrap();
@@ -2631,7 +2794,10 @@ steps: []
         assert_eq!(config.step_timeout, 2400);
         assert_eq!(config.timeout, 9600);
         assert!(config.steps.is_empty());
-        assert!(config.bootcmd.is_empty(), "bootcmd should default to empty");
+        assert!(
+            config.cloud_init.is_none(),
+            "cloud_init should default to None"
+        );
     }
 
     #[test]
@@ -2970,11 +3136,11 @@ steps: []
     }
 
     // -----------------------------------------------------------------
-    // bootcmd field tests
+    // cloud_init field tests (replaced bootcmd)
     // -----------------------------------------------------------------
 
     #[test]
-    fn test_load_build_config_bootcmd_absent_is_empty() {
+    fn test_load_build_config_cloud_init_absent_is_none() {
         let repo = TempDir::new().unwrap();
         write_build_config(
             &repo,
@@ -2983,14 +3149,13 @@ steps: []
         );
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
         assert!(
-            config.bootcmd.is_empty(),
-            "absent bootcmd must deserialize as empty vec"
+            config.cloud_init.is_none(),
+            "absent cloud_init must deserialize as None"
         );
     }
 
     #[test]
-    fn test_load_build_config_bootcmd_string_entries() {
-        use crate::iso::BootcmdEntry;
+    fn test_load_build_config_cloud_init_bootcmd_string_entries() {
         let repo = TempDir::new().unwrap();
         write_build_config(
             &repo,
@@ -3000,26 +3165,25 @@ type: build
 image: "@base"
 output: "out.qcow2"
 steps: []
-bootcmd:
-  - echo hello
-  - echo world
+cloud_init:
+  bootcmd:
+    - echo hello
+    - echo world
 "#,
         );
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
-        assert_eq!(config.bootcmd.len(), 2);
-        assert_eq!(
-            config.bootcmd[0],
-            BootcmdEntry::Shell("echo hello".to_string())
-        );
-        assert_eq!(
-            config.bootcmd[1],
-            BootcmdEntry::Shell("echo world".to_string())
-        );
+        let ci = config.cloud_init.expect("cloud_init must be Some");
+        let bootcmd = ci
+            .get(&serde_yaml::Value::String("bootcmd".to_string()))
+            .expect("bootcmd must be present in cloud_init");
+        let entries = bootcmd.as_sequence().expect("bootcmd must be a sequence");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].as_str(), Some("echo hello"));
+        assert_eq!(entries[1].as_str(), Some("echo world"));
     }
 
     #[test]
-    fn test_load_build_config_bootcmd_exec_entry() {
-        use crate::iso::BootcmdEntry;
+    fn test_load_build_config_cloud_init_bootcmd_exec_entry() {
         let repo = TempDir::new().unwrap();
         write_build_config(
             &repo,
@@ -3029,61 +3193,28 @@ type: build
 image: "@base"
 output: "out.qcow2"
 steps: []
-bootcmd:
-  - [ cloud-init-per, once, mask-stack, sh, -c, "systemctl mask a.service" ]
+cloud_init:
+  bootcmd:
+    - [ cloud-init-per, once, mask-stack, sh, -c, "systemctl mask a.service" ]
 "#,
         );
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
-        assert_eq!(config.bootcmd.len(), 1);
-        assert_eq!(
-            config.bootcmd[0],
-            BootcmdEntry::Exec(vec![
-                "cloud-init-per".to_string(),
-                "once".to_string(),
-                "mask-stack".to_string(),
-                "sh".to_string(),
-                "-c".to_string(),
-                "systemctl mask a.service".to_string(),
-            ])
-        );
+        let ci = config.cloud_init.expect("cloud_init must be Some");
+        let bootcmd = ci
+            .get(&serde_yaml::Value::String("bootcmd".to_string()))
+            .expect("bootcmd must be present");
+        let entries = bootcmd.as_sequence().expect("bootcmd must be a sequence");
+        assert_eq!(entries.len(), 1);
+        let exec = entries[0]
+            .as_sequence()
+            .expect("first entry must be a sequence");
+        assert_eq!(exec[0].as_str(), Some("cloud-init-per"));
+        assert_eq!(exec[5].as_str(), Some("systemctl mask a.service"));
     }
 
     #[test]
-    fn test_load_build_config_bootcmd_mixed_entries() {
-        use crate::iso::BootcmdEntry;
-        let repo = TempDir::new().unwrap();
-        write_build_config(
-            &repo,
-            "build.yaml",
-            r#"
-type: build
-image: "@base"
-output: "out.qcow2"
-steps: []
-bootcmd:
-  - echo shell-entry
-  - [ cloud-init-per, once, mask-stack, sh, -c, "systemctl mask a.service b.service" ]
-"#,
-        );
-        let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
-        assert_eq!(config.bootcmd.len(), 2);
-        assert_eq!(
-            config.bootcmd[0],
-            BootcmdEntry::Shell("echo shell-entry".to_string())
-        );
-        assert!(
-            matches!(&config.bootcmd[1], BootcmdEntry::Exec(args) if args[0] == "cloud-init-per"),
-            "second entry should be exec form: {:?}",
-            config.bootcmd[1]
-        );
-    }
-
-    #[test]
-    fn test_load_build_config_bootcmd_is_a_known_field() {
-        // Verify that `bootcmd:` is recognised as a known field and not silently
-        // discarded or treated as an error.  This guards against the field being
-        // accidentally removed from RawBuildDocument.
-        use crate::iso::BootcmdEntry;
+    fn test_load_build_config_top_level_bootcmd_rejected_with_migration_error() {
+        // top-level bootcmd: must produce a clear migration error.
         let repo = TempDir::new().unwrap();
         write_build_config(
             &repo,
@@ -3097,27 +3228,167 @@ bootcmd:
   - echo hello
 "#,
         );
-        let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
-        assert_eq!(config.bootcmd.len(), 1);
-        assert_eq!(
-            config.bootcmd[0],
-            BootcmdEntry::Shell("echo hello".to_string()),
-            "bootcmd entry must be preserved, not silently dropped"
+        let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("cloud_init"),
+            "migration error must mention cloud_init: {msg}"
+        );
+        assert!(
+            msg.contains("bootcmd"),
+            "migration error must mention bootcmd: {msg}"
         );
     }
 
     #[test]
-    fn test_load_build_config_bootcmd_empty_list_is_empty() {
+    fn test_load_test_config_top_level_bootcmd_rejected_with_migration_error() {
+        // top-level bootcmd: must be rejected in test docs too.
+        let repo = TempDir::new().unwrap();
+        write_test_config(
+            &repo,
+            "test.yaml",
+            r#"
+type: test
+steps: []
+bootcmd:
+  - echo hello
+"#,
+        );
+        let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("cloud_init"),
+            "migration error must mention cloud_init: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_load_build_config_cloud_init_packages_accepted() {
         let repo = TempDir::new().unwrap();
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\nbootcmd: []\n",
+            r#"
+type: build
+image: "@base"
+output: "out.qcow2"
+steps: []
+cloud_init:
+  packages:
+    - curl
+    - git
+"#,
         );
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
+        let ci = config.cloud_init.expect("cloud_init must be Some");
+        let pkgs = ci
+            .get(&serde_yaml::Value::String("packages".to_string()))
+            .expect("packages must be present")
+            .as_sequence()
+            .expect("packages must be a sequence");
+        assert_eq!(pkgs.len(), 2);
+        assert_eq!(pkgs[0].as_str(), Some("curl"));
+        assert_eq!(pkgs[1].as_str(), Some("git"));
+    }
+
+    #[test]
+    fn test_load_test_config_cloud_init_mounts_accepted() {
+        // type: test also accepts cloud_init: (motivating tmpfs-on-test example).
+        let repo = TempDir::new().unwrap();
+        write_test_config(
+            &repo,
+            "test.yaml",
+            r#"
+type: test
+steps: []
+cloud_init:
+  mounts:
+    - [tmpfs, /var/cache/apt, tmpfs, "size=512M", "0", "0"]
+"#,
+        );
+        let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+        let ci = config.cloud_init.expect("cloud_init must be Some");
+        let mounts = ci
+            .get(&serde_yaml::Value::String("mounts".to_string()))
+            .expect("mounts must be present")
+            .as_sequence()
+            .expect("mounts must be a sequence");
+        assert_eq!(mounts.len(), 1);
+    }
+
+    #[test]
+    fn test_cloud_init_write_files_source_rejected_ingress_guard() {
+        // write_files with source: must be rejected (ingress guard).
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            r#"
+type: build
+image: "@base"
+output: "out.qcow2"
+steps: []
+cloud_init:
+  write_files:
+    - path: /etc/myapp.conf
+      source: file:///etc/host.conf
+"#,
+        );
+        let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
         assert!(
-            config.bootcmd.is_empty(),
-            "explicit empty bootcmd list must deserialize as empty vec"
+            msg.contains("source"),
+            "ingress guard error must mention source: {msg}"
+        );
+        assert!(
+            msg.contains("write_files"),
+            "ingress guard error must mention write_files: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_cloud_init_write_files_inline_content_allowed() {
+        // write_files with content: is allowed (inline value, not host-path ingress).
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            r#"
+type: build
+image: "@base"
+output: "out.qcow2"
+steps: []
+cloud_init:
+  write_files:
+    - path: /etc/myapp.conf
+      content: "key=value\n"
+"#,
+        );
+        let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
+        assert!(config.cloud_init.is_some(), "cloud_init must be accepted");
+    }
+
+    #[test]
+    fn test_cloud_init_ssh_pwauth_false_rejected_harness_guard() {
+        // ssh_pwauth: false must be rejected (harness guard).
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            r#"
+type: build
+image: "@base"
+output: "out.qcow2"
+steps: []
+cloud_init:
+  ssh_pwauth: false
+"#,
+        );
+        let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("ssh_pwauth"),
+            "harness guard error must mention ssh_pwauth: {msg}"
         );
     }
 

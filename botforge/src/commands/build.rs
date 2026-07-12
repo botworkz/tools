@@ -230,10 +230,15 @@ pub(crate) fn cmd_build(config: &Path, args: BuildArgs) -> Result<()> {
             None,
             ssh_public_key.trim(),
             Some(installer_user.as_str()),
-            &build_config.bootcmd,
+            build_config.cloud_init.as_ref(),
         )
     } else {
-        render_user_data(None, ssh_public_key.trim(), None, &build_config.bootcmd)
+        render_user_data(
+            None,
+            ssh_public_key.trim(),
+            None,
+            build_config.cloud_init.as_ref(),
+        )
     };
     crate::plan::print_phase("setup", "Preparing build environment (seed image)");
     write_seed_files(&seed_dir, &user_data)?;
