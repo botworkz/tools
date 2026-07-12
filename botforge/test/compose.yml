@@ -15,12 +15,7 @@ x-botforge-base: &botforge-base
   - ${REPO_ROOT:-${PWD}}:${REPO_ROOT:-${PWD}}
 
 services:
-  build:
-    <<: *botforge-base
-    devices:
-    - /dev/kvm:/dev/kvm
-
-  test:
+  botforge:
     <<: *botforge-base
     devices:
     - /dev/kvm:/dev/kvm
