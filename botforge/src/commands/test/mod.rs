@@ -1,12 +1,13 @@
 use anyhow::{bail, Context, Result};
 use clap::Args;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::commands::build::CpusArg;
 use crate::iso::{
     build_iso, detect_iso_tool, generate_installer_username, render_user_data, write_seed_files,
 };
 use crate::qemu::{create_overlay_image, qemu_run_args, require_kvm, spawn_qemu_with_log};
+use crate::resolver::{Reference, ResolveFileContext};
 use crate::ssh::{SshOptions, TemporarySshKeypair};
 use crate::util::{create_temp_dir, ensure_command, resolve_under_root};
 
@@ -20,9 +21,9 @@ pub(crate) struct TestArgs {
     /// Path to test.yaml config.
     #[arg(long = "test-config", required = true)]
     test_config: PathBuf,
-    /// Base qcow2 image path.
-    #[arg(long, required = true)]
-    base_image: PathBuf,
+    /// Base qcow2 image path or `@…` reference. Overrides `image:` in the test config.
+    #[arg(long)]
+    base_image: Option<PathBuf>,
     /// SSH private key path for guest access. Required when --ssh-user is provided;
     /// ignored when --ssh-user is omitted (botforge generates an ephemeral keypair).
     #[arg(long)]
@@ -54,7 +55,7 @@ pub(crate) struct TestArgs {
     cpus: CpusArg,
 }
 
-pub(crate) fn cmd_test(args: TestArgs) -> Result<()> {
+pub(crate) fn cmd_test(config: &Path, args: TestArgs) -> Result<()> {
     require_kvm()?;
     ensure_command("qemu-system-x86_64")?;
     ensure_command("qemu-img")?;
@@ -62,9 +63,14 @@ pub(crate) fn cmd_test(args: TestArgs) -> Result<()> {
 
     let repo_root = std::fs::canonicalize(args.repo_root).context("failed to resolve repo root")?;
     let test_config_path = resolve_under_root(&repo_root, args.test_config);
-    let base_image = resolve_under_root(&repo_root, args.base_image);
 
     let test_config = load_test_config(&repo_root, &test_config_path)?;
+    let base_image = resolve_test_base_image(
+        &repo_root,
+        config,
+        args.base_image,
+        test_config.image.as_ref(),
+    )?;
     validate_test_steps(&test_config.steps, &test_config.ports)?;
     let build_dir = repo_root.join("build");
     std::fs::create_dir_all(&build_dir)
@@ -197,10 +203,41 @@ pub(crate) fn cmd_test(args: TestArgs) -> Result<()> {
     Ok(())
 }
 
+fn resolve_test_base_image(
+    repo_root: &Path,
+    manifest_path: &Path,
+    base_image_arg: Option<PathBuf>,
+    config_image: Option<&Reference>,
+) -> Result<PathBuf> {
+    let resolve_context = ResolveFileContext {
+        repo_root,
+        manifest_path,
+        cache_dir_override: None,
+    };
+
+    if let Some(base_image) = base_image_arg {
+        if let Some(raw) = base_image.to_str().filter(|raw| raw.starts_with('@')) {
+            let reference = Reference::parse(raw)
+                .with_context(|| format!("invalid --base-image reference: {raw:?}"))?;
+            return reference.resolve_to_file(&resolve_context);
+        }
+        return Ok(resolve_under_root(repo_root, base_image));
+    }
+
+    let image = config_image.context(
+        "no base image provided: set `image:` in the test config or pass `--base-image`",
+    )?;
+    image.resolve_to_file(&resolve_context)
+}
+
 #[cfg(test)]
 mod tests {
+    use super::resolve_test_base_image;
     use crate::cli::Cli;
+    use crate::resolver::Reference;
     use clap::Parser;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
 
     #[test]
     fn test_test_cli_requires_repo_root() {
@@ -264,6 +301,23 @@ mod tests {
     }
 
     #[test]
+    fn test_test_cli_accepts_config_image_without_base_image_flag() {
+        let result = Cli::try_parse_from([
+            "botforge",
+            "test",
+            "--test-config",
+            "test.yaml",
+            "--repo-root",
+            "/repo",
+        ]);
+        assert!(
+            result.is_ok(),
+            "CLI should allow test-config image without --base-image: {}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
     fn test_test_cli_shows_memory_and_cpus_in_help() {
         let help = Cli::try_parse_from(["botforge", "test", "--help"])
             .unwrap_err()
@@ -275,6 +329,60 @@ mod tests {
         assert!(
             help.contains("--cpus"),
             "--cpus missing from test help: {help}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_test_base_image_uses_cli_override_before_config_image() {
+        let repo = TempDir::new().unwrap();
+        let manifest = repo.path().join("shasset.yaml");
+        let cli_image = repo.path().join("cli.qcow2");
+        let config_image = repo.path().join("config.qcow2");
+        std::fs::write(&cli_image, "cli").unwrap();
+        std::fs::write(&config_image, "config").unwrap();
+
+        let resolved = resolve_test_base_image(
+            repo.path(),
+            &manifest,
+            Some(cli_image.clone()),
+            Some(&Reference::Repo {
+                path: Some(PathBuf::from("config.qcow2")),
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(resolved, cli_image);
+    }
+
+    #[test]
+    fn test_resolve_test_base_image_uses_config_image_when_cli_absent() {
+        let repo = TempDir::new().unwrap();
+        let manifest = repo.path().join("shasset.yaml");
+        let artifact = repo.path().join("build/artifact/base.qcow2");
+        std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        std::fs::write(&artifact, "base").unwrap();
+
+        let resolved = resolve_test_base_image(
+            repo.path(),
+            &manifest,
+            None,
+            Some(&Reference::Repo {
+                path: Some(PathBuf::from("build/artifact/base.qcow2")),
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(resolved, artifact);
+    }
+
+    #[test]
+    fn test_resolve_test_base_image_requires_cli_or_config_image() {
+        let repo = TempDir::new().unwrap();
+        let manifest = repo.path().join("shasset.yaml");
+        let err = resolve_test_base_image(repo.path(), &manifest, None, None).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("no base image provided"),
+            "missing base image should be rejected: {err:#}"
         );
     }
 }

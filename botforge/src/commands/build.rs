@@ -5,7 +5,7 @@
 use anyhow::{bail, Context, Result};
 use clap::Args;
 use serde_yaml::Value;
-use shasset::fetch::{fetch_asset, FetchParams, MaterializeMode, Transport};
+use shasset::fetch::{fetch_asset, FetchParams, MaterializeMode};
 use shasset::manifest::load;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -15,11 +15,11 @@ use crate::iso::{
     build_iso, detect_iso_tool, generate_installer_username, render_user_data, write_seed_files,
 };
 use crate::qemu::{qemu_build_args, require_kvm, spawn_qemu_with_log};
-use crate::resolver::ARTIFACT_DIR;
+use crate::resolver::{ResolveFileContext, ARTIFACT_DIR};
 use crate::ssh::{scp_with_retry, ssh_with_retry, SshOptions, TemporarySshKeypair};
 use crate::util::{
     botforge_debug_enabled, create_temp_dir, default_cache_dir, ensure_command, format_bytes_human,
-    materialize_flat, repo_relative_display, resolve_under_root, unique_suffix,
+    repo_relative_display, resolve_under_root, unique_suffix,
 };
 
 use crate::plan::config::{CompressConfig, CompressionType, ReclaimMode};
@@ -145,12 +145,15 @@ pub(crate) fn cmd_build(config: &Path, args: BuildArgs) -> Result<()> {
         ensure_command("qemu-nbd")?;
     }
 
-    // Resolve the source qcow2: --source wins; otherwise fetch image via shasset.
+    // Resolve the source qcow2: --source wins; otherwise resolve image: via the shared resolver.
     let source = if let Some(src) = args.source {
         resolve_under_root(&repo_root, src)
     } else {
-        let crate::plan::config::ImageRef::ShassetDefault(ref shasset_name) = build_config.image;
-        resolve_base_image(config, shasset_name, args.cache_dir.as_deref())?
+        build_config.image.resolve_to_file(&ResolveFileContext {
+            repo_root: &repo_root,
+            manifest_path: config,
+            cache_dir_override: args.cache_dir.as_deref(),
+        })?
     };
 
     if !source.is_file() {
@@ -560,81 +563,6 @@ fn commit_output(partial: &Path, output: &Path, compress: Option<&CompressConfig
         }
     }
     Ok(())
-}
-
-/// Resolve the `image:` shasset asset key to a local qcow2 path.
-///
-/// Mirrors `deps.rs`'s `fetch_asset` pattern: loads the manifest, looks up the
-/// asset, fetches + verifies + caches it via the shasset library, then materializes
-/// a copy into the build cache dir so the cached blob is never mutated by qemu.
-fn resolve_base_image(
-    manifest_path: &Path,
-    asset_key: &str,
-    cache_dir_override: Option<&Path>,
-) -> Result<PathBuf> {
-    resolve_base_image_with_transport(manifest_path, asset_key, cache_dir_override, || None)
-}
-
-fn resolve_base_image_with_transport<F>(
-    manifest_path: &Path,
-    asset_key: &str,
-    cache_dir_override: Option<&Path>,
-    mut transport_factory: F,
-) -> Result<PathBuf>
-where
-    F: FnMut() -> Option<Box<dyn Transport>>,
-{
-    let manifest = load(manifest_path)
-        .with_context(|| format!("cannot load shasset manifest: {}", manifest_path.display()))?;
-    let cache_dir = cache_dir_override
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(default_cache_dir);
-
-    let asset = manifest.assets.get(asset_key).with_context(|| {
-        format!(
-            "asset '{asset_key}' not found in manifest {}",
-            manifest_path.display()
-        )
-    })?;
-
-    let uri = asset.expanded_uri();
-    if uri.starts_with("oci://") {
-        bail!(
-            "image asset '{asset_key}' is an oci:// image; \
-             image must resolve to a qcow2 file asset"
-        );
-    }
-    if asset.checksum.is_none() {
-        eprintln!(
-            "warning: image asset '{asset_key}' has no checksum; \
-             integrity will not be verified"
-        );
-    }
-
-    let fetched = fetch_asset(FetchParams {
-        name: asset_key,
-        asset,
-        out_dir: None,
-        cache_dir: &cache_dir,
-        retries: manifest.settings.retries,
-        backoff: &manifest.settings.backoff,
-        compute_checksum: true,
-        no_reverify: false,
-        materialize_mode: MaterializeMode::Copy,
-        transport: transport_factory(),
-    })
-    .with_context(|| format!("failed to fetch image asset '{asset_key}'"))?;
-
-    // Materialize a copy into the cache dir so qemu boots a mutable copy
-    // without polluting the shasset blob cache.
-    let filename = asset
-        .output_filename()
-        .with_context(|| format!("image asset '{asset_key}': cannot determine output filename"))?;
-    let out_dir = cache_dir.join("base-images");
-    let qcow2_path = materialize_flat(&fetched.blob_path, &out_dir, &filename, false)
-        .with_context(|| format!("failed to stage image asset '{asset_key}'"))?;
-
-    Ok(qcow2_path)
 }
 
 fn run_archive_step(
@@ -1402,38 +1330,15 @@ mod tests {
         cloud_init_clean_guest_command, derive_artifact_output_path, failed_partial_path,
         fstrim_guest_command, fstrim_mount_args, guest_untar_command, installer_teardown_command,
         mount_discard_args, output_stem, parse_archive_asset_key, partial_path,
-        qemu_nbd_connect_args, qemu_nbd_disconnect_args, resolve_base_image_with_transport,
-        should_run_zero_cluster_sparsify, unpack_archive_to_dir,
+        qemu_nbd_connect_args, qemu_nbd_disconnect_args, should_run_zero_cluster_sparsify,
+        unpack_archive_to_dir,
     };
     use crate::cli::Cli;
     use crate::plan::config::ReclaimMode;
     use clap::Parser;
-    use shasset::fetch::{DownloadResponse, FetchError, Transport};
-    use std::io::Cursor;
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use tempfile::TempDir;
-
-    struct MockTransport {
-        expected_uri: String,
-        body: Vec<u8>,
-    }
-
-    impl Transport for MockTransport {
-        fn get(
-            &self,
-            uri: &str,
-            _auth: Option<&str>,
-            accept: Option<&str>,
-        ) -> std::result::Result<DownloadResponse, FetchError> {
-            assert_eq!(uri, self.expected_uri);
-            assert!(accept.is_none());
-            Ok(DownloadResponse {
-                body: Box::new(Cursor::new(self.body.clone())),
-                content_length: Some(self.body.len() as u64),
-            })
-        }
-    }
 
     #[test]
     fn partial_path_appends_partial_suffix() {
@@ -1755,80 +1660,6 @@ mod tests {
         std::fs::write(tmp.path().join("other.yaml"), "type: [\n").unwrap();
 
         check_same_directory_output_filename_clash(&spec, "one.qcow2").unwrap();
-    }
-
-    #[test]
-    fn resolve_base_image_fails_on_unknown_asset() {
-        let tmp = TempDir::new().unwrap();
-        let manifest = tmp.path().join("shasset.yaml");
-        std::fs::write(
-            &manifest,
-            "settings:\n  retries: 0\nassets:\n  other-asset:\n    uri: https://example.com/img.qcow2\n    version: \"1\"\n",
-        )
-        .unwrap();
-        let err = resolve_base_image_with_transport(
-            &manifest,
-            "nonexistent-key",
-            Some(tmp.path()),
-            || None,
-        )
-        .unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("nonexistent-key") && msg.contains("not found"),
-            "error should name the missing key: {msg}"
-        );
-    }
-
-    #[test]
-    fn resolve_base_image_fails_on_oci_asset() {
-        let tmp = TempDir::new().unwrap();
-        let manifest = tmp.path().join("shasset.yaml");
-        std::fs::write(
-            &manifest,
-            "settings:\n  retries: 0\nassets:\n  my-image:\n    uri: oci://ghcr.io/example/img@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n    version: \"1\"\n",
-        )
-        .unwrap();
-        let err =
-            resolve_base_image_with_transport(&manifest, "my-image", Some(tmp.path()), || None)
-                .unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("oci://") || msg.contains("qcow2"),
-            "error should mention oci or qcow2: {msg}"
-        );
-    }
-
-    #[test]
-    fn resolve_base_image_fetches_and_materializes() {
-        let tmp = TempDir::new().unwrap();
-        let manifest = tmp.path().join("shasset.yaml");
-        let cache = tmp.path().join("cache");
-        let body = b"fake-qcow2-content".to_vec();
-        let uri = "https://example.com/v1/base.qcow2".to_string();
-        let checksum = "34cb20b33d115697e75baf0d12172c7c3b42a5f04b047c64f38d0aa2b57c988f";
-        std::fs::write(
-            &manifest,
-            format!(
-                "settings:\n  retries: 0\nassets:\n  debian-base:\n    uri: {uri}\n    version: \"13\"\n    checksum: sha256:{checksum}\n    filename: debian-13.qcow2\n"
-            ),
-        )
-        .unwrap();
-
-        let mut transport = Some(Box::new(MockTransport {
-            expected_uri: uri,
-            body: body.clone(),
-        }) as Box<dyn Transport>);
-
-        let path =
-            resolve_base_image_with_transport(&manifest, "debian-base", Some(&cache), || {
-                transport.take()
-            })
-            .unwrap();
-
-        assert!(path.exists(), "materialized qcow2 should exist: {path:?}");
-        assert_eq!(std::fs::read(&path).unwrap(), body);
-        assert_eq!(path.file_name().unwrap(), "debian-13.qcow2");
     }
 
     #[test]
