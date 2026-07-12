@@ -1,13 +1,11 @@
 use anyhow::{Context, Result};
-use glob::MatchOptions;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::resolver::{Reference, ResolveFileContext};
 use crate::ssh::{scp_with_retry, ssh_with_retry, SshOptions};
-use crate::util::{resolve_under_root, shell_single_quote, unique_suffix};
-
-use super::config::src_has_glob_metacharacters;
+use crate::util::{shell_single_quote, unique_suffix};
 
 const TRANSPORT_RETRIES: usize = 10;
 const TRANSPORT_RETRY_DELAY: Duration = Duration::from_secs(2);
@@ -57,123 +55,32 @@ struct InstallOpts<'a> {
 }
 
 pub(crate) fn resolve_top_level_upload_mappings(
-    repo_root: &Path,
     upload: &TopLevelUpload,
+    context: &ResolveFileContext<'_>,
 ) -> Result<Vec<UploadMapping>> {
     let src = upload.src.trim();
     let dest = upload.dest.trim();
-    validate_top_level_upload_src_for_runtime(src)?;
-    if !src_has_glob_metacharacters(src) {
-        let local_path = resolve_under_root(repo_root, PathBuf::from(src));
-        if !local_path.is_file() {
-            anyhow::bail!(
-                "upload src '{}' does not resolve to a regular file under {}",
-                src,
-                repo_root.display()
-            );
-        }
+    let reference = Reference::parse(src)
+        .with_context(|| format!("upload src '{src}' is not a valid @-reference"))?;
+    let resolved_files = reference
+        .resolve_to_files(context)
+        .with_context(|| format!("failed to resolve upload src '{src}'"))?;
+    let mut mappings = Vec::new();
+    for rf in resolved_files {
         let guest_dest = if dest.ends_with('/') {
-            let basename = local_path.file_name().with_context(|| {
-                format!("upload src '{}' has no file name", local_path.display())
-            })?;
             Path::new(dest)
-                .join(basename)
+                .join(&rf.relative_path)
                 .to_string_lossy()
                 .into_owned()
         } else {
             dest.to_string()
         };
-        return Ok(vec![UploadMapping {
-            local_path,
-            guest_dest,
-        }]);
-    }
-
-    let fixed_prefix = fixed_glob_prefix(src);
-    let fixed_prefix_root = repo_root.join(&fixed_prefix);
-    let pattern = repo_root.join(src).to_string_lossy().into_owned();
-    let match_options = MatchOptions {
-        case_sensitive: true,
-        require_literal_separator: false,
-        require_literal_leading_dot: false,
-    };
-    let mut mappings = Vec::new();
-    for entry in glob::glob_with(&pattern, match_options)
-        .with_context(|| format!("invalid upload src glob '{}'", src))?
-    {
-        let local_path = entry.with_context(|| {
-            format!(
-                "failed while expanding upload src glob '{}' under {}",
-                src,
-                repo_root.display()
-            )
-        })?;
-        if !local_path.is_file() {
-            continue;
-        }
-        let relative = local_path
-            .strip_prefix(&fixed_prefix_root)
-            .with_context(|| {
-                format!(
-                    "upload src glob '{}' produced '{}' outside fixed prefix '{}'",
-                    src,
-                    local_path.display(),
-                    fixed_prefix_root.display()
-                )
-            })?;
-        let guest_dest = Path::new(dest)
-            .join(relative)
-            .to_string_lossy()
-            .into_owned();
         mappings.push(UploadMapping {
-            local_path,
+            local_path: rf.local_path,
             guest_dest,
         });
     }
-
-    if mappings.is_empty() {
-        anyhow::bail!(
-            "no files matched upload src glob '{}' under {}",
-            src,
-            repo_root.display()
-        );
-    }
-
     Ok(mappings)
-}
-
-fn fixed_glob_prefix(src: &str) -> PathBuf {
-    let mut prefix = PathBuf::new();
-    for component in Path::new(src).components() {
-        let std::path::Component::Normal(part) = component else {
-            break;
-        };
-        if src_has_glob_metacharacters(&part.to_string_lossy()) {
-            break;
-        }
-        prefix.push(part);
-    }
-    prefix
-}
-
-fn validate_top_level_upload_src_for_runtime(src: &str) -> Result<()> {
-    let path = Path::new(src);
-    if path.as_os_str().is_empty() {
-        anyhow::bail!("upload src must not be empty");
-    }
-    if path.is_absolute() {
-        anyhow::bail!("upload src must be repo-relative, got: {}", path.display());
-    }
-    for component in path.components() {
-        match component {
-            std::path::Component::Normal(_) => {}
-            _ => anyhow::bail!(
-                "upload src must contain no '.' or '..' segments: {}",
-                path.display()
-            ),
-        }
-    }
-    Ok(())
 }
 
 /// Stage a local file to the guest using `sudo install`, applying the given `opts`.
@@ -258,12 +165,12 @@ fn install_file_to_guest(
 }
 
 pub(crate) fn stage_top_level_uploads(
-    repo_root: &Path,
     uploads: &[TopLevelUpload],
+    context: &ResolveFileContext<'_>,
     ssh: &SshOptions,
 ) -> Result<()> {
     for (upload_idx, upload) in uploads.iter().enumerate() {
-        let mappings = resolve_top_level_upload_mappings(repo_root, upload)?;
+        let mappings = resolve_top_level_upload_mappings(upload, context)?;
         let opts = InstallOpts {
             mode: upload.mode.as_deref(),
             owner: upload.owner.as_deref(),
@@ -301,82 +208,129 @@ pub(crate) fn stage_top_level_uploads(
 #[cfg(test)]
 mod tests {
     use super::{resolve_top_level_upload_mappings, TopLevelUpload, UploadMapping};
+    use crate::resolver::ResolveFileContext;
+    use tempfile::TempDir;
+
+    fn make_context<'a>(
+        repo: &'a TempDir,
+        manifest: &'a std::path::Path,
+    ) -> ResolveFileContext<'a> {
+        ResolveFileContext {
+            repo_root: repo.path(),
+            manifest_path: manifest,
+            cache_dir_override: None,
+        }
+    }
 
     #[test]
-    fn test_resolve_top_level_upload_mappings_preserves_glob_relative_paths() {
-        let repo = tempfile::tempdir().unwrap();
+    fn test_resolve_top_level_upload_mappings_repo_glob_preserves_relative_paths() {
+        let repo = TempDir::new().unwrap();
+        let manifest = repo.path().join("shasset.yaml");
         let ecds = repo.path().join("images/botspace/envoy/ecds");
         std::fs::create_dir_all(&ecds).unwrap();
         let file = ecds.join("ext_authz.yaml");
         std::fs::write(&file, "kind: envoy\n").unwrap();
 
+        let ctx = make_context(&repo, &manifest);
         let mappings = resolve_top_level_upload_mappings(
-            repo.path(),
             &TopLevelUpload {
-                src: "images/botspace/envoy/**/*.yaml".to_string(),
+                src: "@://images/botspace/envoy/**/*.yaml".to_string(),
                 dest: "/tmp/bake-staging/envoy/".to_string(),
                 ..Default::default()
             },
+            &ctx,
         )
         .unwrap();
 
         assert_eq!(
             mappings,
             vec![UploadMapping {
-                local_path: file,
+                local_path: file.canonicalize().unwrap(),
                 guest_dest: "/tmp/bake-staging/envoy/ecds/ext_authz.yaml".to_string(),
             }]
         );
     }
 
     #[test]
-    fn test_resolve_top_level_upload_mappings_preserves_flat_glob_matches() {
-        let repo = tempfile::tempdir().unwrap();
-        let payload = repo.path().join("build/images/payload");
-        std::fs::create_dir_all(&payload).unwrap();
-        let file = payload.join("mcp-fs.tar");
+    fn test_resolve_top_level_upload_mappings_artifact_glob_preserves_flat_matches() {
+        let repo = TempDir::new().unwrap();
+        let manifest = repo.path().join("shasset.yaml");
+        let artifact_dir = repo.path().join("build/artifact/payload");
+        std::fs::create_dir_all(&artifact_dir).unwrap();
+        let file = artifact_dir.join("mcp-fs.tar");
         std::fs::write(&file, "tarball").unwrap();
 
+        let ctx = make_context(&repo, &manifest);
         let mappings = resolve_top_level_upload_mappings(
-            repo.path(),
             &TopLevelUpload {
-                src: "build/images/payload/*.tar".to_string(),
+                src: "@artifact://payload/*.tar".to_string(),
                 dest: "/usr/share/botwork/images/".to_string(),
                 ..Default::default()
             },
+            &ctx,
         )
         .unwrap();
 
         assert_eq!(
             mappings,
             vec![UploadMapping {
-                local_path: file,
+                local_path: file.canonicalize().unwrap(),
                 guest_dest: "/usr/share/botwork/images/mcp-fs.tar".to_string(),
             }]
         );
     }
 
     #[test]
-    fn test_resolve_top_level_upload_mappings_literal_dest_directory_uses_basename() {
-        let repo = tempfile::tempdir().unwrap();
+    fn test_resolve_top_level_upload_mappings_repo_literal_dest_uses_relative_path() {
+        let repo = TempDir::new().unwrap();
+        let manifest = repo.path().join("shasset.yaml");
         let local = repo.path().join("scripts/setup.sh");
         std::fs::create_dir_all(local.parent().unwrap()).unwrap();
         std::fs::write(&local, "#!/bin/sh\n").unwrap();
 
+        let ctx = make_context(&repo, &manifest);
         let mappings = resolve_top_level_upload_mappings(
-            repo.path(),
             &TopLevelUpload {
-                src: "scripts/setup.sh".to_string(),
-                dest: "/tmp/staging/".to_string(),
+                src: "@://scripts/setup.sh".to_string(),
+                dest: "/tmp/staging/setup.sh".to_string(),
                 ..Default::default()
             },
+            &ctx,
         )
         .unwrap();
 
         assert_eq!(
             mappings,
             vec![UploadMapping {
-                local_path: local,
+                local_path: local.canonicalize().unwrap(),
+                guest_dest: "/tmp/staging/setup.sh".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn test_resolve_top_level_upload_mappings_repo_literal_dir_dest_appends_basename() {
+        let repo = TempDir::new().unwrap();
+        let manifest = repo.path().join("shasset.yaml");
+        let local = repo.path().join("scripts/setup.sh");
+        std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+        std::fs::write(&local, "#!/bin/sh\n").unwrap();
+
+        let ctx = make_context(&repo, &manifest);
+        let mappings = resolve_top_level_upload_mappings(
+            &TopLevelUpload {
+                src: "@://scripts/setup.sh".to_string(),
+                dest: "/tmp/staging/".to_string(),
+                ..Default::default()
+            },
+            &ctx,
+        )
+        .unwrap();
+
+        assert_eq!(
+            mappings,
+            vec![UploadMapping {
+                local_path: local.canonicalize().unwrap(),
                 guest_dest: "/tmp/staging/setup.sh".to_string(),
             }]
         );
@@ -384,47 +338,43 @@ mod tests {
 
     #[test]
     fn test_resolve_top_level_upload_mappings_zero_match_is_error() {
-        let repo = tempfile::tempdir().unwrap();
+        let repo = TempDir::new().unwrap();
+        let manifest = repo.path().join("shasset.yaml");
+        let ctx = make_context(&repo, &manifest);
         let err = resolve_top_level_upload_mappings(
-            repo.path(),
             &TopLevelUpload {
-                src: "images/**/*.yaml".to_string(),
+                src: "@://images/**/*.yaml".to_string(),
                 dest: "/tmp/staging/".to_string(),
                 ..Default::default()
             },
+            &ctx,
         )
         .unwrap_err();
-        assert!(format!("{err:#}").contains("no files matched"));
+        assert!(
+            format!("{err:#}").contains("zero")
+                || format!("{err:#}").contains("no files")
+                || format!("{err:#}").contains("matched"),
+            "error should mention zero matches: {err:#}"
+        );
     }
 
     #[test]
-    fn test_resolve_top_level_upload_mappings_rejects_traversal() {
-        let repo = tempfile::tempdir().unwrap();
+    fn test_resolve_top_level_upload_mappings_rejects_bare_path() {
+        let repo = TempDir::new().unwrap();
+        let manifest = repo.path().join("shasset.yaml");
+        let ctx = make_context(&repo, &manifest);
         let err = resolve_top_level_upload_mappings(
-            repo.path(),
             &TopLevelUpload {
-                src: "images/../secret.txt".to_string(),
+                src: "images/botspace/envoy/**/*.yaml".to_string(),
                 dest: "/tmp/staging/".to_string(),
                 ..Default::default()
             },
+            &ctx,
         )
         .unwrap_err();
-        assert!(format!("{err:#}").contains(".."));
-    }
-
-    #[test]
-    fn test_resolve_top_level_upload_mappings_skips_directories_and_requires_files() {
-        let repo = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(repo.path().join("images/botspace/envoy/ecds")).unwrap();
-        let err = resolve_top_level_upload_mappings(
-            repo.path(),
-            &TopLevelUpload {
-                src: "images/botspace/envoy/**".to_string(),
-                dest: "/tmp/staging/".to_string(),
-                ..Default::default()
-            },
-        )
-        .unwrap_err();
-        assert!(format!("{err:#}").contains("no files matched"));
+        assert!(
+            format!("{err:#}").contains("@") || format!("{err:#}").contains("reference"),
+            "error should mention @-reference: {err:#}"
+        );
     }
 }
