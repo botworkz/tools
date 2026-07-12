@@ -149,11 +149,13 @@ pub(crate) fn cmd_build(config: &Path, args: BuildArgs) -> Result<()> {
     let source = if let Some(src) = args.source {
         resolve_under_root(&repo_root, src)
     } else {
-        build_config.image.resolve_to_file(&ResolveFileContext {
-            repo_root: &repo_root,
-            manifest_path: config,
-            cache_dir_override: args.cache_dir.as_deref(),
-        })?
+        build_config
+            .image
+            .resolve_base_image_to_file(&ResolveFileContext {
+                repo_root: &repo_root,
+                manifest_path: config,
+                cache_dir_override: args.cache_dir.as_deref(),
+            })?
     };
 
     if !source.is_file() {

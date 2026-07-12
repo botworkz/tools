@@ -150,6 +150,39 @@ impl Reference {
         self.resolve_to_file_with_transport(context, || None)
     }
 
+    /// Resolve this reference to a local file path for use as a **base image** (qcow2 slot).
+    ///
+    /// Identical to [`resolve_to_file`] for all reference kinds except bare asset references
+    /// (`@<name>`): for those, this helper additionally enforces the base-image contract that
+    /// the asset must **not** be an `oci://` image.  `oci://` assets are valid upload sources
+    /// but cannot be booted directly as a qcow2 base image.
+    ///
+    /// Both `botforge build` (the `image:` slot) and `botforge test` (the `--base-image`/
+    /// `image:` slot) use this helper so the contract lives in exactly one place.
+    pub(crate) fn resolve_base_image_to_file(
+        &self,
+        context: &ResolveFileContext<'_>,
+    ) -> Result<PathBuf> {
+        if let Reference::Asset { name, path: None } = self {
+            let manifest = load(context.manifest_path).with_context(|| {
+                format!(
+                    "cannot load shasset manifest: {}",
+                    context.manifest_path.display()
+                )
+            })?;
+            if let Some(asset) = manifest.assets.get(name) {
+                let uri = asset.expanded_uri();
+                if uri.starts_with("oci://") {
+                    bail!(
+                        "base image asset '{name}' is an oci:// image; \
+                         image must resolve to a qcow2 file asset"
+                    );
+                }
+            }
+        }
+        self.resolve_to_file(context)
+    }
+
     fn resolve_to_file_with_transport<F>(
         &self,
         context: &ResolveFileContext<'_>,
@@ -187,13 +220,6 @@ impl Reference {
                     )
                 })?;
 
-                let uri = asset.expanded_uri();
-                if uri.starts_with("oci://") {
-                    bail!(
-                        "image asset '{name}' is an oci:// image; \
-                         image must resolve to a qcow2 file asset"
-                    );
-                }
                 if asset.checksum.is_none() {
                     eprintln!(
                         "warning: image asset '{name}' has no checksum; \
@@ -760,7 +786,34 @@ mod tests {
     }
 
     #[test]
-    fn resolve_to_file_fails_on_oci_asset() {
+    fn resolve_to_file_succeeds_on_oci_asset() {
+        // The shared resolver no longer enforces the "must be qcow2" contract.
+        // Verify that resolve_to_file for an oci:// asset does NOT fail with the
+        // base-image/qcow2 contract error — it may fail for other reasons (e.g.
+        // no network in tests) but that's a different failure path.
+        let tmp = TempDir::new().unwrap();
+        let manifest = tmp.path().join("shasset.yaml");
+        std::fs::write(
+            &manifest,
+            "settings:\n  retries: 0\nassets:\n  session-broker:\n    uri: oci://ghcr.io/example/session-broker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n    version: \"1\"\n",
+        )
+        .unwrap();
+        let err = Reference::Asset {
+            name: "session-broker".to_string(),
+            path: None,
+        }
+        .resolve_to_file(&resolve_context(tmp.path(), &manifest, Some(tmp.path())))
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        // Must NOT be the base-image qcow2 contract error.
+        assert!(
+            !msg.contains("image must resolve to a qcow2 file asset"),
+            "resolve_to_file must not enforce the base-image qcow2 contract: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_base_image_to_file_rejects_oci_asset() {
         let tmp = TempDir::new().unwrap();
         let manifest = tmp.path().join("shasset.yaml");
         std::fs::write(
@@ -772,12 +825,38 @@ mod tests {
             name: "my-image".to_string(),
             path: None,
         }
-        .resolve_to_file(&resolve_context(tmp.path(), &manifest, Some(tmp.path())))
+        .resolve_base_image_to_file(&resolve_context(tmp.path(), &manifest, Some(tmp.path())))
         .unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("oci://") || msg.contains("qcow2"),
-            "error should mention oci or qcow2: {msg}"
+            msg.contains("oci://") && msg.contains("qcow2"),
+            "base-image helper should reject oci:// assets with oci+qcow2 message: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_to_files_oci_asset_does_not_hit_qcow2_contract_error() {
+        // An upload src like `@session-broker` (oci:// asset) must not fail with the
+        // "image must resolve to a qcow2 file asset" message.  It may still fail (e.g.
+        // fetch error) but not because of the base-image contract.
+        let tmp = TempDir::new().unwrap();
+        let manifest = tmp.path().join("shasset.yaml");
+        std::fs::write(
+            &manifest,
+            "settings:\n  retries: 0\nassets:\n  session-broker:\n    uri: oci://ghcr.io/example/session-broker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n    version: \"1\"\n",
+        )
+        .unwrap();
+        let err = Reference::Asset {
+            name: "session-broker".to_string(),
+            path: None,
+        }
+        .resolve_to_files(&resolve_context(tmp.path(), &manifest, Some(tmp.path())))
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        // Must NOT be the base-image/qcow2 contract error.
+        assert!(
+            !msg.contains("image must resolve to a qcow2 file asset"),
+            "resolve_to_files must not enforce the qcow2 base-image contract: {msg}"
         );
     }
 
