@@ -130,6 +130,15 @@ impl Reference {
     where
         F: FnMut() -> Option<Box<dyn Transport>>,
     {
+        // Pre-canonicalize the repo root once so containment checks in
+        // resolve_existing_file can detect symlink escapes at resolve time.
+        let canonical_root = context.repo_root.canonicalize().with_context(|| {
+            format!(
+                "cannot canonicalize repo root: {}",
+                context.repo_root.display()
+            )
+        })?;
+
         match self {
             Reference::Asset { name, path: None } => {
                 let manifest = load(context.manifest_path).with_context(|| {
@@ -186,11 +195,12 @@ impl Reference {
                     .with_context(|| format!("failed to stage image asset '{name}'"))
             }
             Reference::Repo { path: Some(path) } => {
-                resolve_existing_file(context.repo_root.join(path), "repo image reference")
+                resolve_existing_file(context.repo_root.join(path), "repo image reference", &canonical_root)
             }
             Reference::Artifact { path: Some(path) } => resolve_existing_file(
                 context.repo_root.join(ARTIFACT_DIR).join(path),
                 "artifact image reference",
+                &canonical_root,
             ),
             Reference::Asset { name, path: Some(path) } => bail!(
                 "image reference '@{name}://{}' requires archive traversal, which is not yet supported",
@@ -206,14 +216,29 @@ impl Reference {
     }
 }
 
-fn resolve_existing_file(path: PathBuf, label: &str) -> Result<PathBuf> {
+fn resolve_existing_file(path: PathBuf, label: &str, canonical_root: &Path) -> Result<PathBuf> {
     if !path.exists() {
         bail!("{label} not found: {}", path.display());
     }
     if !path.is_file() {
         bail!("{label} must resolve to a file: {}", path.display());
     }
-    Ok(path)
+    // Resolve any symlinks and assert the result stays inside the repo root.
+    // This is the complement to the parse-time dot/dotdot check: it catches
+    // a symlink placed inside `build/artifact` (or the repo tree) that points
+    // outside the root.
+    let canonical = path
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize {label}: {}", path.display()))?;
+    if !canonical.starts_with(canonical_root) {
+        bail!(
+            "{label} escapes repository root via symlink: \
+             resolved path '{}' is outside root '{}'",
+            canonical.display(),
+            canonical_root.display()
+        );
+    }
+    Ok(canonical)
 }
 
 /// Validate that a `://`-suffix path component is repo-relative.
@@ -594,6 +619,54 @@ mod tests {
         assert!(
             format!("{err:#}").contains("not yet supported"),
             "asset traversal should remain unsupported: {err:#}"
+        );
+    }
+
+    #[test]
+    fn resolve_to_file_rejects_artifact_symlink_escaping_root() {
+        let tmp = TempDir::new().unwrap();
+        let manifest = tmp.path().join("shasset.yaml");
+        // Create a target file outside the repo root.
+        let outside = TempDir::new().unwrap();
+        let target = outside.path().join("secret.qcow2");
+        std::fs::write(&target, "not-in-repo").unwrap();
+        // Plant a symlink inside build/artifact that points out of the root.
+        let artifact_dir = tmp.path().join(ARTIFACT_DIR);
+        std::fs::create_dir_all(&artifact_dir).unwrap();
+        std::os::unix::fs::symlink(&target, artifact_dir.join("escape.qcow2")).unwrap();
+
+        let err = Reference::Artifact {
+            path: Some(PathBuf::from("escape.qcow2")),
+        }
+        .resolve_to_file(&resolve_context(tmp.path(), &manifest, None))
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("escapes") || msg.contains("outside"),
+            "symlink escaping artifact root should be rejected: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_to_file_rejects_repo_symlink_escaping_root() {
+        let tmp = TempDir::new().unwrap();
+        let manifest = tmp.path().join("shasset.yaml");
+        // Create a target file outside the repo root.
+        let outside = TempDir::new().unwrap();
+        let target = outside.path().join("secret.qcow2");
+        std::fs::write(&target, "not-in-repo").unwrap();
+        // Plant a symlink directly in the repo root that points outside.
+        std::os::unix::fs::symlink(&target, tmp.path().join("escape.qcow2")).unwrap();
+
+        let err = Reference::Repo {
+            path: Some(PathBuf::from("escape.qcow2")),
+        }
+        .resolve_to_file(&resolve_context(tmp.path(), &manifest, None))
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("escapes") || msg.contains("outside"),
+            "symlink escaping repo root should be rejected: {msg}"
         );
     }
 }
