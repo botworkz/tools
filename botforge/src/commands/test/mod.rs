@@ -226,7 +226,7 @@ fn resolve_test_base_image(
         if let Some(raw) = base_image.to_str().filter(|raw| raw.starts_with('@')) {
             let reference = Reference::parse(raw)
                 .with_context(|| format!("invalid --base-image reference: {raw:?}"))?;
-            return reference.resolve_to_file(&resolve_context);
+            return reference.resolve_base_image_to_file(&resolve_context);
         }
         return Ok(resolve_under_root(repo_root, base_image));
     }
@@ -234,7 +234,7 @@ fn resolve_test_base_image(
     let image = config_image.context(
         "no base image provided: set `image:` in the test config or pass `--base-image`",
     )?;
-    image.resolve_to_file(&resolve_context)
+    image.resolve_base_image_to_file(&resolve_context)
 }
 
 #[cfg(test)]
