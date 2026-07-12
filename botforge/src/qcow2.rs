@@ -1,10 +1,11 @@
 use anyhow::{bail, Context, Result};
+use rayon::prelude::*;
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
-use crate::compressor::{build_compressor, decompress_cluster};
+use crate::compressor::{build_compressor, decompress_cluster, Compressor};
 use crate::plan::config::CompressionType;
 
 const QCOW_MAGIC: u32 = 0x5146_49fb;
@@ -20,6 +21,8 @@ const QCOW2_COMPRESSION_TYPE_ZLIB: u8 = 0;
 const QCOW2_COMPRESSION_TYPE_ZSTD: u8 = 1;
 const DEFAULT_REFCOUNT_ORDER: u32 = 4;
 const QCOW_HEADER_LENGTH_V3: u32 = 112;
+const COMPRESSION_BATCH: usize = 64;
+const MAX_EXPLICIT_COMPRESSION_THREADS: usize = 64;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct ZeroClusterSparsifyStats {
@@ -128,7 +131,22 @@ pub(crate) fn compress_qcow2_image(
         .open(dest)
         .with_context(|| format!("cannot create compressed qcow2: {}", dest.display()))?;
     let compressor = build_compressor(compression_type, compressor_opts)?;
-    let _compressor_id = compressor.id();
+
+    // Build a rayon thread pool sized by the compressor's worker setting.
+    // workers() == 0 means "all available cores" (rayon's default when
+    // num_threads is 0). Explicit worker requests are capped to local
+    // parallelism and to a fixed 64-thread ceiling: these per-cluster jobs are
+    // at most 2 MiB each, so a larger fixed pool mostly adds scheduler/RSS
+    // pressure while making pathological `-T999999` requests expensive.
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(compression_thread_count(compressor.as_ref())?)
+        .build()
+        .with_context(|| {
+            format!(
+                "failed to build {} compression thread pool",
+                compressor.id()
+            )
+        })?;
 
     let total_l2_entries = usize::try_from(
         l1_size
@@ -138,42 +156,65 @@ pub(crate) fn compress_qcow2_image(
     .context("l2 entry count too large")?;
     let mut l2_entries = vec![0u64; total_l2_entries];
     let mut refcounts = BTreeMap::<u64, u64>::new();
-    let mut cluster_buf =
-        vec![0u8; usize::try_from(cluster_size).context("cluster size too large")?];
+    let cluster_size_usize = usize::try_from(cluster_size).context("cluster size too large")?;
     let mut allocator = DataAllocator::new(cluster_size, data_start);
 
-    for guest_cluster_index in 0..guest_cluster_count {
-        cluster_buf.fill(0);
-        let guest_offset = guest_cluster_index
-            .checked_mul(cluster_size)
-            .context("guest offset overflow")?;
-        let remaining = virtual_size.saturating_sub(guest_offset);
-        let to_read = remaining.min(cluster_size) as usize;
-        source_image.read_virtual_range(guest_offset, &mut cluster_buf[..to_read])?;
-        if cluster_buf.iter().all(|b| *b == 0) {
-            continue;
+    // Process clusters in batches: read sequentially, compress in parallel,
+    // write sequentially in guest-cluster order for deterministic output.
+    // Batch size bounds peak memory: 64 clusters × max 2 MiB = 128 MiB.
+
+    let mut next_guest_cluster = 0u64;
+    while next_guest_cluster < guest_cluster_count {
+        // Collect up to COMPRESSION_BATCH non-zero clusters for this batch,
+        // preserving their guest-cluster indices.
+        let mut batch: Vec<(u64, Vec<u8>)> = Vec::with_capacity(COMPRESSION_BATCH);
+        while next_guest_cluster < guest_cluster_count && batch.len() < COMPRESSION_BATCH {
+            let mut cluster_buf = vec![0u8; cluster_size_usize];
+            let guest_offset = next_guest_cluster
+                .checked_mul(cluster_size)
+                .context("guest offset overflow")?;
+            let remaining = virtual_size.saturating_sub(guest_offset);
+            let to_read = remaining.min(cluster_size) as usize;
+            source_image.read_virtual_range(guest_offset, &mut cluster_buf[..to_read])?;
+            if !cluster_buf.iter().all(|b| *b == 0) {
+                batch.push((next_guest_cluster, cluster_buf));
+            }
+            next_guest_cluster += 1;
         }
 
-        let compressed = compressor.compress_cluster(&cluster_buf)?;
-        let entry = if compressed.len() < cluster_buf.len() {
-            let host_offset = allocator.allocate_compressed(compressed.len() as u64)?;
-            write_exact_at(&mut output, host_offset, &compressed)?;
-            increment_refcount_range(
-                &mut refcounts,
-                host_offset,
-                compressed.len() as u64,
-                cluster_size,
-            )?;
-            encode_compressed_l2_entry(host_offset, compressed.len() as u64, cluster_size)?
-        } else {
-            let host_offset = allocator.allocate_raw()?;
-            write_exact_at(&mut output, host_offset, &cluster_buf)?;
-            increment_refcount_range(&mut refcounts, host_offset, cluster_size, cluster_size)?;
-            host_offset | QCOW_OFLAG_COPIED
-        };
-        l2_entries
-            [usize::try_from(guest_cluster_index).context("guest cluster index too large")?] =
-            entry;
+        // Compress the batch in parallel; par_iter preserves order so the
+        // result vec is indexed the same as `batch`.
+        let compressed_results: Vec<Result<Vec<u8>>> = pool.install(|| {
+            batch
+                .par_iter()
+                .map(|(_, data)| compressor.compress_cluster(data))
+                .collect()
+        });
+
+        // Write results in guest-cluster order (deterministic allocation).
+        for ((guest_cluster_index, original), compressed_result) in
+            batch.iter().zip(compressed_results)
+        {
+            let compressed = compressed_result?;
+            let entry = if compressed.len() < original.len() {
+                let host_offset = allocator.allocate_compressed(compressed.len() as u64)?;
+                write_exact_at(&mut output, host_offset, &compressed)?;
+                increment_refcount_range(
+                    &mut refcounts,
+                    host_offset,
+                    compressed.len() as u64,
+                    cluster_size,
+                )?;
+                encode_compressed_l2_entry(host_offset, compressed.len() as u64, cluster_size)?
+            } else {
+                let host_offset = allocator.allocate_raw()?;
+                write_exact_at(&mut output, host_offset, original)?;
+                increment_refcount_range(&mut refcounts, host_offset, cluster_size, cluster_size)?;
+                host_offset | QCOW_OFLAG_COPIED
+            };
+            l2_entries[usize::try_from(*guest_cluster_index)
+                .context("guest cluster index too large")?] = entry;
+        }
     }
 
     let refcount_table_offset = align_up(allocator.next_offset, cluster_size);
@@ -256,6 +297,22 @@ pub(crate) fn compress_qcow2_image(
         .sync_all()
         .with_context(|| format!("cannot flush compressed qcow2: {}", dest.display()))?;
     Ok(())
+}
+
+fn compression_thread_count(compressor: &dyn Compressor) -> Result<usize> {
+    let requested = compressor.workers();
+    if requested == 0 {
+        return Ok(0);
+    }
+
+    let requested = usize::try_from(requested)
+        .with_context(|| format!("{} worker count does not fit usize", compressor.id()))?;
+    let available = std::thread::available_parallelism()
+        .context("failed to query available parallelism")?
+        .get();
+    Ok(requested
+        .min(available)
+        .min(MAX_EXPLICIT_COMPRESSION_THREADS))
 }
 
 pub(crate) fn read_virtual_sector0(path: &Path) -> Result<[u8; 512]> {
@@ -1194,6 +1251,70 @@ mod tests {
                 "cluster {i} data mismatch"
             );
         }
+    }
+
+    fn require_multicore_parallelism(fixture_name: &str) -> bool {
+        let available = std::thread::available_parallelism()
+            .expect("query available parallelism")
+            .get();
+        if available < 2 {
+            eprintln!(
+                "WARNING: only {available} core{} available — skipping multi-core zstd determinism assertion for {fixture_name}",
+                if available == 1 { "" } else { "s" }
+            );
+            return false;
+        }
+        true
+    }
+
+    fn assert_zstd_parallel_output_is_deterministic(source: &Path, fixture_name: &str) {
+        if !require_multicore_parallelism(fixture_name) {
+            return;
+        }
+        let opts_list = ["-3 -T1", "-3 -T4", "-3 -T0"];
+        let mut outputs: Vec<Vec<u8>> = Vec::with_capacity(opts_list.len());
+
+        for opts in &opts_list {
+            let suffix = opts.replace(' ', "_");
+            let dest = source
+                .parent()
+                .expect("fixture source should have a parent directory")
+                .join(format!("{fixture_name}_{suffix}.qcow2"));
+            compress_qcow2_image(source, &dest, CompressionType::Zstd, &BTreeMap::new(), opts)
+                .unwrap_or_else(|e| panic!("compress with {opts}: {e:#}"));
+            let bytes =
+                std::fs::read(&dest).unwrap_or_else(|e| panic!("read dest with {opts}: {e:#}"));
+            outputs.push(bytes);
+        }
+
+        for (i, opts) in opts_list[1..].iter().enumerate() {
+            assert_eq!(
+                outputs[0],
+                outputs[i + 1],
+                "output with '{opts}' differs from output with '{}'",
+                opts_list[0]
+            );
+        }
+    }
+
+    /// Parallel compression must be deterministic: compressing the same source
+    /// image with -T1, -T4, and -T0 must produce bit-for-bit identical output.
+    /// This verifies that the sequential write order (guest-cluster order) is
+    /// preserved regardless of the number of rayon workers used.
+    #[test]
+    fn compress_qcow2_zstd_parallel_output_is_deterministic() {
+        let tmp = tempdir().expect("tempdir");
+        let source = tmp.path().join("source.qcow2");
+        write_multi_cluster_test_image(&source, 130).expect("write source qcow2");
+        assert_zstd_parallel_output_is_deterministic(&source, "single_l2");
+    }
+
+    #[test]
+    fn compress_qcow2_zstd_parallel_output_is_deterministic_across_l2_tables() {
+        let tmp = tempdir().expect("tempdir");
+        let source = tmp.path().join("multi_l1_source.qcow2");
+        make_multi_l1_source_qcow2(&source, 4096, 3);
+        assert_zstd_parallel_output_is_deterministic(&source, "multi_l1");
     }
 
     /// Check that no two compressed L2 entries share a 512-byte sector.
@@ -2547,16 +2668,18 @@ mod tests {
         let refcount_block_cluster = 3 + l1_count;
         let first_data_cluster = 4 + l1_count;
 
-        // For each L1 table, put non-zero data in its first cluster
+        // For each L1 table, put non-zero data in its first and last cluster.
         let mut written_clusters: Vec<(u64, Vec<u8>)> = Vec::new(); // (guest_cluster, data)
         for l1_idx in 0..l1_count {
-            let guest_cluster_in_table = l1_idx * l2_entries; // first cluster in this L2 range
-            let mut data = vec![0u8; cluster_size as usize];
-            // unique pattern per l1_idx
-            for (i, b) in data.iter_mut().enumerate() {
-                *b = ((l1_idx as u8).wrapping_mul(37)).wrapping_add((i % 256) as u8);
+            for guest_cluster_in_table in [l1_idx * l2_entries, (l1_idx + 1) * l2_entries - 1] {
+                let mut data = vec![0u8; cluster_size as usize];
+                // unique pattern per guest cluster
+                for (i, b) in data.iter_mut().enumerate() {
+                    *b = ((guest_cluster_in_table as u8).wrapping_mul(37))
+                        .wrapping_add((i % 256) as u8);
+                }
+                written_clusters.push((guest_cluster_in_table, data));
             }
-            written_clusters.push((guest_cluster_in_table, data));
         }
 
         let data_cluster_count = written_clusters.len() as u64;
