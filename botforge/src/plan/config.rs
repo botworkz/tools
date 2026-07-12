@@ -6,6 +6,7 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::iso::BootcmdEntry;
 use crate::qemu::PortSpec;
+use crate::resolver::Reference;
 use crate::util::resolve_under_root;
 
 use super::step::{deserialize_optional_positive_seconds, resolve_shell, StepTarget, TestStep};
@@ -81,6 +82,8 @@ pub(super) struct InputDeclaration {
 #[derive(Debug, Deserialize, Default)]
 pub(crate) struct TestConfig {
     #[serde(default)]
+    pub(crate) image: Option<Reference>,
+    #[serde(default)]
     pub(crate) isos: Vec<TestIso>,
     #[serde(default)]
     pub(crate) ports: Vec<PortSpec>,
@@ -111,6 +114,8 @@ pub(crate) struct TestConfig {
 struct RawTestDocument {
     #[serde(rename = "type")]
     doc_type: DocumentType,
+    #[serde(default)]
+    image: Option<String>,
     #[serde(default)]
     isos: Vec<TestIso>,
     #[serde(default)]
@@ -161,50 +166,8 @@ fn default_build_cloud_init_timeout() -> u64 {
     600
 }
 
-/// A parsed `image:` reference from a `type: build` spec.
-///
-/// `@<name>` is the only supported form today: it resolves the named shasset
-/// dep-provider's default artifact (a single qcow2).  The `@://…` traversal
-/// form is **reserved** — the parser recognises it and hard-errors.  A future
-/// `Traversal { … }` variant will be added here when traversal is implemented.
-#[derive(Debug, PartialEq, Clone)]
-pub(crate) enum ImageRef {
-    /// `@<name>` — resolve the named shasset dep-provider's default artifact.
-    ShassetDefault(String),
-}
-
-/// Parse the raw `image:` string from a `type: build` spec into an [`ImageRef`].
-///
-/// Delegates to [`crate::resolver::Reference::parse`] for the grammar, then
-/// enforces the `image:`-specific policy:
-/// - Only `Reference::Asset { path: None }` is accepted (`@<name>` form).
-/// - `@` alone, `@artifact`, and all `://`-traversal forms are rejected.
-pub(crate) fn parse_image_ref(raw: &str) -> Result<ImageRef> {
-    use crate::resolver::Reference;
-    let reference = Reference::parse(raw).map_err(|_| {
-        anyhow::anyhow!(
-            "image reference must use the `@` scheme (e.g. `@debian-base`); \
-             bare names are not supported: {raw:?}"
-        )
-    })?;
-    match reference {
-        Reference::Asset { name, path: None } => Ok(ImageRef::ShassetDefault(name)),
-        Reference::Repo { path: None } => {
-            anyhow::bail!(
-                "image reference is missing a shasset name after `@` \
-                 (e.g. `@debian-base`)"
-            )
-        }
-        Reference::Asset { path: Some(_), .. }
-        | Reference::Repo { path: Some(_) }
-        | Reference::Artifact { .. } => {
-            anyhow::bail!(
-                "`@` scheme traversal (`@://…`) is not yet supported for image references; \
-                 use `@<shasset-name>` to resolve a provider's default artifact \
-                 (e.g. `@debian-base`)"
-            )
-        }
-    }
+fn parse_config_image(raw: &str) -> Result<Reference> {
+    Reference::parse(raw)
 }
 
 /// Output-compression options for `botforge build`.
@@ -300,7 +263,7 @@ pub(crate) struct CompressConfig {
 #[derive(Debug)]
 pub(crate) struct BuildConfig {
     /// Parsed `image:` reference naming the source qcow2 to boot from.
-    pub(crate) image: ImageRef,
+    pub(crate) image: Reference,
     /// Declared artifact filename (no directories). The output directory is derived from
     /// the build spec path under the repo root.
     pub(crate) output: String,
@@ -325,8 +288,7 @@ pub(crate) struct BuildConfig {
 struct RawBuildDocument {
     #[serde(rename = "type")]
     doc_type: DocumentType,
-    /// Raw `image:` reference (e.g. `@debian-base`). Required; parsed via
-    /// [`parse_image_ref`] into an [`ImageRef`] after deserialization.
+    /// Raw `image:` reference (e.g. `@debian-base`). Required.
     #[serde(rename = "image", default)]
     image: Option<String>,
     #[serde(default)]
@@ -445,6 +407,16 @@ pub(crate) fn load_test_config(repo_root: &Path, path: &Path) -> Result<TestConf
     // is caught by the cycle check (A → B → A).
     let mut include_stack = vec![path.to_path_buf()];
     Ok(TestConfig {
+        image: match raw.image {
+            None => None,
+            Some(s) if s.trim().is_empty() => anyhow::bail!(
+                "'image' in a 'type: test' document ({}) must not be blank",
+                path.display()
+            ),
+            Some(s) => Some(parse_config_image(&s).with_context(|| {
+                format!("invalid 'image' value in test config ({})", path.display())
+            })?),
+        },
         isos: raw.isos,
         ports: raw.ports,
         steps: expand_test_steps(repo_root, path, raw.steps, &mut include_stack)?,
@@ -477,15 +449,15 @@ pub(crate) fn load_build_config(repo_root: &Path, path: &Path) -> Result<BuildCo
     let image = match raw.image {
         None => anyhow::bail!(
             "'image' is required in a 'type: build' document ({}): \
-             set it to a shasset dep-provider reference, e.g. `image: \"@debian-base\"`",
+             set it to an `@…` reference, e.g. `image: \"@debian-base\"`",
             path.display()
         ),
         Some(s) if s.trim().is_empty() => anyhow::bail!(
             "'image' is required in a 'type: build' document ({}): \
-             set it to a shasset dep-provider reference, e.g. `image: \"@debian-base\"`",
+             set it to an `@…` reference, e.g. `image: \"@debian-base\"`",
             path.display()
         ),
-        Some(s) => parse_image_ref(&s).with_context(|| {
+        Some(s) => parse_config_image(&s).with_context(|| {
             format!("invalid 'image' value in build config ({})", path.display())
         })?,
     };
@@ -709,7 +681,7 @@ fn check_no_entrypoint_sections_in_fragment(path: &Path, value: &Value) -> Resul
     Ok(())
 }
 
-/// Reject build-only sections (`disk_size:`, `memsize:`, `smp:`, `image:`,
+/// Reject build-only sections (`disk_size:`, `memsize:`, `smp:`,
 /// `output:`, `compress:`) inside a
 /// `type: test` document.  Serde would silently ignore them; this turns a
 /// misplaced key into an explicit load-time error.
@@ -718,7 +690,7 @@ fn check_no_build_sections_in_test_doc(path: &Path, value: &Value) -> Result<()>
         Value::Mapping(m) => m,
         _ => return Ok(()),
     };
-    for section in &["disk_size", "memsize", "smp", "image", "output", "compress"] {
+    for section in &["disk_size", "memsize", "smp", "output", "compress"] {
         if mapping.contains_key(Value::String(section.to_string())) {
             anyhow::bail!(
                 "{}: is not valid in a 'type: test' document ({})",
@@ -1186,14 +1158,14 @@ fn validate_archive_build_step(step: &crate::plan::step::ArchiveStep) -> Result<
 #[cfg(test)]
 mod tests {
     use super::{
-        default_bootstrap_path, load_build_config, load_test_config, parse_image_ref,
-        resolve_fragment_inputs, validate_build_steps, validate_test_ports, validate_test_steps,
-        CompressionType, ImageRef, InputDeclaration, InputType, ReclaimMode, TestConfig, TestIso,
-        MAX_INCLUDE_DEPTH,
+        default_bootstrap_path, load_build_config, load_test_config, resolve_fragment_inputs,
+        validate_build_steps, validate_test_ports, validate_test_steps, CompressionType,
+        InputDeclaration, InputType, ReclaimMode, TestConfig, TestIso, MAX_INCLUDE_DEPTH,
     };
     use crate::plan::step::{ArchiveStep, ArchiveStepSpec, RunStep, StepTarget, TestStep};
     use crate::plan::upload::TopLevelUpload;
     use crate::qemu::PortSpec;
+    use crate::resolver::Reference;
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
@@ -2598,56 +2570,6 @@ steps:
         );
     }
 
-    // --- parse_image_ref ---
-
-    #[test]
-    fn test_parse_image_ref_shasset_default() {
-        let r = parse_image_ref("@debian-base").unwrap();
-        assert_eq!(r, ImageRef::ShassetDefault("debian-base".to_string()));
-    }
-
-    #[test]
-    fn test_parse_image_ref_bare_name_rejected() {
-        let err = parse_image_ref("debian-base").unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("`@` scheme") || msg.contains("@ scheme"),
-            "error should mention @ scheme: {msg}"
-        );
-    }
-
-    #[test]
-    fn test_parse_image_ref_empty_rejected() {
-        let err = parse_image_ref("").unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("`@` scheme") || msg.contains("@ scheme"),
-            "error should mention @ scheme: {msg}"
-        );
-    }
-
-    #[test]
-    fn test_parse_image_ref_at_alone_rejected() {
-        let err = parse_image_ref("@").unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("missing") || msg.contains("shasset name"),
-            "error should mention missing name: {msg}"
-        );
-    }
-
-    #[test]
-    fn test_parse_image_ref_traversal_scheme_rejected() {
-        for raw in &["@://debian-base", "@debian-base://something", "@://foo/bar"] {
-            let err = parse_image_ref(raw).unwrap_err();
-            let msg = format!("{err:#}");
-            assert!(
-                msg.contains("traversal") || msg.contains("not yet supported"),
-                "error should mention traversal not supported for {raw:?}: {msg}"
-            );
-        }
-    }
-
     // --- BuildConfig loading ---
 
     fn write_build_config(repo: &TempDir, name: &str, content: &str) {
@@ -2673,7 +2595,10 @@ steps:
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
         assert_eq!(
             config.image,
-            ImageRef::ShassetDefault("debian-base".to_string())
+            Reference::Asset {
+                name: "debian-base".to_string(),
+                path: None
+            }
         );
         assert_eq!(config.output, "built.qcow2");
         assert_eq!(config.disk_size, "10G");
@@ -2703,13 +2628,50 @@ steps: []
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
         assert_eq!(
             config.image,
-            ImageRef::ShassetDefault("my-base".to_string())
+            Reference::Asset {
+                name: "my-base".to_string(),
+                path: None
+            }
         );
         assert_eq!(config.disk_size, "20G");
         assert_eq!(config.step_timeout, 2400);
         assert_eq!(config.timeout, 9600);
         assert!(config.steps.is_empty());
         assert!(config.bootcmd.is_empty(), "bootcmd should default to empty");
+    }
+
+    #[test]
+    fn test_load_build_config_accepts_repo_traversal_image() {
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            "type: build\nimage: >-\n  @://build/artifact/foo.qcow2\noutput: \"out.qcow2\"\nsteps: []\n",
+        );
+        let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
+        assert_eq!(
+            config.image,
+            Reference::Repo {
+                path: Some(PathBuf::from("build/artifact/foo.qcow2"))
+            }
+        );
+    }
+
+    #[test]
+    fn test_load_build_config_accepts_artifact_traversal_image() {
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            "type: build\nimage: \"@artifact://foo.qcow2\"\noutput: \"out.qcow2\"\nsteps: []\n",
+        );
+        let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
+        assert_eq!(
+            config.image,
+            Reference::Artifact {
+                path: Some(PathBuf::from("foo.qcow2"))
+            }
+        );
     }
 
     #[test]
@@ -3778,16 +3740,20 @@ steps: []
     }
 
     #[test]
-    fn test_load_test_config_rejects_image_section() {
+    fn test_load_test_config_accepts_image_section() {
         let repo = TempDir::new().unwrap();
         std::fs::write(
             repo.path().join("test.yaml"),
-            "type: test\nimage: \"@debian-base\"\nsteps: []\n",
+            "type: test\nimage: \"@artifact://foo.qcow2\"\nsteps: []\n",
         )
         .unwrap();
-        let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(msg.contains("image"), "error should mention image: {msg}");
+        let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+        assert_eq!(
+            config.image,
+            Some(Reference::Artifact {
+                path: Some(PathBuf::from("foo.qcow2"))
+            })
+        );
     }
 
     #[test]
