@@ -21,6 +21,7 @@ on:
     paths:
     - .github/workflows/ci.yml
     - .github/workflows/_crate.yml
+    - .github/workflows/_botforge.yml
     - .dockerignore
     - Earthfile
     - VERSION
@@ -34,6 +35,7 @@ on:
     paths:
     - .github/workflows/ci.yml
     - .github/workflows/_crate.yml
+    - .github/workflows/_botforge.yml
     - .dockerignore
     - Earthfile
     - VERSION
@@ -58,7 +60,6 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Single source of truth for tested crates: add the next crate directory name here.
         crate:
         - shasset
         - botforge
@@ -71,7 +72,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-
     steps:
     - uses: actions/checkout@v4
     - uses: dtolnay/rust-toolchain@nightly
@@ -85,9 +85,40 @@ jobs:
     - name: cargo udeps
       run: cargo +nightly udeps --workspace --all-targets --locked
 
+  botforge:
+    needs: crate
+    strategy:
+      fail-fast: false
+      matrix:
+        variant:
+        - name: none
+          compress_enabled: false
+          compressor: ''
+          compressor_opts: ''
+        - name: zstd-default
+          compress_enabled: true
+          compressor: zstd
+          compressor_opts: ''
+        - name: zstd-aggressive
+          compress_enabled: true
+          compressor: zstd
+          compressor_opts: '-19 -T0'
+        - name: zlib
+          compress_enabled: true
+          compressor: zlib
+          compressor_opts: ''
+    uses: ./.github/workflows/_botforge.yml
+    with:
+      compress_enabled: ${{ matrix.variant.compress_enabled }}
+      compressor: ${{ matrix.variant.compressor }}
+      compressor_opts: ${{ matrix.variant.compressor_opts }}
+      name: ${{ matrix.variant.name }}
+
   publish:
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
-    needs: crate
+    needs:
+    - crate
+    - botforge
     runs-on: ubuntu-latest
     permissions:
       contents: write
