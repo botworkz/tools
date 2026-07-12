@@ -1,4 +1,5 @@
 use anyhow::{bail, Context, Result};
+use rayon::prelude::*;
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -128,7 +129,19 @@ pub(crate) fn compress_qcow2_image(
         .open(dest)
         .with_context(|| format!("cannot create compressed qcow2: {}", dest.display()))?;
     let compressor = build_compressor(compression_type, compressor_opts)?;
-    let _compressor_id = compressor.id();
+
+    // Build a rayon thread pool sized by the compressor's worker setting.
+    // workers() == 0 means "all available cores" (rayon's default when
+    // num_threads is 0); workers() == n means exactly n threads.
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(compressor.workers() as usize)
+        .build()
+        .with_context(|| {
+            format!(
+                "failed to build {} compression thread pool",
+                compressor.id()
+            )
+        })?;
 
     let total_l2_entries = usize::try_from(
         l1_size
@@ -138,42 +151,66 @@ pub(crate) fn compress_qcow2_image(
     .context("l2 entry count too large")?;
     let mut l2_entries = vec![0u64; total_l2_entries];
     let mut refcounts = BTreeMap::<u64, u64>::new();
-    let mut cluster_buf =
-        vec![0u8; usize::try_from(cluster_size).context("cluster size too large")?];
+    let cluster_size_usize = usize::try_from(cluster_size).context("cluster size too large")?;
     let mut allocator = DataAllocator::new(cluster_size, data_start);
 
-    for guest_cluster_index in 0..guest_cluster_count {
-        cluster_buf.fill(0);
-        let guest_offset = guest_cluster_index
-            .checked_mul(cluster_size)
-            .context("guest offset overflow")?;
-        let remaining = virtual_size.saturating_sub(guest_offset);
-        let to_read = remaining.min(cluster_size) as usize;
-        source_image.read_virtual_range(guest_offset, &mut cluster_buf[..to_read])?;
-        if cluster_buf.iter().all(|b| *b == 0) {
-            continue;
+    // Process clusters in batches: read sequentially, compress in parallel,
+    // write sequentially in guest-cluster order for deterministic output.
+    // Batch size bounds peak memory: 64 clusters × max 2 MiB = 128 MiB.
+    const COMPRESSION_BATCH: usize = 64;
+
+    let mut next_guest_cluster = 0u64;
+    while next_guest_cluster < guest_cluster_count {
+        // Collect up to COMPRESSION_BATCH non-zero clusters for this batch,
+        // preserving their guest-cluster indices.
+        let mut batch: Vec<(u64, Vec<u8>)> = Vec::with_capacity(COMPRESSION_BATCH);
+        while next_guest_cluster < guest_cluster_count && batch.len() < COMPRESSION_BATCH {
+            let mut cluster_buf = vec![0u8; cluster_size_usize];
+            let guest_offset = next_guest_cluster
+                .checked_mul(cluster_size)
+                .context("guest offset overflow")?;
+            let remaining = virtual_size.saturating_sub(guest_offset);
+            let to_read = remaining.min(cluster_size) as usize;
+            source_image.read_virtual_range(guest_offset, &mut cluster_buf[..to_read])?;
+            if !cluster_buf.iter().all(|b| *b == 0) {
+                batch.push((next_guest_cluster, cluster_buf));
+            }
+            next_guest_cluster += 1;
         }
 
-        let compressed = compressor.compress_cluster(&cluster_buf)?;
-        let entry = if compressed.len() < cluster_buf.len() {
-            let host_offset = allocator.allocate_compressed(compressed.len() as u64)?;
-            write_exact_at(&mut output, host_offset, &compressed)?;
-            increment_refcount_range(
-                &mut refcounts,
-                host_offset,
-                compressed.len() as u64,
-                cluster_size,
-            )?;
-            encode_compressed_l2_entry(host_offset, compressed.len() as u64, cluster_size)?
-        } else {
-            let host_offset = allocator.allocate_raw()?;
-            write_exact_at(&mut output, host_offset, &cluster_buf)?;
-            increment_refcount_range(&mut refcounts, host_offset, cluster_size, cluster_size)?;
-            host_offset | QCOW_OFLAG_COPIED
-        };
-        l2_entries
-            [usize::try_from(guest_cluster_index).context("guest cluster index too large")?] =
-            entry;
+        // Compress the batch in parallel; par_iter preserves order so the
+        // result vec is indexed the same as `batch`.
+        let compressed_results: Vec<Result<Vec<u8>>> = pool.install(|| {
+            batch
+                .par_iter()
+                .map(|(_, data)| compressor.compress_cluster(data))
+                .collect()
+        });
+
+        // Write results in guest-cluster order (deterministic allocation).
+        for ((guest_cluster_index, original), compressed_result) in
+            batch.iter().zip(compressed_results)
+        {
+            let compressed = compressed_result?;
+            let entry = if compressed.len() < original.len() {
+                let host_offset = allocator.allocate_compressed(compressed.len() as u64)?;
+                write_exact_at(&mut output, host_offset, &compressed)?;
+                increment_refcount_range(
+                    &mut refcounts,
+                    host_offset,
+                    compressed.len() as u64,
+                    cluster_size,
+                )?;
+                encode_compressed_l2_entry(host_offset, compressed.len() as u64, cluster_size)?
+            } else {
+                let host_offset = allocator.allocate_raw()?;
+                write_exact_at(&mut output, host_offset, original)?;
+                increment_refcount_range(&mut refcounts, host_offset, cluster_size, cluster_size)?;
+                host_offset | QCOW_OFLAG_COPIED
+            };
+            l2_entries[usize::try_from(*guest_cluster_index)
+                .context("guest cluster index too large")?] = entry;
+        }
     }
 
     let refcount_table_offset = align_up(allocator.next_offset, cluster_size);
@@ -1192,6 +1229,46 @@ mod tests {
                 cluster,
                 vec![expected_byte; 4096],
                 "cluster {i} data mismatch"
+            );
+        }
+    }
+
+    /// Parallel compression must be deterministic: compressing the same source
+    /// image with -T1, -T4, and -T0 must produce bit-for-bit identical output.
+    /// This verifies that the sequential write order (guest-cluster order) is
+    /// preserved regardless of the number of rayon workers used.
+    #[test]
+    fn compress_qcow2_zstd_parallel_output_is_deterministic() {
+        let tmp = tempdir().expect("tempdir");
+        let source = tmp.path().join("source.qcow2");
+        write_multi_cluster_test_image(&source, 8).expect("write source qcow2");
+
+        let opts_list = ["-3 -T1", "-3 -T4", "-3 -T0"];
+        let mut outputs: Vec<Vec<u8>> = Vec::with_capacity(opts_list.len());
+
+        for opts in &opts_list {
+            let dest = tmp
+                .path()
+                .join(format!("dest_{}.qcow2", opts.replace(' ', "_")));
+            compress_qcow2_image(
+                &source,
+                &dest,
+                CompressionType::Zstd,
+                &BTreeMap::new(),
+                opts,
+            )
+            .unwrap_or_else(|e| panic!("compress with {opts}: {e:#}"));
+            let bytes =
+                std::fs::read(&dest).unwrap_or_else(|e| panic!("read dest with {opts}: {e:#}"));
+            outputs.push(bytes);
+        }
+
+        for (i, opts) in opts_list[1..].iter().enumerate() {
+            assert_eq!(
+                outputs[0],
+                outputs[i + 1],
+                "output with '{opts}' differs from output with '{}'",
+                opts_list[0]
             );
         }
     }
@@ -2921,10 +2998,10 @@ mod integration_tests {
             eprintln!("integration source not found — skipping {label} integration test");
             return;
         };
-        if !std::process::Command::new("qemu-img")
+        if std::process::Command::new("qemu-img")
             .arg("--version")
             .output()
-            .is_ok()
+            .is_err()
         {
             eprintln!("qemu-img not available — skipping {label} integration test");
             return;

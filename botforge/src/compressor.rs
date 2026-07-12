@@ -6,15 +6,20 @@ use std::io::{Read, Write};
 
 use crate::plan::config::CompressionType;
 
-pub(crate) trait Compressor {
+pub(crate) trait Compressor: Sync {
     fn id(&self) -> &str;
     fn compress_cluster(&self, cluster: &[u8]) -> Result<Vec<u8>>;
+    /// Number of rayon worker threads to use for cluster-level parallelism.
+    /// `0` means "use all available cores"; `n` means exactly `n` threads.
+    /// `ZlibCompressor` always returns `1` (serial); zstd derives this from
+    /// the `-T0`/`-Tn` option parsed by `ZstdCompressor::from_opts`.
+    fn workers(&self) -> u32;
 }
 
 pub(crate) fn build_compressor(
     compression_type: CompressionType,
     raw_opts: &str,
-) -> Result<Box<dyn Compressor>> {
+) -> Result<Box<dyn Compressor + Sync>> {
     match compression_type {
         CompressionType::Zstd => Ok(Box::new(ZstdCompressor::from_opts(raw_opts)?)),
         CompressionType::Zlib => Ok(Box::new(ZlibCompressor::from_opts(raw_opts)?)),
@@ -123,14 +128,14 @@ impl Compressor for ZstdCompressor {
     }
 
     fn compress_cluster(&self, cluster: &[u8]) -> Result<Vec<u8>> {
-        // Per-cluster payloads are at most cluster_size (≤ 2 MiB).
-        // Multithreaded zstd compression (NbWorkers > 0) can split the output
-        // into a worker-chunked multi-frame stream.  qemu's qcow2_zstd_decompress
-        // performs a single ZSTD_decompressStream pass and requires exactly one
-        // self-contained frame per cluster — multi-frame output causes -EIO.
-        // We therefore intentionally do NOT apply self.workers here; the parsed
-        // worker count is preserved so existing specs with -T0/-Tn don't error,
-        // but per-cluster single-threaded compression is correct and deterministic.
+        // Each cluster is compressed as a single self-contained zstd frame with
+        // the content size pledged in the frame header.  qemu's
+        // qcow2_zstd_decompress performs a single ZSTD_decompressStream pass and
+        // requires exactly one frame per cluster — multi-frame output (produced
+        // by libzstd's NbWorkers > 0 multithreaded mode) causes -EIO.
+        //
+        // Cluster-level parallelism (via rayon) is handled by the caller
+        // (compress_qcow2_image).  Do NOT set NbWorkers here.
         let mut compressor = zstd::bulk::Compressor::new(self.level)
             .context("failed to initialize zstd compressor")?;
         compressor
@@ -139,6 +144,10 @@ impl Compressor for ZstdCompressor {
         compressor
             .compress(cluster)
             .context("failed to encode zstd qcow2 cluster")
+    }
+
+    fn workers(&self) -> u32 {
+        self.workers
     }
 }
 
@@ -172,6 +181,10 @@ impl Compressor for ZlibCompressor {
         encoder
             .finish()
             .context("failed to finish zlib qcow2 cluster compression")
+    }
+
+    fn workers(&self) -> u32 {
+        1
     }
 }
 
