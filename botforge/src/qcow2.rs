@@ -1,5 +1,4 @@
 use anyhow::{bail, Context, Result};
-use rayon::prelude::*;
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -21,7 +20,12 @@ const QCOW2_COMPRESSION_TYPE_ZLIB: u8 = 0;
 const QCOW2_COMPRESSION_TYPE_ZSTD: u8 = 1;
 const DEFAULT_REFCOUNT_ORDER: u32 = 4;
 const QCOW_HEADER_LENGTH_V3: u32 = 112;
-const COMPRESSION_BATCH: usize = 64;
+// Maximum number of non-zero cluster buffers that may be simultaneously in-flight
+// across the reader, compression workers, and reorder buffer.  This bounds peak
+// memory: at most PIPELINE_WINDOW buffers in the work channel + PIPELINE_WINDOW
+// in the reorder buffer = 2 × PIPELINE_WINDOW × cluster_size
+// (e.g. 2 × 64 × 2 MiB = 256 MiB at the maximum supported cluster size).
+const PIPELINE_WINDOW: usize = 64;
 const MAX_EXPLICIT_COMPRESSION_THREADS: usize = 64;
 
 // Byte offsets of fields within the fixed qcow2 v3 header (112 bytes).
@@ -177,63 +181,206 @@ pub(crate) fn compress_qcow2_image(
     let cluster_size_usize = usize::try_from(cluster_size).context("cluster size too large")?;
     let mut allocator = DataAllocator::new(cluster_size, data_start);
 
-    // Process clusters in batches: read sequentially, compress in parallel,
-    // write sequentially in guest-cluster order for deterministic output.
-    // Batch size bounds peak memory: 64 clusters × max 2 MiB = 128 MiB.
+    // Pipelined reader → parallel compressor → ordered writer.
+    //
+    // Three concurrent stages replace the previous bulk-synchronous batch loop
+    // (read-all → compress-all → write-all, one batch at a time).  All three
+    // stages now overlap, keeping CPU cores and I/O busy simultaneously and
+    // eliminating the per-batch straggler stall.
+    //
+    // Stage 1 — Reader OS thread:
+    //   Walks every guest cluster in order.  Zero clusters (all-zero bytes) are
+    //   forwarded as lightweight `None` markers directly to the result channel.
+    //   Non-zero clusters are sent into the bounded work channel (capacity
+    //   PIPELINE_WINDOW), which naturally throttles the reader so that at most
+    //   PIPELINE_WINDOW cluster buffers are held simultaneously.
+    //
+    // Stage 2 — Compression OS thread (pool.install + rayon::scope):
+    //   A dispatch loop receives (idx, buf) pairs from the work channel and fans
+    //   each out to a rayon::scope task that compresses the buffer and sends
+    //   (idx, Some((original, compressed))) to the result channel.  Work-stealing
+    //   means a slow cluster (straggler) never blocks a worker from picking up
+    //   the next available item — no per-batch synchronisation barrier.
+    //
+    // Stage 3 — Writer (this thread):
+    //   Receives from the result channel (which carries both zero markers from
+    //   the reader and compressed results from the workers), inserts each item
+    //   into a BTreeMap reorder buffer keyed by guest-cluster index, then flushes
+    //   contiguous runs starting at `next_write`.  Allocation, L2-entry
+    //   assignment, and data writes always occur in strictly increasing
+    //   guest-cluster-index order regardless of completion order, producing
+    //   byte-for-byte deterministic output for any worker count.
+    //
+    // Peak in-flight memory: PIPELINE_WINDOW non-zero cluster buffers in the
+    // work channel + up to PIPELINE_WINDOW in the reorder buffer =
+    // 2 × PIPELINE_WINDOW × cluster_size
+    // (e.g. 2 × 64 × 2 MiB = 256 MiB at the maximum cluster size).
 
-    let mut next_guest_cluster = 0u64;
-    while next_guest_cluster < guest_cluster_count {
-        // Collect up to COMPRESSION_BATCH non-zero clusters for this batch,
-        // preserving their guest-cluster indices.
-        let mut batch: Vec<(u64, Vec<u8>)> = Vec::with_capacity(COMPRESSION_BATCH);
-        while next_guest_cluster < guest_cluster_count && batch.len() < COMPRESSION_BATCH {
-            let mut cluster_buf = vec![0u8; cluster_size_usize];
-            let guest_offset = next_guest_cluster
+    // Stage 1 ↔ Stage 2: bounded channel caps in-flight cluster buffer count.
+    let (work_tx, work_rx) = std::sync::mpsc::sync_channel::<(u64, Vec<u8>)>(PIPELINE_WINDOW);
+    // Stage 2 ↔ Stage 3 (and reader zero-markers ↔ Stage 3): unbounded channel.
+    // Value: Ok((idx, None)) = zero cluster (skip write);
+    //        Ok((idx, Some((original, compressed)))) = non-zero cluster;
+    //        Err(e) = compression failure.
+    let (result_tx, result_rx) =
+        std::sync::mpsc::channel::<anyhow::Result<(u64, Option<(Vec<u8>, Vec<u8>)>)>>();
+
+    // Stage 1: reader OS thread — walk every guest cluster in order.
+    let reader_result_tx = result_tx.clone();
+    let reader_handle = std::thread::spawn(move || -> Result<()> {
+        let mut next = 0u64;
+        while next < guest_cluster_count {
+            let mut buf = vec![0u8; cluster_size_usize];
+            let guest_offset = next
                 .checked_mul(cluster_size)
                 .context("guest offset overflow")?;
             let remaining = virtual_size.saturating_sub(guest_offset);
             let to_read = remaining.min(cluster_size) as usize;
-            source_image.read_virtual_range(guest_offset, &mut cluster_buf[..to_read])?;
-            if !cluster_buf.iter().all(|b| *b == 0) {
-                batch.push((next_guest_cluster, cluster_buf));
-            }
-            next_guest_cluster += 1;
-        }
-
-        // Compress the batch in parallel; par_iter preserves order so the
-        // result vec is indexed the same as `batch`.
-        let compressed_results: Vec<Result<Vec<u8>>> = pool.install(|| {
-            batch
-                .par_iter()
-                .map(|(_, data)| compressor.compress_cluster(data))
-                .collect()
-        });
-
-        // Write results in guest-cluster order (deterministic allocation).
-        for ((guest_cluster_index, original), compressed_result) in
-            batch.iter().zip(compressed_results)
-        {
-            let compressed = compressed_result?;
-            let entry = if compressed.len() < original.len() {
-                let host_offset = allocator.allocate_compressed(compressed.len() as u64)?;
-                write_exact_at(&mut output, host_offset, &compressed)?;
-                increment_refcount_range(
-                    &mut refcounts,
-                    host_offset,
-                    compressed.len() as u64,
-                    cluster_size,
-                )?;
-                encode_compressed_l2_entry(host_offset, compressed.len() as u64, cluster_size)?
+            source_image.read_virtual_range(guest_offset, &mut buf[..to_read])?;
+            if buf.iter().all(|b| *b == 0) {
+                // Zero cluster: no allocation needed; notify writer directly.
+                reader_result_tx
+                    .send(Ok((next, None)))
+                    .map_err(|_| anyhow::anyhow!("compression pipeline closed early"))?;
             } else {
-                let host_offset = allocator.allocate_raw()?;
-                write_exact_at(&mut output, host_offset, original)?;
-                increment_refcount_range(&mut refcounts, host_offset, cluster_size, cluster_size)?;
-                host_offset | QCOW_OFLAG_COPIED
-            };
-            l2_entries[usize::try_from(*guest_cluster_index)
-                .context("guest cluster index too large")?] = entry;
+                // Non-zero: hand off to the compression stage.
+                // sync_channel blocks here when PIPELINE_WINDOW items are in flight,
+                // which is the back-pressure mechanism that bounds peak memory.
+                work_tx
+                    .send((next, buf))
+                    .map_err(|_| anyhow::anyhow!("compression pipeline closed early"))?;
+            }
+            next += 1;
         }
-    }
+        Ok(())
+        // Dropping work_tx and reader_result_tx closes both producer ends.
+    });
+
+    // Stage 2: compression OS thread — dispatch to rayon pool workers.
+    let compression_handle = std::thread::spawn(move || {
+        // Use a plain reference so every scope task shares the same compressor
+        // without cloning or moving; `Sync` makes the shared borrow valid across
+        // workers.
+        let compressor_ref: &(dyn Compressor + Sync) = &*compressor;
+        // Wrap work_rx in a Mutex so the scope closure is Send (std::mpsc::Receiver
+        // is Send but !Sync; rayon::scope requires the closure to be Send).
+        // The dispatch loop is strictly sequential so there is never any contention.
+        let work_rx = std::sync::Mutex::new(work_rx);
+        pool.install(|| {
+            rayon::scope(|s| {
+                while let Ok((idx, buf)) = work_rx.lock().unwrap().recv() {
+                    let tx = result_tx.clone();
+                    s.spawn(move |_| {
+                        let r = compressor_ref
+                            .compress_cluster(&buf)
+                            .map(|compressed| (idx, Some((buf, compressed))));
+                        // Ignore send errors: writer may have exited early.
+                        let _ = tx.send(r);
+                    });
+                }
+                // rayon::scope waits here for all spawned tasks to complete.
+            });
+        });
+        // Dropping result_tx closes the last producer end, signalling the writer.
+    });
+
+    // Stage 3: writer — receive results, reorder, commit in guest-cluster order.
+    // ReorderEntry: None = zero cluster (no write); Some = (original, compressed).
+    type ReorderEntry = Option<(Vec<u8>, Vec<u8>)>;
+    let mut reorder: BTreeMap<u64, ReorderEntry> = BTreeMap::new();
+    let mut next_write = 0u64;
+
+    // Use a labeled block so ? works naturally inside the writer loop while
+    // still allowing us to join background threads before propagating any error.
+    let write_result: Result<()> = 'writer: {
+        while let Ok(msg) = result_rx.recv() {
+            let (idx, data) = match msg {
+                Ok(v) => v,
+                Err(e) => break 'writer Err(e),
+            };
+            reorder.insert(idx, data);
+
+            // Flush every consecutive result whose index equals next_write.
+            // A missing key means its result hasn't arrived yet (still in
+            // compression); the flush will resume on the next recv iteration.
+            while let Some(entry) = reorder.remove(&next_write) {
+                if let Some((original, compressed)) = entry {
+                    // Commit in guest-cluster-index order: allocate host offset,
+                    // write data, update refcounts and L2 entry — identical to
+                    // the former sequential write loop.
+                    let entry_val = if compressed.len() < original.len() {
+                        let host_offset =
+                            match allocator.allocate_compressed(compressed.len() as u64) {
+                                Ok(v) => v,
+                                Err(e) => break 'writer Err(e),
+                            };
+                        if let Err(e) = write_exact_at(&mut output, host_offset, &compressed) {
+                            break 'writer Err(e);
+                        }
+                        if let Err(e) = increment_refcount_range(
+                            &mut refcounts,
+                            host_offset,
+                            compressed.len() as u64,
+                            cluster_size,
+                        ) {
+                            break 'writer Err(e);
+                        }
+                        match encode_compressed_l2_entry(
+                            host_offset,
+                            compressed.len() as u64,
+                            cluster_size,
+                        ) {
+                            Ok(v) => v,
+                            Err(e) => break 'writer Err(e),
+                        }
+                    } else {
+                        let host_offset = match allocator.allocate_raw() {
+                            Ok(v) => v,
+                            Err(e) => break 'writer Err(e),
+                        };
+                        if let Err(e) = write_exact_at(&mut output, host_offset, &original) {
+                            break 'writer Err(e);
+                        }
+                        if let Err(e) = increment_refcount_range(
+                            &mut refcounts,
+                            host_offset,
+                            cluster_size,
+                            cluster_size,
+                        ) {
+                            break 'writer Err(e);
+                        }
+                        host_offset | QCOW_OFLAG_COPIED
+                    };
+                    match usize::try_from(next_write).context("guest cluster index too large") {
+                        Ok(i) => l2_entries[i] = entry_val,
+                        Err(e) => break 'writer Err(e),
+                    }
+                }
+                // Zero cluster: l2_entries[next_write] stays 0 (initialised above).
+                next_write += 1;
+            }
+        }
+        Ok(())
+    };
+
+    // Drop result_rx so any still-running producers see a closed channel and
+    // terminate promptly rather than blocking on their next send.
+    drop(result_rx);
+
+    // Join both background threads; collect their errors (if any) so we always
+    // wait for clean teardown before propagating an error to the caller.
+    let reader_result = reader_handle
+        .join()
+        .map_err(|e| anyhow::anyhow!("reader thread panicked: {e:?}"))
+        .and_then(|r| r);
+    let compression_result = compression_handle
+        .join()
+        .map_err(|e| anyhow::anyhow!("compression thread panicked: {e:?}"));
+
+    // Propagate the first error encountered.
+    write_result?;
+    reader_result?;
+    compression_result?;
 
     let refcount_table_offset = align_up(allocator.next_offset, cluster_size);
     let host_clusters_before_refcounts = refcount_table_offset / cluster_size;
@@ -1439,6 +1586,70 @@ mod tests {
         let source = tmp.path().join("multi_l1_source.qcow2");
         make_multi_l1_source_qcow2(&source, 4096, 3);
         assert_zstd_parallel_output_is_deterministic(&source, "multi_l1");
+    }
+
+    /// Determinism test with a source whose cluster count is larger than
+    /// PIPELINE_WINDOW (the bounded work-channel capacity).  This exercises
+    /// the ordered-commit path across the window boundary: the reorder buffer
+    /// must flush results in strictly increasing guest-cluster-index order even
+    /// when earlier-indexed clusters complete compression later than
+    /// higher-indexed ones.
+    ///
+    /// The fixture uses 130 clusters, which is 2× the PIPELINE_WINDOW of 64 and
+    /// therefore forces the pipeline to wrap around the window at least twice.
+    /// Gate on multi-core availability so single-core CI runners skip it rather
+    /// than trivially passing with no parallelism.
+    #[test]
+    fn compress_qcow2_pipeline_ordered_commit_across_window_boundary() {
+        if !require_multicore_parallelism("pipeline_window_boundary") {
+            return;
+        }
+        let tmp = tempdir().expect("tempdir");
+        let source = tmp.path().join("source.qcow2");
+        // 130 > 2 × PIPELINE_WINDOW; forces multiple window wraparounds.
+        write_multi_cluster_test_image(&source, 130).expect("write source qcow2");
+
+        // Compress twice with different worker counts and assert bit-identical output.
+        let dest_t1 = tmp.path().join("dest_t1.qcow2");
+        let dest_t0 = tmp.path().join("dest_t0.qcow2");
+        compress_qcow2_image(
+            &source,
+            &dest_t1,
+            CompressionType::Zstd,
+            &BTreeMap::new(),
+            "-3 -T1",
+        )
+        .expect("compress -T1");
+        compress_qcow2_image(
+            &source,
+            &dest_t0,
+            CompressionType::Zstd,
+            &BTreeMap::new(),
+            "-3 -T0",
+        )
+        .expect("compress -T0");
+
+        let bytes_t1 = std::fs::read(&dest_t1).expect("read -T1 output");
+        let bytes_t0 = std::fs::read(&dest_t0).expect("read -T0 output");
+        assert_eq!(
+            bytes_t1, bytes_t0,
+            "pipeline output must be identical for -T1 and -T0 across the window boundary"
+        );
+
+        // Round-trip: every guest cluster must decode to its expected value.
+        let mut image = SourceImage::open(&dest_t0).expect("open compressed image");
+        for i in 0u64..130 {
+            let mut cluster = vec![0u8; 4096];
+            image
+                .read_virtual_range(i * 4096, &mut cluster)
+                .unwrap_or_else(|e| panic!("read cluster {i}: {e:#}"));
+            let expected = 0x41u8.wrapping_add(i as u8);
+            assert!(
+                cluster.iter().all(|&b| b == expected),
+                "cluster {i}: expected all 0x{expected:02x}, got first byte 0x{:02x}",
+                cluster[0]
+            );
+        }
     }
 
     /// Check that no two compressed L2 entries share a 512-byte sector.

@@ -768,10 +768,13 @@ that names the offending token.
 > worker-chunked multi-frame stream that qemu rejects with `-EIO`.  Per-cluster
 > payloads are at most `cluster_size` (≤ 2 MiB), so botforge keeps each cluster
 > as one deterministic frame and parallelizes across guest clusters instead.
-> Work is batched in groups of `COMPRESSION_BATCH = 64`, so peak compression RSS
-> scales with `64 × cluster_size` (for example `64 × 2 MiB = 128 MiB` at the
-> maximum cluster size). `-Tn` changes worker count only; it does not change the
-> 64-cluster batch size.
+> Compression uses a three-stage pipeline (reader → rayon workers → ordered
+> writer) that overlaps I/O and CPU work and eliminates per-batch straggler
+> stalls.  At most `PIPELINE_WINDOW = 64` non-zero cluster buffers are held
+> simultaneously in the work channel plus the reorder buffer, so peak
+> compression RSS scales with `2 × 64 × cluster_size`
+> (for example `2 × 64 × 2 MiB = 256 MiB` at the maximum cluster size).
+> `-Tn` changes worker count only; it does not change the window size.
 
 When compression is enabled and `compressor:` is omitted, botforge now
 defaults to `zstd`. `zstd`-compressed qcow2 images require qemu >= 5.1 on any
