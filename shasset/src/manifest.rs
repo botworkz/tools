@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// Top-level manifest (`shasset.yaml`).
@@ -101,6 +101,11 @@ pub struct Asset {
     /// asset without `archive: true` is a hard resolution error.
     #[serde(default, skip_serializing_if = "is_false")]
     pub archive: bool,
+    /// Optional set of labels attached to this asset.  Labels are arbitrary
+    /// strings (e.g. `"internal"`, `"experimental"`) that consumers can use to
+    /// gate resolution via [`serde_default`](std::default::Default).
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub labels: BTreeSet<String>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -320,6 +325,7 @@ pub fn save(path: &Path, manifest: &Manifest) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{Asset, Manifest};
+    use std::collections::BTreeSet;
 
     #[test]
     fn version_defaults_empty_for_versionless_asset() {
@@ -349,6 +355,7 @@ mod tests {
             auth: None,
             platform: None,
             archive: false,
+            labels: BTreeSet::new(),
         };
         assert_eq!(
             default_asset.resolved_platform().unwrap(),
@@ -391,6 +398,7 @@ mod tests {
                 auth: None,
                 platform: Some(raw.to_string()),
                 archive: false,
+                labels: BTreeSet::new(),
             };
             let err = asset.resolved_platform().unwrap_err();
             assert!(
@@ -414,6 +422,7 @@ mod tests {
             auth: None,
             platform: None,
             archive: false,
+            labels: BTreeSet::new(),
         }
     }
 

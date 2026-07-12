@@ -1651,6 +1651,7 @@ mod tests {
             auth: None,
             platform: None,
             archive: false,
+            labels: Default::default(),
         }
     }
 
@@ -1880,6 +1881,7 @@ mod tests {
             auth: None,
             platform: None,
             archive: false,
+            labels: Default::default(),
         };
         let cache = TempDir::new().unwrap();
         let (transport, calls) = MockTransport::new(data.to_vec());
@@ -1948,6 +1950,7 @@ mod tests {
             auth: Some("${SHASSET_TEST_TOKEN}".to_string()),
             platform: None,
             archive: false,
+            labels: Default::default(),
         };
         std::env::set_var("SHASSET_TEST_TOKEN", "token123");
 
@@ -2036,6 +2039,7 @@ mod tests {
             auth: Some("${SHASSET_TEST_TOKEN}".to_string()),
             platform: None,
             archive: false,
+            labels: Default::default(),
         };
         std::env::set_var("SHASSET_TEST_TOKEN", "token123");
 
@@ -2106,6 +2110,7 @@ mod tests {
             auth: None,
             platform: None,
             archive: false,
+            labels: Default::default(),
         };
         let out = TempDir::new().unwrap();
         let cache = TempDir::new().unwrap();
@@ -2149,6 +2154,7 @@ mod tests {
             auth: None,
             platform: None,
             archive: false,
+            labels: Default::default(),
         };
 
         let err = download_via_scheme(
@@ -2382,6 +2388,7 @@ mod tests {
             auth: None,
             platform: None,
             archive: false,
+            labels: Default::default(),
         };
 
         let cache = TempDir::new().unwrap();
@@ -2497,6 +2504,7 @@ mod tests {
             auth: None,
             platform: None,
             archive: false,
+            labels: Default::default(),
         };
 
         let cache = TempDir::new().unwrap();
@@ -2554,6 +2562,7 @@ mod tests {
             auth: None,
             platform: None,
             archive: false,
+            labels: Default::default(),
         };
 
         let cache = TempDir::new().unwrap();
@@ -2626,6 +2635,7 @@ mod tests {
             auth: None,
             platform: None,
             archive: false,
+            labels: Default::default(),
         };
 
         let cache = TempDir::new().unwrap();
@@ -2718,6 +2728,7 @@ mod tests {
             auth: None,
             platform: None,
             archive: false,
+            labels: Default::default(),
         };
 
         let cache = TempDir::new().unwrap();
@@ -2775,6 +2786,7 @@ mod tests {
             auth: None,
             platform: Some("linux/amd64".to_string()),
             archive: false,
+            labels: Default::default(),
         };
 
         let cache = TempDir::new().unwrap();
@@ -2855,6 +2867,7 @@ mod tests {
                 auth: None,
                 platform: None,
                 archive: false,
+                labels: Default::default(),
             };
             let cache = TempDir::new().unwrap();
             let (transport, _) = MockTransport::with_outcomes(vec![
@@ -2927,6 +2940,7 @@ mod tests {
             auth: None,
             platform: None,
             archive: false,
+            labels: Default::default(),
         };
 
         let cache = TempDir::new().unwrap();
@@ -3017,6 +3031,7 @@ mod tests {
             auth: None,
             platform: None,
             archive: false,
+            labels: Default::default(),
         };
         let (transport1, _) = MockTransport::with_outcomes(vec![
             MockOutcome::Body {
@@ -3057,6 +3072,7 @@ mod tests {
             auth: None,
             platform: None,
             archive: false,
+            labels: Default::default(),
         };
         // Transport with NO outcomes — any real request would panic.
         let (transport2, calls2) = MockTransport::with_outcomes(vec![]);
@@ -3099,6 +3115,7 @@ mod tests {
             auth: None,
             platform: None,
             archive: false,
+            labels: Default::default(),
         };
 
         let cache = TempDir::new().unwrap();
@@ -3281,6 +3298,7 @@ mod tests {
             auth: auth_value.map(str::to_string),
             platform: None,
             archive: false,
+            labels: Default::default(),
         };
 
         let cache = TempDir::new().unwrap();

@@ -98,6 +98,7 @@ fn cmd_add(config: &Path, args: cli::AddArgs) -> Result<()> {
         auth: args.auth.clone(),
         platform: None,
         archive: false,
+        labels: Default::default(),
     };
 
     let checksum = if args.compute {
@@ -132,6 +133,7 @@ fn cmd_add(config: &Path, args: cli::AddArgs) -> Result<()> {
         auth: args.auth,
         platform: None,
         archive: false,
+        labels: Default::default(),
     };
 
     manifest.assets.insert(args.name.clone(), stored);
@@ -693,6 +695,7 @@ mod tests {
             auth: None,
             platform: None,
             archive: false,
+            labels: Default::default(),
         }
     }
 
@@ -805,6 +808,7 @@ mod tests {
                     auth: None,
                     platform: None,
                     archive: false,
+                    labels: Default::default(),
                 },
             )]),
         };
@@ -836,6 +840,7 @@ mod tests {
                 auth: None,
                 platform: None,
                 archive: false,
+                labels: Default::default(),
             },
         );
         save(&path, &m).unwrap();
@@ -862,6 +867,7 @@ mod tests {
             auth: None,
             platform: None,
             archive: false,
+            labels: Default::default(),
         };
         assert_eq!(
             a.expanded_uri(),
@@ -880,6 +886,7 @@ mod tests {
             auth: None,
             platform: None,
             archive: false,
+            labels: Default::default(),
         };
         assert_eq!(a.output_filename().unwrap(), "tool-2.0.0.tar.gz");
     }
@@ -895,6 +902,7 @@ mod tests {
             auth: None,
             platform: None,
             archive: false,
+            labels: Default::default(),
         };
         assert_eq!(a.output_filename().unwrap(), "archive.zip");
     }
@@ -973,6 +981,7 @@ mod tests {
             auth: None,
             platform: None,
             archive: false,
+            labels: Default::default(),
         };
 
         let result = fetch_asset(FetchParams {
@@ -1011,6 +1020,7 @@ mod tests {
             auth: None,
             platform: None,
             archive: false,
+            labels: Default::default(),
         };
 
         let err = fetch_asset(FetchParams {
@@ -1045,6 +1055,7 @@ mod tests {
             auth: None,
             platform: None,
             archive: false,
+            labels: Default::default(),
         };
 
         let err = fetch_asset(FetchParams {
@@ -1082,6 +1093,7 @@ mod tests {
             auth: None,
             platform: None,
             archive: false,
+            labels: Default::default(),
         };
 
         let err = fetch_asset(FetchParams {
@@ -1116,6 +1128,7 @@ mod tests {
             auth: None,
             platform: None,
             archive: false,
+            labels: Default::default(),
         };
 
         let err = fetch_asset(FetchParams {
@@ -1157,6 +1170,7 @@ mod tests {
             auth: Some("${TEST_SHASSET_TOKEN_ABC}".to_string()),
             platform: None,
             archive: false,
+            labels: Default::default(),
         };
         assert_eq!(a.resolved_auth().unwrap().as_deref(), Some("supersecret"));
     }
@@ -1173,6 +1187,7 @@ mod tests {
             auth: Some("${SHASSET_DEFINITELY_NOT_SET_XYZ123}".to_string()),
             platform: None,
             archive: false,
+            labels: Default::default(),
         };
         assert!(a.resolved_auth().is_err());
     }
@@ -1212,6 +1227,7 @@ mod tests {
             auth: Some("${SECRET_TOKEN}".to_string()),
             platform: None,
             archive: false,
+            labels: Default::default(),
         };
         let mut map = BTreeMap::new();
         map.insert("tool".to_string(), a);
