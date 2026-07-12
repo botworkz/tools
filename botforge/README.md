@@ -531,20 +531,16 @@ directory); all guest paths must be absolute.
 
 ```yaml
 type: build
-<<<<<<< HEAD
 image: "@debian-base"           # required: @<shasset-name> resolves to the provider's default artifact
+output: "image.qcow2"           # required: bare filename; written to build/artifact/<spec-dir>/<output>
 disk_size: "10G"                 # optional, default 10G — a build requirement (output image is resized to this size)
-=======
-image: "@debian-base"
-output: "foo.qcow2"           # required: @<shasset-name> resolves to the provider's default artifact
-disk_size: "10G"                 # optional, default 10G
-memsize: 4096                    # optional, default 4096 MiB
-smp: 4                           # optional, default 4 vCPUs
->>>>>>> 66ee880 (botforge: derive artifact output path from spec and rename @artifact root)
 step_timeout: 1800               # optional, default 1800 s; applies to each step
 timeout: 7200                    # optional, default 7200 s; overall wall-clock budget
-bootcmd:                         # optional; merged into the first-boot cloud-init user-data
-  - echo "early boot hook"
+cloud_init:                      # optional; cloud-config fragment merged into the runner VM seed
+  bootcmd:
+    - echo "early boot hook"
+  packages:
+    - curl
 compress:                        # optional; absent = plain rename (no compression)
   enabled: true
   compressor_args:               # optional qcow2 structural options
@@ -659,43 +655,77 @@ configured step.
   for details). Files are installed via `sudo install` so mode and ownership are
   applied atomically without a follow-up `chmod`/`chown` step.
 
-#### `bootcmd:` (optional) — early first-boot commands
+#### `cloud_init:` (optional) — cloud-config fragment for the runner VM seed
 
-`bootcmd:` injects commands into the cloud-init **`bootcmd`** module of the
-first-boot user-data that `botforge build` generates.  The `bootcmd` module
-runs very early in the boot sequence — before `multi-user.target` and before
-most systemd services start — making it the right hook for operations that
-must complete before the service stack activates (e.g. masking units so they
-never start during the provisioning boot).
+`cloud_init:` accepts an arbitrary **cloud-config mapping** that botforge
+deep-merges into the `#cloud-config` user-data injected into the runner VM
+that runs `botforge build` or `botforge test`.  Cloud-init's spec is the schema;
+botforge does not enumerate or validate specific cloud-init keys beyond the
+guards listed below.
 
-**`bootcmd:` does NOT replace botforge's generated user-data.** The installer
+**Semi-hermetic invariant:** the build is hermetic up to the runner VM boot
+and open after it (the guest provisions like a normal machine).  `cloud_init:`
+configures the *runner VM*, not the output image's cloud-init:
+
+- On `botforge build`: the runner boots, cloud-init applies the fragment,
+  botforge runs the build steps, then **commits the disk** — so users, packages,
+  and other durable changes land in the produced qcow2.
+- On `botforge test`: the runner boots the already-built image and the overlay
+  is **discarded on exit** — so durable keys have no lasting effect, but
+  boot-time-only knobs (e.g. `mounts:` for a tmpfs over apt directories) are
+  genuinely useful as a perf win.
+
+`cloud_init:` accepts the same schema on both `type: build` and `type: test`.
+
+**`cloud_init:` does NOT replace botforge's generated user-data.** The installer
 user, SSH key injection, and sudo grant that botforge creates remain
-authoritative; `bootcmd:` entries are merged in as an additional top-level key
-in the same `#cloud-config` document.
+authoritative — the installer user always survives the merge.
 
-Each list item is either:
-- A **plain string** — cloud-init passes it to `sh -c`.
-- A **sequence of strings** — cloud-init runs it directly via `execvp`
-  (useful for `cloud-init-per`, `systemctl`, etc.).
+**Merge precedence** (applied when deep-merging the user fragment into
+botforge's base):
 
-**Example — mask systemd units before they start:**
+| Key category | Rule |
+|---|---|
+| `users:` | Botforge's installer entry is always first; user entries are appended after it. |
+| Lists (`runcmd:`, `bootcmd:`, `packages:`, `mounts:`, `write_files:`, …) | Botforge-first concatenation. |
+| Scalars / mappings | User fragment wins. |
+
+**Guards** — two classes of content are hard-rejected at config-load time:
+
+| Guard | What is rejected |
+|---|---|
+| **Ingress** | `write_files:` entries with a `source:` field (host-path ingress). Use `uploads:` for host→guest file transfer; inline `content:` is allowed. |
+| **Harness** | `ssh_pwauth: false` — may break botforge's key-based SSH access to the runner VM. |
+
+Everything else is "cloud-init's problem", which is the whole point.
+
+**`cloud_init:` is NOT a host-filesystem access primitive.** The three host→guest
+channels remain separate:
+
+- Host files → guest: `uploads:` / asset steps (`@`-resolved, pin/verify).
+- Host values → cloud-init: `inputs:` / `${{ inputs.* }}` substitution.
+- Declarative guest state: `cloud_init:`.
+
+**Example — mask systemd units before they start (build):**
 
 ```yaml
 type: build
 image: "@botwork-vm"
-bootcmd:
-  # Mask the application stack before multi-user.target; the provisioning
-  # steps will unmask them after plugin installation.
-  - - cloud-init-per
-    - once
-    - mask-app-stack
-    - sh
-    - -c
-    - >-
-      systemctl mask
-      botwork-api.service
-      botwork-envoy.service
-      botwork-ui.service
+output: "botwork-vm.qcow2"
+cloud_init:
+  bootcmd:
+    # Mask the application stack before multi-user.target; the provisioning
+    # steps will unmask them after plugin installation.
+    - - cloud-init-per
+      - once
+      - mask-app-stack
+      - sh
+      - -c
+      - >-
+        systemctl mask
+        botwork-api.service
+        botwork-envoy.service
+        botwork-ui.service
 steps:
   - on: guest
     name: install-plugins
@@ -707,8 +737,49 @@ steps:
     run: systemctl unmask botwork-api.service botwork-envoy.service botwork-ui.service
 ```
 
-Absent or empty `bootcmd:` produces user-data byte-identical to the current
+**Example — tmpfs over apt dirs to speed up tests (test, motivating):**
+
+This is a boot-time perf win: mount tmpfs over `/var/cache/apt` and
+`/var/lib/apt/lists` so apt I/O stays in memory.  On `type: test` the overlay
+is discarded so this is fully ephemeral; on `type: build` the mounts are
+committed as fstab entries in the output image (author discipline required).
+
+```yaml
+type: test
+cloud_init:
+  mounts:
+    - [tmpfs, /var/cache/apt, tmpfs, "size=512M,mode=0755", "0", "0"]
+    - [tmpfs, /var/lib/apt/lists, tmpfs, "size=256M,mode=0755", "0", "0"]
+steps:
+  - on: guest
+    name: update
+    sudo: true
+    run: apt-get update -q
+```
+
+**Fragments may carry `cloud_init:`.** A `type: fragment` document may include a
+`cloud_init:` block; it is deep-merged with the root's block (and any other
+fragment `cloud_init:` blocks) under the same precedence rules when the fragment
+is spliced via `uses:`.
+
+Absent `cloud_init:` produces user-data semantically identical to the current
 output — there is zero behaviour change for existing specs that omit the field.
+
+**Migration from `bootcmd:`:** the top-level `bootcmd:` field was removed.
+Existing specs that use `bootcmd:` must migrate:
+
+```yaml
+# before
+bootcmd:
+  - echo hello
+
+# after
+cloud_init:
+  bootcmd:
+    - echo hello
+```
+
+botforge emits a clear migration error when a top-level `bootcmd:` is found.
 
 #### `compress:` (optional) — compress the output qcow2
 

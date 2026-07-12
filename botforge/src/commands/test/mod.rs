@@ -132,10 +132,15 @@ pub(crate) fn cmd_test(config: &Path, args: TestArgs) -> Result<()> {
             None,
             ssh_public_key.trim(),
             Some(ssh_user_string.as_str()),
-            &[],
+            test_config.cloud_init.as_ref(),
         )
     } else {
-        render_user_data(None, ssh_public_key.trim(), None, &[])
+        render_user_data(
+            None,
+            ssh_public_key.trim(),
+            None,
+            test_config.cloud_init.as_ref(),
+        )
     };
     write_seed_files(&seed_dir, &user_data)?;
     build_iso(&seed_dir, &seed_iso, "cidata")?;
