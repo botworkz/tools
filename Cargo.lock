@@ -243,6 +243,7 @@ dependencies = [
  "flate2",
  "getrandom 0.4.3",
  "glob",
+ "rayon",
  "russh",
  "russh-sftp",
  "serde",
