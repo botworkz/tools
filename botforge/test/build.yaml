@@ -5,6 +5,11 @@ output: foo.qcow2
 disk_size: 10G
 compress:
   reclaim: fstrim
+cloud_init:
+  write_files:
+  - path: /etc/botforge-ci-marker
+    content: "botforge-ci-test\n"
+    permissions: "0644"
 steps:
 - uses: "@://hello.steps.yaml"
 - name: Base install

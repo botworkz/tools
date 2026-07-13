@@ -188,6 +188,26 @@ pub(crate) struct AssertPackage {
     pub(crate) installed: bool,
 }
 
+/// A single service expectation inside `assert.services:`.
+///
+/// Both `enabled:` and `active:` are optional — omitting either means that
+/// aspect is not checked.  Unknown attributes are rejected at config-load
+/// time via `#[serde(deny_unknown_fields)]`.
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AssertService {
+    /// When `true`, the service must report `enabled` from `systemctl is-enabled`.
+    /// When `false`, the service must not report `enabled`.
+    /// When absent, the enabled state is not checked.
+    #[serde(default)]
+    pub(crate) enabled: Option<bool>,
+    /// When `true`, the service must report `active` from `systemctl is-active`.
+    /// When `false`, the service must not report `active`.
+    /// When absent, the active state is not checked.
+    #[serde(default)]
+    pub(crate) active: Option<bool>,
+}
+
 /// Validated `assert:` block from a `type: test` document.
 #[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
 pub(crate) struct AssertBlock {
@@ -203,6 +223,9 @@ pub(crate) struct AssertBlock {
     /// Map of package name (or glob pattern) → package expectation.
     #[serde(default)]
     pub(crate) packages: BTreeMap<String, AssertPackage>,
+    /// Map of service name → service expectation.
+    #[serde(default)]
+    pub(crate) services: BTreeMap<String, AssertService>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -1495,6 +1518,9 @@ fn validate_assert_block(block: &AssertBlock) -> Result<()> {
     for (name_or_pattern, expectation) in &block.packages {
         validate_assert_package_entry(name_or_pattern, expectation)?;
     }
+    for (name, expectation) in &block.services {
+        validate_assert_service_entry(name, expectation)?;
+    }
     Ok(())
 }
 
@@ -1562,6 +1588,12 @@ fn validate_assert_package_entry(
     Ok(())
 }
 
+fn validate_assert_service_entry(_name: &str, _expectation: &AssertService) -> Result<()> {
+    // Unknown attributes are already rejected at deserialization time via
+    // `#[serde(deny_unknown_fields)]` on `AssertService`.  No further
+    // validation is required in v1.
+    Ok(())
+}
 fn substitute_inputs_in_value(value: &mut Value, inputs: &BTreeMap<String, String>) -> Result<()> {
     match value {
         Value::String(text) => {
@@ -5893,6 +5925,85 @@ assert:
     git:
       installed: true
       version: "2.40"
+"#,
+        )
+        .unwrap();
+        let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("version") || msg.contains("unknown field"),
+            "error should mention unknown field: {msg}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // assert.services: tests
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_load_test_config_assert_services_basic() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            r#"
+type: test
+steps: []
+assert:
+  services:
+    ssh:
+      enabled: true
+      active: true
+    nginx:
+      enabled: false
+"#,
+        )
+        .unwrap();
+        let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+        let assert_block = config.assert.unwrap();
+        assert_eq!(assert_block.services.len(), 2);
+        let ssh = assert_block.services.get("ssh").unwrap();
+        assert_eq!(ssh.enabled, Some(true));
+        assert_eq!(ssh.active, Some(true));
+        let nginx = assert_block.services.get("nginx").unwrap();
+        assert_eq!(nginx.enabled, Some(false));
+        assert!(nginx.active.is_none());
+    }
+
+    #[test]
+    fn test_load_test_config_assert_services_partial_fields() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            r#"
+type: test
+steps: []
+assert:
+  services:
+    cron:
+      active: true
+"#,
+        )
+        .unwrap();
+        let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+        let assert_block = config.assert.unwrap();
+        let cron = assert_block.services.get("cron").unwrap();
+        assert!(cron.enabled.is_none(), "enabled should be absent");
+        assert_eq!(cron.active, Some(true));
+    }
+
+    #[test]
+    fn test_load_test_config_assert_services_rejects_unknown_field() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            r#"
+type: test
+steps: []
+assert:
+  services:
+    ssh:
+      enabled: true
+      version: "3.0"
 "#,
         )
         .unwrap();

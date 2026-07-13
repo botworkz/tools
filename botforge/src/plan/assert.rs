@@ -1,10 +1,11 @@
 //! Declarative `assert:` phase — run after all `steps:` in a `type: test` document.
 //!
 //! Currently implements the `assert.files:`, `assert.users:`, `assert.groups:`,
-//! and `assert.packages:` sub-keys.  File entries are probed via a single batched
-//! SSH script; user and group entries are probed via `getent passwd` / `getent group`
-//! (for names and attributes) and `id -nG <user>` (for group membership); package
-//! entries are probed via a single `dpkg-query -W` dump.
+//! `assert.packages:`, and `assert.services:` sub-keys.  File entries are probed
+//! via a single batched SSH script; user and group entries are probed via
+//! `getent passwd` / `getent group` (for names and attributes) and `id -nG <user>`
+//! (for group membership); package entries are probed via a single `dpkg-query -W`
+//! dump; service entries are probed via `systemctl is-enabled` / `systemctl is-active`.
 
 use anyhow::Result;
 use std::collections::BTreeMap;
@@ -779,6 +780,90 @@ fn parse_dpkg_installed<'a>(lines: &mut impl Iterator<Item = &'a str>) -> Vec<St
         }
     }
     installed
+}
+
+// ---------------------------------------------------------------------------
+// Services assert
+// ---------------------------------------------------------------------------
+
+/// Run the `assert.services:` phase.
+///
+/// For each declared service, probes via `systemctl is-enabled` and
+/// `systemctl is-active` in a single batched SSH script.  Each line of
+/// output is `<enabled-state>:<active-state>` (e.g. `enabled:active`).
+///
+/// - `enabled: true` → `systemctl is-enabled` must output `enabled`.
+/// - `enabled: false` → `systemctl is-enabled` must not output `enabled`.
+/// - `active: true` → `systemctl is-active` must output `active`.
+/// - `active: false` → `systemctl is-active` must not output `active`.
+/// - Absent `enabled:`/`active:` → that aspect is not checked.
+pub(crate) fn run_assert_services(ssh: &SshOptions, assert_block: &AssertBlock) -> Result<()> {
+    if assert_block.services.is_empty() {
+        return Ok(());
+    }
+
+    let mut script = String::from("set -e\n");
+    for name in assert_block.services.keys() {
+        let q = shell_single_quote(name);
+        script.push_str(&format!(
+            concat!(
+                "_e=$(systemctl is-enabled {q} 2>/dev/null || true)\n",
+                "_a=$(systemctl is-active {q} 2>/dev/null || true)\n",
+                "printf '%s:%s\\n' \"$_e\" \"$_a\"\n",
+            ),
+            q = q
+        ));
+    }
+
+    let probe_output = ssh_capture_stdout(
+        ssh,
+        &script,
+        ASSERT_TRANSPORT_RETRIES,
+        ASSERT_TRANSPORT_RETRY_DELAY,
+        ASSERT_CONNECT_TIMEOUT,
+    )
+    .map_err(|e| anyhow::anyhow!("assert.services: SSH probe failed: {e:#}"))?;
+
+    let mut lines = probe_output.lines();
+    let mut any_failed = false;
+
+    for (name, expectation) in &assert_block.services {
+        let raw_line = lines.next().unwrap_or(":");
+        let mut parts = raw_line.splitn(2, ':');
+        let enabled_state = parts.next().unwrap_or("").trim();
+        let active_state = parts.next().unwrap_or("").trim();
+
+        if let Some(expected_enabled) = expectation.enabled {
+            let actual_enabled = enabled_state == "enabled";
+            let ok = actual_enabled == expected_enabled;
+            print_phase_status("assert", &format!("service {name} enabled"), ok);
+            if !ok {
+                eprintln!(
+                    "         service {name}: expected enabled={expected_enabled}, \
+                     but systemctl is-enabled returned '{enabled_state}'"
+                );
+                any_failed = true;
+            }
+        }
+
+        if let Some(expected_active) = expectation.active {
+            let actual_active = active_state == "active";
+            let ok = actual_active == expected_active;
+            print_phase_status("assert", &format!("service {name} active"), ok);
+            if !ok {
+                eprintln!(
+                    "         service {name}: expected active={expected_active}, \
+                     but systemctl is-active returned '{active_state}'"
+                );
+                any_failed = true;
+            }
+        }
+    }
+
+    if any_failed {
+        anyhow::bail!("one or more assert.services: checks failed");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
