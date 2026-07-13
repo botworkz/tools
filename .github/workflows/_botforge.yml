@@ -129,6 +129,20 @@ jobs:
         filter: '. + {image: "@artifact://foo.qcow2"}'
         output-path: testrepo/test.yaml
         input: botforge/test/test.yaml
+    - name: Create assert-fail-leaked config
+      uses: envoyproxy/toolshed/actions/jq@6a20085af231aba4c72d6866f94098343a8c5616
+      with:
+        input-format: yaml-path
+        filter: '. + {image: "@artifact://foo.qcow2"}'
+        output-path: testrepo/assert-fail-leaked.yaml
+        input: botforge/test/assert-fail-leaked.yaml
+    - name: Create assert-fail-rootfile config
+      uses: envoyproxy/toolshed/actions/jq@6a20085af231aba4c72d6866f94098343a8c5616
+      with:
+        input-format: yaml-path
+        filter: '. + {image: "@artifact://foo.qcow2"}'
+        output-path: testrepo/assert-fail-rootfile.yaml
+        input: botforge/test/assert-fail-rootfile.yaml
 
     - name: Print build config
       uses: envoyproxy/toolshed/actions/jq@6a20085af231aba4c72d6866f94098343a8c5616
@@ -191,3 +205,36 @@ jobs:
           exit 1
         fi
         echo "Negative-control passed: botforge correctly rejected the failing assertion"
+
+    - name: Negative-control — leaked botforge-evil identity must fail
+      run: |
+        set -euo pipefail
+        . .botforge.env
+        # Regression guard for #351 (assert.groups: installer-exclusion).
+        # Cloud-init creates botforge-evil user+group in the test VM; the
+        # assert then requires no botforge-* user or group to exist — this
+        # MUST fail, proving negatives bite and installer-exclusion is
+        # exact-name only (botforge-evil is not the installer and is caught).
+        if botforge test \
+             --test-config assert-fail-leaked.yaml \
+             --repo-root "$REPO_ROOT"; then
+          echo "ERROR: botforge should have exited non-zero for leaked botforge-evil identity" >&2
+          exit 1
+        fi
+        echo "Negative-control passed: botforge correctly rejected leaked botforge-evil identity"
+
+    - name: Negative-control — wrong root-only file assertion must fail
+      run: |
+        set -euo pipefail
+        . .botforge.env
+        # Regression guard for #352 (assert.files: privileged probe).
+        # Asserts the wrong mode (0640) on the 0440 root:root fixture file —
+        # botforge MUST fail, proving the privileged probe reads real state
+        # rather than silently reporting absent or passing without checking.
+        if botforge test \
+             --test-config assert-fail-rootfile.yaml \
+             --repo-root "$REPO_ROOT"; then
+          echo "ERROR: botforge should have exited non-zero for wrong root-only file assertion" >&2
+          exit 1
+        fi
+        echo "Negative-control passed: botforge correctly rejected wrong root-only file assertion"

@@ -1,0 +1,30 @@
+type: test
+
+# Negative-control fixture: regression guard for the installer-exclusion bug
+# (#351) and proves that negative assert.users:/assert.groups: checks bite when
+# a genuinely leaked botforge-* identity exists.
+#
+# cloud_init.runcmd creates botforge-evil as both a user and a same-named group
+# (distinct from the ephemeral botforge installer identity, which is excluded
+# by exact-name from pattern checks).  The assert then requires no botforge-*
+# user or group to exist — which MUST fail because botforge-evil is present.
+#
+# This verifies two things:
+#  1. The installer-exclusion is exact-name only (botforge-evil is NOT skipped).
+#  2. A genuine leak is reliably caught by the negative pattern assertion.
+#
+# `image:` is injected by .github/workflows/_botforge.yml at CI time.
+cloud_init:
+  runcmd:
+  - groupadd botforge-evil
+  - useradd --no-create-home --system -g botforge-evil botforge-evil
+
+steps: []
+
+assert:
+  users:
+    botforge-*:
+      exists: false
+  groups:
+    botforge-*:
+      exists: false

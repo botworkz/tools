@@ -20,3 +20,14 @@ steps:
     apt-get update
     apt-get -qq dist-upgrade -y
     apt-get -qq install -y python3-virtualenv
+- name: Root-only regression fixture
+  run: |
+    # Regression fixture for assert.files: privileged-probe bug (#352).
+    # Creates a 0440 root:root file inside a 0750 root:root directory —
+    # the same permission pattern as /etc/sudoers.d/ fragments.  The
+    # pre-#352 unprivileged probe would have reported this file as absent;
+    # the post-#352 privileged probe (sudo -n sh) must report it as present.
+    install -d -m 0750 -o root -g root /etc/botforge-ci-restricted
+    echo 'botforge-ci-regression-fixture-0440' \
+      | install -m 0440 -o root -g root /dev/stdin \
+          /etc/botforge-ci-restricted/probe-test
