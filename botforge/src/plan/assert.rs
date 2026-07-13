@@ -21,6 +21,9 @@ use super::log::print_phase_status;
 const ASSERT_TRANSPORT_RETRIES: usize = 3;
 const ASSERT_TRANSPORT_RETRY_DELAY: Duration = Duration::from_secs(2);
 const ASSERT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+const FILE_PROBE_HEREDOC_DELIM: &str = "__BOTFORGE_FILE_PROBE__";
+const USERS_PROBE_HEREDOC_DELIM: &str = "__BOTFORGE_USERS_PROBE__";
+const GROUPS_PROBE_HEREDOC_DELIM: &str = "__BOTFORGE_GROUPS_PROBE__";
 
 // ---------------------------------------------------------------------------
 // Public entry-point
@@ -99,12 +102,16 @@ fn build_file_probe_script(paths: &[&str]) -> String {
 /// If `sudo -n` is unavailable or not configured for passwordless access the
 /// remote command will exit non-zero, causing an error to propagate rather than
 /// silently reporting every path as `absent`.
-fn run_file_probe(ssh: &SshOptions, paths: &[&str]) -> Result<String> {
-    let inner = build_file_probe_script(paths);
-    // Wrap the probe in `sudo -n sh` via a heredoc so the entire script runs
-    // as root.  The delimiter is chosen to be unlikely to appear in any path.
-    let script =
-        format!("sudo -n sh <<'__BOTFORGE_FILE_PROBE__'\n{inner}__BOTFORGE_FILE_PROBE__\n");
+fn build_privileged_probe_script(inner_script: &str, heredoc_delim: &str) -> String {
+    format!("sudo -n sh <<'{heredoc_delim}'\n{inner_script}{heredoc_delim}\n")
+}
+
+fn run_privileged_probe(
+    ssh: &SshOptions,
+    inner_script: &str,
+    heredoc_delim: &str,
+) -> Result<String> {
+    let script = build_privileged_probe_script(inner_script, heredoc_delim);
     ssh_capture_stdout(
         ssh,
         &script,
@@ -112,6 +119,11 @@ fn run_file_probe(ssh: &SshOptions, paths: &[&str]) -> Result<String> {
         ASSERT_TRANSPORT_RETRY_DELAY,
         ASSERT_CONNECT_TIMEOUT,
     )
+}
+
+fn run_file_probe(ssh: &SshOptions, paths: &[&str]) -> Result<String> {
+    let inner = build_file_probe_script(paths);
+    run_privileged_probe(ssh, &inner, FILE_PROBE_HEREDOC_DELIM)
 }
 
 // ---------------------------------------------------------------------------
@@ -274,12 +286,12 @@ pub(crate) fn run_assert_users(
         let q = shell_single_quote(name);
         probe_parts.push(format!(
             concat!(
-                "_u=$(getent passwd {q} 2>/dev/null || true)\n",
-                "if [ -n \"$_u\" ]; then\n",
+                "if _u=$(getent passwd {q}); then\n",
                 "  _shell=$(echo \"$_u\" | cut -d: -f7)\n",
                 "  printf 'present:%s\\n' \"$_shell\"\n",
                 "else\n",
-                "  printf 'absent\\n'\n",
+                "  _rc=$?\n",
+                "  if [ \"$_rc\" -eq 2 ]; then printf 'absent\\n'; else exit \"$_rc\"; fi\n",
                 "fi\n",
             ),
             q = q
@@ -291,7 +303,7 @@ pub(crate) fn run_assert_users(
         if expectation.exists && !expectation.groups.is_empty() {
             let q = shell_single_quote(name);
             probe_parts.push(format!(
-                "_groups=$(id -nG {q} 2>/dev/null || true)\nprintf '%s\\n' \"$_groups\"\n",
+                "_groups=$(id -nG {q})\nprintf '%s\\n' \"$_groups\"\n",
                 q = q
             ));
         }
@@ -299,19 +311,16 @@ pub(crate) fn run_assert_users(
 
     // Emit full passwd dump for pattern matching.
     if need_all_users && !pattern_entries.is_empty() {
-        probe_parts
-            .push("getent passwd 2>/dev/null || true\nprintf '__END_PASSWD__\\n'\n".to_string());
+        probe_parts.push("getent passwd\nprintf '__END_PASSWD__\\n'\n".to_string());
     }
 
     let script = format!("set -e\n{}", probe_parts.join(""));
-    let probe_output = ssh_capture_stdout(
-        ssh,
-        &script,
-        ASSERT_TRANSPORT_RETRIES,
-        ASSERT_TRANSPORT_RETRY_DELAY,
-        ASSERT_CONNECT_TIMEOUT,
-    )
-    .map_err(|e| anyhow::anyhow!("assert.users: SSH probe failed: {e:#}"))?;
+    let probe_output =
+        run_privileged_probe(ssh, &script, USERS_PROBE_HEREDOC_DELIM).map_err(|e| {
+            anyhow::anyhow!(
+                "assert.users: privileged probe failed: sudo -n not available or failed ({e:#})"
+            )
+        })?;
 
     let mut lines = probe_output.lines();
     let mut any_failed = false;
@@ -515,8 +524,12 @@ pub(crate) fn run_assert_groups(
         let q = shell_single_quote(name);
         probe_parts.push(format!(
             concat!(
-                "_g=$(getent group {q} 2>/dev/null || true)\n",
-                "if [ -n \"$_g\" ]; then printf 'present\\n'; else printf 'absent\\n'; fi\n",
+                "if _g=$(getent group {q}); then\n",
+                "  printf 'present\\n'\n",
+                "else\n",
+                "  _rc=$?\n",
+                "  if [ \"$_rc\" -eq 2 ]; then printf 'absent\\n'; else exit \"$_rc\"; fi\n",
+                "fi\n",
             ),
             q = q
         ));
@@ -524,19 +537,16 @@ pub(crate) fn run_assert_groups(
 
     // Full group dump for pattern matching.
     if !pattern_entries.is_empty() {
-        probe_parts
-            .push("getent group 2>/dev/null || true\nprintf '__END_GROUP__\\n'\n".to_string());
+        probe_parts.push("getent group\nprintf '__END_GROUP__\\n'\n".to_string());
     }
 
     let script = format!("set -e\n{}", probe_parts.join(""));
-    let probe_output = ssh_capture_stdout(
-        ssh,
-        &script,
-        ASSERT_TRANSPORT_RETRIES,
-        ASSERT_TRANSPORT_RETRY_DELAY,
-        ASSERT_CONNECT_TIMEOUT,
-    )
-    .map_err(|e| anyhow::anyhow!("assert.groups: SSH probe failed: {e:#}"))?;
+    let probe_output =
+        run_privileged_probe(ssh, &script, GROUPS_PROBE_HEREDOC_DELIM).map_err(|e| {
+            anyhow::anyhow!(
+                "assert.groups: privileged probe failed: sudo -n not available or failed ({e:#})"
+            )
+        })?;
 
     let mut lines = probe_output.lines();
     let mut any_failed = false;
@@ -1256,7 +1266,10 @@ mod tests {
     // build_file_probe_script tests
     // ---------------------------------------------------------------------------
 
-    use super::build_file_probe_script;
+    use super::{
+        build_file_probe_script, build_privileged_probe_script, FILE_PROBE_HEREDOC_DELIM,
+        GROUPS_PROBE_HEREDOC_DELIM, USERS_PROBE_HEREDOC_DELIM,
+    };
 
     #[test]
     fn test_build_file_probe_script_starts_with_set_e() {
@@ -1269,24 +1282,38 @@ mod tests {
 
     #[test]
     fn test_build_file_probe_script_contains_sudo_n_wrapper() {
-        // The SSH command wrapping build_file_probe_script must use sudo -n sh.
-        // Verify the outer wrapper (produced by run_file_probe callers) pattern
-        // is exercised by checking the inner script is correct and can be wrapped.
         let inner = build_file_probe_script(&["/etc/sudoers.d/90-botwork"]);
-        let wrapped =
-            format!("sudo -n sh <<'__BOTFORGE_FILE_PROBE__'\n{inner}__BOTFORGE_FILE_PROBE__\n");
+        let wrapped = build_privileged_probe_script(&inner, FILE_PROBE_HEREDOC_DELIM);
         assert!(
             wrapped.starts_with("sudo -n sh"),
             "outer wrapper must invoke sudo -n sh"
         );
         assert!(
-            wrapped.contains("__BOTFORGE_FILE_PROBE__"),
+            wrapped.contains(FILE_PROBE_HEREDOC_DELIM),
             "heredoc delimiter must be present"
         );
         assert!(
             wrapped.contains("/etc/sudoers.d/90-botwork"),
             "path must appear in the script body"
         );
+    }
+
+    #[test]
+    fn test_build_privileged_probe_script_supports_users_probe_wrapping() {
+        let inner = "set -e\ngetent passwd\nprintf '__END_PASSWD__\\n'\n";
+        let wrapped = build_privileged_probe_script(inner, USERS_PROBE_HEREDOC_DELIM);
+        assert!(wrapped.starts_with("sudo -n sh"));
+        assert!(wrapped.contains(USERS_PROBE_HEREDOC_DELIM));
+        assert!(wrapped.contains("__END_PASSWD__"));
+    }
+
+    #[test]
+    fn test_build_privileged_probe_script_supports_groups_probe_wrapping() {
+        let inner = "set -e\ngetent group\nprintf '__END_GROUP__\\n'\n";
+        let wrapped = build_privileged_probe_script(inner, GROUPS_PROBE_HEREDOC_DELIM);
+        assert!(wrapped.starts_with("sudo -n sh"));
+        assert!(wrapped.contains(GROUPS_PROBE_HEREDOC_DELIM));
+        assert!(wrapped.contains("__END_GROUP__"));
     }
 
     #[test]
