@@ -17,10 +17,12 @@ use super::assert::run_assert_files;
 use super::config::{AssertBlock, TestConfig, TestIsoBootstrap};
 use super::files::{stage_files, FileEntry};
 use super::log::{
-    join_output_forwarders, print_step_status, print_step_title, spawn_output_forwarder,
-    step_log_path, StepLogWriter, StepOutputStream,
+    join_output_forwarders, print_step_status, print_step_title, spawn_capturing_forwarder,
+    spawn_output_forwarder, step_log_path, StepLogWriter, StepOutputStream,
 };
-use super::step::{resolve_shell, ArchiveStep, RunStep, StepTarget, TestStep};
+use super::step::{
+    resolve_shell, ArchiveStep, ExpectBlock, RunStep, StdioExpect, StepTarget, TestStep,
+};
 
 const TEST_SSH_READY_TIMEOUT: Duration = Duration::from_secs(300);
 const TEST_TRANSPORT_RETRIES: usize = 10;
@@ -272,9 +274,12 @@ fn run_run_step(
             )
             .with_context(|| format!("test step '{}' script upload failed", step.name));
 
-            let step_result = if scp_result.is_ok() {
+            let step_result: Result<()> = if let Some(expect) = &step.expect {
+                // Capturing path: surface stdout/stderr and exit code for assertion checking.
+                // Propagate the scp error early if upload failed.
+                scp_result?;
                 let ssh_cmd = build_guest_ssh_cmd(&template, &remote_script, step.sudo_enabled());
-                run_ssh_step_with_step_log(
+                let (capture, actual_exit) = run_ssh_step_capturing(
                     &step.name,
                     context.ssh,
                     &ssh_cmd,
@@ -284,13 +289,9 @@ fn run_run_step(
                     TEST_TRANSPORT_RETRIES,
                     TEST_TRANSPORT_RETRY_DELAY,
                 )
-                .with_context(|| format!("test step '{}' command failed", step.name))
-            } else {
-                scp_result
-            };
+                .with_context(|| format!("test step '{}' command failed", step.name))?;
 
-            // On success, read back the remote env file and merge into accumulated env.
-            if step_result.is_ok() {
+                // Merge env (best-effort; the command ran regardless of exit code).
                 if let Ok(env_contents) = ssh_capture_stdout(
                     context.ssh,
                     &format!("cat {}", shell_single_quote(&remote_env_path)),
@@ -302,7 +303,45 @@ fn run_run_step(
                         env_merge(accumulated_env, new_entries);
                     }
                 }
-            }
+
+                check_expect_block(&step.name, expect, &capture, actual_exit)
+            } else {
+                // Standard path: exit 0 required, no output capture.
+                let result = if scp_result.is_ok() {
+                    let ssh_cmd =
+                        build_guest_ssh_cmd(&template, &remote_script, step.sudo_enabled());
+                    run_ssh_step_with_step_log(
+                        &step.name,
+                        context.ssh,
+                        &ssh_cmd,
+                        Duration::from_secs(300),
+                        &step_log_path,
+                        step_budget,
+                        TEST_TRANSPORT_RETRIES,
+                        TEST_TRANSPORT_RETRY_DELAY,
+                    )
+                    .with_context(|| format!("test step '{}' command failed", step.name))
+                } else {
+                    scp_result
+                };
+
+                // On success, read back the remote env file and merge into accumulated env.
+                if result.is_ok() {
+                    if let Ok(env_contents) = ssh_capture_stdout(
+                        context.ssh,
+                        &format!("cat {}", shell_single_quote(&remote_env_path)),
+                        1,
+                        Duration::from_secs(0),
+                        Duration::from_secs(10),
+                    ) {
+                        if let Ok(new_entries) = parse_env_file(&env_contents) {
+                            env_merge(accumulated_env, new_entries);
+                        }
+                    }
+                }
+
+                result
+            };
 
             // Best-effort cleanup: remote env file, remote script, then local temp file.
             let _ = ssh_with_retry(
@@ -325,36 +364,340 @@ fn run_run_step(
                 .expect("shell already validated at config load");
             let suffix = unique_suffix();
             let env_file = std::env::temp_dir().join(format!("botforge-host-env-{suffix}"));
-            let step_result = run_host_step(
-                &step.name,
-                &step.run,
-                context.repo_root,
-                step_budget,
-                &template,
-                accumulated_env,
-                HostStepFiles {
-                    env_file: &env_file,
-                    log_path: &step_log_path,
-                },
-            )
-            .with_context(|| format!("test step '{}' command failed", step.name));
 
-            // On success, parse the local env file and merge into accumulated env.
-            if step_result.is_ok() {
+            let step_result: Result<()> = if let Some(expect) = &step.expect {
+                // Capturing path: surface stdout/stderr and exit code for assertion checking.
+                let (capture, actual_exit) = run_host_step_capturing(
+                    &step.name,
+                    &step.run,
+                    context.repo_root,
+                    step_budget,
+                    &template,
+                    accumulated_env,
+                    HostStepFiles {
+                        env_file: &env_file,
+                        log_path: &step_log_path,
+                    },
+                )
+                .with_context(|| format!("test step '{}' command failed", step.name))?;
+
+                // Merge env (best-effort; the command ran regardless of exit code).
                 if let Ok(contents) = std::fs::read_to_string(&env_file) {
                     if let Ok(new_entries) = parse_env_file(&contents) {
                         env_merge(accumulated_env, new_entries);
                     }
                 }
-            }
 
-            // Best-effort cleanup of the local env file.
-            let _ = std::fs::remove_file(&env_file);
+                let _ = std::fs::remove_file(&env_file);
+                check_expect_block(&step.name, expect, &capture, actual_exit)
+            } else {
+                // Standard path: exit 0 required, no output capture.
+                let result = run_host_step(
+                    &step.name,
+                    &step.run,
+                    context.repo_root,
+                    step_budget,
+                    &template,
+                    accumulated_env,
+                    HostStepFiles {
+                        env_file: &env_file,
+                        log_path: &step_log_path,
+                    },
+                )
+                .with_context(|| format!("test step '{}' command failed", step.name));
+
+                // On success, parse the local env file and merge into accumulated env.
+                if result.is_ok() {
+                    if let Ok(contents) = std::fs::read_to_string(&env_file) {
+                        if let Ok(new_entries) = parse_env_file(&contents) {
+                            env_merge(accumulated_env, new_entries);
+                        }
+                    }
+                }
+
+                let _ = std::fs::remove_file(&env_file);
+                result
+            };
 
             step_result
         }
     }?;
     Ok(())
+}
+
+/// Captured stdout and stderr from a step execution, available for `expect:` matching.
+struct StepCapture {
+    stdout: String,
+    stderr: String,
+}
+
+/// Like `run_ssh_step_with_step_log` but also captures stdout and stderr for post-execution
+/// expectation matching.  Returns `(capture, exit_code)` instead of `Result<()>`:
+/// - transport errors still propagate as `Err`
+/// - `RemoteFailure(code)` returns `Ok((capture, code))` so the caller decides pass/fail
+/// - `Success` returns `Ok((capture, 0))`
+#[allow(clippy::too_many_arguments)]
+fn run_ssh_step_capturing(
+    name: &str,
+    ssh: &SshOptions,
+    remote_command: &str,
+    connect_timeout: Duration,
+    log_path: &Path,
+    budget: StepExecutionBudget,
+    retries: usize,
+    retry_delay: Duration,
+) -> Result<(StepCapture, i32)> {
+    let logger = Arc::new(StepLogWriter::create(log_path)?);
+    let mut attempts = 0usize;
+    loop {
+        let mut pending_out: Vec<u8> = Vec::new();
+        let mut pending_err: Vec<u8> = Vec::new();
+        let mut cap_out: Vec<u8> = Vec::new();
+        let mut cap_err: Vec<u8> = Vec::new();
+
+        let logger_ref = Arc::clone(&logger);
+        let mut on_output = |is_stderr: bool, data: &[u8]| {
+            use std::io::Write;
+            if is_stderr {
+                let _ = std::io::stderr().write_all(data);
+                pending_err.extend_from_slice(data);
+                cap_err.extend_from_slice(data);
+                flush_log_lines(&logger_ref, &mut pending_err, StepOutputStream::Stderr);
+            } else {
+                let _ = std::io::stdout().write_all(data);
+                pending_out.extend_from_slice(data);
+                cap_out.extend_from_slice(data);
+                flush_log_lines(&logger_ref, &mut pending_out, StepOutputStream::Stdout);
+            }
+        };
+
+        let outcome = ssh_exec_logged(
+            ssh,
+            remote_command,
+            connect_timeout,
+            budget.step_timeout,
+            budget.overall_deadline,
+            &mut on_output,
+        );
+
+        // Flush any partial (no-newline) buffered lines to the log.
+        if !pending_out.is_empty() {
+            let _ = logger_ref.log_line(StepOutputStream::Stdout, &pending_out);
+        }
+        if !pending_err.is_empty() {
+            let _ = logger_ref.log_line(StepOutputStream::Stderr, &pending_err);
+        }
+
+        let capture = StepCapture {
+            stdout: String::from_utf8_lossy(&cap_out).into_owned(),
+            stderr: String::from_utf8_lossy(&cap_err).into_owned(),
+        };
+
+        match outcome {
+            SshExecOutcome::Success => return Ok((capture, 0)),
+            SshExecOutcome::StepTimeout => {
+                anyhow::bail!(
+                    "guest step '{}' timed out after {}s",
+                    name,
+                    budget.step_timeout.as_secs()
+                );
+            }
+            SshExecOutcome::OverallTimeout => {
+                return Err(overall_timeout_error(budget.overall_timeout));
+            }
+            SshExecOutcome::RemoteFailure(code) => {
+                // Return the exit code to the caller for expectation checking.
+                return Ok((capture, code as i32));
+            }
+            SshExecOutcome::TransportError(e) => {
+                attempts += 1;
+                if attempts >= retries {
+                    anyhow::bail!("ssh command failed (transport error, retries exhausted): {e:#}");
+                }
+                std::thread::sleep(retry_delay);
+            }
+        }
+    }
+}
+
+/// Like `run_host_step` but also captures stdout and stderr for post-execution expectation
+/// matching.  Returns `(capture, exit_code)` instead of `Result<()>`:
+/// - timeout and spawn errors still propagate as `Err`
+/// - any exit code (including non-zero) is returned in the `Ok` tuple
+fn run_host_step_capturing(
+    name: &str,
+    run: &str,
+    repo_root: &Path,
+    budget: StepExecutionBudget,
+    template: &[String],
+    accumulated_env: &[(String, String)],
+    files: HostStepFiles<'_>,
+) -> Result<(StepCapture, i32)> {
+    // Create/truncate the env file so `>>` always works inside the step.
+    std::fs::write(files.env_file, b"")
+        .with_context(|| format!("failed to create env file for host step '{name}'"))?;
+
+    let script = std::env::temp_dir().join(format!("botforge-host-step-{}.sh", unique_suffix()));
+    std::fs::write(&script, run.as_bytes())
+        .with_context(|| format!("failed to write script file for host step '{name}'"))?;
+
+    let argv: Vec<String> = template
+        .iter()
+        .map(|a| {
+            if a == "{0}" {
+                script.to_string_lossy().into_owned()
+            } else {
+                a.clone()
+            }
+        })
+        .collect();
+
+    let logger = Arc::new(StepLogWriter::create(files.log_path)?);
+    let mut command = Command::new(&argv[0]);
+    command
+        .args(&argv[1..])
+        .current_dir(repo_root)
+        .env("BOTFORGE_ENV", files.env_file)
+        .envs(
+            accumulated_env
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str())),
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("failed to spawn host step '{name}'"))?;
+    let child_stdout = child
+        .stdout
+        .take()
+        .context("failed to capture child stdout for step logging")?;
+    let child_stderr = child
+        .stderr
+        .take()
+        .context("failed to capture child stderr for step logging")?;
+
+    let (stdout_handle, stdout_cap) =
+        spawn_capturing_forwarder(child_stdout, StepOutputStream::Stdout, Arc::clone(&logger));
+    let (stderr_handle, stderr_cap) =
+        spawn_capturing_forwarder(child_stderr, StepOutputStream::Stderr, logger);
+
+    let step_deadline = Instant::now() + budget.step_timeout;
+    let exit_result: Result<i32> = loop {
+        match child
+            .try_wait()
+            .with_context(|| format!("failed to wait for host step '{name}'"))?
+        {
+            Some(status) => {
+                break Ok(status.code().unwrap_or(-1));
+            }
+            None => {
+                match timeout_cause(step_deadline, budget.overall_deadline) {
+                    Some(WaitResult::StepTimeout) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break Err(anyhow::anyhow!(
+                            "host step '{name}' timed out after {}s",
+                            budget.step_timeout.as_secs()
+                        ));
+                    }
+                    Some(WaitResult::OverallTimeout) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break Err(overall_timeout_error(budget.overall_timeout));
+                    }
+                    None => {}
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
+    };
+
+    // Join forwarders to ensure all output is captured before reading the buffers.
+    // Forwarder errors are suppressed: exit_result is the source of truth.
+    let _ = stdout_handle.join();
+    let _ = stderr_handle.join();
+
+    // Best-effort cleanup of temp script.
+    let _ = std::fs::remove_file(&script);
+
+    let exit_code = exit_result?;
+    let stdout = String::from_utf8_lossy(
+        &stdout_cap
+            .lock()
+            .map_err(|_| anyhow::anyhow!("stdout capture mutex poisoned"))?,
+    )
+    .into_owned();
+    let stderr = String::from_utf8_lossy(
+        &stderr_cap
+            .lock()
+            .map_err(|_| anyhow::anyhow!("stderr capture mutex poisoned"))?,
+    )
+    .into_owned();
+    Ok((StepCapture { stdout, stderr }, exit_code))
+}
+
+/// Evaluate an `expect:` block against the captured step output and actual exit code.
+///
+/// Prints a per-failure diagnostic line to stderr before returning `Err`, so the
+/// caller's `print_step_status` ✗ line is preceded by the specific failure reason.
+fn check_expect_block(
+    step_name: &str,
+    expect: &ExpectBlock,
+    capture: &StepCapture,
+    actual_exit: i32,
+) -> Result<()> {
+    let mut failures: Vec<String> = Vec::new();
+
+    let expected_exit = expect.expected_exit();
+    if actual_exit != expected_exit {
+        failures.push(format!("exit: expected {expected_exit}, got {actual_exit}"));
+    }
+
+    if let Some(stdout_exp) = &expect.stdout {
+        check_stdio_expect(&capture.stdout, "stdout", stdout_exp, &mut failures);
+    }
+    if let Some(stderr_exp) = &expect.stderr {
+        check_stdio_expect(&capture.stderr, "stderr", stderr_exp, &mut failures);
+    }
+
+    if failures.is_empty() {
+        return Ok(());
+    }
+
+    for failure in &failures {
+        eprintln!("  {failure}");
+    }
+    anyhow::bail!(
+        "step '{}' failed outcome assertions: {}",
+        step_name,
+        failures.join("; ")
+    )
+}
+
+fn check_stdio_expect(
+    output: &str,
+    stream: &str,
+    expect: &StdioExpect,
+    failures: &mut Vec<String>,
+) {
+    for needle in &expect.contains {
+        if !output.contains(needle.as_str()) {
+            failures.push(format!(
+                "{stream}: expected to contain {:?}, not found",
+                needle
+            ));
+        }
+    }
+    for needle in &expect.not_contains {
+        if output.contains(needle.as_str()) {
+            failures.push(format!(
+                "{stream}: expected NOT to contain {:?}, but it was present",
+                needle
+            ));
+        }
+    }
 }
 
 fn resolve_step_timeout(step_timeout: Option<u64>, default_step_timeout: Duration) -> Duration {
@@ -1514,6 +1857,7 @@ run: echo ok
             shell: None,
             sudo: None,
             id: None,
+            expect: None,
         };
         assert_eq!(
             resolve_step_timeout(step.timeout, Duration::from_secs(300)),
@@ -1531,10 +1875,260 @@ run: echo ok
             shell: None,
             sudo: None,
             id: None,
+            expect: None,
         };
         assert_eq!(
             resolve_step_timeout(step.timeout, Duration::from_secs(1800)),
             Duration::from_secs(1800)
+        );
+    }
+
+    // --- check_expect_block ---
+
+    use super::{check_expect_block, check_stdio_expect, StepCapture};
+    use crate::plan::step::{ExpectBlock, StdioExpect};
+
+    fn make_capture(stdout: &str, stderr: &str) -> StepCapture {
+        StepCapture {
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
+        }
+    }
+
+    fn make_expect(
+        exit: Option<i32>,
+        stdout: Option<StdioExpect>,
+        stderr: Option<StdioExpect>,
+    ) -> ExpectBlock {
+        ExpectBlock {
+            exit,
+            stdout,
+            stderr,
+        }
+    }
+
+    #[test]
+    fn test_check_expect_exit_code_matches_succeeds() {
+        let expect = make_expect(Some(0), None, None);
+        let cap = make_capture("", "");
+        assert!(check_expect_block("step", &expect, &cap, 0).is_ok());
+    }
+
+    #[test]
+    fn test_check_expect_exit_code_mismatch_fails() {
+        let expect = make_expect(Some(0), None, None);
+        let cap = make_capture("", "");
+        let err = check_expect_block("step", &expect, &cap, 1).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("exit"), "should mention 'exit': {msg}");
+        assert!(
+            msg.contains("expected 0"),
+            "should mention expected 0: {msg}"
+        );
+        assert!(msg.contains("got 1"), "should mention got 1: {msg}");
+    }
+
+    #[test]
+    fn test_check_expect_nonzero_exit_matches_succeeds() {
+        let expect = make_expect(Some(2), None, None);
+        let cap = make_capture("", "");
+        assert!(check_expect_block("must-exit-2", &expect, &cap, 2).is_ok());
+    }
+
+    #[test]
+    fn test_check_expect_default_exit_zero() {
+        // No `exit:` in expect block → defaults to 0
+        let expect = make_expect(None, None, None);
+        let cap = make_capture("", "");
+        assert!(check_expect_block("step", &expect, &cap, 0).is_ok());
+        let err = check_expect_block("step", &expect, &cap, 1).unwrap_err();
+        assert!(err.to_string().contains("expected 0, got 1"));
+    }
+
+    #[test]
+    fn test_check_expect_stdout_contains_present_succeeds() {
+        let expect = make_expect(
+            None,
+            Some(StdioExpect {
+                contains: vec!["hello".to_string(), "world".to_string()],
+                not_contains: vec![],
+            }),
+            None,
+        );
+        let cap = make_capture("hello world\n", "");
+        assert!(check_expect_block("step", &expect, &cap, 0).is_ok());
+    }
+
+    #[test]
+    fn test_check_expect_stdout_contains_missing_fails() {
+        let expect = make_expect(
+            None,
+            Some(StdioExpect {
+                contains: vec!["missing".to_string()],
+                not_contains: vec![],
+            }),
+            None,
+        );
+        let cap = make_capture("something else\n", "");
+        let err = check_expect_block("step", &expect, &cap, 0).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("stdout"), "should mention stdout: {msg}");
+        assert!(msg.contains("missing"), "should mention needle: {msg}");
+        assert!(msg.contains("not found"), "should say not found: {msg}");
+    }
+
+    #[test]
+    fn test_check_expect_stdout_not_contains_absent_succeeds() {
+        let expect = make_expect(
+            None,
+            Some(StdioExpect {
+                contains: vec![],
+                not_contains: vec!["error".to_string()],
+            }),
+            None,
+        );
+        let cap = make_capture("all good\n", "");
+        assert!(check_expect_block("step", &expect, &cap, 0).is_ok());
+    }
+
+    #[test]
+    fn test_check_expect_stdout_not_contains_present_fails() {
+        let expect = make_expect(
+            None,
+            Some(StdioExpect {
+                contains: vec![],
+                not_contains: vec!["denied".to_string()],
+            }),
+            None,
+        );
+        let cap = make_capture("permission denied\n", "");
+        let err = check_expect_block("step", &expect, &cap, 0).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("stdout"), "should mention stdout: {msg}");
+        assert!(msg.contains("denied"), "should mention needle: {msg}");
+        assert!(
+            msg.contains("NOT to contain"),
+            "should say NOT to contain: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_check_expect_stderr_matchers_work() {
+        let expect = make_expect(
+            None,
+            None,
+            Some(StdioExpect {
+                contains: vec!["warn".to_string()],
+                not_contains: vec!["error".to_string()],
+            }),
+        );
+        // passes: stderr contains "warn" and does not contain "error"
+        let cap = make_capture("", "warning: something\n");
+        assert!(check_expect_block("step", &expect, &cap, 0).is_ok());
+        // fails: stderr contains forbidden "error"
+        let cap_bad = make_capture("", "error: bad\n");
+        let err = check_expect_block("step", &expect, &cap_bad, 0).unwrap_err();
+        assert!(err.to_string().contains("stderr"));
+    }
+
+    #[test]
+    fn test_check_expect_multiple_failures_all_reported() {
+        let expect = make_expect(
+            Some(0),
+            Some(StdioExpect {
+                contains: vec!["expected1".to_string(), "expected2".to_string()],
+                not_contains: vec!["forbidden".to_string()],
+            }),
+            None,
+        );
+        let cap = make_capture("forbidden text\n", "");
+        let err = check_expect_block("step", &expect, &cap, 1).unwrap_err();
+        let msg = err.to_string();
+        // All three failures (wrong exit, missing expected1, missing expected2, forbidden present)
+        // should appear in the error
+        assert!(msg.contains("exit"), "should mention exit: {msg}");
+        assert!(msg.contains("expected1"), "should mention expected1: {msg}");
+        assert!(msg.contains("expected2"), "should mention expected2: {msg}");
+        assert!(msg.contains("forbidden"), "should mention forbidden: {msg}");
+    }
+
+    #[test]
+    fn test_check_stdio_expect_all_contains_must_match() {
+        let expect = StdioExpect {
+            contains: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            not_contains: vec![],
+        };
+        let mut failures = Vec::new();
+        check_stdio_expect("a b", "stdout", &expect, &mut failures);
+        // "c" is missing
+        assert_eq!(failures.len(), 1, "one failure expected: {failures:?}");
+        assert!(
+            failures[0].contains("c"),
+            "failure should mention 'c': {:?}",
+            failures[0]
+        );
+    }
+
+    // --- run_host_step_capturing ---
+
+    #[test]
+    fn test_host_step_capturing_captures_stdout_and_stderr() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmpl = resolve_shell(Some("sh")).unwrap();
+        let env_file = tmp_env_file();
+        let log_file = tmp_step_log(dir.path());
+        let (cap, code) = super::run_host_step_capturing(
+            "capture-test",
+            "printf 'out-line\\n'; printf 'err-line\\n' >&2",
+            dir.path(),
+            test_budget(),
+            &tmpl,
+            &[],
+            HostStepFiles {
+                env_file: &env_file,
+                log_path: &log_file,
+            },
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(&env_file);
+        assert_eq!(code, 0, "exit code should be 0");
+        assert!(
+            cap.stdout.contains("out-line"),
+            "stdout should contain out-line: {:?}",
+            cap.stdout
+        );
+        assert!(
+            cap.stderr.contains("err-line"),
+            "stderr should contain err-line: {:?}",
+            cap.stderr
+        );
+    }
+
+    #[test]
+    fn test_host_step_capturing_returns_nonzero_exit_without_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmpl = resolve_shell(Some("sh")).unwrap();
+        let env_file = tmp_env_file();
+        let log_file = tmp_step_log(dir.path());
+        let (cap, code) = super::run_host_step_capturing(
+            "nonzero",
+            "echo failing; exit 2",
+            dir.path(),
+            test_budget(),
+            &tmpl,
+            &[],
+            HostStepFiles {
+                env_file: &env_file,
+                log_path: &log_file,
+            },
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(&env_file);
+        assert_eq!(code, 2, "should return exit code 2, got {code}");
+        assert!(
+            cap.stdout.contains("failing"),
+            "stdout should contain 'failing': {:?}",
+            cap.stdout
         );
     }
 }

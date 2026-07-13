@@ -1324,6 +1324,13 @@ pub(crate) fn validate_build_steps(steps: &[TestStep]) -> Result<()> {
     for step in steps {
         match step {
             TestStep::Run(step) => {
+                if step.expect.is_some() {
+                    anyhow::bail!(
+                        "build step '{}': 'expect:' is only allowed on 'type: test' steps; \
+                         build steps must not carry outcome assertions",
+                        step.name
+                    );
+                }
                 if step.target == StepTarget::Host && step.sudo == Some(true) {
                     anyhow::bail!(
                         "build step '{}': 'sudo: true' is only supported on 'on: guest' steps",
@@ -1929,6 +1936,7 @@ steps:
             shell: None,
             sudo: None,
             id: None,
+            expect: None,
         })
     }
 
@@ -4533,6 +4541,40 @@ steps:
         run.shell = Some("fish".to_string());
         let err = validate_build_steps(&[step]).unwrap_err();
         assert!(format!("{err:#}").contains("fish"));
+    }
+
+    #[test]
+    fn test_validate_build_steps_rejects_expect_block() {
+        use crate::plan::step::{ExpectBlock, StdioExpect};
+        let mut step = make_step(StepTarget::Guest, "assert-step");
+        let TestStep::Run(run) = &mut step else {
+            panic!("expected run step");
+        };
+        run.expect = Some(ExpectBlock {
+            exit: Some(0),
+            stdout: Some(StdioExpect {
+                contains: vec!["ok".to_string()],
+                not_contains: vec![],
+            }),
+            stderr: None,
+        });
+        let err = validate_build_steps(&[step]).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("assert-step"),
+            "error should mention step name: {msg}"
+        );
+        assert!(
+            msg.contains("expect"),
+            "error should mention 'expect': {msg}"
+        );
+        assert!(msg.contains("test"), "error should mention 'test': {msg}");
+    }
+
+    #[test]
+    fn test_validate_build_steps_accepts_step_without_expect() {
+        let step = make_step(StepTarget::Guest, "no-expect");
+        assert!(validate_build_steps(&[step]).is_ok());
     }
 
     #[test]
