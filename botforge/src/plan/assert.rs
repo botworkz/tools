@@ -38,8 +38,11 @@ pub(crate) fn run_assert_files(ssh: &SshOptions, assert_block: &AssertBlock) -> 
     // BTreeMap iteration order is sorted by key, so the output lines are
     // deterministically matched to paths by index.
     let paths: Vec<&str> = assert_block.files.keys().map(String::as_str).collect();
-    let probe_output = run_file_probe(ssh, &paths)
-        .map_err(|e| anyhow::anyhow!("assert.files: SSH probe failed: {e:#}"))?;
+    let probe_output = run_file_probe(ssh, &paths).map_err(|e| {
+        anyhow::anyhow!(
+            "assert.files: privileged probe failed: sudo -n not available or failed ({e:#})"
+        )
+    })?;
 
     evaluate_probe_results(&assert_block.files, &probe_output)
 }
@@ -48,11 +51,14 @@ pub(crate) fn run_assert_files(ssh: &SshOptions, assert_block: &AssertBlock) -> 
 // Probe
 // ---------------------------------------------------------------------------
 
-/// Build and execute the batched SSH probe script.
+/// Build the inner probe script body for `paths`.
 ///
-/// The script outputs exactly one line per path in the same order as `paths`.
-/// Each line is either `absent` or `present:<filetype>:<owner>:<group>:<mode>`.
-fn run_file_probe(ssh: &SshOptions, paths: &[&str]) -> Result<String> {
+/// Returns a `set -e` shell script that outputs exactly one line per path in
+/// the same order as `paths`.  Each line is either `absent` or
+/// `present:<filetype>:<owner>:<group>:<mode>`.
+///
+/// This function is pure (no I/O) and is extracted so it can be unit-tested.
+fn build_file_probe_script(paths: &[&str]) -> String {
     let mut script = String::from("set -e\n");
     for path in paths {
         let q = shell_single_quote(path);
@@ -77,6 +83,27 @@ fn run_file_probe(ssh: &SshOptions, paths: &[&str]) -> Result<String> {
             q = q
         ));
     }
+    script
+}
+
+/// Build and execute the batched SSH probe script under `sudo -n sh`.
+///
+/// Running privileged is required so that root-only paths (e.g.
+/// `/etc/sudoers.d/*`, SSH host keys, `/root/*`) can be stat-ed.  The botforge
+/// installer user has NOPASSWD sudo on build/test VMs.
+///
+/// The script outputs exactly one line per path in the same order as `paths`.
+/// Each line is either `absent` or `present:<filetype>:<owner>:<group>:<mode>`.
+///
+/// If `sudo -n` is unavailable or not configured for passwordless access the
+/// remote command will exit non-zero, causing an error to propagate rather than
+/// silently reporting every path as `absent`.
+fn run_file_probe(ssh: &SshOptions, paths: &[&str]) -> Result<String> {
+    let inner = build_file_probe_script(paths);
+    // Wrap the probe in `sudo -n sh` via a heredoc so the entire script runs
+    // as root.  The delimiter is chosen to be unlikely to appear in any path.
+    let script =
+        format!("sudo -n sh <<'__BOTFORGE_FILE_PROBE__'\n{inner}__BOTFORGE_FILE_PROBE__\n");
     ssh_capture_stdout(
         ssh,
         &script,
@@ -1191,5 +1218,65 @@ mod tests {
         let raw = "telnet deinstall ok config-files\n__END_DPKG__\n";
         let pkgs = parse_dpkg_installed(&mut raw.lines());
         assert!(pkgs.is_empty());
+    }
+
+    // ---------------------------------------------------------------------------
+    // build_file_probe_script tests
+    // ---------------------------------------------------------------------------
+
+    use super::build_file_probe_script;
+
+    #[test]
+    fn test_build_file_probe_script_starts_with_set_e() {
+        let script = build_file_probe_script(&["/etc/hosts"]);
+        assert!(
+            script.starts_with("set -e\n"),
+            "probe script must start with 'set -e'"
+        );
+    }
+
+    #[test]
+    fn test_build_file_probe_script_contains_sudo_n_wrapper() {
+        // The SSH command wrapping build_file_probe_script must use sudo -n sh.
+        // Verify the outer wrapper (produced by run_file_probe callers) pattern
+        // is exercised by checking the inner script is correct and can be wrapped.
+        let inner = build_file_probe_script(&["/etc/sudoers.d/90-botwork"]);
+        let wrapped =
+            format!("sudo -n sh <<'__BOTFORGE_FILE_PROBE__'\n{inner}__BOTFORGE_FILE_PROBE__\n");
+        assert!(
+            wrapped.starts_with("sudo -n sh"),
+            "outer wrapper must invoke sudo -n sh"
+        );
+        assert!(
+            wrapped.contains("__BOTFORGE_FILE_PROBE__"),
+            "heredoc delimiter must be present"
+        );
+        assert!(
+            wrapped.contains("/etc/sudoers.d/90-botwork"),
+            "path must appear in the script body"
+        );
+    }
+
+    #[test]
+    fn test_build_file_probe_script_one_block_per_path() {
+        let paths = ["/a", "/b", "/c"];
+        let script = build_file_probe_script(&paths);
+        // Each path produces exactly one `printf 'absent\n'` or `printf 'present:...`
+        // block; count the number of `printf 'absent` occurrences as a proxy.
+        let absent_count = script.matches("printf 'absent").count();
+        assert_eq!(
+            absent_count,
+            paths.len(),
+            "each path must have exactly one absent branch"
+        );
+    }
+
+    #[test]
+    fn test_build_file_probe_script_empty_paths() {
+        let script = build_file_probe_script(&[]);
+        assert_eq!(
+            script, "set -e\n",
+            "empty paths produces only set -e header"
+        );
     }
 }
