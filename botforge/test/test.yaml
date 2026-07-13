@@ -36,6 +36,15 @@ assert:
       mode: "644"
     /tmp/should-not-exist-botforge-ci-test:
       exists: false
+    # Regression guard for #352 (assert.files: privileged probe).
+    # 0440 root:root inside a 0750 root:root dir — the pre-#352 unprivileged
+    # probe reported this absent; the privileged probe must see it as present.
+    /etc/botforge-ci-restricted/probe-test:
+      exists: true
+      filetype: file
+      owner: root
+      group: root
+      mode: "0440"
   packages:
     python3-virtualenv:
       installed: true
