@@ -13,7 +13,7 @@ use crate::ssh::{
 };
 use crate::util::unique_suffix;
 
-use super::assert::run_assert_files;
+use super::assert::{run_assert_files, run_assert_groups, run_assert_users};
 use super::config::{AssertBlock, TestConfig, TestIsoBootstrap};
 use super::files::{stage_files, FileEntry};
 use super::log::{
@@ -73,6 +73,7 @@ pub(crate) fn run_test_flow(
     bootstraps: &[TestIsoBootstrap],
     manifest_path: &Path,
     cache_dir_override: Option<&Path>,
+    installer_username: Option<&str>,
 ) -> Result<()> {
     run_step_flow(
         repo_root,
@@ -95,15 +96,30 @@ pub(crate) fn run_test_flow(
 
     // Run the declarative `assert:` phase as an implicit final step (test-only).
     if let Some(ref assert_block) = config.assert {
-        run_assert_phase(ssh, assert_block)?;
+        run_assert_phase(ssh, assert_block, installer_username)?;
     }
     Ok(())
 }
 
 /// Execute the `assert:` block as an implicit final phase.
-fn run_assert_phase(ssh: &SshOptions, assert_block: &AssertBlock) -> Result<()> {
+///
+/// `installer_username` is the ephemeral botforge installer account for this
+/// run (e.g. `botforge-abc123`).  It is excluded from pattern-based negative
+/// user assertions so that `botforge-*: { exists: false }` does not spuriously
+/// fail against botforge's own installer.
+fn run_assert_phase(
+    ssh: &SshOptions,
+    assert_block: &AssertBlock,
+    installer_username: Option<&str>,
+) -> Result<()> {
     if !assert_block.files.is_empty() {
         run_assert_files(ssh, assert_block)?;
+    }
+    if !assert_block.users.is_empty() {
+        run_assert_users(ssh, assert_block, installer_username)?;
+    }
+    if !assert_block.groups.is_empty() {
+        run_assert_groups(ssh, assert_block)?;
     }
     Ok(())
 }
