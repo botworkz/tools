@@ -111,9 +111,11 @@ pub(crate) fn run_test_flow(
 /// before any `steps:` entry).
 ///
 /// `installer_username` is the ephemeral botforge installer account for this
-/// run (e.g. `botforge-abc123`).  It is excluded from pattern-based negative
-/// user assertions so that `botforge-*: { exists: false }` does not spuriously
-/// fail against botforge's own installer.
+/// run (e.g. `botforge-abc123`).  Both the installer user and its same-named
+/// primary group are excluded from pattern-based assertions (positive and
+/// negative) so that `botforge-*: { exists: false }` does not spuriously fail
+/// and `botforge-*: { exists: true }` cannot be satisfied by the installer
+/// identity alone.
 fn run_assert_phase(
     ssh: &SshOptions,
     assert_block: &AssertBlock,
@@ -126,7 +128,7 @@ fn run_assert_phase(
         run_assert_users(ssh, assert_block, installer_username)?;
     }
     if !assert_block.groups.is_empty() {
-        run_assert_groups(ssh, assert_block)?;
+        run_assert_groups(ssh, assert_block, installer_username)?;
     }
     if !assert_block.packages.is_empty() {
         run_assert_packages(ssh, assert_block)?;
