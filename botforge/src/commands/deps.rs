@@ -2,29 +2,46 @@ use anyhow::{Context, Result};
 use clap::Args;
 use shasset::fetch::{fetch_asset, FetchParams, MaterializeMode, Transport};
 use shasset::manifest::{load, Asset};
+use shasset::prune::{format_prune_summary, prune_cache};
 use std::path::{Path, PathBuf};
 
 use crate::util::{default_cache_dir, materialize_flat, validate_flat_filename};
 
 #[derive(Args, Debug)]
 pub(crate) struct DepsArgs {
-    /// Asset name to fetch (all assets if omitted).
+    /// Asset name to fetch (all assets if omitted; ignored when `--prune` is set).
+    #[arg(conflicts_with = "prune")]
     name: Option<String>,
     /// Flat output directory; each asset is materialized to `<out>/<asset-filename>`.
-    #[arg(long, required = true)]
-    out: PathBuf,
+    /// Required when fetching; mutually exclusive with `--prune`.
+    #[arg(long, required_unless_present = "prune", conflicts_with = "prune")]
+    out: Option<PathBuf>,
     /// Cache directory (default: `~/.cache/shasset`).
     #[arg(long)]
     cache_dir: Option<PathBuf>,
-    /// Skip re-verifying cache blobs before use.
-    #[arg(long)]
+    /// Skip re-verifying cache blobs before use (fetch mode only).
+    #[arg(long, conflicts_with = "prune")]
     no_reverify: bool,
-    /// Set the executable bit (0o755) on each staged file (Unix only).
-    #[arg(long)]
+    /// Set the executable bit (0o755) on each staged file (fetch mode only; Unix only).
+    #[arg(long, conflicts_with = "prune")]
     executable: bool,
+    /// Prune the shasset cache: remove blobs not referenced by the current manifest
+    /// and clear stale quarantine/oci-index entries.  Mutually exclusive with `--out`.
+    #[arg(long)]
+    prune: bool,
+    /// Report what would be removed without actually deleting (only meaningful with `--prune`).
+    #[arg(long, requires = "prune")]
+    dry_run: bool,
 }
 
 pub(crate) fn cmd_deps(config: &Path, args: DepsArgs) -> Result<()> {
+    if args.prune {
+        let manifest = load(config)?;
+        let cache_dir = args.cache_dir.unwrap_or_else(default_cache_dir);
+        let summary = prune_cache(&cache_dir, &manifest, args.dry_run)?;
+        println!("{}", format_prune_summary(&summary, args.dry_run));
+        return Ok(());
+    }
     cmd_deps_with_transport(config, args, || None)
 }
 
@@ -34,6 +51,9 @@ where
 {
     let manifest = load(config)?;
     let cache_dir = args.cache_dir.unwrap_or_else(default_cache_dir);
+    let out = args
+        .out
+        .expect("--out is required in fetch mode (enforced by clap)");
 
     let targets: Vec<(&str, &Asset)> = if let Some(ref name) = args.name {
         let asset = manifest
@@ -54,8 +74,8 @@ where
         return Ok(());
     }
 
-    std::fs::create_dir_all(&args.out)
-        .with_context(|| format!("cannot create output dir: {}", args.out.display()))?;
+    std::fs::create_dir_all(&out)
+        .with_context(|| format!("cannot create output dir: {}", out.display()))?;
 
     for (name, asset) in targets {
         if asset.expanded_uri().starts_with("oci://") && asset.checksum.is_some() {
@@ -78,7 +98,7 @@ where
 
         let filename = oci_or_default_filename(name, asset)
             .with_context(|| format!("asset '{name}': cannot determine output filename"))?;
-        let out_path = materialize_flat(&fetched.blob_path, &args.out, &filename, args.executable)
+        let out_path = materialize_flat(&fetched.blob_path, &out, &filename, args.executable)
             .with_context(|| format!("failed to stage asset '{name}'"))?;
         println!("fetched '{}' → {}", name, out_path.display());
     }
@@ -110,7 +130,7 @@ fn oci_or_default_filename(asset_key: &str, asset: &Asset) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{cmd_deps_with_transport, oci_or_default_filename, DepsArgs};
+    use super::{cmd_deps, cmd_deps_with_transport, oci_or_default_filename, DepsArgs};
     use shasset::fetch::{DownloadResponse, FetchError, Transport};
     use shasset::manifest::Asset;
     use std::io::Cursor;
@@ -163,10 +183,12 @@ mod tests {
             &manifest,
             DepsArgs {
                 name: None,
-                out: out.clone(),
+                out: Some(out.clone()),
                 cache_dir: Some(cache.clone()),
                 no_reverify: false,
                 executable: true,
+                prune: false,
+                dry_run: false,
             },
             || transport.take(),
         )
@@ -212,10 +234,12 @@ mod tests {
             &manifest,
             DepsArgs {
                 name: None,
-                out: out.clone(),
+                out: Some(out.clone()),
                 cache_dir: Some(cache),
                 no_reverify: false,
                 executable: false,
+                prune: false,
+                dry_run: false,
             },
             || transport.take(),
         )
@@ -277,5 +301,88 @@ mod tests {
             labels: Default::default(),
         };
         assert!(oci_or_default_filename("session-broker", &asset).is_err());
+    }
+
+    #[test]
+    fn deps_prune_removes_unreferenced_blob_and_keeps_referenced_blob() {
+        let tmp = TempDir::new().unwrap();
+        let manifest_path = tmp.path().join("shasset.yaml");
+        let cache = tmp.path().join("cache");
+        let kept_hex = "a".repeat(64);
+        let removed_hex = "b".repeat(64);
+        let blobs_dir = cache.join("blobs").join("sha256");
+        std::fs::create_dir_all(&blobs_dir).unwrap();
+        std::fs::write(blobs_dir.join(&kept_hex), b"keep").unwrap();
+        std::fs::write(blobs_dir.join(&removed_hex), b"gone!").unwrap();
+
+        std::fs::write(
+            &manifest_path,
+            format!(
+                "settings:\n  retries: 0\nassets:\n  kept:\n    uri: https://example.com/v1/tool\n    version: \"1\"\n    checksum: sha256:{kept_hex}\n    filename: tool.bin\n"
+            ),
+        )
+        .unwrap();
+
+        cmd_deps(
+            &manifest_path,
+            DepsArgs {
+                name: None,
+                out: None,
+                cache_dir: Some(cache.clone()),
+                no_reverify: false,
+                executable: false,
+                prune: true,
+                dry_run: false,
+            },
+        )
+        .unwrap();
+
+        assert!(
+            blobs_dir.join(&kept_hex).exists(),
+            "referenced blob must be kept"
+        );
+        assert!(
+            !blobs_dir.join(&removed_hex).exists(),
+            "unreferenced blob must be removed"
+        );
+    }
+
+    #[test]
+    fn deps_prune_dry_run_removes_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let manifest_path = tmp.path().join("shasset.yaml");
+        let cache = tmp.path().join("cache");
+        let kept_hex = "a".repeat(64);
+        let removed_hex = "b".repeat(64);
+        let blobs_dir = cache.join("blobs").join("sha256");
+        std::fs::create_dir_all(&blobs_dir).unwrap();
+        std::fs::write(blobs_dir.join(&kept_hex), b"keep").unwrap();
+        std::fs::write(blobs_dir.join(&removed_hex), b"gone!").unwrap();
+
+        std::fs::write(
+            &manifest_path,
+            format!(
+                "settings:\n  retries: 0\nassets:\n  kept:\n    uri: https://example.com/v1/tool\n    version: \"1\"\n    checksum: sha256:{kept_hex}\n    filename: tool.bin\n"
+            ),
+        )
+        .unwrap();
+
+        cmd_deps(
+            &manifest_path,
+            DepsArgs {
+                name: None,
+                out: None,
+                cache_dir: Some(cache.clone()),
+                no_reverify: false,
+                executable: false,
+                prune: true,
+                dry_run: true,
+            },
+        )
+        .unwrap();
+
+        // dry-run: both blobs must still exist
+        assert!(blobs_dir.join(&kept_hex).exists());
+        assert!(blobs_dir.join(&removed_hex).exists());
     }
 }
