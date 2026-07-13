@@ -323,29 +323,22 @@ pub(crate) fn run_assert_users(
 
     // Evaluate pattern entries using the full passwd dump.
     if !pattern_entries.is_empty() {
-        // Collect remaining lines up to __END_PASSWD__ sentinel.
-        let mut all_usernames: Vec<String> = Vec::new();
-        for line in lines.by_ref() {
-            if line == "__END_PASSWD__" {
-                break;
-            }
-            // getent passwd lines: name:password:uid:gid:gecos:home:shell
-            if let Some(uname) = line.split(':').next() {
-                if !uname.is_empty() {
-                    all_usernames.push(uname.to_string());
-                }
-            }
-        }
+        // Collect remaining lines up to __END_PASSWD__ sentinel, filtering out
+        // the installer identity so it is invisible to all pattern assertions
+        // (positive and negative).
+        let all_usernames =
+            parse_names_from_dump(&mut lines, "__END_PASSWD__", installer_username);
 
         for (pattern, expectation) in &pattern_entries {
             let glob_pat = glob::Pattern::new(pattern)
                 .unwrap_or_else(|_| glob::Pattern::new("__no_match__").unwrap());
 
             if !expectation.exists {
-                // Negative pattern: no matching user (except the installer) may exist.
+                // Negative pattern: no matching user may exist (installer already
+                // excluded from the candidate list).
                 let matched: Vec<&str> = all_usernames
                     .iter()
-                    .filter(|u| glob_pat.matches(u) && Some(u.as_str()) != installer_username)
+                    .filter(|u| glob_pat.matches(u))
                     .map(String::as_str)
                     .collect();
 
@@ -467,7 +460,17 @@ fn check_user_groups(name: &str, expectation: &AssertUser, groups_line: &str) ->
 ///
 /// Probes via `getent group` for existence.  Pattern keys are matched against
 /// all group names from `getent group`.
-pub(crate) fn run_assert_groups(ssh: &SshOptions, assert_block: &AssertBlock) -> Result<()> {
+///
+/// `installer_username` is the ephemeral botforge installer account for this
+/// run.  The installer's same-named primary group is **excluded** from the
+/// candidate set before any matching so that `botforge-*: { exists: false }`
+/// does not spuriously fail, and so that `botforge-*: { exists: true }` cannot
+/// be satisfied by the installer group alone.
+pub(crate) fn run_assert_groups(
+    ssh: &SshOptions,
+    assert_block: &AssertBlock,
+    installer_username: Option<&str>,
+) -> Result<()> {
     if assert_block.groups.is_empty() {
         return Ok(());
     }
@@ -536,46 +539,50 @@ pub(crate) fn run_assert_groups(ssh: &SshOptions, assert_block: &AssertBlock) ->
 
     // Evaluate pattern entries.
     if !pattern_entries.is_empty() {
-        let mut all_groups: Vec<String> = Vec::new();
-        for line in lines.by_ref() {
-            if line == "__END_GROUP__" {
-                break;
-            }
-            // getent group lines: name:password:gid:members
-            if let Some(gname) = line.split(':').next() {
-                if !gname.is_empty() {
-                    all_groups.push(gname.to_string());
-                }
-            }
-        }
+        // Collect remaining lines up to __END_GROUP__ sentinel, filtering out
+        // the installer identity (its same-named primary group) so it is
+        // invisible to all pattern assertions (positive and negative).
+        let all_groups =
+            parse_names_from_dump(&mut lines, "__END_GROUP__", installer_username);
 
         for (pattern, expectation) in &pattern_entries {
             let glob_pat = glob::Pattern::new(pattern)
                 .unwrap_or_else(|_| glob::Pattern::new("__no_match__").unwrap());
 
             if !expectation.exists {
+                // Negative pattern: no matching group may exist (installer already
+                // excluded from the candidate list).
                 let matched: Vec<&str> = all_groups
                     .iter()
                     .filter(|g| glob_pat.matches(g))
                     .map(String::as_str)
                     .collect();
                 if matched.is_empty() {
-                    print_phase_status(
-                        "assert",
-                        &format!(r#"groups: no group matching "{pattern}""#),
-                        true,
-                    );
+                    let label = match installer_username {
+                        Some(inst) => format!(
+                            r#"no group matching "{pattern}" (excluding installer "{inst}")"#
+                        ),
+                        None => format!(r#"no group matching "{pattern}""#),
+                    };
+                    print_phase_status("assert", &format!("groups: {label}"), true);
                 } else {
                     for found in matched {
-                        let label = format!(
-                            r#"expected no group matching "{pattern}", but found "{found}""#
-                        );
+                        let label = match installer_username {
+                            Some(inst) => format!(
+                                r#"expected no group matching "{pattern}" (excluding installer "{inst}"), but found "{found}""#
+                            ),
+                            None => format!(
+                                r#"expected no group matching "{pattern}", but found "{found}""#
+                            ),
+                        };
                         eprintln!("         {label}");
                         print_phase_status("assert", &format!("groups: {label}"), false);
                         any_failed = true;
                     }
                 }
             } else {
+                // Positive pattern: at least one matching group must exist (installer
+                // excluded from candidates, so it cannot satisfy this assertion alone).
                 let matched: Vec<&str> = all_groups
                     .iter()
                     .filter(|g| glob_pat.matches(g))
@@ -606,6 +613,32 @@ pub(crate) fn run_assert_groups(ssh: &SshOptions, assert_block: &AssertBlock) ->
 /// Returns `true` if the string contains any glob metacharacters (`*`, `?`, `[`).
 fn is_glob_pattern(s: &str) -> bool {
     s.contains('*') || s.contains('?') || s.contains('[')
+}
+
+/// Parse a `getent passwd` or `getent group` output dump up to a sentinel line,
+/// extracting the first colon-separated field (name) from each line.
+///
+/// If `installer` is `Some(name)`, that exact name is **omitted** from the
+/// returned list so it is invisible to all pattern assertions — positive and
+/// negative, exact and glob — for both users and groups.  This is the single,
+/// authoritative place where the ephemeral installer identity is filtered.
+fn parse_names_from_dump<'a>(
+    lines: &mut impl Iterator<Item = &'a str>,
+    sentinel: &str,
+    installer: Option<&str>,
+) -> Vec<String> {
+    let mut names = Vec::new();
+    for line in lines {
+        if line == sentinel {
+            break;
+        }
+        if let Some(name) = line.split(':').next() {
+            if !name.is_empty() && Some(name) != installer {
+                names.push(name.to_string());
+            }
+        }
+    }
+    names
 }
 
 // ---------------------------------------------------------------------------
@@ -1191,5 +1224,67 @@ mod tests {
         let raw = "telnet deinstall ok config-files\n__END_DPKG__\n";
         let pkgs = parse_dpkg_installed(&mut raw.lines());
         assert!(pkgs.is_empty());
+    }
+
+    // ---------------------------------------------------------------------------
+    // parse_names_from_dump tests
+    // ---------------------------------------------------------------------------
+
+    use super::parse_names_from_dump;
+
+    #[test]
+    fn test_parse_names_from_dump_basic_passwd() {
+        let raw = "root:x:0:0::/root:/bin/bash\nbot:x:1000:1000::/home/bot:/bin/bash\n__END_PASSWD__\n";
+        let names = parse_names_from_dump(&mut raw.lines(), "__END_PASSWD__", None);
+        assert_eq!(names, vec!["root", "bot"]);
+    }
+
+    #[test]
+    fn test_parse_names_from_dump_basic_group() {
+        let raw = "root:x:0:\nbot:x:1000:bot\n__END_GROUP__\n";
+        let names = parse_names_from_dump(&mut raw.lines(), "__END_GROUP__", None);
+        assert_eq!(names, vec!["root", "bot"]);
+    }
+
+    #[test]
+    fn test_parse_names_from_dump_filters_installer_user() {
+        // The installer user must be removed from the candidate set.
+        let raw = "root:x:0:0::/root:/bin/bash\nbotforge-abc123:x:999:999::/home/botforge-abc123:/usr/sbin/nologin\nbot:x:1000:1000::/home/bot:/bin/bash\n__END_PASSWD__\n";
+        let names =
+            parse_names_from_dump(&mut raw.lines(), "__END_PASSWD__", Some("botforge-abc123"));
+        assert_eq!(names, vec!["root", "bot"]);
+    }
+
+    #[test]
+    fn test_parse_names_from_dump_filters_installer_group() {
+        // The installer's same-named primary group must be removed from the candidate set.
+        let raw = "root:x:0:\nbotforge-abc123:x:999:botforge-abc123\nbot:x:1000:bot\n__END_GROUP__\n";
+        let names =
+            parse_names_from_dump(&mut raw.lines(), "__END_GROUP__", Some("botforge-abc123"));
+        assert_eq!(names, vec!["root", "bot"]);
+    }
+
+    #[test]
+    fn test_parse_names_from_dump_filters_only_exact_installer() {
+        // A genuinely leaked name that is different from the installer must NOT be filtered.
+        let raw = "root:x:0:0::/root:/bin/bash\nbotforge-evil:x:998:998::/:/nologin\nbotforge-abc123:x:999:999::/:/nologin\n__END_PASSWD__\n";
+        let names =
+            parse_names_from_dump(&mut raw.lines(), "__END_PASSWD__", Some("botforge-abc123"));
+        assert_eq!(names, vec!["root", "botforge-evil"]);
+    }
+
+    #[test]
+    fn test_parse_names_from_dump_stops_at_sentinel() {
+        let raw = "foo:x:1:1::/:/nologin\n__END_PASSWD__\nbar:x:2:2::/:/nologin\n";
+        let names = parse_names_from_dump(&mut raw.lines(), "__END_PASSWD__", None);
+        assert_eq!(names, vec!["foo"]);
+    }
+
+    #[test]
+    fn test_parse_names_from_dump_no_installer_keeps_all() {
+        // When installer is None, no filtering occurs.
+        let raw = "botforge-abc123:x:999:999::/:/nologin\nbot:x:1000:1000::/home/bot:/bin/bash\n__END_PASSWD__\n";
+        let names = parse_names_from_dump(&mut raw.lines(), "__END_PASSWD__", None);
+        assert_eq!(names, vec!["botforge-abc123", "bot"]);
     }
 }
