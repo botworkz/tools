@@ -16,6 +16,46 @@ pub(crate) enum StepTarget {
     Host,
 }
 
+/// Per-stream matchers for an `expect:` block.
+///
+/// `contains` is an AND over its list: **all** strings must appear in the output.
+/// `not_contains` is an AND-of-negations: **none** of the strings may appear.
+#[derive(Debug, Deserialize, Default, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StdioExpect {
+    /// All strings in this list must appear in the stream output (AND).
+    #[serde(default)]
+    pub(crate) contains: Vec<String>,
+    /// No string in this list may appear in the stream output (AND-of-negations).
+    #[serde(default)]
+    pub(crate) not_contains: Vec<String>,
+}
+
+/// Declarative outcome assertions for a `type: test` run step.
+///
+/// Honored only for `type: test` runs.  `validate_build_steps` rejects any build step
+/// that carries an `expect:` block with a clear error.
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ExpectBlock {
+    /// Expected exit code.  Defaults to `0` when `expect:` is present but `exit:` is absent.
+    #[serde(default)]
+    pub(crate) exit: Option<i32>,
+    /// Matchers applied to the step's stdout.
+    #[serde(default)]
+    pub(crate) stdout: Option<StdioExpect>,
+    /// Matchers applied to the step's stderr.
+    #[serde(default)]
+    pub(crate) stderr: Option<StdioExpect>,
+}
+
+impl ExpectBlock {
+    /// The expected exit code; defaults to `0` when `exit:` is absent.
+    pub(crate) fn expected_exit(&self) -> i32 {
+        self.exit.unwrap_or(0)
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RunStep {
@@ -44,6 +84,10 @@ pub(crate) struct RunStep {
     /// not required to be unique and is not addressable by other steps.
     #[serde(default)]
     pub(crate) id: Option<String>,
+    /// Declarative outcome assertions (test-only; rejected on build steps by
+    /// `validate_build_steps`).
+    #[serde(default)]
+    pub(crate) expect: Option<ExpectBlock>,
 }
 
 impl RunStep {
@@ -423,5 +467,117 @@ surprise: nope
         )
         .unwrap_err();
         assert!(err.to_string().contains("unknown field"));
+    }
+
+    // --- expect: block ---
+
+    #[test]
+    fn test_expect_block_parses_full() {
+        let step: RunStep = serde_yaml::from_str(
+            r#"
+name: check-service
+run: systemctl is-enabled foo.service
+expect:
+  exit: 0
+  stdout:
+    contains: [enabled]
+    not_contains: [masked, disabled]
+  stderr:
+    not_contains: [error]
+"#,
+        )
+        .unwrap();
+        let expect = step.expect.expect("expect should be Some");
+        assert_eq!(expect.exit, Some(0));
+        let stdout = expect.stdout.expect("stdout should be Some");
+        assert_eq!(stdout.contains, vec!["enabled"]);
+        assert_eq!(stdout.not_contains, vec!["masked", "disabled"]);
+        let stderr = expect.stderr.expect("stderr should be Some");
+        assert!(stderr.contains.is_empty());
+        assert_eq!(stderr.not_contains, vec!["error"]);
+    }
+
+    #[test]
+    fn test_expect_block_absent_yields_none() {
+        let step: RunStep = serde_yaml::from_str(
+            r#"
+name: no-expect
+run: echo ok
+"#,
+        )
+        .unwrap();
+        assert!(step.expect.is_none());
+    }
+
+    #[test]
+    fn test_expect_block_exit_only() {
+        let step: RunStep = serde_yaml::from_str(
+            r#"
+name: must-fail
+run: exit 2
+expect:
+  exit: 2
+"#,
+        )
+        .unwrap();
+        let expect = step.expect.expect("expect should be Some");
+        assert_eq!(expect.exit, Some(2));
+        assert!(expect.stdout.is_none());
+        assert!(expect.stderr.is_none());
+        assert_eq!(expect.expected_exit(), 2);
+    }
+
+    #[test]
+    fn test_expect_block_default_exit_is_zero() {
+        let step: RunStep = serde_yaml::from_str(
+            r#"
+name: default-exit
+run: echo hi
+expect:
+  stdout:
+    contains: [hi]
+"#,
+        )
+        .unwrap();
+        let expect = step.expect.expect("expect should be Some");
+        assert_eq!(expect.exit, None);
+        assert_eq!(expect.expected_exit(), 0);
+    }
+
+    #[test]
+    fn test_expect_block_unknown_field_is_rejected() {
+        let err = serde_yaml::from_str::<RunStep>(
+            r#"
+name: bad
+run: echo ok
+expect:
+  exit: 0
+  unknown_key: true
+"#,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("unknown field"),
+            "should reject unknown field in expect block: {err}"
+        );
+    }
+
+    #[test]
+    fn test_stdio_expect_unknown_field_is_rejected() {
+        let err = serde_yaml::from_str::<RunStep>(
+            r#"
+name: bad
+run: echo ok
+expect:
+  stdout:
+    contains: [ok]
+    unexpected: true
+"#,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("unknown field"),
+            "should reject unknown field in stdout expect block: {err}"
+        );
     }
 }

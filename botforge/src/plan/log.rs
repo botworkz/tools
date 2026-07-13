@@ -239,6 +239,43 @@ fn stream_child_output<R: Read, W: Write>(
     Ok(())
 }
 
+/// Like `stream_child_output` but also accumulates all bytes into `cap` for
+/// post-execution expectation matching.
+fn stream_child_output_capturing<R: Read, W: Write>(
+    mut reader: R,
+    mut writer: W,
+    stream: StepOutputStream,
+    logger: &StepLogWriter,
+    cap: &Arc<Mutex<Vec<u8>>>,
+) -> Result<()> {
+    let mut chunk = [0u8; 8192];
+    let mut pending = Vec::new();
+    loop {
+        let bytes_read = reader
+            .read(&mut chunk)
+            .context("failed to read child process output")?;
+        if bytes_read == 0 {
+            break;
+        }
+        let slice = &chunk[..bytes_read];
+        write_all_resilient(&mut writer, slice)
+            .context("failed to forward child process output")?;
+        cap.lock()
+            .map_err(|_| anyhow::anyhow!("capture buffer mutex poisoned"))?
+            .extend_from_slice(slice);
+        pending.extend_from_slice(slice);
+        while let Some(pos) = pending.iter().position(|&b| b == b'\n') {
+            let mut line = pending.drain(..=pos).collect::<Vec<_>>();
+            line.pop();
+            logger.log_line(stream, &line)?;
+        }
+    }
+    if !pending.is_empty() {
+        logger.log_line(stream, &pending)?;
+    }
+    Ok(())
+}
+
 pub(super) fn spawn_output_forwarder<R: Read + Send + 'static>(
     reader: R,
     stream: StepOutputStream,
@@ -254,6 +291,30 @@ pub(super) fn spawn_output_forwarder<R: Read + Send + 'static>(
             stream_child_output(reader, stderr.lock(), stream, &logger)
         }
     })
+}
+
+/// Like `spawn_output_forwarder` but also captures all output in a shared buffer.
+///
+/// Returns the join handle and the capture buffer; the buffer is fully populated
+/// once the handle has been joined.
+pub(super) fn spawn_capturing_forwarder<R: Read + Send + 'static>(
+    reader: R,
+    stream: StepOutputStream,
+    logger: Arc<StepLogWriter>,
+) -> (JoinHandle<Result<()>>, Arc<Mutex<Vec<u8>>>) {
+    let cap: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let cap_clone = Arc::clone(&cap);
+    let handle = std::thread::spawn(move || match stream {
+        StepOutputStream::Stdout => {
+            let stdout = std::io::stdout();
+            stream_child_output_capturing(reader, stdout.lock(), stream, &logger, &cap_clone)
+        }
+        StepOutputStream::Stderr => {
+            let stderr = std::io::stderr();
+            stream_child_output_capturing(reader, stderr.lock(), stream, &logger, &cap_clone)
+        }
+    });
+    (handle, cap)
 }
 
 pub(super) fn join_output_forwarders(handles: Vec<JoinHandle<Result<()>>>) -> Result<()> {
