@@ -173,6 +173,21 @@ pub(crate) struct AssertGroup {
     pub(crate) exists: bool,
 }
 
+/// A single package expectation inside `assert.packages:`.
+///
+/// The only supported attribute is `installed:`.  Unknown attributes are
+/// rejected at config-load time via `#[serde(deny_unknown_fields)]`.
+/// The key may be an exact package name **or** a glob pattern (e.g. `*-dev`).
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AssertPackage {
+    /// When `true`, the package must be installed (`install ok installed` via
+    /// `dpkg-query`).  When `false`, the package must not be installed.
+    /// Defaults to `true`.
+    #[serde(default = "default_assert_exists")]
+    pub(crate) installed: bool,
+}
+
 /// Validated `assert:` block from a `type: test` document.
 #[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
 pub(crate) struct AssertBlock {
@@ -185,6 +200,9 @@ pub(crate) struct AssertBlock {
     /// Map of group name (or glob pattern) → group expectation.
     #[serde(default)]
     pub(crate) groups: BTreeMap<String, AssertGroup>,
+    /// Map of package name (or glob pattern) → package expectation.
+    #[serde(default)]
+    pub(crate) packages: BTreeMap<String, AssertPackage>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -1474,6 +1492,9 @@ fn validate_assert_block(block: &AssertBlock) -> Result<()> {
     for (name_or_pattern, expectation) in &block.groups {
         validate_assert_group_entry(name_or_pattern, expectation)?;
     }
+    for (name_or_pattern, expectation) in &block.packages {
+        validate_assert_package_entry(name_or_pattern, expectation)?;
+    }
     Ok(())
 }
 
@@ -1528,6 +1549,16 @@ fn validate_assert_user_entry(name_or_pattern: &str, expectation: &AssertUser) -
 
 fn validate_assert_group_entry(_name_or_pattern: &str, _expectation: &AssertGroup) -> Result<()> {
     // Currently no additional validation beyond deserialization for groups.
+    Ok(())
+}
+
+fn validate_assert_package_entry(
+    _name_or_pattern: &str,
+    _expectation: &AssertPackage,
+) -> Result<()> {
+    // Unknown attributes are already rejected at deserialization time via
+    // `#[serde(deny_unknown_fields)]` on `AssertPackage`.  No further
+    // validation is required in v1.
     Ok(())
 }
 
@@ -5739,5 +5770,95 @@ assert:
         let assert_block = config.assert.unwrap();
         assert_eq!(assert_block.users.len(), 1);
         assert_eq!(assert_block.groups.len(), 1);
+    }
+
+    #[test]
+    fn test_load_test_config_assert_packages_basic() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            r#"
+type: test
+steps: []
+assert:
+  packages:
+    git:
+      installed: true
+    telnet:
+      installed: false
+"#,
+        )
+        .unwrap();
+        let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+        let assert_block = config.assert.unwrap();
+        assert_eq!(assert_block.packages.len(), 2);
+        assert!(assert_block.packages.get("git").unwrap().installed);
+        assert!(!assert_block.packages.get("telnet").unwrap().installed);
+    }
+
+    #[test]
+    fn test_load_test_config_assert_packages_pattern_negative() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            r#"
+type: test
+steps: []
+assert:
+  packages:
+    "*-dev":
+      installed: false
+"#,
+        )
+        .unwrap();
+        let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+        let assert_block = config.assert.unwrap();
+        let pat = assert_block.packages.get("*-dev").unwrap();
+        assert!(!pat.installed);
+    }
+
+    #[test]
+    fn test_load_test_config_assert_packages_pattern_positive() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            r#"
+type: test
+steps: []
+assert:
+  packages:
+    "linux-image-*":
+      installed: true
+"#,
+        )
+        .unwrap();
+        let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+        let assert_block = config.assert.unwrap();
+        let pat = assert_block.packages.get("linux-image-*").unwrap();
+        assert!(pat.installed);
+    }
+
+    #[test]
+    fn test_load_test_config_assert_packages_rejects_unknown_field() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            r#"
+type: test
+steps: []
+assert:
+  packages:
+    git:
+      installed: true
+      version: "2.40"
+"#,
+        )
+        .unwrap();
+        let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("version") || msg.contains("unknown field"),
+            "error should mention unknown field: {msg}"
+        );
     }
 }

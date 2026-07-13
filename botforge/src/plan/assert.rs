@@ -1,9 +1,10 @@
 //! Declarative `assert:` phase — run after all `steps:` in a `type: test` document.
 //!
-//! Currently implements the `assert.files:`, `assert.users:`, and `assert.groups:`
-//! sub-keys.  File entries are probed via a single batched SSH script; user and
-//! group entries are probed via `getent passwd` / `getent group` (for names and
-//! attributes) and `id -nG <user>` (for group membership).
+//! Currently implements the `assert.files:`, `assert.users:`, `assert.groups:`,
+//! and `assert.packages:` sub-keys.  File entries are probed via a single batched
+//! SSH script; user and group entries are probed via `getent passwd` / `getent group`
+//! (for names and attributes) and `id -nG <user>` (for group membership); package
+//! entries are probed via a single `dpkg-query -W` dump.
 
 use anyhow::Result;
 use std::collections::BTreeMap;
@@ -12,7 +13,7 @@ use std::time::Duration;
 use crate::ssh::{ssh_capture_stdout, SshOptions};
 use crate::util::shell_single_quote;
 
-use super::config::{AssertBlock, AssertFile, AssertGroup, AssertUser};
+use super::config::{AssertBlock, AssertFile, AssertGroup, AssertPackage, AssertUser};
 use super::log::print_phase_status;
 
 const ASSERT_TRANSPORT_RETRIES: usize = 3;
@@ -606,6 +607,180 @@ fn is_glob_pattern(s: &str) -> bool {
     s.contains('*') || s.contains('?') || s.contains('[')
 }
 
+// ---------------------------------------------------------------------------
+// Packages assert
+// ---------------------------------------------------------------------------
+
+/// Run the `assert.packages:` phase.
+///
+/// Probes via a single `dpkg-query -W` dump.  A package is considered
+/// installed only when its status is `install ok installed`.  Pattern keys
+/// (containing `*`, `?`, or `[`) are matched against all package names from
+/// the dump.
+///
+/// - Exact positive (`installed: true`): the package must be installed.
+/// - Exact negative (`installed: false`): the package must not be installed.
+/// - Pattern positive (`installed: true`): at least one installed package must match.
+/// - Pattern negative (`installed: false`): no installed package may match.
+pub(crate) fn run_assert_packages(ssh: &SshOptions, assert_block: &AssertBlock) -> Result<()> {
+    if assert_block.packages.is_empty() {
+        return Ok(());
+    }
+
+    type PkgEntries<'a> = Vec<(&'a String, &'a AssertPackage)>;
+    let (exact_entries, pattern_entries): (PkgEntries<'_>, PkgEntries<'_>) = assert_block
+        .packages
+        .iter()
+        .partition(|(k, _)| !is_glob_pattern(k));
+
+    // Single round-trip: dump all installed packages once.
+    let need_all_packages = !pattern_entries.is_empty();
+    let need_exact = !exact_entries.is_empty();
+
+    let mut probe_parts: Vec<String> = Vec::new();
+
+    // Per-exact-name probes: "present" or "absent".
+    for (name, _) in &exact_entries {
+        let q = shell_single_quote(name);
+        probe_parts.push(format!(
+            concat!(
+                "_s=$(dpkg-query -W -f='${{Status}}' {q} 2>/dev/null || true)\n",
+                "if [ \"$_s\" = 'install ok installed' ]; then\n",
+                "  printf 'present\\n'\n",
+                "else\n",
+                "  printf 'absent\\n'\n",
+                "fi\n",
+            ),
+            q = q
+        ));
+    }
+
+    // Full dump for pattern matching — emitted once regardless of how many patterns.
+    if need_all_packages {
+        probe_parts.push(
+            "dpkg-query -W -f='${Package} ${Status}\\n' 2>/dev/null || true\nprintf '__END_DPKG__\\n'\n"
+                .to_string(),
+        );
+    }
+
+    if !need_exact && !need_all_packages {
+        return Ok(());
+    }
+
+    let script = format!("set -e\n{}", probe_parts.join(""));
+    let probe_output = ssh_capture_stdout(
+        ssh,
+        &script,
+        ASSERT_TRANSPORT_RETRIES,
+        ASSERT_TRANSPORT_RETRY_DELAY,
+        ASSERT_CONNECT_TIMEOUT,
+    )
+    .map_err(|e| anyhow::anyhow!("assert.packages: SSH probe failed: {e:#}"))?;
+
+    let mut lines = probe_output.lines();
+    let mut any_failed = false;
+
+    // Evaluate exact-name entries.
+    for (name, expectation) in &exact_entries {
+        let raw_line = lines.next().unwrap_or("absent");
+        let is_installed = raw_line == "present";
+        let ok = is_installed == expectation.installed;
+        print_phase_status("assert", &format!("package {name}"), ok);
+        if !ok {
+            let msg = if expectation.installed {
+                format!("package {name}: expected installed, but not installed")
+            } else {
+                format!("package {name}: expected NOT installed, but present")
+            };
+            eprintln!("         {msg}");
+            any_failed = true;
+        }
+    }
+
+    // Evaluate pattern entries using the full dpkg-query dump.
+    if !pattern_entries.is_empty() {
+        // Collect installed package names up to the sentinel.
+        let installed_pkgs = parse_dpkg_installed(&mut lines);
+
+        for (pattern, expectation) in &pattern_entries {
+            let glob_pat = glob::Pattern::new(pattern)
+                .unwrap_or_else(|_| glob::Pattern::new("__no_match__").unwrap());
+
+            if !expectation.installed {
+                // Negative pattern: no installed package may match.
+                let matched: Vec<&str> = installed_pkgs
+                    .iter()
+                    .filter(|p| glob_pat.matches(p))
+                    .map(String::as_str)
+                    .collect();
+                if matched.is_empty() {
+                    print_phase_status(
+                        "assert",
+                        &format!(r#"packages: expected no installed package matching "{pattern}""#),
+                        true,
+                    );
+                } else {
+                    for found in matched {
+                        let label = format!(
+                            r#"packages: expected no installed package matching "{pattern}", but found "{found}""#
+                        );
+                        eprintln!("         {label}");
+                        print_phase_status("assert", &label, false);
+                        any_failed = true;
+                    }
+                }
+            } else {
+                // Positive pattern: at least one installed package must match.
+                let matched: Vec<&str> = installed_pkgs
+                    .iter()
+                    .filter(|p| glob_pat.matches(p))
+                    .map(String::as_str)
+                    .collect();
+                if matched.is_empty() {
+                    let label = format!(
+                        r#"packages: expected ≥1 installed matching "{pattern}", found none"#
+                    );
+                    eprintln!("         {label}");
+                    print_phase_status("assert", &label, false);
+                    any_failed = true;
+                } else {
+                    print_phase_status(
+                        "assert",
+                        &format!(r#"packages: at least one installed matching "{pattern}""#),
+                        true,
+                    );
+                }
+            }
+        }
+    }
+
+    if any_failed {
+        anyhow::bail!("one or more assert.packages: checks failed");
+    }
+    Ok(())
+}
+
+/// Parse lines from `dpkg-query -W -f='${Package} ${Status}\n'` up to (but not
+/// including) a sentinel line, returning the names of all installed packages
+/// (status == `install ok installed`).
+///
+/// Exposed for unit testing.
+fn parse_dpkg_installed<'a>(lines: &mut impl Iterator<Item = &'a str>) -> Vec<String> {
+    let mut installed = Vec::new();
+    for line in lines {
+        if line == "__END_DPKG__" {
+            break;
+        }
+        let mut parts = line.splitn(2, ' ');
+        let pkg_name = parts.next().unwrap_or("").trim();
+        let status = parts.next().unwrap_or("").trim();
+        if !pkg_name.is_empty() && status == "install ok installed" {
+            installed.push(pkg_name.to_string());
+        }
+    }
+    installed
+}
+
 #[cfg(test)]
 mod tests {
     use super::{check_one_path, normalize_mode};
@@ -889,5 +1064,47 @@ mod tests {
     #[test]
     fn test_is_glob_pattern_bracket_is_true() {
         assert!(is_glob_pattern("bot[0-9]"));
+    }
+
+    // ---------------------------------------------------------------------------
+    // parse_dpkg_installed tests
+    // ---------------------------------------------------------------------------
+
+    use super::parse_dpkg_installed;
+
+    #[test]
+    fn test_parse_dpkg_installed_returns_only_installed_packages() {
+        let raw = "git install ok installed\ntelnet deinstall ok config-files\ncurl install ok installed\n__END_DPKG__\n";
+        let pkgs = parse_dpkg_installed(&mut raw.lines());
+        assert_eq!(pkgs, vec!["git", "curl"]);
+    }
+
+    #[test]
+    fn test_parse_dpkg_installed_stops_at_sentinel() {
+        let raw = "git install ok installed\n__END_DPKG__\nextra install ok installed\n";
+        let pkgs = parse_dpkg_installed(&mut raw.lines());
+        assert_eq!(pkgs, vec!["git"]);
+    }
+
+    #[test]
+    fn test_parse_dpkg_installed_empty_output() {
+        let raw = "__END_DPKG__\n";
+        let pkgs = parse_dpkg_installed(&mut raw.lines());
+        assert!(pkgs.is_empty());
+    }
+
+    #[test]
+    fn test_parse_dpkg_installed_excludes_half_removed() {
+        // config-remains / half-removed should not count as installed
+        let raw = "libssl-dev remove ok half-removed\nbash install ok installed\n__END_DPKG__\n";
+        let pkgs = parse_dpkg_installed(&mut raw.lines());
+        assert_eq!(pkgs, vec!["bash"]);
+    }
+
+    #[test]
+    fn test_parse_dpkg_installed_excludes_config_files() {
+        let raw = "telnet deinstall ok config-files\n__END_DPKG__\n";
+        let pkgs = parse_dpkg_installed(&mut raw.lines());
+        assert!(pkgs.is_empty());
     }
 }
