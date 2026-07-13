@@ -234,7 +234,8 @@ pub(crate) struct TestConfig {
     /// Merged cloud-config fragment for the runner VM seed.  Accumulated from
     /// the root document and any `uses:` fragment includes.
     pub(crate) cloud_init: Option<serde_yaml::Mapping>,
-    /// Declarative assertions checked as an implicit final phase after `steps:`.
+    /// Declarative assertions checked as a pre-steps phase (after boot/SSH/cloud-init,
+    /// before the first `steps:` entry).
     #[serde(default)]
     pub(crate) assert: Option<AssertBlock>,
 }
@@ -271,7 +272,7 @@ struct RawTestDocument {
     /// Optional cloud-config fragment to merge into the runner VM seed.
     #[serde(default)]
     cloud_init: Option<serde_yaml::Mapping>,
-    /// Declarative assertions to run as an implicit final phase.
+    /// Declarative assertions to run as a pre-steps phase (before `steps:`).
     #[serde(default)]
     assert: Option<AssertBlock>,
 }
