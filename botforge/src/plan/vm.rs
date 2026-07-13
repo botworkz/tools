@@ -13,7 +13,8 @@ use crate::ssh::{
 };
 use crate::util::unique_suffix;
 
-use super::config::{TestConfig, TestIsoBootstrap};
+use super::assert::run_assert_files;
+use super::config::{AssertBlock, TestConfig, TestIsoBootstrap};
 use super::files::{stage_files, FileEntry};
 use super::log::{
     join_output_forwarders, print_step_status, print_step_title, spawn_output_forwarder,
@@ -90,7 +91,21 @@ pub(crate) fn run_test_flow(
         },
         None,
     )
-    .map(|_| ())
+    .map(|_| ())?;
+
+    // Run the declarative `assert:` phase as an implicit final step (test-only).
+    if let Some(ref assert_block) = config.assert {
+        run_assert_phase(ssh, assert_block)?;
+    }
+    Ok(())
+}
+
+/// Execute the `assert:` block as an implicit final phase.
+fn run_assert_phase(ssh: &SshOptions, assert_block: &AssertBlock) -> Result<()> {
+    if !assert_block.files.is_empty() {
+        run_assert_files(ssh, assert_block)?;
+    }
+    Ok(())
 }
 
 /// Shared boot→wait-for-SSH→wait-for-cloud-init→run-steps spine used by both
