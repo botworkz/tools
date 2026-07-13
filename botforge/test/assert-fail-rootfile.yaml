@@ -1,0 +1,23 @@
+type: test
+
+# Negative-control fixture: regression guard for the assert.files:
+# privileged-probe bug (#352).
+#
+# The build fixture creates /etc/botforge-ci-restricted/probe-test as a
+# 0440 root:root file inside a 0750 root:root directory.  We deliberately
+# assert the wrong mode (0640) — botforge MUST fail, proving that the
+# privileged probe (sudo -n sh) reads and reports real file state rather
+# than silently treating the root-only path as absent or skipping mode
+# verification.
+#
+# `image:` is injected by .github/workflows/_botforge.yml at CI time.
+
+steps: []
+
+assert:
+  files:
+    /etc/botforge-ci-restricted/probe-test:
+      exists: true
+      owner: root
+      group: root
+      mode: "0640"
