@@ -3,11 +3,13 @@ use serde::{de, Deserialize};
 use serde_yaml::Value;
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use crate::qemu::PortSpec;
 use crate::resolver::Reference;
-use crate::util::resolve_under_root;
+use crate::util::{command_exists, create_temp_dir, resolve_under_root};
 
 use super::files::FileEntry;
 use super::step::{deserialize_optional_positive_seconds, resolve_shell, StepTarget, TestStep};
@@ -157,7 +159,7 @@ pub(crate) struct TestConfig {
     pub(crate) ports: Vec<PortSpec>,
     #[serde(default)]
     pub(crate) steps: Vec<TestStep>,
-    #[serde(default, alias = "uploads")]
+    #[serde(default, alias = "files")]
     pub(crate) files: Vec<FileEntry>,
     #[serde(default)]
     pub(crate) diagnostics_units: Vec<String>,
@@ -196,7 +198,7 @@ struct RawTestDocument {
     ports: Vec<PortSpec>,
     #[serde(default)]
     steps: Vec<RawTestStep>,
-    #[serde(default, alias = "uploads")]
+    #[serde(default, alias = "files")]
     files: Vec<FileEntry>,
     #[serde(default)]
     diagnostics_units: Vec<String>,
@@ -376,7 +378,7 @@ struct RawBuildDocument {
     disk_size: String,
     #[serde(default)]
     steps: Vec<RawTestStep>,
-    #[serde(default, alias = "uploads")]
+    #[serde(default, alias = "files")]
     files: Vec<FileEntry>,
     #[serde(
         default = "default_build_step_timeout",
@@ -487,14 +489,12 @@ pub(crate) fn load_test_config(repo_root: &Path, path: &Path) -> Result<TestConf
             raw.doc_type.as_str()
         );
     }
-    if let Some(ref ci) = raw.cloud_init {
-        validate_cloud_init_fragment(ci, path)?;
-    }
+    let root_cloud_init = raw.cloud_init.clone();
     // Seed the stack with the root document so that a fragment including the root
     // is caught by the cycle check (A → B → A).
     let mut include_stack = vec![path.to_path_buf()];
     let mut cloud_init_acc = raw.cloud_init;
-    Ok(TestConfig {
+    let config = TestConfig {
         image: match raw.image {
             None => None,
             Some(s) if s.trim().is_empty() => anyhow::bail!(
@@ -531,7 +531,15 @@ pub(crate) fn load_test_config(repo_root: &Path, path: &Path) -> Result<TestConf
             }
             raw.assert
         },
-    })
+    };
+    run_semantic_validators(SemanticValidationTarget::Test {
+        path,
+        root_cloud_init: root_cloud_init.as_ref(),
+        steps: &config.steps,
+        ports: &config.ports,
+        files: &config.files,
+    })?;
+    Ok(config)
 }
 
 pub(crate) fn load_build_config(repo_root: &Path, path: &Path) -> Result<BuildConfig> {
@@ -575,21 +583,12 @@ pub(crate) fn load_build_config(repo_root: &Path, path: &Path) -> Result<BuildCo
              set it to a bare artifact filename, e.g. `output: \"image.qcow2\"`",
             path.display()
         ),
-        Some(s) => validate_build_output_filename(&s)
-            .with_context(|| {
-                format!(
-                    "invalid 'output' value in build config ({})",
-                    path.display()
-                )
-            })?
-            .to_string(),
+        Some(s) => s,
     };
-    if let Some(ref ci) = raw.cloud_init {
-        validate_cloud_init_fragment(ci, path)?;
-    }
+    let root_cloud_init = raw.cloud_init.clone();
     let mut include_stack = vec![path.to_path_buf()];
     let mut cloud_init_acc = raw.cloud_init;
-    Ok(BuildConfig {
+    let config = BuildConfig {
         image,
         output,
         disk_size: raw.disk_size,
@@ -610,7 +609,15 @@ pub(crate) fn load_build_config(repo_root: &Path, path: &Path) -> Result<BuildCo
         cloud_init_timeout: default_build_cloud_init_timeout(),
         cloud_init: cloud_init_acc,
         compress: raw.compress,
-    })
+    };
+    run_semantic_validators(SemanticValidationTarget::Build {
+        path,
+        output: &config.output,
+        root_cloud_init: root_cloud_init.as_ref(),
+        steps: &config.steps,
+        files: &config.files,
+    })?;
+    Ok(config)
 }
 
 fn validate_build_output_filename(output: &str) -> Result<&str> {
@@ -648,6 +655,64 @@ fn validate_build_output_filename(output: &str) -> Result<&str> {
         );
     }
     Ok(output)
+}
+
+enum SemanticValidationTarget<'a> {
+    Build {
+        path: &'a Path,
+        output: &'a str,
+        root_cloud_init: Option<&'a serde_yaml::Mapping>,
+        steps: &'a [TestStep],
+        files: &'a [FileEntry],
+    },
+    Test {
+        path: &'a Path,
+        root_cloud_init: Option<&'a serde_yaml::Mapping>,
+        steps: &'a [TestStep],
+        ports: &'a [PortSpec],
+        files: &'a [FileEntry],
+    },
+}
+
+fn run_semantic_validators(target: SemanticValidationTarget<'_>) -> Result<()> {
+    match target {
+        SemanticValidationTarget::Build {
+            path,
+            output,
+            root_cloud_init,
+            steps,
+            files,
+        } => {
+            validate_build_output_filename(output).with_context(|| {
+                format!(
+                    "invalid 'output' value in build config ({})",
+                    path.display()
+                )
+            })?;
+            if let Some(ci) = root_cloud_init {
+                validate_cloud_init_fragment(ci, path)?;
+                validate_cloud_init_schema_fragment(ci, path)?;
+            }
+            validate_top_level_files("build", files)
+                .with_context(|| format!("invalid build config: {}", path.display()))?;
+            validate_build_steps(steps)
+        }
+        SemanticValidationTarget::Test {
+            path,
+            root_cloud_init,
+            steps,
+            ports,
+            files,
+        } => {
+            if let Some(ci) = root_cloud_init {
+                validate_cloud_init_fragment(ci, path)?;
+                validate_cloud_init_schema_fragment(ci, path)?;
+            }
+            validate_top_level_files("test", files)
+                .with_context(|| format!("invalid test config: {}", path.display()))?;
+            validate_test_steps(steps, ports)
+        }
+    }
 }
 
 fn expand_test_steps(
@@ -802,7 +867,6 @@ fn check_no_entrypoint_sections_in_fragment(path: &Path, value: &Value) -> Resul
         "output",
         "compress",
         "files",
-        "uploads",
     ] {
         if mapping.contains_key(Value::String(section.to_string())) {
             anyhow::bail!(
@@ -932,6 +996,206 @@ pub(crate) fn validate_cloud_init_fragment(
         );
     }
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CloudInitSchemaMode {
+    Off,
+    Warn,
+    Strict,
+}
+
+impl CloudInitSchemaMode {
+    fn from_env() -> Self {
+        let raw = std::env::var("BOTFORGE_CLOUD_INIT_SCHEMA")
+            .unwrap_or_else(|_| "warn".to_string())
+            .trim()
+            .to_ascii_lowercase();
+        match raw.as_str() {
+            "off" => Self::Off,
+            "warn" => Self::Warn,
+            "strict" => Self::Strict,
+            _ => Self::Warn,
+        }
+    }
+}
+
+enum CloudInitSchemaCheck {
+    Pass,
+    MissingBinary,
+    InvocationFailed(String),
+    Invalid(String),
+}
+
+fn validate_cloud_init_schema_fragment(
+    cloud_init: &serde_yaml::Mapping,
+    path: &Path,
+) -> Result<()> {
+    let mode = cloud_init_schema_mode();
+    if matches!(mode, CloudInitSchemaMode::Off) {
+        return Ok(());
+    }
+
+    let rendered = render_cloud_init_schema_document(cloud_init)
+        .with_context(|| format!("failed to render cloud_init document in {}", path.display()))?;
+    match run_cloud_init_schema_check(&rendered) {
+        CloudInitSchemaCheck::Pass | CloudInitSchemaCheck::MissingBinary => Ok(()),
+        CloudInitSchemaCheck::InvocationFailed(details) => {
+            emit_cloud_init_schema_warning(&format!(
+                "cloud-init schema pre-validation skipped for {}: {}",
+                path.display(),
+                details
+            ));
+            Ok(())
+        }
+        CloudInitSchemaCheck::Invalid(details) => match mode {
+            CloudInitSchemaMode::Warn => {
+                emit_cloud_init_schema_warning(&format!(
+                    "cloud-init schema pre-validation reported issues for {}:\n{}",
+                    path.display(),
+                    details
+                ));
+                Ok(())
+            }
+            CloudInitSchemaMode::Strict => anyhow::bail!(
+                "cloud-init schema pre-validation failed for {}:\n{}",
+                path.display(),
+                details
+            ),
+            CloudInitSchemaMode::Off => Ok(()),
+        },
+    }
+}
+
+fn render_cloud_init_schema_document(cloud_init: &serde_yaml::Mapping) -> Result<String> {
+    // Deliberately validate the user-provided fragment (with `#cloud-config` header)
+    // rather than botforge's merged installer user-data. This keeps pre-validation
+    // focused on user-authored keys while preserving authoritative runtime merge
+    // behavior in `iso::render_user_data`.
+    let yaml = serde_yaml::to_string(&Value::Mapping(cloud_init.clone()))
+        .context("failed to serialize cloud_init fragment as YAML")?;
+    Ok(format!("#cloud-config\n{yaml}"))
+}
+
+fn cloud_init_schema_mode() -> CloudInitSchemaMode {
+    #[cfg(test)]
+    {
+        if let Some(mode) = cloud_init_schema_mode_override() {
+            return mode;
+        }
+    }
+    CloudInitSchemaMode::from_env()
+}
+
+fn run_cloud_init_schema_check(document: &str) -> CloudInitSchemaCheck {
+    #[cfg(test)]
+    {
+        if let Some(result) = run_cloud_init_schema_check_override(document) {
+            return result;
+        }
+    }
+    let Some(cloud_init_bin) = locate_cloud_init_binary() else {
+        return CloudInitSchemaCheck::MissingBinary;
+    };
+    match run_cloud_init_schema_via_stdin(&cloud_init_bin, document) {
+        Ok(CloudInitSchemaCheck::Pass) => CloudInitSchemaCheck::Pass,
+        Ok(_) => match run_cloud_init_schema_via_temp_file(&cloud_init_bin, document) {
+            Ok(result) => result,
+            Err(err) => CloudInitSchemaCheck::InvocationFailed(err),
+        },
+        Err(err) => CloudInitSchemaCheck::InvocationFailed(err),
+    }
+}
+
+fn locate_cloud_init_binary() -> Option<PathBuf> {
+    if command_exists("cloud-init") {
+        Some(PathBuf::from("cloud-init"))
+    } else {
+        None
+    }
+}
+
+fn run_cloud_init_schema_via_stdin(
+    cloud_init_bin: &Path,
+    document: &str,
+) -> std::result::Result<CloudInitSchemaCheck, String> {
+    let mut child = Command::new(cloud_init_bin)
+        .arg("schema")
+        .arg("--config-file")
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("failed to execute {}: {err}", cloud_init_bin.display()))?;
+    child
+        .stdin
+        .as_mut()
+        .ok_or_else(|| "failed to open stdin for cloud-init schema".to_string())?
+        .write_all(document.as_bytes())
+        .map_err(|err| format!("failed to write cloud-init schema stdin: {err}"))?;
+    let output = child
+        .wait_with_output()
+        .map_err(|err| format!("failed to wait for cloud-init schema: {err}"))?;
+    Ok(parse_cloud_init_schema_output(output))
+}
+
+fn run_cloud_init_schema_via_temp_file(
+    cloud_init_bin: &Path,
+    document: &str,
+) -> std::result::Result<CloudInitSchemaCheck, String> {
+    let temp_dir = create_temp_dir("botforge-cloud-init-schema")
+        .map_err(|err| format!("failed to create temp dir for cloud-init schema: {err:#}"))?;
+    let config_path = temp_dir.join("cloud-init.yaml");
+    std::fs::write(&config_path, document).map_err(|err| {
+        format!(
+            "failed to write temp cloud-init config {}: {err}",
+            config_path.display()
+        )
+    })?;
+    let output = Command::new(cloud_init_bin)
+        .arg("schema")
+        .arg("--config-file")
+        .arg(&config_path)
+        .output()
+        .map_err(|err| format!("failed to execute {}: {err}", cloud_init_bin.display()));
+    let cleanup_result = std::fs::remove_dir_all(&temp_dir);
+    if let Err(err) = cleanup_result {
+        emit_cloud_init_schema_warning(&format!(
+            "failed to remove temp dir {} after cloud-init schema pre-validation: {}",
+            temp_dir.display(),
+            err
+        ));
+    }
+    output.map(parse_cloud_init_schema_output)
+}
+
+fn parse_cloud_init_schema_output(output: std::process::Output) -> CloudInitSchemaCheck {
+    if output.status.success() {
+        return CloudInitSchemaCheck::Pass;
+    }
+    CloudInitSchemaCheck::Invalid(format_cloud_init_schema_message(&output))
+}
+
+fn format_cloud_init_schema_message(output: &std::process::Output) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    match (stdout.is_empty(), stderr.is_empty()) {
+        (true, true) => format!("cloud-init schema exited with {}", output.status),
+        (true, false) => stderr,
+        (false, true) => stdout,
+        (false, false) => format!("{stderr}\n{stdout}"),
+    }
+}
+
+fn emit_cloud_init_schema_warning(message: &str) {
+    #[cfg(test)]
+    {
+        if capture_cloud_init_schema_warning_for_test(message) {
+            return;
+        }
+    }
+    eprintln!("warning: {message}");
 }
 
 /// Deep-merge two cloud-config mappings under botforge's merge semantics:
@@ -1417,12 +1681,51 @@ fn validate_archive_build_step(step: &crate::plan::step::ArchiveStep) -> Result<
 }
 
 #[cfg(test)]
+type CloudInitSchemaCheckFn = fn(&str) -> CloudInitSchemaCheck;
+
+#[cfg(test)]
+thread_local! {
+    static CLOUD_INIT_SCHEMA_MODE_OVERRIDE: std::cell::RefCell<Option<CloudInitSchemaMode>> =
+        const { std::cell::RefCell::new(None) };
+    static CLOUD_INIT_SCHEMA_CHECK_OVERRIDE: std::cell::RefCell<Option<CloudInitSchemaCheckFn>> =
+        const { std::cell::RefCell::new(None) };
+    static CLOUD_INIT_SCHEMA_WARNINGS: std::cell::RefCell<Option<Vec<String>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn cloud_init_schema_mode_override() -> Option<CloudInitSchemaMode> {
+    CLOUD_INIT_SCHEMA_MODE_OVERRIDE.with(|slot| *slot.borrow())
+}
+
+#[cfg(test)]
+fn run_cloud_init_schema_check_override(document: &str) -> Option<CloudInitSchemaCheck> {
+    CLOUD_INIT_SCHEMA_CHECK_OVERRIDE
+        .with(|slot| slot.borrow().as_ref().copied())
+        .map(|check| check(document))
+}
+
+#[cfg(test)]
+fn capture_cloud_init_schema_warning_for_test(message: &str) -> bool {
+    CLOUD_INIT_SCHEMA_WARNINGS.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if let Some(ref mut warnings) = *slot {
+            warnings.push(message.to_string());
+            true
+        } else {
+            false
+        }
+    })
+}
+
+#[cfg(test)]
 mod tests {
     use super::{
         default_bootstrap_path, load_build_config, load_test_config, resolve_fragment_inputs,
         validate_build_steps, validate_test_ports, validate_test_steps, AssertFileType,
-        CompressionType, InputDeclaration, InputType, ReclaimMode, TestConfig, TestIso,
-        MAX_INCLUDE_DEPTH,
+        CloudInitSchemaCheck, CloudInitSchemaMode, CompressionType, InputDeclaration, InputType,
+        ReclaimMode, TestConfig, TestIso, CLOUD_INIT_SCHEMA_CHECK_OVERRIDE,
+        CLOUD_INIT_SCHEMA_MODE_OVERRIDE, CLOUD_INIT_SCHEMA_WARNINGS, MAX_INCLUDE_DEPTH,
     };
     use crate::plan::files::FileEntry;
     use crate::plan::step::{ArchiveStep, ArchiveStepSpec, RunStep, StepTarget, TestStep};
@@ -1437,6 +1740,44 @@ mod tests {
             addr: "127.0.0.1".into(),
             port,
         }
+    }
+
+    fn with_cloud_init_schema_mode<T>(mode: CloudInitSchemaMode, f: impl FnOnce() -> T) -> T {
+        CLOUD_INIT_SCHEMA_MODE_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(mode));
+        let result = f();
+        CLOUD_INIT_SCHEMA_MODE_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+        result
+    }
+
+    fn with_cloud_init_schema_check<T>(
+        check: fn(&str) -> CloudInitSchemaCheck,
+        f: impl FnOnce() -> T,
+    ) -> T {
+        CLOUD_INIT_SCHEMA_CHECK_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(check));
+        let result = f();
+        CLOUD_INIT_SCHEMA_CHECK_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+        result
+    }
+
+    fn with_warning_capture<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
+        CLOUD_INIT_SCHEMA_WARNINGS.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
+        let result = f();
+        let warnings = CLOUD_INIT_SCHEMA_WARNINGS
+            .with(|slot| slot.borrow_mut().take())
+            .unwrap_or_default();
+        (result, warnings)
+    }
+
+    fn schema_pass(_: &str) -> CloudInitSchemaCheck {
+        CloudInitSchemaCheck::Pass
+    }
+
+    fn schema_missing(_: &str) -> CloudInitSchemaCheck {
+        CloudInitSchemaCheck::MissingBinary
+    }
+
+    fn schema_invalid(_: &str) -> CloudInitSchemaCheck {
+        CloudInitSchemaCheck::Invalid("invalid cloud-config key".to_string())
     }
 
     fn run_ref(step: &TestStep) -> &RunStep {
@@ -3513,6 +3854,206 @@ cloud_init:
         );
     }
 
+    #[test]
+    fn test_cloud_init_schema_missing_binary_is_skipped() {
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            r#"
+type: build
+image: "@base"
+output: "out.qcow2"
+steps: []
+cloud_init:
+  users:
+    - name: app
+"#,
+        );
+        let (result, warnings) = with_warning_capture(|| {
+            with_cloud_init_schema_mode(CloudInitSchemaMode::Warn, || {
+                with_cloud_init_schema_check(schema_missing, || {
+                    load_build_config(repo.path(), &repo.path().join("build.yaml"))
+                })
+            })
+        });
+        let config = result.expect("missing cloud-init binary should not fail config load");
+        assert!(config.cloud_init.is_some());
+        assert!(
+            warnings.is_empty(),
+            "missing cloud-init should be skipped without warnings: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn test_cloud_init_schema_invalid_warn_mode_emits_warning() {
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            r#"
+type: build
+image: "@base"
+output: "out.qcow2"
+steps: []
+cloud_init:
+  user: typo
+"#,
+        );
+        let (result, warnings) = with_warning_capture(|| {
+            with_cloud_init_schema_mode(CloudInitSchemaMode::Warn, || {
+                with_cloud_init_schema_check(schema_invalid, || {
+                    load_build_config(repo.path(), &repo.path().join("build.yaml"))
+                })
+            })
+        });
+        assert!(
+            result.is_ok(),
+            "warn mode should not fail cloud-init schema violations"
+        );
+        assert_eq!(warnings.len(), 1, "warn mode must emit one warning");
+        assert!(
+            warnings[0].contains("invalid cloud-config key"),
+            "warning must include validator message: {}",
+            warnings[0]
+        );
+    }
+
+    #[test]
+    fn test_cloud_init_schema_invalid_strict_mode_is_hard_error() {
+        let repo = TempDir::new().unwrap();
+        write_test_config(
+            &repo,
+            "test.yaml",
+            r#"
+type: test
+steps: []
+cloud_init:
+  user: typo
+"#,
+        );
+        let err = with_cloud_init_schema_mode(CloudInitSchemaMode::Strict, || {
+            with_cloud_init_schema_check(schema_invalid, || {
+                load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err()
+            })
+        });
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("cloud-init schema pre-validation failed"),
+            "strict mode must hard-fail schema violations: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_cloud_init_schema_valid_fragment_passes_in_all_modes() {
+        for mode in [
+            CloudInitSchemaMode::Off,
+            CloudInitSchemaMode::Warn,
+            CloudInitSchemaMode::Strict,
+        ] {
+            let repo = TempDir::new().unwrap();
+            write_test_config(
+                &repo,
+                "test.yaml",
+                r#"
+type: test
+steps: []
+cloud_init:
+  users:
+    - name: app
+"#,
+            );
+            let (result, warnings) = with_warning_capture(|| {
+                with_cloud_init_schema_mode(mode, || {
+                    with_cloud_init_schema_check(schema_pass, || {
+                        load_test_config(repo.path(), &repo.path().join("test.yaml"))
+                    })
+                })
+            });
+            assert!(
+                result.is_ok(),
+                "valid cloud_init should pass in mode {mode:?}"
+            );
+            assert!(
+                warnings.is_empty(),
+                "valid cloud_init should not warn in mode {mode:?}: {warnings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_cloud_init_guards_still_hard_fail_in_strict_mode() {
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            r#"
+type: build
+image: "@base"
+output: "out.qcow2"
+steps: []
+cloud_init:
+  ssh_pwauth: false
+"#,
+        );
+        let err = with_cloud_init_schema_mode(CloudInitSchemaMode::Strict, || {
+            with_cloud_init_schema_check(schema_pass, || {
+                load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err()
+            })
+        });
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("ssh_pwauth"),
+            "harness guard must still hard-fail independent of schema mode: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_load_build_config_still_rejects_invalid_files_via_pipeline() {
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            r#"
+type: build
+image: "@base"
+output: "out.qcow2"
+steps: []
+files:
+  - src: "asset.txt"
+    dest: relative/path
+"#,
+        );
+        let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("files"),
+            "invalid files must still be rejected by loader pipeline: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_load_test_config_still_rejects_invalid_steps_via_pipeline() {
+        let repo = TempDir::new().unwrap();
+        write_test_config(
+            &repo,
+            "test.yaml",
+            r#"
+type: test
+steps:
+  - on: host
+    name: host-step
+    run: echo hi
+"#,
+        );
+        let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("ports"),
+            "invalid host step without ports must be rejected by loader pipeline: {msg}"
+        );
+    }
+
     // -----------------------------------------------------------------
     // compress field tests
     // -----------------------------------------------------------------
@@ -3903,7 +4444,7 @@ cloud_init:
         let repo = TempDir::new().unwrap();
         std::fs::write(
             repo.path().join("frag.yaml"),
-            "type: fragment\nuploads:\n  - src: payload/file.txt\n    dest: /tmp/file.txt\nsteps: []\n",
+            "type: fragment\nfiles:\n  - src: payload/file.txt\n    dest: /tmp/file.txt\nsteps: []\n",
         )
         .unwrap();
         std::fs::write(
@@ -3914,8 +4455,8 @@ cloud_init:
         let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("uploads"),
-            "error should reject uploads in fragment doc: {msg}"
+            msg.contains("files"),
+            "error should reject files in fragment doc: {msg}"
         );
     }
 
