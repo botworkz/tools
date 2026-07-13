@@ -161,7 +161,7 @@ type: test
 ports:
   - 80              # bind 127.0.0.1:80 -> guest :80  (loopback only)
   - "0.0.0.0:9901"  # bind 0.0.0.0:9901 -> guest :9901 (all interfaces)
-uploads:
+files:
   - src: fixtures/envoy/**/*.yaml
     dest: /tmp/test-staging/envoy/
 steps:
@@ -169,9 +169,9 @@ steps:
     run: curl -fsS http://127.0.0.1/
 ```
 
-#### Top-level `uploads:` (optional)
+#### Top-level `files:` (optional)
 
-Both `type: test` and `type: build` support an optional top-level `uploads:`
+Both `type: test` and `type: build` support an optional top-level `files:`
 list that stages files into the guest **once, after cloud-init is ready and
 before the first `steps:` entry runs**.
 
@@ -546,7 +546,7 @@ compress:                        # optional; absent = plain rename (no compressi
   compressor_args:               # optional qcow2 structural options
     cluster_size: "1M"
   compressor_opts: "-19 -T0"     # optional raw codec opts parsed by the compressor
-uploads:                         # optional; guest-only pre-step staging
+files:                           # optional; guest-only pre-step staging
   - src: images/botspace/envoy/**/*.yaml
     dest: /tmp/bake-staging/envoy/
   - src: scripts/install.sh
@@ -639,19 +639,19 @@ via SSH; host steps run in the botforge container.
 
 Reusable `uses:` fragment includes work exactly as in `type: test`.
 
-#### `uploads:` (optional) — guest pre-staging before `steps:`
+#### `files:` (optional) — guest pre-staging before `steps:`
 
-`type: build` supports the same top-level `uploads:` list described above for
+`type: build` supports the same top-level `files:` list described above for
 `type: test`. Entries are always guest-only and run once before the first
 configured step.
 
 - `src` must be a repo-relative file path or glob under `--repo-root`.
-- `src` may not start with `@`; top-level `uploads:` is filesystem-only.
+- `src` may not start with `@`; top-level `files:` is filesystem-only.
 - `dest` must be an absolute guest path.
 - Glob `src` requires `dest` to end in `/`, and matched files are staged with
   path preservation relative to the glob's fixed literal prefix.
 - Optional `mode`, `owner`, `group`, `overwrite`, and `parents` fields are
-  supported (see [Top-level `uploads:` (optional)](#top-level-uploads-optional)
+  supported (see [Top-level `files:` (optional)](#top-level-files-optional)
   for details). Files are installed via `sudo install` so mode and ownership are
   applied atomically without a follow-up `chmod`/`chown` step.
 
@@ -694,7 +694,7 @@ botforge's base):
 
 | Guard | What is rejected |
 |---|---|
-| **Ingress** | `write_files:` entries with a `source:` field (host-path ingress). Use `uploads:` for host→guest file transfer; inline `content:` is allowed. |
+| **Ingress** | `write_files:` entries with a `source:` field (host-path ingress). Use `files:` for host→guest file transfer; inline `content:` is allowed. |
 | **Harness** | `ssh_pwauth: false` — may break botforge's key-based SSH access to the runner VM. |
 
 Everything else is "cloud-init's problem", which is the whole point.
@@ -702,7 +702,7 @@ Everything else is "cloud-init's problem", which is the whole point.
 **`cloud_init:` is NOT a host-filesystem access primitive.** The three host→guest
 channels remain separate:
 
-- Host files → guest: `uploads:` / asset steps (`@`-resolved, pin/verify).
+- Host files → guest: `files:` / asset steps (`@`-resolved, pin/verify).
 - Host values → cloud-init: `inputs:` / `${{ inputs.* }}` substitution.
 - Declarative guest state: `cloud_init:`.
 

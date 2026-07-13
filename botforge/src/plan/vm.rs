@@ -14,12 +14,12 @@ use crate::ssh::{
 use crate::util::unique_suffix;
 
 use super::config::{TestConfig, TestIsoBootstrap};
+use super::files::{stage_files, FileEntry};
 use super::log::{
     join_output_forwarders, print_step_status, print_step_title, spawn_output_forwarder,
     step_log_path, StepLogWriter, StepOutputStream,
 };
 use super::step::{resolve_shell, ArchiveStep, RunStep, StepTarget, TestStep};
-use super::upload::{stage_top_level_uploads, TopLevelUpload};
 
 const TEST_SSH_READY_TIMEOUT: Duration = Duration::from_secs(300);
 const TEST_TRANSPORT_RETRIES: usize = 10;
@@ -29,10 +29,10 @@ const TEST_STABLE_SSH_REQUIRED: usize = 2;
 type ArchiveExecutor<'a> = dyn FnMut(usize, &ArchiveStep) -> Result<()> + 'a;
 
 pub(crate) struct StepFlowPlan<'a> {
-    pub(crate) top_level_uploads: &'a [TopLevelUpload],
+    pub(crate) files: &'a [FileEntry],
     pub(crate) steps: &'a [TestStep],
     pub(crate) bootstraps: &'a [TestIsoBootstrap],
-    /// Shasset manifest path, forwarded to the resolver for `@`-reference srcs in uploads.
+    /// Shasset manifest path, forwarded to the resolver for `@`-reference srcs in files.
     pub(crate) manifest_path: &'a Path,
     /// Optional cache directory override, forwarded to the resolver.
     pub(crate) cache_dir_override: Option<&'a Path>,
@@ -76,7 +76,7 @@ pub(crate) fn run_test_flow(
     run_step_flow(
         repo_root,
         StepFlowPlan {
-            top_level_uploads: &config.uploads,
+            files: &config.files,
             steps: &config.steps,
             bootstraps,
             manifest_path,
@@ -160,14 +160,14 @@ pub(crate) fn run_step_flow(
         .with_context(|| format!("iso bootstrap script failed for label {}", bootstrap.label))?;
     }
 
-    if !plan.top_level_uploads.is_empty() {
+    if !plan.files.is_empty() {
         ensure_overall_budget(overall_deadline, timeouts.overall_timeout)?;
         let resolve_context = ResolveFileContext {
             repo_root,
             manifest_path: plan.manifest_path,
             cache_dir_override: plan.cache_dir_override,
         };
-        stage_top_level_uploads(plan.top_level_uploads, &resolve_context, ssh)?;
+        stage_files(plan.files, &resolve_context, ssh)?;
     }
 
     // Shared ordered env map threaded across all steps (both guest and host).

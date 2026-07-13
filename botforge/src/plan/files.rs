@@ -12,7 +12,7 @@ const TRANSPORT_RETRY_DELAY: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Deserialize, Clone, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct TopLevelUpload {
+pub(crate) struct FileEntry {
     pub(crate) src: String,
     pub(crate) dest: String,
     /// File permission mode (3–4 octal digits). Defaults to `"0644"` at install time.
@@ -35,7 +35,7 @@ pub(crate) struct TopLevelUpload {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct UploadMapping {
+pub(crate) struct FileMapping {
     pub(crate) local_path: PathBuf,
     pub(crate) guest_dest: String,
 }
@@ -54,17 +54,17 @@ struct InstallOpts<'a> {
     parents: Option<bool>,
 }
 
-pub(crate) fn resolve_top_level_upload_mappings(
-    upload: &TopLevelUpload,
+pub(crate) fn resolve_file_mappings(
+    file: &FileEntry,
     context: &ResolveFileContext<'_>,
-) -> Result<Vec<UploadMapping>> {
-    let src = upload.src.trim();
-    let dest = upload.dest.trim();
+) -> Result<Vec<FileMapping>> {
+    let src = file.src.trim();
+    let dest = file.dest.trim();
     let reference = Reference::parse(src)
-        .with_context(|| format!("upload src '{src}' is not a valid @-reference"))?;
+        .with_context(|| format!("file src '{src}' is not a valid @-reference"))?;
     let resolved_files = reference
         .resolve_to_files(context)
-        .with_context(|| format!("failed to resolve upload src '{src}'"))?;
+        .with_context(|| format!("failed to resolve file src '{src}'"))?;
     let mut mappings = Vec::new();
     for rf in resolved_files {
         let guest_dest = if dest.ends_with('/') {
@@ -75,7 +75,7 @@ pub(crate) fn resolve_top_level_upload_mappings(
         } else {
             dest.to_string()
         };
-        mappings.push(UploadMapping {
+        mappings.push(FileMapping {
             local_path: rf.local_path,
             guest_dest,
         });
@@ -126,7 +126,7 @@ fn install_file_to_guest(
                 Duration::from_secs(0),
                 Duration::from_secs(10),
             );
-            anyhow::bail!("upload dest '{dest}' already exists and overwrite is false");
+            anyhow::bail!("file dest '{dest}' already exists and overwrite is false");
         }
     }
 
@@ -164,19 +164,19 @@ fn install_file_to_guest(
     install_result
 }
 
-pub(crate) fn stage_top_level_uploads(
-    uploads: &[TopLevelUpload],
+pub(crate) fn stage_files(
+    files: &[FileEntry],
     context: &ResolveFileContext<'_>,
     ssh: &SshOptions,
 ) -> Result<()> {
-    for (upload_idx, upload) in uploads.iter().enumerate() {
-        let mappings = resolve_top_level_upload_mappings(upload, context)?;
+    for (file_idx, file) in files.iter().enumerate() {
+        let mappings = resolve_file_mappings(file, context)?;
         let opts = InstallOpts {
-            mode: upload.mode.as_deref(),
-            owner: upload.owner.as_deref(),
-            group: upload.group.as_deref(),
-            overwrite: upload.overwrite,
-            parents: upload.parents,
+            mode: file.mode.as_deref(),
+            owner: file.owner.as_deref(),
+            group: file.group.as_deref(),
+            overwrite: file.overwrite,
+            parents: file.parents,
         };
         for (mapping_idx, mapping) in mappings.iter().enumerate() {
             install_file_to_guest(
@@ -184,19 +184,19 @@ pub(crate) fn stage_top_level_uploads(
                 &mapping.local_path,
                 &mapping.guest_dest,
                 &opts,
-                &format!("{upload_idx}-{mapping_idx}"),
+                &format!("{file_idx}-{mapping_idx}"),
             )
             .with_context(|| {
                 format!(
-                    "top-level upload '{}' failed while staging '{}' to '{}'",
-                    upload.src,
+                    "file entry '{}' failed while staging '{}' to '{}'",
+                    file.src,
                     mapping.local_path.display(),
                     mapping.guest_dest
                 )
             })?;
             println!(
-                "top-level upload {} staged {} -> {}",
-                upload_idx + 1,
+                "file {} staged {} -> {}",
+                file_idx + 1,
                 mapping.local_path.display(),
                 mapping.guest_dest
             );
@@ -207,7 +207,7 @@ pub(crate) fn stage_top_level_uploads(
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_top_level_upload_mappings, TopLevelUpload, UploadMapping};
+    use super::{resolve_file_mappings, FileEntry, FileMapping};
     use crate::resolver::ResolveFileContext;
     use tempfile::TempDir;
 
@@ -223,7 +223,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_top_level_upload_mappings_repo_glob_preserves_relative_paths() {
+    fn test_resolve_file_mappings_repo_glob_preserves_relative_paths() {
         let repo = TempDir::new().unwrap();
         let manifest = repo.path().join("shasset.yaml");
         let ecds = repo.path().join("images/botspace/envoy/ecds");
@@ -232,8 +232,8 @@ mod tests {
         std::fs::write(&file, "kind: envoy\n").unwrap();
 
         let ctx = make_context(&repo, &manifest);
-        let mappings = resolve_top_level_upload_mappings(
-            &TopLevelUpload {
+        let mappings = resolve_file_mappings(
+            &FileEntry {
                 src: "@://images/botspace/envoy/**/*.yaml".to_string(),
                 dest: "/tmp/bake-staging/envoy/".to_string(),
                 ..Default::default()
@@ -244,7 +244,7 @@ mod tests {
 
         assert_eq!(
             mappings,
-            vec![UploadMapping {
+            vec![FileMapping {
                 local_path: file.canonicalize().unwrap(),
                 guest_dest: "/tmp/bake-staging/envoy/ecds/ext_authz.yaml".to_string(),
             }]
@@ -252,7 +252,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_top_level_upload_mappings_artifact_glob_preserves_flat_matches() {
+    fn test_resolve_file_mappings_artifact_glob_preserves_flat_matches() {
         let repo = TempDir::new().unwrap();
         let manifest = repo.path().join("shasset.yaml");
         let artifact_dir = repo.path().join("build/artifact/payload");
@@ -261,8 +261,8 @@ mod tests {
         std::fs::write(&file, "tarball").unwrap();
 
         let ctx = make_context(&repo, &manifest);
-        let mappings = resolve_top_level_upload_mappings(
-            &TopLevelUpload {
+        let mappings = resolve_file_mappings(
+            &FileEntry {
                 src: "@artifact://payload/*.tar".to_string(),
                 dest: "/usr/share/botwork/images/".to_string(),
                 ..Default::default()
@@ -273,7 +273,7 @@ mod tests {
 
         assert_eq!(
             mappings,
-            vec![UploadMapping {
+            vec![FileMapping {
                 local_path: file.canonicalize().unwrap(),
                 guest_dest: "/usr/share/botwork/images/mcp-fs.tar".to_string(),
             }]
@@ -281,7 +281,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_top_level_upload_mappings_repo_literal_dest_uses_relative_path() {
+    fn test_resolve_file_mappings_repo_literal_dest_uses_relative_path() {
         let repo = TempDir::new().unwrap();
         let manifest = repo.path().join("shasset.yaml");
         let local = repo.path().join("scripts/setup.sh");
@@ -289,8 +289,8 @@ mod tests {
         std::fs::write(&local, "#!/bin/sh\n").unwrap();
 
         let ctx = make_context(&repo, &manifest);
-        let mappings = resolve_top_level_upload_mappings(
-            &TopLevelUpload {
+        let mappings = resolve_file_mappings(
+            &FileEntry {
                 src: "@://scripts/setup.sh".to_string(),
                 dest: "/tmp/staging/setup.sh".to_string(),
                 ..Default::default()
@@ -301,7 +301,7 @@ mod tests {
 
         assert_eq!(
             mappings,
-            vec![UploadMapping {
+            vec![FileMapping {
                 local_path: local.canonicalize().unwrap(),
                 guest_dest: "/tmp/staging/setup.sh".to_string(),
             }]
@@ -309,7 +309,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_top_level_upload_mappings_repo_literal_dir_dest_appends_basename() {
+    fn test_resolve_file_mappings_repo_literal_dir_dest_appends_basename() {
         let repo = TempDir::new().unwrap();
         let manifest = repo.path().join("shasset.yaml");
         let local = repo.path().join("scripts/setup.sh");
@@ -317,8 +317,8 @@ mod tests {
         std::fs::write(&local, "#!/bin/sh\n").unwrap();
 
         let ctx = make_context(&repo, &manifest);
-        let mappings = resolve_top_level_upload_mappings(
-            &TopLevelUpload {
+        let mappings = resolve_file_mappings(
+            &FileEntry {
                 src: "@://scripts/setup.sh".to_string(),
                 dest: "/tmp/staging/".to_string(),
                 ..Default::default()
@@ -329,7 +329,7 @@ mod tests {
 
         assert_eq!(
             mappings,
-            vec![UploadMapping {
+            vec![FileMapping {
                 local_path: local.canonicalize().unwrap(),
                 guest_dest: "/tmp/staging/setup.sh".to_string(),
             }]
@@ -337,12 +337,12 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_top_level_upload_mappings_zero_match_is_error() {
+    fn test_resolve_file_mappings_zero_match_is_error() {
         let repo = TempDir::new().unwrap();
         let manifest = repo.path().join("shasset.yaml");
         let ctx = make_context(&repo, &manifest);
-        let err = resolve_top_level_upload_mappings(
-            &TopLevelUpload {
+        let err = resolve_file_mappings(
+            &FileEntry {
                 src: "@://images/**/*.yaml".to_string(),
                 dest: "/tmp/staging/".to_string(),
                 ..Default::default()
@@ -359,12 +359,12 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_top_level_upload_mappings_rejects_bare_path() {
+    fn test_resolve_file_mappings_rejects_bare_path() {
         let repo = TempDir::new().unwrap();
         let manifest = repo.path().join("shasset.yaml");
         let ctx = make_context(&repo, &manifest);
-        let err = resolve_top_level_upload_mappings(
-            &TopLevelUpload {
+        let err = resolve_file_mappings(
+            &FileEntry {
                 src: "images/botspace/envoy/**/*.yaml".to_string(),
                 dest: "/tmp/staging/".to_string(),
                 ..Default::default()
