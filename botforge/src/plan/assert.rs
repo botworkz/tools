@@ -1,4 +1,5 @@
-//! Declarative `assert:` phase — run after all `steps:` in a `type: test` document.
+//! Declarative `assert:` phase — run before `steps:` in a `type: test` document
+//! (after boot/SSH/cloud-init, on the fresh-boot image state).
 //!
 //! Currently implements the `assert.files:`, `assert.users:`, `assert.groups:`,
 //! and `assert.packages:` sub-keys.  File entries are probed via a single batched

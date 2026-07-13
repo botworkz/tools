@@ -30,6 +30,7 @@ const TEST_TRANSPORT_RETRY_DELAY: Duration = Duration::from_secs(2);
 const TEST_STABLE_SSH_ATTEMPTS: usize = 5;
 const TEST_STABLE_SSH_REQUIRED: usize = 2;
 type ArchiveExecutor<'a> = dyn FnMut(usize, &ArchiveStep) -> Result<()> + 'a;
+type PreStepsHook<'a> = dyn Fn(&SshOptions) -> Result<()> + 'a;
 
 pub(crate) struct StepFlowPlan<'a> {
     pub(crate) files: &'a [FileEntry],
@@ -77,6 +78,14 @@ pub(crate) fn run_test_flow(
     cache_dir_override: Option<&Path>,
     installer_username: Option<&str>,
 ) -> Result<()> {
+    // Run the declarative `assert:` block as a pre-steps phase (after boot /
+    // SSH / cloud-init, but before the first `steps:` entry) so that
+    // assertions validate the image as built rather than the post-steps state.
+    let pre_steps: Option<Box<PreStepsHook<'_>>> = config.assert.as_ref().map(|assert_block| {
+        Box::new(move |ssh: &SshOptions| run_assert_phase(ssh, assert_block, installer_username))
+            as Box<PreStepsHook<'_>>
+    });
+
     run_step_flow(
         repo_root,
         StepFlowPlan {
@@ -93,17 +102,13 @@ pub(crate) fn run_test_flow(
             cloud_init_timeout: Duration::from_secs(config.cloud_init_timeout),
         },
         None,
+        pre_steps.as_deref(),
     )
-    .map(|_| ())?;
-
-    // Run the declarative `assert:` phase as an implicit final step (test-only).
-    if let Some(ref assert_block) = config.assert {
-        run_assert_phase(ssh, assert_block, installer_username)?;
-    }
-    Ok(())
+    .map(|_| ())
 }
 
-/// Execute the `assert:` block as an implicit final phase.
+/// Execute the `assert:` block as a pre-steps phase (after boot/SSH/cloud-init,
+/// before any `steps:` entry).
 ///
 /// `installer_username` is the ephemeral botforge installer account for this
 /// run (e.g. `botforge-abc123`).  It is excluded from pattern-based negative
@@ -131,12 +136,17 @@ fn run_assert_phase(
 
 /// Shared boot→wait-for-SSH→wait-for-cloud-init→run-steps spine used by both
 /// `botforge test` and `botforge build`.  `bootstraps` is empty for build runs.
+///
+/// `pre_steps` is an optional callback invoked after cloud-init/bootstraps/files
+/// staging but **before** the first step executes.  `botforge test` uses this to
+/// run the declarative `assert:` phase on the fresh-boot image state.
 pub(crate) fn run_step_flow(
     repo_root: &Path,
     plan: StepFlowPlan<'_>,
     ssh: &SshOptions,
     timeouts: StepTimeoutPolicy,
     mut archive_executor: Option<&mut ArchiveExecutor<'_>>,
+    pre_steps: Option<&PreStepsHook<'_>>,
 ) -> Result<Instant> {
     let overall_deadline = Instant::now() + timeouts.overall_timeout;
     let step_log_dir = repo_root.join("build").join("logs");
@@ -216,6 +226,12 @@ pub(crate) fn run_step_flow(
         overall_timeout: timeouts.overall_timeout,
         default_step_timeout: timeouts.default_step_timeout,
     };
+
+    // Run the optional pre-steps hook (e.g. the declarative `assert:` phase
+    // for `botforge test`) before any step mutates the guest.
+    if let Some(hook) = pre_steps {
+        hook(ssh)?;
+    }
 
     for (step_idx, step) in plan.steps.iter().enumerate() {
         ensure_overall_budget(overall_deadline, timeouts.overall_timeout)?;

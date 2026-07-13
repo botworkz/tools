@@ -298,6 +298,7 @@ pub(crate) fn cmd_build(config: &Path, args: BuildArgs) -> Result<()> {
             cloud_init_timeout: std::time::Duration::from_secs(build_config.cloud_init_timeout),
         },
         Some(&mut archive_executor),
+        None,
     );
     let overall_deadline = match step_result {
         Ok(overall_deadline) => overall_deadline,
