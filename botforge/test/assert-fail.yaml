@@ -1,0 +1,12 @@
+type: test
+
+steps: []
+
+# Negative-control fixture: deliberately wrong assertion so the gate can
+# verify that botforge exits non-zero when an assertion fails.
+# /etc/botforge-ci-marker is created by the build's cloud_init: block, so it
+# DOES exist — asserting `exists: false` here must fail.
+assert:
+  files:
+    /etc/botforge-ci-marker:
+      exists: false

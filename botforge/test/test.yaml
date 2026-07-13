@@ -12,3 +12,49 @@ steps:
 
     apt-get -qq update
     apt show python3-virtualenv | grep "APT-Manual-Installed: yes"
+- name: Expect non-zero exit with stdout check
+  run: |
+    echo "expected-output"
+    exit 1
+  expect:
+    exit: 1
+    stdout:
+      contains:
+      - expected-output
+      not_contains:
+      - unexpected-content
+    stderr:
+      not_contains:
+      - fatal error
+
+assert:
+  files:
+    /etc/botforge-ci-marker:
+      filetype: file
+      owner: root
+      group: root
+      mode: "644"
+    /tmp/should-not-exist-botforge-ci-test:
+      exists: false
+  packages:
+    python3-virtualenv:
+      installed: true
+    telnet:
+      installed: false
+    python3-*:
+      installed: true
+  users:
+    root:
+      exists: true
+      shell: /bin/bash
+    botforge-*:
+      exists: false
+  groups:
+    root:
+      exists: true
+    botforge-*:
+      exists: false
+  services:
+    ssh:
+      enabled: true
+      active: true
