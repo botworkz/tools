@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use serde::{de, Deserialize};
 use serde_yaml::Value;
 use std::collections::{BTreeMap, HashSet};
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::qemu::PortSpec;
@@ -78,6 +79,74 @@ pub(super) struct InputDeclaration {
     pub(super) default: Option<String>,
 }
 
+// ---------------------------------------------------------------------------
+// assert: block types
+// ---------------------------------------------------------------------------
+
+/// Expected file type for an `assert.files:` entry.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum AssertFileType {
+    File,
+    Directory,
+    Symlink,
+}
+
+impl AssertFileType {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::File => "file",
+            Self::Directory => "directory",
+            Self::Symlink => "symlink",
+        }
+    }
+}
+
+impl fmt::Display for AssertFileType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+fn default_assert_exists() -> bool {
+    true
+}
+
+/// A single file-existence/attribute expectation inside `assert.files:`.
+///
+/// When `exists: false`, all other attribute fields must be absent (rejected
+/// at config-load time).
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+pub(crate) struct AssertFile {
+    /// When `false`, the path must not exist on the guest.  Defaults to `true`.
+    #[serde(default = "default_assert_exists")]
+    pub(crate) exists: bool,
+    /// Expected file type (`file`, `directory`, or `symlink`).
+    /// Only meaningful when `exists: true`.
+    #[serde(default)]
+    pub(crate) filetype: Option<AssertFileType>,
+    /// Expected owning user name or numeric uid.
+    /// Only meaningful when `exists: true`.
+    #[serde(default)]
+    pub(crate) owner: Option<String>,
+    /// Expected owning group name or numeric gid.
+    /// Only meaningful when `exists: true`.
+    #[serde(default)]
+    pub(crate) group: Option<String>,
+    /// Expected permission mode (3–4 octal digits, e.g. `"0755"`).
+    /// Only meaningful when `exists: true`.
+    #[serde(default)]
+    pub(crate) mode: Option<String>,
+}
+
+/// Validated `assert:` block from a `type: test` document.
+#[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
+pub(crate) struct AssertBlock {
+    /// Map of absolute guest path → file expectation.
+    #[serde(default)]
+    pub(crate) files: BTreeMap<String, AssertFile>,
+}
+
 #[derive(Debug, Deserialize, Default)]
 pub(crate) struct TestConfig {
     #[serde(default)]
@@ -107,6 +176,9 @@ pub(crate) struct TestConfig {
     /// Merged cloud-config fragment for the runner VM seed.  Accumulated from
     /// the root document and any `uses:` fragment includes.
     pub(crate) cloud_init: Option<serde_yaml::Mapping>,
+    /// Declarative assertions checked as an implicit final phase after `steps:`.
+    #[serde(default)]
+    pub(crate) assert: Option<AssertBlock>,
 }
 
 /// Raw deserialization target for a top-level `botforge test` document.
@@ -141,6 +213,9 @@ struct RawTestDocument {
     /// Optional cloud-config fragment to merge into the runner VM seed.
     #[serde(default)]
     cloud_init: Option<serde_yaml::Mapping>,
+    /// Declarative assertions to run as an implicit final phase.
+    #[serde(default)]
+    assert: Option<AssertBlock>,
 }
 
 fn default_disk_size() -> String {
@@ -449,6 +524,13 @@ pub(crate) fn load_test_config(repo_root: &Path, path: &Path) -> Result<TestConf
         timeout: raw.timeout,
         cloud_init_timeout: default_test_cloud_init_timeout(),
         cloud_init: cloud_init_acc,
+        assert: {
+            if let Some(ref block) = raw.assert {
+                validate_assert_block(block)
+                    .with_context(|| format!("invalid test config: {}", path.display()))?;
+            }
+            raw.assert
+        },
     })
 }
 
@@ -1080,6 +1162,45 @@ fn validate_top_level_file(kind: &str, file: &FileEntry) -> Result<()> {
     Ok(())
 }
 
+fn validate_assert_block(block: &AssertBlock) -> Result<()> {
+    for (guest_path, expectation) in &block.files {
+        validate_assert_file_entry(guest_path, expectation)?;
+    }
+    Ok(())
+}
+
+fn validate_assert_file_entry(guest_path: &str, expectation: &AssertFile) -> Result<()> {
+    if !guest_path.starts_with('/') {
+        anyhow::bail!(
+            "assert.files: path '{guest_path}' must be an absolute guest path (must start with '/')"
+        );
+    }
+    if !expectation.exists {
+        // When exists: false, attribute fields are meaningless — reject them.
+        if expectation.filetype.is_some()
+            || expectation.owner.is_some()
+            || expectation.group.is_some()
+            || expectation.mode.is_some()
+        {
+            anyhow::bail!(
+                "assert.files: path '{guest_path}': attribute fields \
+                 (filetype/owner/group/mode) must not be set when `exists: false`"
+            );
+        }
+        return Ok(());
+    }
+    if let Some(ref mode) = expectation.mode {
+        validate_mode_string(mode, guest_path, "assert")?;
+    }
+    if let Some(ref owner) = expectation.owner {
+        validate_owner_group_string(owner, "owner", guest_path, "assert")?;
+    }
+    if let Some(ref group) = expectation.group {
+        validate_owner_group_string(group, "group", guest_path, "assert")?;
+    }
+    Ok(())
+}
+
 pub(crate) fn src_has_glob_metacharacters(src: &str) -> bool {
     src.contains('*') || src.contains('?') || src.contains('[')
 }
@@ -1299,8 +1420,9 @@ fn validate_archive_build_step(step: &crate::plan::step::ArchiveStep) -> Result<
 mod tests {
     use super::{
         default_bootstrap_path, load_build_config, load_test_config, resolve_fragment_inputs,
-        validate_build_steps, validate_test_ports, validate_test_steps, CompressionType,
-        InputDeclaration, InputType, ReclaimMode, TestConfig, TestIso, MAX_INCLUDE_DEPTH,
+        validate_build_steps, validate_test_ports, validate_test_steps, AssertFileType,
+        CompressionType, InputDeclaration, InputType, ReclaimMode, TestConfig, TestIso,
+        MAX_INCLUDE_DEPTH,
     };
     use crate::plan::files::FileEntry;
     use crate::plan::step::{ArchiveStep, ArchiveStepSpec, RunStep, StepTarget, TestStep};
@@ -4720,5 +4842,175 @@ steps:
                 || msg.contains("unknown field"),
             "error should indicate archive/run field conflict: {msg}"
         );
+    }
+
+    // --- assert: block ---
+
+    #[test]
+    fn test_load_test_config_assert_absent_is_none() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(repo.path().join("test.yaml"), "type: test\nsteps: []\n").unwrap();
+        let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+        assert!(config.assert.is_none(), "assert should default to None");
+    }
+
+    #[test]
+    fn test_load_test_config_assert_files_parses_exists_true() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            r#"
+type: test
+steps: []
+assert:
+  files:
+    /usr/local/bin/tool:
+      exists: true
+      filetype: file
+      owner: root
+      group: root
+      mode: "0755"
+"#,
+        )
+        .unwrap();
+        let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+        let assert_block = config.assert.unwrap();
+        let entry = assert_block.files.get("/usr/local/bin/tool").unwrap();
+        assert!(entry.exists);
+        assert_eq!(entry.filetype, Some(AssertFileType::File));
+        assert_eq!(entry.owner.as_deref(), Some("root"));
+        assert_eq!(entry.group.as_deref(), Some("root"));
+        assert_eq!(entry.mode.as_deref(), Some("0755"));
+    }
+
+    #[test]
+    fn test_load_test_config_assert_files_parses_exists_false() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            r#"
+type: test
+steps: []
+assert:
+  files:
+    /tmp/should-be-gone:
+      exists: false
+"#,
+        )
+        .unwrap();
+        let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+        let assert_block = config.assert.unwrap();
+        let entry = assert_block.files.get("/tmp/should-be-gone").unwrap();
+        assert!(!entry.exists);
+        assert!(entry.filetype.is_none());
+        assert!(entry.owner.is_none());
+        assert!(entry.group.is_none());
+        assert!(entry.mode.is_none());
+    }
+
+    #[test]
+    fn test_load_test_config_assert_files_rejects_exists_false_with_attributes() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            r#"
+type: test
+steps: []
+assert:
+  files:
+    /some/path:
+      exists: false
+      mode: "0755"
+"#,
+        )
+        .unwrap();
+        let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("exists: false") || msg.contains("attribute"),
+            "error should mention exists:false and attributes: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_load_test_config_assert_files_rejects_relative_path() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            r#"
+type: test
+steps: []
+assert:
+  files:
+    relative/path:
+      exists: true
+"#,
+        )
+        .unwrap();
+        let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("absolute"),
+            "error should mention absolute path: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_load_test_config_assert_files_rejects_invalid_mode() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            r#"
+type: test
+steps: []
+assert:
+  files:
+    /some/path:
+      exists: true
+      mode: "rwxr-xr-x"
+"#,
+        )
+        .unwrap();
+        let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("mode") || msg.contains("octal"),
+            "error should mention mode: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_load_test_config_assert_files_multiple_entries() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            r#"
+type: test
+steps: []
+assert:
+  files:
+    /usr/bin/tool:
+      exists: true
+      filetype: file
+    /var/data:
+      exists: true
+      filetype: directory
+    /tmp/gone.tar:
+      exists: false
+"#,
+        )
+        .unwrap();
+        let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+        let assert_block = config.assert.unwrap();
+        assert_eq!(assert_block.files.len(), 3);
+        assert_eq!(
+            assert_block.files.get("/usr/bin/tool").unwrap().filetype,
+            Some(AssertFileType::File)
+        );
+        assert_eq!(
+            assert_block.files.get("/var/data").unwrap().filetype,
+            Some(AssertFileType::Directory)
+        );
+        assert!(!assert_block.files.get("/tmp/gone.tar").unwrap().exists);
     }
 }

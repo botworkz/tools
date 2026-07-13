@@ -1,3 +1,4 @@
+pub(crate) mod assert;
 pub(crate) mod config;
 pub(crate) mod files;
 pub(super) mod log;
