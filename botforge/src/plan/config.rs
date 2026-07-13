@@ -8,8 +8,8 @@ use crate::qemu::PortSpec;
 use crate::resolver::Reference;
 use crate::util::resolve_under_root;
 
+use super::files::FileEntry;
 use super::step::{deserialize_optional_positive_seconds, resolve_shell, StepTarget, TestStep};
-use super::upload::TopLevelUpload;
 
 const DEFAULT_SENTINEL: &str = "__default__";
 
@@ -88,8 +88,8 @@ pub(crate) struct TestConfig {
     pub(crate) ports: Vec<PortSpec>,
     #[serde(default)]
     pub(crate) steps: Vec<TestStep>,
-    #[serde(default)]
-    pub(crate) uploads: Vec<TopLevelUpload>,
+    #[serde(default, alias = "uploads")]
+    pub(crate) files: Vec<FileEntry>,
     #[serde(default)]
     pub(crate) diagnostics_units: Vec<String>,
     #[serde(
@@ -124,8 +124,8 @@ struct RawTestDocument {
     ports: Vec<PortSpec>,
     #[serde(default)]
     steps: Vec<RawTestStep>,
-    #[serde(default)]
-    uploads: Vec<TopLevelUpload>,
+    #[serde(default, alias = "uploads")]
+    files: Vec<FileEntry>,
     #[serde(default)]
     diagnostics_units: Vec<String>,
     #[serde(
@@ -274,7 +274,7 @@ pub(crate) struct BuildConfig {
     pub(crate) output: String,
     pub(crate) disk_size: String,
     pub(crate) steps: Vec<TestStep>,
-    pub(crate) uploads: Vec<TopLevelUpload>,
+    pub(crate) files: Vec<FileEntry>,
     pub(crate) step_timeout: u64,
     pub(crate) timeout: u64,
     pub(crate) cloud_init_timeout: u64,
@@ -301,8 +301,8 @@ struct RawBuildDocument {
     disk_size: String,
     #[serde(default)]
     steps: Vec<RawTestStep>,
-    #[serde(default)]
-    uploads: Vec<TopLevelUpload>,
+    #[serde(default, alias = "uploads")]
+    files: Vec<FileEntry>,
     #[serde(
         default = "default_build_step_timeout",
         deserialize_with = "deserialize_positive_seconds"
@@ -439,10 +439,10 @@ pub(crate) fn load_test_config(repo_root: &Path, path: &Path) -> Result<TestConf
             &mut include_stack,
             &mut cloud_init_acc,
         )?,
-        uploads: {
-            validate_top_level_uploads("test", &raw.uploads)
+        files: {
+            validate_top_level_files("test", &raw.files)
                 .with_context(|| format!("invalid test config: {}", path.display()))?;
-            raw.uploads
+            raw.files
         },
         diagnostics_units: raw.diagnostics_units,
         step_timeout: raw.step_timeout,
@@ -518,10 +518,10 @@ pub(crate) fn load_build_config(repo_root: &Path, path: &Path) -> Result<BuildCo
             &mut include_stack,
             &mut cloud_init_acc,
         )?,
-        uploads: {
-            validate_top_level_uploads("build", &raw.uploads)
+        files: {
+            validate_top_level_files("build", &raw.files)
                 .with_context(|| format!("invalid build config: {}", path.display()))?;
-            raw.uploads
+            raw.files
         },
         step_timeout: raw.step_timeout,
         timeout: raw.timeout,
@@ -719,6 +719,7 @@ fn check_no_entrypoint_sections_in_fragment(path: &Path, value: &Value) -> Resul
         "image",
         "output",
         "compress",
+        "files",
         "uploads",
     ] {
         if mapping.contains_key(Value::String(section.to_string())) {
@@ -829,7 +830,7 @@ pub(crate) fn validate_cloud_init_fragment(
                 if entry_map.contains_key(Value::String("source".to_string())) {
                     anyhow::bail!(
                         "cloud_init.write_files: 'source:' is not allowed in {} \
-                         (ingress guard: use 'uploads:' for host→guest file transfer; \
+                         (ingress guard: use 'files:' for host→guest file transfer; \
                          inline 'content:' is allowed)",
                         path.display()
                     );
@@ -1000,9 +1001,9 @@ fn resolve_uses_path(repo_root: &Path, uses: &str) -> Result<PathBuf> {
     }
 }
 
-fn validate_top_level_uploads(kind: &str, uploads: &[TopLevelUpload]) -> Result<()> {
-    for upload in uploads {
-        validate_top_level_upload(kind, upload)?;
+fn validate_top_level_files(kind: &str, files: &[FileEntry]) -> Result<()> {
+    for file in files {
+        validate_top_level_file(kind, file)?;
     }
     Ok(())
 }
@@ -1010,9 +1011,7 @@ fn validate_top_level_uploads(kind: &str, uploads: &[TopLevelUpload]) -> Result<
 /// Validate a `mode` string: must be 3–4 octal digits (same rule as `payload.rs`).
 fn validate_mode_string(mode: &str, src: &str, kind: &str) -> Result<()> {
     if mode.len() < 3 || mode.len() > 4 || !mode.chars().all(|ch| ('0'..='7').contains(&ch)) {
-        anyhow::bail!(
-            "{kind} uploads entry '{src}': `mode` must be 3–4 octal digits, got '{mode}'"
-        );
+        anyhow::bail!("{kind} files entry '{src}': `mode` must be 3–4 octal digits, got '{mode}'");
     }
     Ok(())
 }
@@ -1020,7 +1019,7 @@ fn validate_mode_string(mode: &str, src: &str, kind: &str) -> Result<()> {
 /// Validate an `owner` or `group` string: non-empty, no whitespace, no `/`, no shell metacharacters.
 fn validate_owner_group_string(value: &str, field: &str, src: &str, kind: &str) -> Result<()> {
     if value.trim().is_empty() {
-        anyhow::bail!("{kind} uploads entry '{src}': `{field}` must be non-empty");
+        anyhow::bail!("{kind} files entry '{src}': `{field}` must be non-empty");
     }
     for ch in value.chars() {
         if ch.is_whitespace()
@@ -1030,7 +1029,7 @@ fn validate_owner_group_string(value: &str, field: &str, src: &str, kind: &str) 
             )
         {
             anyhow::bail!(
-                "{kind} uploads entry '{src}': `{field}` contains invalid character '{ch}'; \
+                "{kind} files entry '{src}': `{field}` contains invalid character '{ch}'; \
                  must not contain whitespace, '/', or shell metacharacters"
             );
         }
@@ -1038,44 +1037,44 @@ fn validate_owner_group_string(value: &str, field: &str, src: &str, kind: &str) 
     Ok(())
 }
 
-fn validate_top_level_upload(kind: &str, upload: &TopLevelUpload) -> Result<()> {
-    let src = upload.src.trim();
-    let dest = upload.dest.trim();
+fn validate_top_level_file(kind: &str, file: &FileEntry) -> Result<()> {
+    let src = file.src.trim();
+    let dest = file.dest.trim();
 
     if src.is_empty() {
-        anyhow::bail!("{kind} uploads entry: `src` is required and must be non-empty");
+        anyhow::bail!("{kind} files entry: `src` is required and must be non-empty");
     }
     if !src.starts_with('@') {
         anyhow::bail!(
-            "{kind} uploads entry '{src}': `src` must be an `@`-reference \
+            "{kind} files entry '{src}': `src` must be an `@`-reference \
              (e.g. `@foo`, `@://<glob>`, `@artifact://<glob>`); bare paths are not supported"
         );
     }
     // Validate the reference syntax at config-load time so bad references are caught early.
     Reference::parse(src)
-        .with_context(|| format!("{kind} uploads entry '{src}': invalid `@`-reference in `src`"))?;
+        .with_context(|| format!("{kind} files entry '{src}': invalid `@`-reference in `src`"))?;
     if dest.is_empty() {
         anyhow::bail!(
-            "{kind} uploads entry '{src}': `dest` is required and must be a non-empty absolute path"
+            "{kind} files entry '{src}': `dest` is required and must be a non-empty absolute path"
         );
     }
     if !dest.starts_with('/') {
         anyhow::bail!(
-            "{kind} uploads entry '{src}': `dest` must be an absolute guest path (got '{dest}')"
+            "{kind} files entry '{src}': `dest` must be an absolute guest path (got '{dest}')"
         );
     }
     if src_has_glob_metacharacters(src) && !dest.ends_with('/') {
         anyhow::bail!(
-            "{kind} uploads entry '{src}': glob `src` requires `dest` to be a directory path ending with '/'"
+            "{kind} files entry '{src}': glob `src` requires `dest` to be a directory path ending with '/'"
         );
     }
-    if let Some(mode) = &upload.mode {
+    if let Some(mode) = &file.mode {
         validate_mode_string(mode, src, kind)?;
     }
-    if let Some(owner) = &upload.owner {
+    if let Some(owner) = &file.owner {
         validate_owner_group_string(owner, "owner", src, kind)?;
     }
-    if let Some(group) = &upload.group {
+    if let Some(group) = &file.group {
         validate_owner_group_string(group, "group", src, kind)?;
     }
     Ok(())
@@ -1303,8 +1302,8 @@ mod tests {
         validate_build_steps, validate_test_ports, validate_test_steps, CompressionType,
         InputDeclaration, InputType, ReclaimMode, TestConfig, TestIso, MAX_INCLUDE_DEPTH,
     };
+    use crate::plan::files::FileEntry;
     use crate::plan::step::{ArchiveStep, ArchiveStepSpec, RunStep, StepTarget, TestStep};
-    use crate::plan::upload::TopLevelUpload;
     use crate::qemu::PortSpec;
     use crate::resolver::Reference;
     use std::collections::BTreeMap;
@@ -2867,7 +2866,7 @@ steps: []
     }
 
     #[test]
-    fn test_load_build_config_uploads_absent_is_empty() {
+    fn test_load_build_config_files_absent_is_empty() {
         let repo = TempDir::new().unwrap();
         write_build_config(
             &repo,
@@ -2875,11 +2874,11 @@ steps: []
             "type: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\n",
         );
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
-        assert!(config.uploads.is_empty(), "uploads should default to empty");
+        assert!(config.files.is_empty(), "files should default to empty");
     }
 
     #[test]
-    fn test_load_build_config_parses_top_level_uploads() {
+    fn test_load_build_config_parses_top_level_files() {
         let repo = TempDir::new().unwrap();
         write_build_config(
             &repo,
@@ -2888,7 +2887,7 @@ steps: []
 type: build
 image: "@base"
 output: "out.qcow2"
-uploads:
+files:
   - src: "@://images/botspace/envoy/**/*.yaml"
     dest: /tmp/bake-staging/envoy/
   - src: "@artifact://build/images/payload/*.tar"
@@ -2898,14 +2897,14 @@ steps: []
         );
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
         assert_eq!(
-            config.uploads,
+            config.files,
             vec![
-                TopLevelUpload {
+                FileEntry {
                     src: "@://images/botspace/envoy/**/*.yaml".to_string(),
                     dest: "/tmp/bake-staging/envoy/".to_string(),
                     ..Default::default()
                 },
-                TopLevelUpload {
+                FileEntry {
                     src: "@artifact://build/images/payload/*.tar".to_string(),
                     dest: "/usr/share/botwork/images/".to_string(),
                     ..Default::default()
@@ -2915,7 +2914,7 @@ steps: []
     }
 
     #[test]
-    fn test_load_build_config_rejects_top_level_upload_bare_path_src() {
+    fn test_load_build_config_rejects_top_level_file_bare_path_src() {
         let repo = TempDir::new().unwrap();
         write_build_config(
             &repo,
@@ -2924,7 +2923,7 @@ steps: []
 type: build
 image: "@base"
 output: "out.qcow2"
-uploads:
+files:
   - src: payload/file.txt
     dest: /tmp/payload
 steps: []
@@ -2939,7 +2938,7 @@ steps: []
     }
 
     #[test]
-    fn test_load_build_config_rejects_top_level_upload_relative_dest() {
+    fn test_load_build_config_rejects_top_level_file_relative_dest() {
         let repo = TempDir::new().unwrap();
         write_build_config(
             &repo,
@@ -2948,7 +2947,7 @@ steps: []
 type: build
 image: "@base"
 output: "out.qcow2"
-uploads:
+files:
   - src: "@://payload/file.txt"
     dest: relative/path
 steps: []
@@ -2963,7 +2962,7 @@ steps: []
     }
 
     #[test]
-    fn test_load_build_config_rejects_top_level_upload_src_invalid_ref() {
+    fn test_load_build_config_rejects_top_level_file_src_invalid_ref() {
         let repo = TempDir::new().unwrap();
         write_build_config(
             &repo,
@@ -2972,7 +2971,7 @@ steps: []
 type: build
 image: "@base"
 output: "out.qcow2"
-uploads:
+files:
   - src: "@://secret/../etc/passwd"
     dest: /tmp/secret.txt
 steps: []
@@ -2987,7 +2986,7 @@ steps: []
     }
 
     #[test]
-    fn test_load_build_config_rejects_top_level_upload_glob_with_non_directory_dest() {
+    fn test_load_build_config_rejects_top_level_file_glob_with_non_directory_dest() {
         let repo = TempDir::new().unwrap();
         write_build_config(
             &repo,
@@ -2996,7 +2995,7 @@ steps: []
 type: build
 image: "@base"
 output: "out.qcow2"
-uploads:
+files:
   - src: "@artifact://payload/*.tar"
     dest: /tmp/payload.tar
 steps: []
@@ -3011,7 +3010,7 @@ steps: []
     }
 
     #[test]
-    fn test_load_build_config_rejects_top_level_upload_unknown_field() {
+    fn test_load_build_config_rejects_top_level_file_unknown_field() {
         let repo = TempDir::new().unwrap();
         write_build_config(
             &repo,
@@ -3020,7 +3019,7 @@ steps: []
 type: build
 image: "@base"
 output: "out.qcow2"
-uploads:
+files:
   - src: "@://payload/file.txt"
     dest: /tmp/file.txt
     bogus: 1
@@ -3033,7 +3032,7 @@ steps: []
     }
 
     #[test]
-    fn test_load_build_config_parses_top_level_upload_permission_fields() {
+    fn test_load_build_config_parses_top_level_file_permission_fields() {
         let repo = TempDir::new().unwrap();
         write_build_config(
             &repo,
@@ -3042,7 +3041,7 @@ steps: []
 type: build
 image: "@base"
 output: "out.qcow2"
-uploads:
+files:
   - src: "@payload"
     dest: /usr/local/bin/file
     mode: "0755"
@@ -3054,17 +3053,17 @@ steps: []
 "#,
         );
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
-        assert_eq!(config.uploads.len(), 1);
-        let upload = &config.uploads[0];
-        assert_eq!(upload.mode.as_deref(), Some("0755"));
-        assert_eq!(upload.owner.as_deref(), Some("root"));
-        assert_eq!(upload.group.as_deref(), Some("root"));
-        assert_eq!(upload.overwrite, Some(true));
-        assert_eq!(upload.parents, Some(true));
+        assert_eq!(config.files.len(), 1);
+        let file = &config.files[0];
+        assert_eq!(file.mode.as_deref(), Some("0755"));
+        assert_eq!(file.owner.as_deref(), Some("root"));
+        assert_eq!(file.group.as_deref(), Some("root"));
+        assert_eq!(file.overwrite, Some(true));
+        assert_eq!(file.parents, Some(true));
     }
 
     #[test]
-    fn test_load_build_config_rejects_top_level_upload_invalid_mode() {
+    fn test_load_build_config_rejects_top_level_file_invalid_mode() {
         let repo = TempDir::new().unwrap();
         write_build_config(
             &repo,
@@ -3073,7 +3072,7 @@ steps: []
 type: build
 image: "@base"
 output: "out.qcow2"
-uploads:
+files:
   - src: "@payload"
     dest: /tmp/file.txt
     mode: "abc"
@@ -3089,7 +3088,7 @@ steps: []
     }
 
     #[test]
-    fn test_load_build_config_rejects_top_level_upload_owner_with_slash() {
+    fn test_load_build_config_rejects_top_level_file_owner_with_slash() {
         let repo = TempDir::new().unwrap();
         write_build_config(
             &repo,
@@ -3098,7 +3097,7 @@ steps: []
 type: build
 image: "@base"
 output: "out.qcow2"
-uploads:
+files:
   - src: "@payload"
     dest: /tmp/file.txt
     owner: "root/admin"
@@ -3114,7 +3113,7 @@ steps: []
     }
 
     #[test]
-    fn test_load_build_config_rejects_top_level_upload_group_with_metachar() {
+    fn test_load_build_config_rejects_top_level_file_group_with_metachar() {
         let repo = TempDir::new().unwrap();
         write_build_config(
             &repo,
@@ -3123,7 +3122,7 @@ steps: []
 type: build
 image: "@base"
 output: "out.qcow2"
-uploads:
+files:
   - src: "@payload"
     dest: /tmp/file.txt
     group: "adm;in"
@@ -3778,7 +3777,7 @@ cloud_init:
     }
 
     #[test]
-    fn test_load_fragment_rejects_uploads_section() {
+    fn test_load_fragment_rejects_files_section() {
         let repo = TempDir::new().unwrap();
         std::fs::write(
             repo.path().join("frag.yaml"),
@@ -3799,21 +3798,21 @@ cloud_init:
     }
 
     #[test]
-    fn test_load_test_config_uploads_absent_is_empty() {
+    fn test_load_test_config_files_absent_is_empty() {
         let repo = TempDir::new().unwrap();
         std::fs::write(repo.path().join("test.yaml"), "type: test\nsteps: []\n").unwrap();
         let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
-        assert!(config.uploads.is_empty(), "uploads should default to empty");
+        assert!(config.files.is_empty(), "files should default to empty");
     }
 
     #[test]
-    fn test_load_test_config_parses_top_level_uploads() {
+    fn test_load_test_config_parses_top_level_files() {
         let repo = TempDir::new().unwrap();
         std::fs::write(
             repo.path().join("test.yaml"),
             r#"
 type: test
-uploads:
+files:
   - src: "@://fixtures/envoy/**/*.yaml"
     dest: /tmp/envoy/
 steps: []
@@ -3822,8 +3821,8 @@ steps: []
         .unwrap();
         let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
         assert_eq!(
-            config.uploads,
-            vec![TopLevelUpload {
+            config.files,
+            vec![FileEntry {
                 src: "@://fixtures/envoy/**/*.yaml".to_string(),
                 dest: "/tmp/envoy/".to_string(),
                 ..Default::default()

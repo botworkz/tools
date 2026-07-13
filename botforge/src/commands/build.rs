@@ -285,7 +285,7 @@ pub(crate) fn cmd_build(config: &Path, args: BuildArgs) -> Result<()> {
     let step_result = run_step_flow(
         &repo_root,
         StepFlowPlan {
-            top_level_uploads: &build_config.uploads,
+            files: &build_config.files,
             steps: &build_config.steps,
             bootstraps: &[],
             manifest_path: config,

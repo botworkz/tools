@@ -1,7 +1,7 @@
 pub(crate) mod config;
+pub(crate) mod files;
 pub(super) mod log;
 pub(crate) mod step;
-pub(crate) mod upload;
 pub(crate) mod vm;
 
 pub(crate) use config::{
