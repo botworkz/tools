@@ -139,12 +139,50 @@ pub(crate) struct AssertFile {
     pub(crate) mode: Option<String>,
 }
 
+/// A single user expectation inside `assert.users:`.
+///
+/// When `exists: false`, the `shell` and `groups` fields must be absent
+/// (rejected at config-load time).  The key may be an exact name **or** a
+/// glob pattern (e.g. `botforge-*`); pattern negatives enumerate
+/// `getent passwd` output and match against each user name.
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+pub(crate) struct AssertUser {
+    /// When `false`, the user must not exist on the guest.  Defaults to `true`.
+    #[serde(default = "default_assert_exists")]
+    pub(crate) exists: bool,
+    /// Expected login shell (e.g. `/bin/bash`).
+    /// Only meaningful when `exists: true`.
+    #[serde(default)]
+    pub(crate) shell: Option<String>,
+    /// All listed groups must be present in the user's supplementary groups
+    /// (checked via `id -nG <user>`).  Only meaningful when `exists: true`.
+    #[serde(default)]
+    pub(crate) groups: Vec<String>,
+}
+
+/// A single group expectation inside `assert.groups:`.
+///
+/// When `exists: false`, no other attribute fields are supported.
+/// The key may be an exact name **or** a glob pattern.
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+pub(crate) struct AssertGroup {
+    /// When `false`, the group must not exist on the guest.  Defaults to `true`.
+    #[serde(default = "default_assert_exists")]
+    pub(crate) exists: bool,
+}
+
 /// Validated `assert:` block from a `type: test` document.
 #[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
 pub(crate) struct AssertBlock {
     /// Map of absolute guest path → file expectation.
     #[serde(default)]
     pub(crate) files: BTreeMap<String, AssertFile>,
+    /// Map of user name (or glob pattern) → user expectation.
+    #[serde(default)]
+    pub(crate) users: BTreeMap<String, AssertUser>,
+    /// Map of group name (or glob pattern) → group expectation.
+    #[serde(default)]
+    pub(crate) groups: BTreeMap<String, AssertGroup>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -1166,6 +1204,12 @@ fn validate_assert_block(block: &AssertBlock) -> Result<()> {
     for (guest_path, expectation) in &block.files {
         validate_assert_file_entry(guest_path, expectation)?;
     }
+    for (name_or_pattern, expectation) in &block.users {
+        validate_assert_user_entry(name_or_pattern, expectation)?;
+    }
+    for (name_or_pattern, expectation) in &block.groups {
+        validate_assert_group_entry(name_or_pattern, expectation)?;
+    }
     Ok(())
 }
 
@@ -1203,6 +1247,24 @@ fn validate_assert_file_entry(guest_path: &str, expectation: &AssertFile) -> Res
 
 pub(crate) fn src_has_glob_metacharacters(src: &str) -> bool {
     src.contains('*') || src.contains('?') || src.contains('[')
+}
+
+fn validate_assert_user_entry(name_or_pattern: &str, expectation: &AssertUser) -> Result<()> {
+    if !expectation.exists {
+        // When exists: false, attribute fields are meaningless — reject them.
+        if expectation.shell.is_some() || !expectation.groups.is_empty() {
+            anyhow::bail!(
+                "assert.users: entry '{name_or_pattern}': attribute fields \
+                 (shell/groups) must not be set when `exists: false`"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_assert_group_entry(_name_or_pattern: &str, _expectation: &AssertGroup) -> Result<()> {
+    // Currently no additional validation beyond deserialization for groups.
+    Ok(())
 }
 
 fn substitute_inputs_in_value(value: &mut Value, inputs: &BTreeMap<String, String>) -> Result<()> {
@@ -5012,5 +5074,129 @@ assert:
             Some(AssertFileType::Directory)
         );
         assert!(!assert_block.files.get("/tmp/gone.tar").unwrap().exists);
+    }
+
+    #[test]
+    fn test_load_test_config_assert_users_basic() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            r#"
+type: test
+steps: []
+assert:
+  users:
+    bot:
+      exists: true
+      shell: /bin/bash
+      groups: [bot, docker]
+    mallory:
+      exists: false
+"#,
+        )
+        .unwrap();
+        let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+        let assert_block = config.assert.unwrap();
+        assert_eq!(assert_block.users.len(), 2);
+        let bot = assert_block.users.get("bot").unwrap();
+        assert!(bot.exists);
+        assert_eq!(bot.shell.as_deref(), Some("/bin/bash"));
+        assert_eq!(bot.groups, vec!["bot", "docker"]);
+        let mallory = assert_block.users.get("mallory").unwrap();
+        assert!(!mallory.exists);
+    }
+
+    #[test]
+    fn test_load_test_config_assert_users_pattern_negative() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            r#"
+type: test
+steps: []
+assert:
+  users:
+    "botforge-*":
+      exists: false
+"#,
+        )
+        .unwrap();
+        let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+        let assert_block = config.assert.unwrap();
+        let pat = assert_block.users.get("botforge-*").unwrap();
+        assert!(!pat.exists);
+    }
+
+    #[test]
+    fn test_load_test_config_assert_users_rejects_attrs_with_exists_false() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            r#"
+type: test
+steps: []
+assert:
+  users:
+    mallory:
+      exists: false
+      shell: /bin/bash
+"#,
+        )
+        .unwrap();
+        let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("shell") || msg.contains("exists: false"),
+            "error should mention shell/exists: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_load_test_config_assert_groups_basic() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            r#"
+type: test
+steps: []
+assert:
+  groups:
+    docker:
+      exists: true
+    evilusers:
+      exists: false
+"#,
+        )
+        .unwrap();
+        let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+        let assert_block = config.assert.unwrap();
+        assert_eq!(assert_block.groups.len(), 2);
+        assert!(assert_block.groups.get("docker").unwrap().exists);
+        assert!(!assert_block.groups.get("evilusers").unwrap().exists);
+    }
+
+    #[test]
+    fn test_load_test_config_assert_users_and_groups_combined() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            r#"
+type: test
+steps: []
+assert:
+  users:
+    bot:
+      exists: true
+      shell: /bin/bash
+  groups:
+    docker:
+      exists: true
+"#,
+        )
+        .unwrap();
+        let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+        let assert_block = config.assert.unwrap();
+        assert_eq!(assert_block.users.len(), 1);
+        assert_eq!(assert_block.groups.len(), 1);
     }
 }
