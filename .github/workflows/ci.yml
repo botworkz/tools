@@ -56,8 +56,12 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # For pull_request events, group by the PR head ref so that new pushes to a
+  # PR cancel earlier in-progress runs. For all other events (push to main,
+  # workflow_dispatch, release) use the unique run_id so each run gets its own
+  # group and is never cancelled by a subsequent run.
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.head_ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   crate:
