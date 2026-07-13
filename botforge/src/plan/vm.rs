@@ -13,7 +13,9 @@ use crate::ssh::{
 };
 use crate::util::unique_suffix;
 
-use super::assert::{run_assert_files, run_assert_groups, run_assert_packages, run_assert_users};
+use super::assert::{
+    run_assert_files, run_assert_groups, run_assert_packages, run_assert_services, run_assert_users,
+};
 use super::config::{AssertBlock, TestConfig, TestIsoBootstrap};
 use super::files::{stage_files, FileEntry};
 use super::log::{
@@ -125,6 +127,9 @@ fn run_assert_phase(
     }
     if !assert_block.packages.is_empty() {
         run_assert_packages(ssh, assert_block)?;
+    }
+    if !assert_block.services.is_empty() {
+        run_assert_services(ssh, assert_block)?;
     }
     Ok(())
 }

@@ -68,6 +68,7 @@ jobs:
     - run: |
         mkdir testrepo
         cp -a botforge/test/hello.steps.yaml testrepo/
+        cp -a botforge/test/assert-fail.yaml testrepo/
     - name: Set runtime environment
       run: |
         {
@@ -172,8 +173,21 @@ jobs:
         qemu-img check -r all -f qcow2 testrepo/build/artifact/foo-chained.qcow2
         sudo guestfish --ro -a testrepo/build/artifact/foo.qcow2 -i sh 'file /boot/vmlinuz*; ls -l /boot'
 
-    - run: |
+    - name: Run acceptance tests (cloud-init + assert + expect)
+      run: |
         . .botforge.env
         botforge test \
           --test-config test.yaml \
           --repo-root "$REPO_ROOT"
+
+    - name: Negative-control — deliberate assert failure must exit non-zero
+      run: |
+        set -euo pipefail
+        . .botforge.env
+        if botforge test \
+             --test-config assert-fail.yaml \
+             --repo-root "$REPO_ROOT"; then
+          echo "ERROR: botforge should have exited non-zero for a failing assertion" >&2
+          exit 1
+        fi
+        echo "Negative-control passed: botforge correctly rejected the failing assertion"
