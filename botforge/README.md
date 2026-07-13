@@ -664,6 +664,17 @@ that runs `botforge build` or `botforge test`.  Cloud-init's spec is the schema;
 botforge does not enumerate or validate specific cloud-init keys beyond the
 guards listed below.
 
+When `cloud-init` is available on the host, botforge also runs a fast
+pre-flight `cloud-init schema` check at config-load time against the user
+fragment (rendered with a `#cloud-config` header). This is **advisory** by
+default: schema issues are shown as warnings and loading continues.
+
+- `BOTFORGE_CLOUD_INIT_SCHEMA=warn` (default): report schema violations as warnings.
+- `BOTFORGE_CLOUD_INIT_SCHEMA=strict`: treat schema violations as hard errors.
+- `BOTFORGE_CLOUD_INIT_SCHEMA=off`: disable the pre-flight schema check.
+
+If `cloud-init` is missing on the host, this pre-flight check is skipped.
+
 **Semi-hermetic invariant:** the build is hermetic up to the runner VM boot
 and open after it (the guest provisions like a normal machine).  `cloud_init:`
 configures the *runner VM*, not the output image's cloud-init:
@@ -698,7 +709,9 @@ botforge's base):
 | **Ingress** | `write_files:` entries with a `source:` field (host-path ingress). Use `uploads:` for host→guest file transfer; inline `content:` is allowed. |
 | **Harness** | `ssh_pwauth: false` — may break botforge's key-based SSH access to the runner VM. |
 
-Everything else is "cloud-init's problem", which is the whole point.
+These two guards are botforge policy and remain hard errors regardless of the
+schema pre-flight mode. Everything else is "cloud-init's problem", which is the
+whole point.
 
 **`cloud_init:` is NOT a host-filesystem access primitive.** The three host→guest
 channels remain separate:
