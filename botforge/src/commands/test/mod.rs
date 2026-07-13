@@ -183,6 +183,13 @@ pub(crate) fn cmd_test(config: &Path, args: TestArgs) -> Result<()> {
     );
 
     let mut vm_child = Some(spawn_qemu_with_log(&qemu_args, &vm_log)?);
+    // Capture the installer username before it is moved into ssh_options.
+    // This is only meaningful when botforge owns the installer (_kept_keypair is Some).
+    let installer_username: Option<String> = if _kept_keypair.is_some() {
+        Some(ssh_user_string.clone())
+    } else {
+        None
+    };
     let ssh_options = SshOptions {
         host: args.ssh_host.clone(),
         port: args.ssh_port,
@@ -197,6 +204,7 @@ pub(crate) fn cmd_test(config: &Path, args: TestArgs) -> Result<()> {
         &bootstraps,
         config,
         None,
+        installer_username.as_deref(),
     );
     if let Err(err) = test_result {
         eprintln!("test failed: {err:#}");
