@@ -26,6 +26,14 @@ steps:
     stderr:
       not_contains:
       - fatal error
+- name: Loop check (${{ args.0 }})
+  for: [auth-broker, config-broker]
+  run: |
+    systemctl is-active botwork-${{ args.0 }}.service
+  expect:
+    stdout:
+      contains:
+      - active
 
 assert:
   files:

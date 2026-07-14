@@ -500,7 +500,7 @@ where
 
 #[derive(Debug)]
 enum RawTestStep {
-    Step(TestStep),
+    Step(Value),
     Include(TestStepInclude),
 }
 
@@ -517,9 +517,7 @@ impl<'de> Deserialize<'de> for RawTestStep {
                     .map_err(de::Error::custom);
             }
         }
-        serde_yaml::from_value::<TestStep>(value)
-            .map(Self::Step)
-            .map_err(de::Error::custom)
+        Ok(Self::Step(value))
     }
 }
 
@@ -805,7 +803,10 @@ fn expand_test_steps(
     let mut expanded = Vec::new();
     for step in steps {
         match step {
-            RawTestStep::Step(step) => expanded.push(step),
+            RawTestStep::Step(step) => expanded.extend(
+                expand_raw_step(step)
+                    .with_context(|| format!("invalid step in {}", current_file.display()))?,
+            ),
             RawTestStep::Include(include) => {
                 let include_path =
                     resolve_uses_path(repo_root, &include.uses).with_context(|| {
@@ -858,6 +859,68 @@ fn expand_test_steps(
         }
     }
     Ok(expanded)
+}
+
+fn expand_raw_step(step: Value) -> Result<Vec<TestStep>> {
+    let mut mapping = match step {
+        Value::Mapping(mapping) => mapping,
+        _ => anyhow::bail!("step entry must be a mapping"),
+    };
+
+    let for_key = Value::String("for".to_string());
+    let Some(items_value) = mapping.remove(&for_key) else {
+        let parsed: TestStep = serde_yaml::from_value(Value::Mapping(mapping))?;
+        return Ok(vec![parsed]);
+    };
+
+    let body = Value::Mapping(mapping);
+    let items = match items_value {
+        Value::Sequence(items) => items,
+        _ => anyhow::bail!("step `for:` must be a sequence"),
+    };
+
+    let mut expanded = Vec::new();
+    for item in items {
+        let args = resolve_for_args(&item)?;
+        let mut concrete = body.clone();
+        substitute_args_in_value(&mut concrete, &args)?;
+        expanded.push(serde_yaml::from_value::<TestStep>(concrete)?);
+    }
+    Ok(expanded)
+}
+
+fn resolve_for_args(item: &Value) -> Result<BTreeMap<String, String>> {
+    let mut args = BTreeMap::new();
+    match item {
+        Value::Sequence(values) => {
+            for (index, value) in values.iter().enumerate() {
+                args.insert(index.to_string(), scalar_value_to_string(value)?);
+            }
+        }
+        Value::Mapping(entries) => {
+            for (key, value) in entries {
+                let name = match key {
+                    Value::String(name) => name.clone(),
+                    _ => anyhow::bail!("step `for:` mapping keys must be strings"),
+                };
+                args.insert(name, scalar_value_to_string(value)?);
+            }
+        }
+        _ => {
+            args.insert("0".to_string(), scalar_value_to_string(item)?);
+        }
+    }
+    Ok(args)
+}
+
+fn scalar_value_to_string(value: &Value) -> Result<String> {
+    match value {
+        Value::String(text) => Ok(text.clone()),
+        Value::Bool(flag) => Ok(flag.to_string()),
+        Value::Number(number) => Ok(number.to_string()),
+        Value::Null => Ok("null".to_string()),
+        _ => anyhow::bail!("step `for:` values must be scalars, sequences, or mappings"),
+    }
 }
 
 fn load_test_steps_fragment(
@@ -1596,18 +1659,30 @@ fn validate_assert_service_entry(_name: &str, _expectation: &AssertService) -> R
     Ok(())
 }
 fn substitute_inputs_in_value(value: &mut Value, inputs: &BTreeMap<String, String>) -> Result<()> {
+    substitute_namespace_in_value(value, "inputs", inputs)
+}
+
+fn substitute_args_in_value(value: &mut Value, args: &BTreeMap<String, String>) -> Result<()> {
+    substitute_namespace_in_value(value, "args", args)
+}
+
+fn substitute_namespace_in_value(
+    value: &mut Value,
+    namespace: &str,
+    values: &BTreeMap<String, String>,
+) -> Result<()> {
     match value {
         Value::String(text) => {
-            *text = substitute_inputs_in_string(text, inputs)?;
+            *text = substitute_namespace_in_string(text, namespace, values)?;
         }
         Value::Sequence(items) => {
             for item in items {
-                substitute_inputs_in_value(item, inputs)?;
+                substitute_namespace_in_value(item, namespace, values)?;
             }
         }
         Value::Mapping(entries) => {
             for (_, value) in entries.iter_mut() {
-                substitute_inputs_in_value(value, inputs)?;
+                substitute_namespace_in_value(value, namespace, values)?;
             }
         }
         _ => {}
@@ -1615,7 +1690,11 @@ fn substitute_inputs_in_value(value: &mut Value, inputs: &BTreeMap<String, Strin
     Ok(())
 }
 
-fn substitute_inputs_in_string(text: &str, inputs: &BTreeMap<String, String>) -> Result<String> {
+fn substitute_namespace_in_string(
+    text: &str,
+    namespace: &str,
+    values: &BTreeMap<String, String>,
+) -> Result<String> {
     let mut rendered = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(start) = rest.find("${{") {
@@ -1625,9 +1704,10 @@ fn substitute_inputs_in_string(text: &str, inputs: &BTreeMap<String, String>) ->
             .find("}}")
             .ok_or_else(|| anyhow::anyhow!("unterminated input expression in '{text}'"))?;
         let expr = after_open[..end].trim();
-        let name = expr.strip_prefix("inputs.").ok_or_else(|| {
+        let prefix = format!("{namespace}.");
+        let name = expr.strip_prefix(&prefix).ok_or_else(|| {
             anyhow::anyhow!(
-                "unsupported expression '${{{{{expr}}}}}'; only ${{{{ inputs.NAME }}}} is supported"
+                "unsupported expression '${{{{{expr}}}}}'; only ${{{{ {namespace}.NAME }}}} is supported"
             )
         })?;
         if name.is_empty()
@@ -1637,7 +1717,7 @@ fn substitute_inputs_in_string(text: &str, inputs: &BTreeMap<String, String>) ->
         {
             anyhow::bail!("invalid input name '{name}' in '{text}'");
         }
-        let value = inputs
+        let value = values
             .get(name)
             .ok_or_else(|| anyhow::anyhow!("missing required input '{name}'"))?;
         rendered.push_str(value);
@@ -2293,6 +2373,158 @@ steps:
         assert_eq!(config.steps.len(), 1);
         assert_eq!(run_ref(&config.steps[0]).name, "frag-root-step");
         assert_eq!(run_ref(&config.steps[0]).sudo, Some(true));
+    }
+
+    #[test]
+    fn test_load_test_config_expands_step_level_for_scalar_items() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            r#"
+type: test
+steps:
+  - name: "check-${{ args.0 }}"
+    for: [auth-broker, api]
+    run: echo ${{ args.0 }}
+"#,
+        )
+        .unwrap();
+
+        let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+        assert_eq!(config.steps.len(), 2);
+        assert_eq!(run_ref(&config.steps[0]).name, "check-auth-broker");
+        assert_eq!(run_ref(&config.steps[0]).run, "echo auth-broker");
+        assert_eq!(run_ref(&config.steps[1]).name, "check-api");
+        assert_eq!(run_ref(&config.steps[1]).run, "echo api");
+    }
+
+    #[test]
+    fn test_load_test_config_expands_step_level_for_sequence_items() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            r#"
+type: test
+steps:
+  - name: "check-${{ args.0 }}"
+    for:
+      - [foo, foo-svc]
+      - [bar, bar-svc]
+    run: echo ${{ args.0 }} ${{ args.1 }}
+"#,
+        )
+        .unwrap();
+
+        let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+        assert_eq!(config.steps.len(), 2);
+        assert_eq!(run_ref(&config.steps[0]).name, "check-foo");
+        assert_eq!(run_ref(&config.steps[0]).run, "echo foo foo-svc");
+        assert_eq!(run_ref(&config.steps[1]).name, "check-bar");
+        assert_eq!(run_ref(&config.steps[1]).run, "echo bar bar-svc");
+    }
+
+    #[test]
+    fn test_load_test_config_expands_step_level_for_assoc_items() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            r#"
+type: test
+steps:
+  - name: "check-${{ args.label }}"
+    for:
+      - { label: foo, svc: foo-svc }
+      - { label: bar, svc: bar-svc }
+    run: echo ${{ args.svc }}
+"#,
+        )
+        .unwrap();
+
+        let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+        assert_eq!(config.steps.len(), 2);
+        assert_eq!(run_ref(&config.steps[0]).name, "check-foo");
+        assert_eq!(run_ref(&config.steps[0]).run, "echo foo-svc");
+        assert_eq!(run_ref(&config.steps[1]).name, "check-bar");
+        assert_eq!(run_ref(&config.steps[1]).run, "echo bar-svc");
+    }
+
+    #[test]
+    fn test_load_test_config_step_level_for_preserves_expect_block() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            r#"
+type: test
+steps:
+  - name: check-${{ args.0 }}
+    for: [alpha, beta]
+    run: echo ${{ args.0 }}
+    expect:
+      stdout:
+        contains:
+          - ${{ args.0 }}
+"#,
+        )
+        .unwrap();
+
+        let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+        assert_eq!(config.steps.len(), 2);
+        assert_eq!(
+            run_ref(&config.steps[0])
+                .expect
+                .as_ref()
+                .unwrap()
+                .stdout
+                .as_ref()
+                .unwrap()
+                .contains,
+            vec!["alpha".to_string()]
+        );
+        assert_eq!(
+            run_ref(&config.steps[1])
+                .expect
+                .as_ref()
+                .unwrap()
+                .stdout
+                .as_ref()
+                .unwrap()
+                .contains,
+            vec!["beta".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_load_test_config_step_level_for_interops_with_uses() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("frag.yaml"),
+            r#"
+type: fragment
+steps:
+  - on: guest
+    name: frag-step
+    run: echo from-fragment
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            r#"
+type: test
+steps:
+  - name: check-${{ args.0 }}
+    for: [one, two]
+    run: echo ${{ args.0 }}
+  - uses: "@://frag.yaml"
+"#,
+        )
+        .unwrap();
+
+        let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+        assert_eq!(config.steps.len(), 3);
+        assert_eq!(run_ref(&config.steps[0]).name, "check-one");
+        assert_eq!(run_ref(&config.steps[1]).name, "check-two");
+        assert_eq!(run_ref(&config.steps[2]).name, "frag-step");
     }
 
     #[test]
@@ -5011,6 +5243,30 @@ steps:
     }
 
     #[test]
+    fn test_build_config_expands_step_level_for() {
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            r#"
+type: build
+image: "@debian-base"
+output: "out.qcow2"
+steps:
+  - name: "build-${{ args.0 }}"
+    for: [alpha, beta]
+    run: echo ${{ args.0 }}
+"#,
+        );
+        let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
+        assert_eq!(config.steps.len(), 2);
+        assert_eq!(run_ref(&config.steps[0]).name, "build-alpha");
+        assert_eq!(run_ref(&config.steps[0]).run, "echo alpha");
+        assert_eq!(run_ref(&config.steps[1]).name, "build-beta");
+        assert_eq!(run_ref(&config.steps[1]).run, "echo beta");
+    }
+
+    #[test]
     fn test_build_config_preserves_fragment_sudo_via_uses() {
         let repo = TempDir::new().unwrap();
         std::fs::write(
@@ -5108,12 +5364,12 @@ steps:
         for (name, content, needle) in [
             (
                 "build-zero-step-timeout.yaml",
-                "type: build\nstep_timeout: 0\nsteps: []\n",
+                "type: build\nimage: \"@debian-base\"\noutput: \"out.qcow2\"\nstep_timeout: 0\nsteps: []\n",
                 "positive integer",
             ),
             (
                 "build-negative-step-timeout.yaml",
-                "type: build\nsteps:\n  - on: host\n    name: slow\n    timeout: -5\n    run: echo ok\n",
+                "type: build\nimage: \"@debian-base\"\noutput: \"out.qcow2\"\nsteps:\n  - on: host\n    name: slow\n    timeout: -5\n    run: echo ok\n",
                 "positive integer",
             ),
         ] {

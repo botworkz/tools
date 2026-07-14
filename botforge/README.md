@@ -323,6 +323,28 @@ string instead, emit `""` from the expression.
 For this first iteration, `@://` is the only supported `uses:` scheme. Plain
 filesystem paths, `../` traversal, and other schemes are rejected.
 
+#### Step-level `for:` expansion
+
+Run steps may declare `for:` directly on the step (alongside `name:` / `run:` /
+`expect:` / `shell:` / `on:`). At load time, one step with `for:` expands into
+N concrete steps (one per item). The `for:` key is removed before strict step
+deserialization, so normal run-step validation still applies to each generated
+step.
+
+`for:` item forms:
+
+- Flat scalar list: `for: [auth-broker, config-broker]` → use `${{ args.0 }}`
+  in the step body.
+- Sequence of sequences: `for: [[foo, foo-svc], [bar, bar-svc]]` → use
+  `${{ args.0 }}`, `${{ args.1 }}`, … positionally.
+- Sequence of mappings: `for: [{ label: foo, svc: foo-svc }, ...]` → use
+  `${{ args.label }}`, `${{ args.svc }}` by key.
+
+Substitution is applied across the entire step body before strict parsing, so
+`${{ args.* }}` works in `name:`, `run:`, `expect:`, etc. The `expect:` block
+is cloned per generated step (no special loop-specific `expect` behavior).
+Runtime `${VAR}` shell/env expansion is unchanged.
+
 Config errors are reported at load time for: invalid `on:`; any `on: host` step present when `ports:` is empty;
 invalid `shell:` value; invalid `uses:` scheme/path; `with:` key not declared
 by the fragment (`unexpected input '<name>' not declared by fragment <path>`);
@@ -338,7 +360,9 @@ document, got 'type: <x>'`); `uses:` pointing at a non-fragment document
 document (`<section>: is not valid in a 'type: fragment' document`); cyclic
 `uses:` chain (`cyclic test step include detected: <chain>`); `uses:` nesting
 exceeding the maximum include depth (`test step include depth limit (32)
-exceeded: <chain>`).
+exceeded: <chain>`); invalid step-level `for:` shape (`for:` must be a
+sequence; mapping keys must be strings; values must be scalars, sequences, or
+mappings).
 
 On **any** step failure (guest or host) the usual guest diagnostics are
 collected (`systemctl --failed`, `journalctl`, `cloud-init status`, VM log
@@ -638,7 +662,8 @@ via SSH; host steps run in the botforge container.
 `on: host` steps in `type: build` do **not** require `ports:` (unlike
 `type: test`).
 
-Reusable `uses:` fragment includes work exactly as in `type: test`.
+Reusable `uses:` fragment includes and step-level `for:` expansion work exactly
+as in `type: test`.
 
 #### `files:` (optional) — guest pre-staging before `steps:`
 
