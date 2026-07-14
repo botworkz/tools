@@ -341,8 +341,12 @@ step.
   `${{ args.label }}`, `${{ args.svc }}` by key.
 
 Substitution is applied across the entire step body before strict parsing, so
-`${{ args.* }}` works in `name:`, `run:`, `expect:`, etc. The `expect:` block
-is cloned per generated step (no special loop-specific `expect` behavior).
+`${{ args.* }}` works in `name:`, `run:`, `expect:`, etc. Step-level `for:`
+also works inside `uses:` fragments: fragment `${{ inputs.* }}` placeholders
+are resolved when the fragment is included, and `${{ args.* }}` placeholders
+are left intact until the later `for:` expansion pass, so both namespaces may
+co-occur in the same scalar. The `expect:` block is cloned per generated step
+(no special loop-specific `expect` behavior).
 Runtime `${VAR}` shell/env expansion is unchanged.
 
 Config errors are reported at load time for: invalid `on:`; any `on: host` step present when `ports:` is empty;

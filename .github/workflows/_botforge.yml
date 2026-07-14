@@ -69,6 +69,7 @@ jobs:
         mkdir testrepo
         cp -a botforge/test/hello.steps.yaml testrepo/
         cp -a botforge/test/assert-fail.yaml testrepo/
+        cp -a botforge/test/for-fragment-test.steps.yaml testrepo/
     - name: Set runtime environment
       run: |
         {
