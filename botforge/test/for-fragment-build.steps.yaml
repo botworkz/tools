@@ -1,0 +1,6 @@
+type: fragment
+steps:
+- name: Fragment loop scalar build (${{ args.0 }})
+  for: [cp, cat, ls]
+  run: |
+    command -v ${{ args.0 }}
