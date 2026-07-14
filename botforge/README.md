@@ -172,16 +172,18 @@ steps:
 
 #### Top-level `files:` (optional)
 
-Both `type: test` and `type: build` support an optional top-level `files:`
-list that stages files into the guest **once, after cloud-init is ready and
-before the first `steps:` entry runs**.
+`type: test` and `type: build` support an optional top-level `files:` list.
+`type: fragment` may also declare `files:`; fragment entries are collected into
+the root config in the same depth-first `uses:` splice walk used for `steps:`
+(root document `files:` first, then included fragment `files:` in inclusion
+order). Structurally-identical entries are de-duplicated (first occurrence
+kept), and the final collected list is staged into the guest **once, after
+cloud-init is ready and before the first `steps:` entry runs**.
 
 Each entry supports the following fields:
 
-- `src` — **required** repo-relative path or glob, resolved under `--repo-root`.
-  `*`, `**`, `?`, and `[...]` are supported. `@<shasset>` and `@://...` are
-  **not** supported here; use an `archive:` step for
-  shasset assets.
+- `src` — **required** `@` reference (`@name`, `@://...`, or
+  `@artifact://...`), including glob forms (`*`, `**`, `?`, `[...]`).
 - `dest` — **required** absolute guest path. For glob `src`, `dest` must end in
   `/` and is treated as a guest base directory.
 - `mode` — optional; 3–4 octal digits (e.g. `"0755"`). Defaults to `"0644"`.
@@ -208,6 +210,9 @@ Semantics:
 - Only regular files are staged; directories matched by a glob are skipped.
 - When `src` is a glob, `mode`/`owner`/`group`/`overwrite`/`parents` apply to
   **every** matched file.
+- No extra clash/overwrite arbitration is performed between non-identical
+  entries that resolve to the same destination yet; runtime staging currently
+  applies entries in collected order. This is tracked separately.
 
 ### `botforge test` step model
 
@@ -675,8 +680,7 @@ as in `type: test`.
 `type: test`. Entries are always guest-only and run once before the first
 configured step.
 
-- `src` must be a repo-relative file path or glob under `--repo-root`.
-- `src` may not start with `@`; top-level `files:` is filesystem-only.
+- `src` must be an `@` reference and may include globs.
 - `dest` must be an absolute guest path.
 - Glob `src` requires `dest` to end in `/`, and matched files are staged with
   path preservation relative to the glob's fixed literal prefix.
