@@ -5,6 +5,7 @@ ports:
 steps:
 - uses: "@://hello.steps.yaml"
 - uses: "@://for-fragment-test.steps.yaml"
+- uses: "@://files-fragment.steps.yaml"
 - name: Base install test
   run: |
     whoami | grep root
@@ -77,6 +78,11 @@ steps:
 assert:
   files:
     /etc/botforge-ci-marker:
+      filetype: file
+      owner: root
+      group: root
+      mode: "644"
+    /tmp/botforge-fragment-file.txt:
       filetype: file
       owner: root
       group: root
