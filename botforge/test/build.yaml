@@ -21,6 +21,13 @@ steps:
     apt-get update
     apt-get -qq dist-upgrade -y
     apt-get -qq install -y python3-virtualenv
+- name: Build expect smoke
+  run: |
+    /bin/echo "botforge-build-expect-ok"
+  expect:
+    exit: 0
+    stdout:
+      contains: ["botforge-build-expect-ok"]
 - name: Root-only regression fixture
   run: |
     # Regression fixture for assert.files: privileged-probe bug (#352).
