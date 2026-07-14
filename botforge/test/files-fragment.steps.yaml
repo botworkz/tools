@@ -1,0 +1,5 @@
+type: fragment
+files:
+- src: "@://fragment-file-fixture.txt"
+  dest: /tmp/botforge-fragment-file.txt
+steps: []

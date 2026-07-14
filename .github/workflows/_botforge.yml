@@ -71,6 +71,8 @@ jobs:
         cp -a botforge/test/assert-fail.yaml testrepo/
         cp -a botforge/test/for-fragment-build.steps.yaml testrepo/
         cp -a botforge/test/for-fragment-test.steps.yaml testrepo/
+        cp -a botforge/test/files-fragment.steps.yaml testrepo/
+        cp -a botforge/test/fragment-file-fixture.txt testrepo/
     - name: Set runtime environment
       run: |
         {
