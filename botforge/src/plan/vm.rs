@@ -308,10 +308,8 @@ fn run_run_step(
             let remote_script = format!("/tmp/botforge-step-{step_idx}-{suffix}.sh");
             let remote_env_path = format!("/tmp/botforge-env-{step_idx}-{suffix}");
 
-            // Prepend env preamble (exports + BOTFORGE_ENV setup) to the script body.
-            let preamble = build_guest_env_preamble(accumulated_env, &remote_env_path);
-            let script_content = format!("{preamble}{}", step.run);
-            std::fs::write(&local_script, script_content.as_bytes()).with_context(|| {
+            // Write only the user's script body — no interpreter-specific preamble.
+            std::fs::write(&local_script, step.run.as_bytes()).with_context(|| {
                 format!("test step '{}': failed to write script file", step.name)
             })?;
 
@@ -331,7 +329,21 @@ fn run_run_step(
                 // Capturing path: surface stdout/stderr and exit code for assertion checking.
                 // Propagate the scp error early if upload failed.
                 scp_result?;
-                let ssh_cmd = build_guest_ssh_cmd(&template, &remote_script, step.sudo_enabled());
+                // Initialize the remote env file so the script can append to it via $BOTFORGE_ENV.
+                let _ = ssh_with_retry(
+                    context.ssh,
+                    &format!(": > {}", shell_single_quote(&remote_env_path)),
+                    1,
+                    Duration::from_secs(0),
+                    Duration::from_secs(10),
+                );
+                let ssh_cmd = build_guest_ssh_cmd(
+                    &template,
+                    &remote_script,
+                    step.sudo_enabled(),
+                    accumulated_env,
+                    &remote_env_path,
+                );
                 let (capture, actual_exit) = run_ssh_step_capturing(
                     &step.name,
                     context.ssh,
@@ -361,8 +373,21 @@ fn run_run_step(
             } else {
                 // Standard path: exit 0 required, no output capture.
                 let result = if scp_result.is_ok() {
-                    let ssh_cmd =
-                        build_guest_ssh_cmd(&template, &remote_script, step.sudo_enabled());
+                    // Initialize the remote env file so the script can append to it via $BOTFORGE_ENV.
+                    let _ = ssh_with_retry(
+                        context.ssh,
+                        &format!(": > {}", shell_single_quote(&remote_env_path)),
+                        1,
+                        Duration::from_secs(0),
+                        Duration::from_secs(10),
+                    );
+                    let ssh_cmd = build_guest_ssh_cmd(
+                        &template,
+                        &remote_script,
+                        step.sudo_enabled(),
+                        accumulated_env,
+                        &remote_env_path,
+                    );
                     run_ssh_step_with_step_log(
                         &step.name,
                         context.ssh,
@@ -1055,8 +1080,14 @@ fn shell_single_quote(value: &str) -> String {
     crate::util::shell_single_quote(value)
 }
 
-fn build_guest_ssh_cmd(template: &[String], remote_script: &str, sudo: bool) -> String {
-    let ssh_cmd = template
+fn build_guest_ssh_cmd(
+    template: &[String],
+    remote_script: &str,
+    sudo: bool,
+    accumulated_env: &[(String, String)],
+    remote_env_path: &str,
+) -> String {
+    let interpreter_cmd = template
         .iter()
         .map(|arg| {
             if arg == "{0}" {
@@ -1067,10 +1098,24 @@ fn build_guest_ssh_cmd(template: &[String], remote_script: &str, sudo: bool) -> 
         })
         .collect::<Vec<_>>()
         .join(" ");
+
+    // Inject accumulated env vars and BOTFORGE_ENV via a POSIX `env` prefix so that
+    // the interpreter (bash, sh, python, or any custom template) receives them as
+    // genuine environment variables rather than bash-syntax text in the script body.
+    let mut env_parts: Vec<String> = accumulated_env
+        .iter()
+        .map(|(k, v)| format!("{}={}", k, shell_single_quote(v)))
+        .collect();
+    env_parts.push(format!(
+        "BOTFORGE_ENV={}",
+        shell_single_quote(remote_env_path)
+    ));
+    let env_prefix = format!("env {}", env_parts.join(" "));
+
     if sudo {
-        format!("sudo -E {ssh_cmd}")
+        format!("sudo -E {env_prefix} {interpreter_cmd}")
     } else {
-        ssh_cmd
+        format!("{env_prefix} {interpreter_cmd}")
     }
 }
 
@@ -1144,23 +1189,6 @@ fn env_merge(accumulated: &mut Vec<(String, String)>, new_entries: Vec<(String, 
             accumulated.push((key, value));
         }
     }
-}
-
-/// Build the shell preamble that exports all accumulated env vars and sets up
-/// `BOTFORGE_ENV` pointing at `remote_env_path` for a guest step script.
-fn build_guest_env_preamble(accumulated_env: &[(String, String)], remote_env_path: &str) -> String {
-    let mut lines: Vec<String> = Vec::new();
-    for (key, value) in accumulated_env {
-        lines.push(format!("export {}={}", key, shell_single_quote(value)));
-    }
-    lines.push(format!(
-        "export BOTFORGE_ENV={}",
-        shell_single_quote(remote_env_path)
-    ));
-    lines.push(": > \"$BOTFORGE_ENV\"".to_string());
-    let mut preamble = lines.join("\n");
-    preamble.push('\n');
-    preamble
 }
 
 pub(crate) fn collect_test_diagnostics(ssh: &SshOptions, units: &[String]) {
@@ -1322,9 +1350,8 @@ pub(crate) fn shutdown_build_vm(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_guest_env_preamble, build_guest_ssh_cmd, env_merge, parse_env_file,
-        resolve_step_timeout, run_host_step, shell_single_quote, HostStepFiles,
-        StepExecutionBudget,
+        build_guest_ssh_cmd, env_merge, parse_env_file, resolve_step_timeout, run_host_step,
+        shell_single_quote, HostStepFiles, StepExecutionBudget,
     };
     use crate::plan::step::{resolve_shell, RunStep, StepTarget};
     use crate::util::unique_suffix;
@@ -1745,60 +1772,38 @@ mod tests {
         assert_eq!(acc, vec![("X".to_string(), "second".to_string())]);
     }
 
-    // --- build_guest_env_preamble ---
-
-    #[test]
-    fn test_build_guest_env_preamble_empty_env() {
-        let preamble = build_guest_env_preamble(&[], "/tmp/botforge-env-1");
-        assert!(preamble.contains("export BOTFORGE_ENV='/tmp/botforge-env-1'"));
-        assert!(preamble.contains(": > \"$BOTFORGE_ENV\""));
-        // No extra export lines when accumulated env is empty
-        assert!(!preamble.contains("export A="));
-    }
-
-    #[test]
-    fn test_build_guest_env_preamble_exports_accumulated_vars() {
-        let acc = vec![
-            ("FOO".to_string(), "bar".to_string()),
-            ("MSG".to_string(), "hello world".to_string()),
-        ];
-        let preamble = build_guest_env_preamble(&acc, "/tmp/env");
-        assert!(
-            preamble.contains("export FOO='bar'"),
-            "preamble: {preamble}"
-        );
-        assert!(
-            preamble.contains("export MSG='hello world'"),
-            "preamble: {preamble}"
-        );
-        assert!(preamble.contains("export BOTFORGE_ENV="));
-        assert!(preamble.contains(": > \"$BOTFORGE_ENV\""));
-    }
-
-    #[test]
-    fn test_build_guest_env_preamble_quotes_special_chars() {
-        let acc = vec![("VAL".to_string(), "it's a value".to_string())];
-        let preamble = build_guest_env_preamble(&acc, "/tmp/env");
-        // shell_single_quote escapes embedded single quotes
-        let expected = format!("export VAL={}", shell_single_quote("it's a value"));
-        assert!(preamble.contains(&expected), "preamble: {preamble}");
-    }
+    // --- build_guest_ssh_cmd env injection ---
 
     #[test]
     fn test_build_guest_ssh_cmd_prefixes_sudo_for_guest_root_step() {
         let tmpl = resolve_shell(None).unwrap();
-        let cmd = build_guest_ssh_cmd(&tmpl, "/tmp/botforge-step.sh", true);
+        let cmd = build_guest_ssh_cmd(
+            &tmpl,
+            "/tmp/botforge-step.sh",
+            true,
+            &[],
+            "/tmp/botforge-env-1",
+        );
         assert_eq!(
             cmd,
-            "sudo -E bash --noprofile --norc -e -o pipefail '/tmp/botforge-step.sh'"
+            "sudo -E env BOTFORGE_ENV='/tmp/botforge-env-1' bash --noprofile --norc -e -o pipefail '/tmp/botforge-step.sh'"
         );
     }
 
     #[test]
-    fn test_build_guest_ssh_cmd_without_sudo_matches_previous_command() {
+    fn test_build_guest_ssh_cmd_without_sudo_injects_env_prefix() {
         let tmpl = resolve_shell(Some("sh")).unwrap();
-        let cmd = build_guest_ssh_cmd(&tmpl, "/tmp/botforge-step.sh", false);
-        assert_eq!(cmd, "sh -e '/tmp/botforge-step.sh'");
+        let cmd = build_guest_ssh_cmd(
+            &tmpl,
+            "/tmp/botforge-step.sh",
+            false,
+            &[],
+            "/tmp/botforge-env-1",
+        );
+        assert_eq!(
+            cmd,
+            "env BOTFORGE_ENV='/tmp/botforge-env-1' sh -e '/tmp/botforge-step.sh'"
+        );
     }
 
     #[test]
@@ -1811,10 +1816,88 @@ run: echo ok
         )
         .unwrap();
         let tmpl = resolve_shell(None).unwrap();
-        let cmd = build_guest_ssh_cmd(&tmpl, "/tmp/botforge-step.sh", step.sudo_enabled());
+        let cmd = build_guest_ssh_cmd(
+            &tmpl,
+            "/tmp/botforge-step.sh",
+            step.sudo_enabled(),
+            &[],
+            "/tmp/botforge-env-1",
+        );
         assert_eq!(
             cmd,
-            "sudo -E bash --noprofile --norc -e -o pipefail '/tmp/botforge-step.sh'"
+            "sudo -E env BOTFORGE_ENV='/tmp/botforge-env-1' bash --noprofile --norc -e -o pipefail '/tmp/botforge-step.sh'"
+        );
+    }
+
+    #[test]
+    fn test_build_guest_ssh_cmd_injects_accumulated_env_via_posix_env() {
+        let tmpl = resolve_shell(None).unwrap();
+        let acc = vec![
+            ("FOO".to_string(), "bar".to_string()),
+            ("MSG".to_string(), "hello world".to_string()),
+        ];
+        let cmd = build_guest_ssh_cmd(&tmpl, "/tmp/botforge-step.sh", true, &acc, "/tmp/env");
+        assert!(
+            cmd.starts_with("sudo -E env "),
+            "expected sudo -E env prefix: {cmd}"
+        );
+        assert!(cmd.contains("FOO='bar'"), "expected FOO: {cmd}");
+        assert!(cmd.contains("MSG='hello world'"), "expected MSG: {cmd}");
+        assert!(
+            cmd.contains("BOTFORGE_ENV='/tmp/env'"),
+            "expected BOTFORGE_ENV: {cmd}"
+        );
+        // No bash-syntax export statements in the command
+        assert!(
+            !cmd.contains("export "),
+            "must not contain bash export: {cmd}"
+        );
+    }
+
+    #[test]
+    fn test_build_guest_ssh_cmd_quotes_special_chars_in_env() {
+        let tmpl = resolve_shell(Some("sh")).unwrap();
+        let acc = vec![("VAL".to_string(), "it's a value".to_string())];
+        let cmd = build_guest_ssh_cmd(&tmpl, "/tmp/s.sh", false, &acc, "/tmp/env");
+        let expected_val = format!("VAL={}", shell_single_quote("it's a value"));
+        assert!(cmd.contains(&expected_val), "cmd: {cmd}");
+    }
+
+    #[test]
+    fn test_build_guest_ssh_cmd_empty_env_includes_only_botforge_env() {
+        let tmpl = resolve_shell(None).unwrap();
+        let cmd = build_guest_ssh_cmd(
+            &tmpl,
+            "/tmp/botforge-step.sh",
+            true,
+            &[],
+            "/tmp/botforge-env-1",
+        );
+        assert!(
+            cmd.contains("BOTFORGE_ENV='/tmp/botforge-env-1'"),
+            "cmd: {cmd}"
+        );
+        // No extra env var assignments beyond BOTFORGE_ENV
+        assert!(!cmd.contains("FOO="), "unexpected extra env var: {cmd}");
+    }
+
+    #[test]
+    fn test_build_guest_ssh_cmd_python_interpreter_no_bash_syntax() {
+        let tmpl = resolve_shell(Some("python")).unwrap();
+        let acc = vec![("MYVAR".to_string(), "myval".to_string())];
+        let cmd = build_guest_ssh_cmd(&tmpl, "/tmp/script.py", false, &acc, "/tmp/env");
+        // No bash-specific syntax in the SSH command
+        assert!(!cmd.contains("export "), "must not have bash export: {cmd}");
+        assert!(
+            !cmd.contains(": > "),
+            "must not have bash redirect init: {cmd}"
+        );
+        // POSIX env prefix carries the variable
+        assert!(cmd.contains("env "), "must have env prefix: {cmd}");
+        assert!(cmd.contains("MYVAR='myval'"), "must pass MYVAR: {cmd}");
+        assert!(
+            cmd.contains("python3 '/tmp/script.py'"),
+            "must invoke python3: {cmd}"
         );
     }
 
