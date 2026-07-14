@@ -201,6 +201,25 @@ pub(super) fn print_step_status(
     );
 }
 
+fn step_skipped_marker(step_idx: usize, name: &str, id: Option<&str>, color: bool) -> String {
+    let counter = match id {
+        Some(id) => format!("{step_idx}/{id}"),
+        None => format!("{step_idx}"),
+    };
+    if color {
+        format!(" ⊘ ({counter}) \x1b[2m{name}\x1b[0m")
+    } else {
+        format!(" ⊘ ({counter}) {name}")
+    }
+}
+
+pub(super) fn print_step_skipped(step_idx: usize, step_name: &str, step_id: Option<&str>) {
+    eprintln!(
+        "{}",
+        step_skipped_marker(step_idx, step_name, step_id, stderr_color_enabled())
+    );
+}
+
 use crate::util::write_all_resilient;
 
 fn stream_child_output<R: Read, W: Write>(
