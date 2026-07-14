@@ -1705,16 +1705,18 @@ fn substitute_namespace_in_string(
             .ok_or_else(|| anyhow::anyhow!("unterminated input expression in '{text}'"))?;
         let expr = after_open[..end].trim();
         let prefix = format!("{namespace}.");
-        let name = expr.strip_prefix(&prefix).ok_or_else(|| {
-            anyhow::anyhow!(
+        let placeholder = &rest[start..start + 3 + end + 2];
+        let Some(name) = expr.strip_prefix(&prefix) else {
+            if is_deferred_namespace_expression(namespace, expr) {
+                rendered.push_str(placeholder);
+                rest = &after_open[end + 2..];
+                continue;
+            }
+            return Err(anyhow::anyhow!(
                 "unsupported expression '${{{{{expr}}}}}'; only ${{{{ {namespace}.NAME }}}} is supported"
-            )
-        })?;
-        if name.is_empty()
-            || name
-                .chars()
-                .any(|ch| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'))
-        {
+            ));
+        };
+        if !is_valid_namespace_name(name) {
             anyhow::bail!("invalid input name '{name}' in '{text}'");
         }
         let value = values
@@ -1725,6 +1727,29 @@ fn substitute_namespace_in_string(
     }
     rendered.push_str(rest);
     Ok(rendered)
+}
+
+fn is_deferred_namespace_expression(active_namespace: &str, expr: &str) -> bool {
+    let Some((namespace, name)) = expr.split_once('.') else {
+        return false;
+    };
+    namespace != active_namespace
+        && is_deferred_namespace(active_namespace, namespace)
+        && is_valid_namespace_name(name)
+}
+
+fn is_deferred_namespace(active_namespace: &str, namespace: &str) -> bool {
+    matches!(
+        (active_namespace, namespace),
+        ("inputs", "args") | ("args", "inputs")
+    )
+}
+
+fn is_valid_namespace_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
 }
 
 pub(crate) fn validate_test_ports(ports: &[PortSpec], ssh_port: u16) -> Result<()> {
@@ -2525,6 +2550,245 @@ steps:
         assert_eq!(run_ref(&config.steps[0]).name, "check-one");
         assert_eq!(run_ref(&config.steps[1]).name, "check-two");
         assert_eq!(run_ref(&config.steps[2]).name, "frag-step");
+    }
+
+    #[test]
+    fn test_load_test_config_expands_fragment_scalar_for_via_uses() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("frag.yaml"),
+            r#"
+type: fragment
+steps:
+  - name: "frag-${{ args.0 }}"
+    for: [alpha, beta]
+    run: echo ${{ args.0 }}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            "type: test\nsteps:\n  - uses: \"@://frag.yaml\"\n",
+        )
+        .unwrap();
+
+        let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+
+        assert_eq!(config.steps.len(), 2);
+        assert_eq!(run_ref(&config.steps[0]).name, "frag-alpha");
+        assert_eq!(run_ref(&config.steps[0]).run, "echo alpha");
+        assert_eq!(run_ref(&config.steps[1]).name, "frag-beta");
+        assert_eq!(run_ref(&config.steps[1]).run, "echo beta");
+    }
+
+    #[test]
+    fn test_load_test_config_expands_fragment_sequence_for_via_uses() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("frag.yaml"),
+            r#"
+type: fragment
+steps:
+  - name: "pair-${{ args.0 }}"
+    for:
+      - [cat, /usr/bin/cat]
+      - [ls, /usr/bin/ls]
+    run: echo ${{ args.0 }} ${{ args.1 }}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            "type: test\nsteps:\n  - uses: \"@://frag.yaml\"\n",
+        )
+        .unwrap();
+
+        let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+
+        assert_eq!(config.steps.len(), 2);
+        assert_eq!(run_ref(&config.steps[0]).name, "pair-cat");
+        assert_eq!(run_ref(&config.steps[0]).run, "echo cat /usr/bin/cat");
+        assert_eq!(run_ref(&config.steps[1]).name, "pair-ls");
+        assert_eq!(run_ref(&config.steps[1]).run, "echo ls /usr/bin/ls");
+    }
+
+    #[test]
+    fn test_load_test_config_expands_fragment_mapping_for_via_uses() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("frag.yaml"),
+            r#"
+type: fragment
+steps:
+  - name: "svc-${{ args.name }}"
+    for:
+      - { name: coreutils-cat, bin: cat }
+      - { name: coreutils-ls, bin: ls }
+    run: echo ${{ args.bin }}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            "type: test\nsteps:\n  - uses: \"@://frag.yaml\"\n",
+        )
+        .unwrap();
+
+        let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+
+        assert_eq!(config.steps.len(), 2);
+        assert_eq!(run_ref(&config.steps[0]).name, "svc-coreutils-cat");
+        assert_eq!(run_ref(&config.steps[0]).run, "echo cat");
+        assert_eq!(run_ref(&config.steps[1]).name, "svc-coreutils-ls");
+        assert_eq!(run_ref(&config.steps[1]).run, "echo ls");
+    }
+
+    #[test]
+    fn test_load_test_config_expands_fragment_mixed_inputs_and_args_namespaces() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("frag.yaml"),
+            r#"
+type: fragment
+inputs:
+  svc:
+    type: string
+    required: true
+steps:
+  - name: "${{ inputs.svc }}-${{ args.0 }}"
+    for: [cp, ls]
+    run: echo ${{ inputs.svc }} ${{ args.0 }}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            r#"
+type: test
+steps:
+  - uses: "@://frag.yaml"
+    with:
+      svc: api
+"#,
+        )
+        .unwrap();
+
+        let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+
+        assert_eq!(config.steps.len(), 2);
+        assert_eq!(run_ref(&config.steps[0]).name, "api-cp");
+        assert_eq!(run_ref(&config.steps[0]).run, "echo api cp");
+        assert_eq!(run_ref(&config.steps[1]).name, "api-ls");
+        assert_eq!(run_ref(&config.steps[1]).run, "echo api ls");
+    }
+
+    #[test]
+    fn test_load_test_config_fragment_missing_active_namespace_input_still_errors() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("frag.yaml"),
+            r#"
+type: fragment
+inputs:
+  svc:
+    type: string
+    required: true
+steps:
+  - name: broken
+    run: echo ${{ inputs.typo }}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            r#"
+type: test
+steps:
+  - uses: "@://frag.yaml"
+    with:
+      svc: api
+"#,
+        )
+        .unwrap();
+
+        let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+        assert!(format!("{err:#}").contains("missing required input 'typo'"));
+    }
+
+    #[test]
+    fn test_load_test_config_fragment_unknown_namespace_still_errors() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("frag.yaml"),
+            r#"
+type: fragment
+steps:
+  - name: broken
+    run: echo ${{ bogus.x }}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            "type: test\nsteps:\n  - uses: \"@://frag.yaml\"\n",
+        )
+        .unwrap();
+
+        let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("unsupported expression"));
+        assert!(msg.contains("bogus.x"));
+    }
+
+    #[test]
+    fn test_load_test_config_fragment_for_expect_is_cloned_and_substituted() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("frag.yaml"),
+            r#"
+type: fragment
+steps:
+  - name: "check-${{ args.0 }}"
+    for: [alpha, beta]
+    run: echo ${{ args.0 }}
+    expect:
+      stdout:
+        contains:
+          - ${{ args.0 }}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            "type: test\nsteps:\n  - uses: \"@://frag.yaml\"\n",
+        )
+        .unwrap();
+
+        let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+
+        assert_eq!(config.steps.len(), 2);
+        assert_eq!(
+            run_ref(&config.steps[0])
+                .expect
+                .as_ref()
+                .unwrap()
+                .stdout
+                .as_ref()
+                .unwrap()
+                .contains,
+            vec!["alpha".to_string()]
+        );
+        assert_eq!(
+            run_ref(&config.steps[1])
+                .expect
+                .as_ref()
+                .unwrap()
+                .stdout
+                .as_ref()
+                .unwrap()
+                .contains,
+            vec!["beta".to_string()]
+        );
     }
 
     #[test]
@@ -5259,6 +5523,41 @@ steps:
 "#,
         );
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
+        assert_eq!(config.steps.len(), 2);
+        assert_eq!(run_ref(&config.steps[0]).name, "build-alpha");
+        assert_eq!(run_ref(&config.steps[0]).run, "echo alpha");
+        assert_eq!(run_ref(&config.steps[1]).name, "build-beta");
+        assert_eq!(run_ref(&config.steps[1]).run, "echo beta");
+    }
+
+    #[test]
+    fn test_build_config_expands_fragment_scalar_for_via_uses() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("frag.yaml"),
+            r#"
+type: fragment
+steps:
+  - name: "build-${{ args.0 }}"
+    for: [alpha, beta]
+    run: echo ${{ args.0 }}
+"#,
+        )
+        .unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            r#"
+type: build
+image: "@debian-base"
+output: "out.qcow2"
+steps:
+  - uses: "@://frag.yaml"
+"#,
+        );
+
+        let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
+
         assert_eq!(config.steps.len(), 2);
         assert_eq!(run_ref(&config.steps[0]).name, "build-alpha");
         assert_eq!(run_ref(&config.steps[0]).run, "echo alpha");

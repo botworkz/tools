@@ -12,6 +12,7 @@ cloud_init:
     permissions: "0644"
 steps:
 - uses: "@://hello.steps.yaml"
+- uses: "@://for-fragment-build.steps.yaml"
 - name: Base install
   run: |
     whoami | grep root

@@ -1,0 +1,10 @@
+type: fragment
+steps:
+- name: Fragment loop scalar (${{ args.0 }})
+  for: [cp, cat, ls]
+  run: |
+    command -v ${{ args.0 }}
+  expect:
+    stdout:
+      contains:
+      - /
