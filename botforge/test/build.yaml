@@ -31,3 +31,37 @@ steps:
     echo 'botforge-ci-regression-fixture-0440' \
       | install -m 0440 -o root -g root /dev/stdin \
           /etc/botforge-ci-restricted/probe-test
+# --- for: expansion acceptance coverage (build path) -------------------------
+# Exercises all three item forms with MULTIPLE items each so the build-time
+# loop expansion and args.N / args.KEY addressing are genuinely tested. All
+# targets are real on-disk coreutils binaries (NOT shell builtins) guaranteed
+# present on the minimal Debian cloud image, so `command -v` resolves to a
+# /path and the loops assert stable facts.
+
+# 1. flat seq of scalars -> ${{ args.0 }}
+- name: Loop scalar build (${{ args.0 }})
+  for: [cp, cat, ls]
+  run: |
+    command -v ${{ args.0 }}
+
+# 2. seq of seqs -> ${{ args.0 }}, ${{ args.1 }}
+- name: Loop seq build (${{ args.0 }})
+  for:
+  - [cat, /usr/bin/cat]
+  - [ls, /usr/bin/ls]
+  run: |
+    # args.0 is the binary name, args.1 its expected resolved path.
+    resolved="$(command -v ${{ args.0 }})"
+    test "$resolved" = "${{ args.1 }}"
+    echo "${{ args.0 }} resolved-ok"
+
+# 3. seq of hashes -> ${{ args.KEY }}
+- name: Loop assoc build (${{ args.name }})
+  for:
+  - name: coreutils-cat
+    bin: cat
+  - name: coreutils-ls
+    bin: ls
+  run: |
+    echo "checking ${{ args.name }}"
+    command -v ${{ args.bin }}

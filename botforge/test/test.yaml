@@ -26,6 +26,52 @@ steps:
     stderr:
       not_contains:
       - fatal error
+# --- for: expansion acceptance coverage --------------------------------------
+# Exercises all three item forms with MULTIPLE items each, so iteration and the
+# args.N / args.KEY addressing are genuinely tested (not a single-item no-op).
+# Everything checked here is a real on-disk binary (NOT a shell builtin, so
+# `command -v` resolves to a /path) guaranteed present on the minimal Debian
+# cloud image, so the loops assert real, stable facts.
+
+# 1. flat seq of scalars -> ${{ args.0 }}
+- name: Loop scalar (${{ args.0 }})
+  for: [cp, cat, ls]
+  run: |
+    command -v ${{ args.0 }}
+  expect:
+    stdout:
+      contains:
+      - /
+
+# 2. seq of seqs -> ${{ args.0 }}, ${{ args.1 }}
+- name: Loop seq (${{ args.0 }})
+  for:
+  - [cat, /usr/bin/cat]
+  - [ls, /usr/bin/ls]
+  run: |
+    # args.0 is the binary name, args.1 its expected resolved path.
+    resolved="$(command -v ${{ args.0 }})"
+    test "$resolved" = "${{ args.1 }}"
+    echo "${{ args.0 }} resolved-ok"
+  expect:
+    stdout:
+      contains:
+      - resolved-ok
+
+# 3. seq of hashes -> ${{ args.KEY }}
+- name: Loop assoc (${{ args.name }})
+  for:
+  - name: coreutils-cat
+    bin: cat
+  - name: coreutils-ls
+    bin: ls
+  run: |
+    echo "checking ${{ args.name }}"
+    command -v ${{ args.bin }}
+  expect:
+    stdout:
+      contains:
+      - /
 
 assert:
   files:
