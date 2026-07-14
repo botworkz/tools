@@ -1819,13 +1819,6 @@ pub(crate) fn validate_build_steps(steps: &[TestStep]) -> Result<()> {
     for step in steps {
         match step {
             TestStep::Run(step) => {
-                if step.expect.is_some() {
-                    anyhow::bail!(
-                        "build step '{}': 'expect:' is only allowed on 'type: test' steps; \
-                         build steps must not carry outcome assertions",
-                        step.name
-                    );
-                }
                 if step.target == StepTarget::Host && step.sudo == Some(true) {
                     anyhow::bail!(
                         "build step '{}': 'sudo: true' is only supported on 'on: guest' steps",
@@ -1966,7 +1959,9 @@ mod tests {
         CLOUD_INIT_SCHEMA_MODE_OVERRIDE, CLOUD_INIT_SCHEMA_WARNINGS, MAX_INCLUDE_DEPTH,
     };
     use crate::plan::files::FileEntry;
-    use crate::plan::step::{ArchiveStep, ArchiveStepSpec, RunStep, StepTarget, TestStep};
+    use crate::plan::step::{
+        ArchiveStep, ArchiveStepSpec, ExpectBlock, RunStep, StdioExpect, StepTarget, TestStep,
+    };
     use crate::qemu::PortSpec;
     use crate::resolver::Reference;
     use std::collections::BTreeMap;
@@ -5598,6 +5593,86 @@ steps:
     }
 
     #[test]
+    fn test_load_build_config_accepts_expect_block() {
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            r#"
+type: build
+image: "@debian-base"
+output: "out.qcow2"
+steps:
+  - name: expect-step
+    run: echo ok
+    expect:
+      exit: 0
+      stdout:
+        contains: ["ok"]
+"#,
+        );
+        let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
+        assert_eq!(config.steps.len(), 1);
+        assert_eq!(run_ref(&config.steps[0]).name, "expect-step");
+        assert_eq!(
+            run_ref(&config.steps[0]).expect,
+            Some(ExpectBlock {
+                exit: Some(0),
+                stdout: Some(StdioExpect {
+                    contains: vec!["ok".to_string()],
+                    not_contains: vec![],
+                }),
+                stderr: None,
+            })
+        );
+    }
+
+    #[test]
+    fn test_build_config_preserves_fragment_expect_via_uses() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("frag.yaml"),
+            r#"
+type: fragment
+steps:
+  - on: guest
+    name: frag-step
+    run: echo from-fragment
+    expect:
+      exit: 0
+      stdout:
+        contains: ["from-fragment"]
+"#,
+        )
+        .unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            r#"
+type: build
+image: "@debian-base"
+output: "out.qcow2"
+steps:
+  - uses: "@://frag.yaml"
+"#,
+        );
+        let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
+        assert_eq!(config.steps.len(), 1);
+        assert_eq!(run_ref(&config.steps[0]).name, "frag-step");
+        assert_eq!(
+            run_ref(&config.steps[0]).expect,
+            Some(ExpectBlock {
+                exit: Some(0),
+                stdout: Some(StdioExpect {
+                    contains: vec!["from-fragment".to_string()],
+                    not_contains: vec![],
+                }),
+                stderr: None,
+            })
+        );
+    }
+
+    #[test]
     fn test_build_config_fragment_input_substitution_preserves_step_timeout() {
         let repo = TempDir::new().unwrap();
         std::fs::write(
@@ -5766,8 +5841,7 @@ steps:
     }
 
     #[test]
-    fn test_validate_build_steps_rejects_expect_block() {
-        use crate::plan::step::{ExpectBlock, StdioExpect};
+    fn test_validate_build_steps_accepts_expect_block() {
         let mut step = make_step(StepTarget::Guest, "assert-step");
         let TestStep::Run(run) = &mut step else {
             panic!("expected run step");
@@ -5780,17 +5854,7 @@ steps:
             }),
             stderr: None,
         });
-        let err = validate_build_steps(&[step]).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("assert-step"),
-            "error should mention step name: {msg}"
-        );
-        assert!(
-            msg.contains("expect"),
-            "error should mention 'expect': {msg}"
-        );
-        assert!(msg.contains("test"), "error should mention 'test': {msg}");
+        assert!(validate_build_steps(&[step]).is_ok());
     }
 
     #[test]

@@ -678,6 +678,14 @@ configured step.
 - `src` must be a repo-relative file path or glob under `--repo-root`.
 - `src` may not start with `@`; top-level `files:` is filesystem-only.
 - `dest` must be an absolute guest path.
+
+Run steps in both `type: test` and `type: build` may carry an `expect:` block.
+`expect.exit` (default `0` when omitted), `expect.stdout.contains` /
+`not_contains`, and `expect.stderr.contains` / `not_contains` use identical
+semantics in both modes: the step output is captured, every declared assertion
+is enforced, and any mismatch aborts the run with an error naming the step and
+the failed expectation. Because fragments are step-model agnostic, a fragment
+step with `expect:` may be reused from either entrypoint kind.
 - Glob `src` requires `dest` to end in `/`, and matched files are staged with
   path preservation relative to the glob's fixed literal prefix.
 - Optional `mode`, `owner`, `group`, `overwrite`, and `parents` fields are

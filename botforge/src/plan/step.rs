@@ -31,10 +31,10 @@ pub(crate) struct StdioExpect {
     pub(crate) not_contains: Vec<String>,
 }
 
-/// Declarative outcome assertions for a `type: test` run step.
+/// Declarative outcome assertions for a `type: test` or `type: build` run step.
 ///
-/// Honored only for `type: test` runs.  `validate_build_steps` rejects any build step
-/// that carries an `expect:` block with a clear error.
+/// When present, the step captures stdout/stderr and validates exit/output expectations
+/// after execution; any mismatch aborts the run.
 #[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ExpectBlock {
@@ -84,8 +84,7 @@ pub(crate) struct RunStep {
     /// not required to be unique and is not addressable by other steps.
     #[serde(default)]
     pub(crate) id: Option<String>,
-    /// Declarative outcome assertions (test-only; rejected on build steps by
-    /// `validate_build_steps`).
+    /// Declarative outcome assertions for test/build run steps.
     #[serde(default)]
     pub(crate) expect: Option<ExpectBlock>,
 }
