@@ -31,3 +31,9 @@ steps:
     echo 'botforge-ci-regression-fixture-0440' \
       | install -m 0440 -o root -g root /dev/stdin \
           /etc/botforge-ci-restricted/probe-test
+- name: User/group membership regression fixture
+  run: |
+    # Regression fixture for assert.users groups membership checks.
+    groupadd ci-probe-grp
+    groupadd ci-probe-wrong-grp
+    useradd -m -G ci-probe-grp ci-probe-user

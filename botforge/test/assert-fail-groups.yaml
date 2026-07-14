@@ -1,0 +1,20 @@
+type: test
+
+# Negative-control fixture: regression guard for assert.users:
+# groups: membership checks.
+#
+# The build fixture creates ci-probe-user and adds it to ci-probe-grp
+# (but not ci-probe-wrong-grp).  We deliberately assert membership in
+# ci-probe-wrong-grp, which MUST fail and prove the membership check
+# path is active end-to-end.
+#
+# `image:` is injected by .github/workflows/_botforge.yml at CI time.
+
+steps: []
+
+assert:
+  users:
+    ci-probe-user:
+      exists: true
+      groups:
+      - ci-probe-wrong-grp
