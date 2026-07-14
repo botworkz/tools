@@ -484,6 +484,8 @@ struct RawBuildDocument {
 struct RawTestStepFragment {
     #[serde(default)]
     steps: Vec<RawTestStep>,
+    #[serde(default, alias = "files")]
+    files: Vec<FileEntry>,
     /// Optional cloud-config fragment contributed by this `type: fragment` document.
     /// Deep-merged with the parent's cloud_init under the same precedence rules.
     #[serde(default)]
@@ -572,6 +574,7 @@ pub(crate) fn load_test_config(repo_root: &Path, path: &Path) -> Result<TestConf
     // is caught by the cycle check (A → B → A).
     let mut include_stack = vec![path.to_path_buf()];
     let mut cloud_init_acc = raw.cloud_init;
+    let mut files_acc = Vec::new();
     let config = TestConfig {
         image: match raw.image {
             None => None,
@@ -591,11 +594,15 @@ pub(crate) fn load_test_config(repo_root: &Path, path: &Path) -> Result<TestConf
             raw.steps,
             &mut include_stack,
             &mut cloud_init_acc,
+            &mut files_acc,
         )?,
         files: {
-            validate_top_level_files("test", &raw.files)
+            let mut files = raw.files;
+            files.extend(files_acc);
+            let files = dedupe_identical_files(files);
+            validate_top_level_files("test", &files)
                 .with_context(|| format!("invalid test config: {}", path.display()))?;
-            raw.files
+            files
         },
         diagnostics_units: raw.diagnostics_units,
         step_timeout: raw.step_timeout,
@@ -666,6 +673,7 @@ pub(crate) fn load_build_config(repo_root: &Path, path: &Path) -> Result<BuildCo
     let root_cloud_init = raw.cloud_init.clone();
     let mut include_stack = vec![path.to_path_buf()];
     let mut cloud_init_acc = raw.cloud_init;
+    let mut files_acc = Vec::new();
     let config = BuildConfig {
         image,
         output,
@@ -676,11 +684,15 @@ pub(crate) fn load_build_config(repo_root: &Path, path: &Path) -> Result<BuildCo
             raw.steps,
             &mut include_stack,
             &mut cloud_init_acc,
+            &mut files_acc,
         )?,
         files: {
-            validate_top_level_files("build", &raw.files)
+            let mut files = raw.files;
+            files.extend(files_acc);
+            let files = dedupe_identical_files(files);
+            validate_top_level_files("build", &files)
                 .with_context(|| format!("invalid build config: {}", path.display()))?;
-            raw.files
+            files
         },
         step_timeout: raw.step_timeout,
         timeout: raw.timeout,
@@ -799,6 +811,7 @@ fn expand_test_steps(
     steps: Vec<RawTestStep>,
     include_stack: &mut Vec<PathBuf>,
     cloud_init_acc: &mut Option<serde_yaml::Mapping>,
+    files_acc: &mut Vec<FileEntry>,
 ) -> Result<Vec<TestStep>> {
     let mut expanded = Vec::new();
     for step in steps {
@@ -834,7 +847,8 @@ fn expand_test_steps(
                 }
                 include_stack.push(include_path.clone());
                 let result = load_test_steps_fragment(&include_path, &include.uses, &include.with)
-                    .and_then(|(steps, ci)| {
+                    .and_then(|(steps, ci, files)| {
+                        files_acc.extend(files);
                         let mut ci_acc = ci;
                         let expanded_steps = expand_test_steps(
                             repo_root,
@@ -842,6 +856,7 @@ fn expand_test_steps(
                             steps,
                             include_stack,
                             &mut ci_acc,
+                            files_acc,
                         )?;
                         Ok((expanded_steps, ci_acc))
                     });
@@ -927,7 +942,11 @@ fn load_test_steps_fragment(
     path: &Path,
     uses: &str,
     with: &BTreeMap<String, String>,
-) -> Result<(Vec<RawTestStep>, Option<serde_yaml::Mapping>)> {
+) -> Result<(
+    Vec<RawTestStep>,
+    Option<serde_yaml::Mapping>,
+    Vec<FileEntry>,
+)> {
     let yaml = std::fs::read_to_string(path)
         .with_context(|| format!("cannot read test step include: {}", path.display()))?;
     let mut value: Value = serde_yaml::from_str(&yaml)
@@ -953,7 +972,7 @@ fn load_test_steps_fragment(
     if let Some(ref ci) = fragment.cloud_init {
         validate_cloud_init_fragment(ci, path)?;
     }
-    Ok((fragment.steps, fragment.cloud_init))
+    Ok((fragment.steps, fragment.cloud_init, fragment.files))
 }
 
 /// Verify that a `uses:` target is a `type: fragment` document.
@@ -1009,7 +1028,6 @@ fn check_no_entrypoint_sections_in_fragment(path: &Path, value: &Value) -> Resul
         "image",
         "output",
         "compress",
-        "files",
     ] {
         if mapping.contains_key(Value::String(section.to_string())) {
             anyhow::bail!(
@@ -1495,6 +1513,16 @@ fn validate_top_level_files(kind: &str, files: &[FileEntry]) -> Result<()> {
         validate_top_level_file(kind, file)?;
     }
     Ok(())
+}
+
+fn dedupe_identical_files(files: Vec<FileEntry>) -> Vec<FileEntry> {
+    let mut deduped = Vec::with_capacity(files.len());
+    for file in files {
+        if !deduped.iter().any(|existing| existing == &file) {
+            deduped.push(file);
+        }
+    }
+    deduped
 }
 
 /// Validate a `mode` string: must be 3–4 octal digits (same rule as `payload.rs`).
@@ -5065,23 +5093,355 @@ steps:
     }
 
     #[test]
-    fn test_load_fragment_rejects_files_section() {
+    fn test_load_test_config_fragment_contributes_file() {
         let repo = TempDir::new().unwrap();
-        std::fs::write(
-            repo.path().join("frag.yaml"),
-            "type: fragment\nfiles:\n  - src: payload/file.txt\n    dest: /tmp/file.txt\nsteps: []\n",
-        )
-        .unwrap();
-        std::fs::write(
-            repo.path().join("test.yaml"),
+        write_test_config(
+            &repo,
+            "frag.yaml",
+            r#"
+type: fragment
+files:
+  - src: "@://payload/file.txt"
+    dest: /tmp/file.txt
+steps: []
+"#,
+        );
+        write_test_config(
+            &repo,
+            "test.yaml",
             "type: test\nsteps:\n  - uses: \"@://frag.yaml\"\n",
-        )
-        .unwrap();
+        );
+        let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+        assert_eq!(
+            config.files,
+            vec![FileEntry {
+                src: "@://payload/file.txt".to_string(),
+                dest: "/tmp/file.txt".to_string(),
+                ..Default::default()
+            }]
+        );
+    }
+
+    #[test]
+    fn test_load_build_config_fragment_contributes_file() {
+        let repo = TempDir::new().unwrap();
+        write_test_config(
+            &repo,
+            "frag.yaml",
+            r#"
+type: fragment
+files:
+  - src: "@://payload/build.txt"
+    dest: /tmp/build.txt
+steps: []
+"#,
+        );
+        write_build_config(
+            &repo,
+            "build.yaml",
+            r#"
+type: build
+image: "@base"
+output: "out.qcow2"
+steps:
+  - uses: "@://frag.yaml"
+"#,
+        );
+        let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
+        assert_eq!(
+            config.files,
+            vec![FileEntry {
+                src: "@://payload/build.txt".to_string(),
+                dest: "/tmp/build.txt".to_string(),
+                ..Default::default()
+            }]
+        );
+    }
+
+    #[test]
+    fn test_load_test_config_fragment_file_walk_order_root_then_includes() {
+        let repo = TempDir::new().unwrap();
+        write_test_config(
+            &repo,
+            "frag-a.yaml",
+            r#"
+type: fragment
+files:
+  - src: "@://frag/a.txt"
+    dest: /tmp/frag-a.txt
+steps: []
+"#,
+        );
+        write_test_config(
+            &repo,
+            "frag-b.yaml",
+            r#"
+type: fragment
+files:
+  - src: "@://frag/b.txt"
+    dest: /tmp/frag-b.txt
+steps: []
+"#,
+        );
+        write_test_config(
+            &repo,
+            "test.yaml",
+            r#"
+type: test
+files:
+  - src: "@://root/first.txt"
+    dest: /tmp/root-first.txt
+  - src: "@://root/second.txt"
+    dest: /tmp/root-second.txt
+steps:
+  - uses: "@://frag-b.yaml"
+  - uses: "@://frag-a.yaml"
+"#,
+        );
+        let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+        assert_eq!(
+            config.files,
+            vec![
+                FileEntry {
+                    src: "@://root/first.txt".to_string(),
+                    dest: "/tmp/root-first.txt".to_string(),
+                    ..Default::default()
+                },
+                FileEntry {
+                    src: "@://root/second.txt".to_string(),
+                    dest: "/tmp/root-second.txt".to_string(),
+                    ..Default::default()
+                },
+                FileEntry {
+                    src: "@://frag/b.txt".to_string(),
+                    dest: "/tmp/frag-b.txt".to_string(),
+                    ..Default::default()
+                },
+                FileEntry {
+                    src: "@://frag/a.txt".to_string(),
+                    dest: "/tmp/frag-a.txt".to_string(),
+                    ..Default::default()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_load_test_config_fragment_file_nested_order_is_deterministic() {
+        let repo = TempDir::new().unwrap();
+        write_test_config(
+            &repo,
+            "frag-b.yaml",
+            r#"
+type: fragment
+files:
+  - src: "@://nested/b.txt"
+    dest: /tmp/nested-b.txt
+steps: []
+"#,
+        );
+        write_test_config(
+            &repo,
+            "frag-a.yaml",
+            r#"
+type: fragment
+files:
+  - src: "@://nested/a.txt"
+    dest: /tmp/nested-a.txt
+steps:
+  - uses: "@://frag-b.yaml"
+"#,
+        );
+        write_test_config(
+            &repo,
+            "test.yaml",
+            r#"
+type: test
+steps:
+  - uses: "@://frag-a.yaml"
+"#,
+        );
+        let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+        assert_eq!(
+            config.files,
+            vec![
+                FileEntry {
+                    src: "@://nested/a.txt".to_string(),
+                    dest: "/tmp/nested-a.txt".to_string(),
+                    ..Default::default()
+                },
+                FileEntry {
+                    src: "@://nested/b.txt".to_string(),
+                    dest: "/tmp/nested-b.txt".to_string(),
+                    ..Default::default()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_load_test_config_fragment_files_dedupe_identicals() {
+        let repo = TempDir::new().unwrap();
+        write_test_config(
+            &repo,
+            "frag-a.yaml",
+            r#"
+type: fragment
+files:
+  - src: "@://same/file.txt"
+    dest: /tmp/same.txt
+steps: []
+"#,
+        );
+        write_test_config(
+            &repo,
+            "frag-b.yaml",
+            r#"
+type: fragment
+files:
+  - src: "@://same/file.txt"
+    dest: /tmp/same.txt
+steps: []
+"#,
+        );
+        write_test_config(
+            &repo,
+            "test.yaml",
+            r#"
+type: test
+steps:
+  - uses: "@://frag-a.yaml"
+  - uses: "@://frag-b.yaml"
+"#,
+        );
+        let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+        assert_eq!(
+            config.files,
+            vec![FileEntry {
+                src: "@://same/file.txt".to_string(),
+                dest: "/tmp/same.txt".to_string(),
+                ..Default::default()
+            }]
+        );
+    }
+
+    #[test]
+    fn test_load_test_config_fragment_files_non_identical_same_dest_not_deduped() {
+        let repo = TempDir::new().unwrap();
+        write_test_config(
+            &repo,
+            "frag-a.yaml",
+            r#"
+type: fragment
+files:
+  - src: "@://same/file.txt"
+    dest: /tmp/same.txt
+    mode: "0644"
+steps: []
+"#,
+        );
+        write_test_config(
+            &repo,
+            "frag-b.yaml",
+            r#"
+type: fragment
+files:
+  - src: "@://same/file.txt"
+    dest: /tmp/same.txt
+    mode: "0755"
+steps: []
+"#,
+        );
+        write_test_config(
+            &repo,
+            "test.yaml",
+            r#"
+type: test
+steps:
+  - uses: "@://frag-a.yaml"
+  - uses: "@://frag-b.yaml"
+"#,
+        );
+        let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+        assert_eq!(
+            config.files,
+            vec![
+                FileEntry {
+                    src: "@://same/file.txt".to_string(),
+                    dest: "/tmp/same.txt".to_string(),
+                    mode: Some("0644".to_string()),
+                    ..Default::default()
+                },
+                FileEntry {
+                    src: "@://same/file.txt".to_string(),
+                    dest: "/tmp/same.txt".to_string(),
+                    mode: Some("0755".to_string()),
+                    ..Default::default()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_load_test_config_fragment_file_validation_matches_top_level() {
+        let repo = TempDir::new().unwrap();
+        write_test_config(
+            &repo,
+            "frag.yaml",
+            r#"
+type: fragment
+files:
+  - src: payload/file.txt
+    dest: /tmp/file.txt
+steps: []
+"#,
+        );
+        write_test_config(
+            &repo,
+            "test.yaml",
+            r#"
+type: test
+steps:
+  - uses: "@://frag.yaml"
+"#,
+        );
         let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("files"),
-            "error should reject files in fragment doc: {msg}"
+            msg.contains("`src` must be an `@`-reference"),
+            "fragment file should be validated using top-level file rules: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_load_test_config_fragment_file_unknown_field_rejected() {
+        let repo = TempDir::new().unwrap();
+        write_test_config(
+            &repo,
+            "frag.yaml",
+            r#"
+type: fragment
+files:
+  - src: "@://payload/file.txt"
+    dest: /tmp/file.txt
+    bogus: true
+steps: []
+"#,
+        );
+        write_test_config(
+            &repo,
+            "test.yaml",
+            r#"
+type: test
+steps:
+  - uses: "@://frag.yaml"
+"#,
+        );
+        let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("unknown field") && msg.contains("bogus"),
+            "fragment file unknown fields should be rejected at parse time: {msg}"
         );
     }
 
