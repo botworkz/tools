@@ -154,7 +154,7 @@ pub(crate) fn cmd_test(config: &Path, args: TestArgs) -> Result<()> {
     for iso in &test_config.isos {
         match iso {
             TestIso::Attach(path) => {
-                extra_isos.push(resolve_under_root(&repo_root, path.clone()));
+                extra_isos.push(resolve_test_iso_path(&repo_root, config, path)?);
             }
             TestIso::Bootstrap {
                 path,
@@ -162,7 +162,7 @@ pub(crate) fn cmd_test(config: &Path, args: TestArgs) -> Result<()> {
                 mount,
                 bootstrap,
             } => {
-                extra_isos.push(resolve_under_root(&repo_root, path.clone()));
+                extra_isos.push(resolve_test_iso_path(&repo_root, config, path)?);
                 bootstraps.push(TestIsoBootstrap {
                     label: label.clone(),
                     mount: mount.clone(),
@@ -254,9 +254,27 @@ fn resolve_test_base_image(
     image.resolve_one_validated(&resolve_context, &base_image_spec)
 }
 
+fn resolve_test_iso_path(repo_root: &Path, manifest_path: &Path, path: &Path) -> Result<PathBuf> {
+    if let Some(raw) = path.to_str().filter(|raw| raw.starts_with('@')) {
+        let iso_spec = ResolveSpec {
+            deny_kinds: vec![AssetKind::OciImage],
+            ..Default::default()
+        };
+        let resolve_context = ResolveFileContext {
+            repo_root,
+            manifest_path,
+            cache_dir_override: None,
+        };
+        let reference = Reference::parse(raw)
+            .with_context(|| format!("invalid iso path reference: {raw:?}"))?;
+        return reference.resolve_one_validated(&resolve_context, &iso_spec);
+    }
+    Ok(resolve_under_root(repo_root, path.to_path_buf()))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::resolve_test_base_image;
+    use super::{resolve_test_base_image, resolve_test_iso_path};
     use crate::cli::Cli;
     use crate::resolver::Reference;
     use clap::Parser;
@@ -407,6 +425,73 @@ mod tests {
         assert!(
             format!("{err:#}").contains("no base image provided"),
             "missing base image should be rejected: {err:#}"
+        );
+    }
+
+    // ── resolve_test_iso_path tests ───────────────────────────────────────────
+
+    #[test]
+    fn test_resolve_iso_path_at_repo_root_ref_resolves_to_absolute_path() {
+        let repo = TempDir::new().unwrap();
+        let manifest = repo.path().join("shasset.yaml");
+        let iso = repo.path().join("build/foo.iso");
+        std::fs::create_dir_all(iso.parent().unwrap()).unwrap();
+        std::fs::write(&iso, "").unwrap();
+
+        let resolved = resolve_test_iso_path(
+            repo.path(),
+            &manifest,
+            std::path::Path::new("@://build/foo.iso"),
+        )
+        .unwrap();
+
+        assert_eq!(resolved, iso);
+    }
+
+    #[test]
+    fn test_resolve_iso_path_plain_relative_resolves_under_root() {
+        let repo = TempDir::new().unwrap();
+        let manifest = repo.path().join("shasset.yaml");
+
+        // Does not require the file to exist — regression guard for plain paths.
+        let resolved = resolve_test_iso_path(
+            repo.path(),
+            &manifest,
+            std::path::Path::new("build/foo.iso"),
+        )
+        .unwrap();
+
+        assert_eq!(resolved, repo.path().join("build/foo.iso"));
+    }
+
+    #[test]
+    fn test_resolve_iso_path_absolute_path_returned_unchanged() {
+        let repo = TempDir::new().unwrap();
+        let manifest = repo.path().join("shasset.yaml");
+        let abs = std::path::PathBuf::from("/tmp/some.iso");
+
+        let resolved = resolve_test_iso_path(repo.path(), &manifest, &abs).unwrap();
+
+        assert_eq!(resolved, abs);
+    }
+
+    #[test]
+    fn test_resolve_iso_path_at_ref_rejects_oci_asset() {
+        let repo = TempDir::new().unwrap();
+        let manifest = repo.path().join("shasset.yaml");
+        std::fs::write(
+            &manifest,
+            "settings:\n  retries: 0\nassets:\n  my-image:\n    uri: oci://ghcr.io/example/img@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n    version: \"1\"\n",
+        )
+        .unwrap();
+
+        let err = resolve_test_iso_path(repo.path(), &manifest, std::path::Path::new("@my-image"))
+            .unwrap_err();
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("oci://") || msg.contains("OCI") || msg.contains("my-image"),
+            "deny_kinds should reject oci:// assets: {msg}"
         );
     }
 }
