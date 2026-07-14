@@ -87,11 +87,33 @@ pub(crate) struct RunStep {
     /// Declarative outcome assertions for test/build run steps.
     #[serde(default)]
     pub(crate) expect: Option<ExpectBlock>,
+    /// Optional runtime condition. When `false`, the step is skipped: it does not
+    /// run, does not fail the plan, and is reported with a distinct skipped marker.
+    /// When `true` (or absent), the step runs as normal.
+    ///
+    /// Accepted literal values (case-insensitive for strings):
+    ///   Truthy: YAML `true`, or the strings `"true"`, `"1"`, `"yes"`, `"on"`.
+    ///   Falsy:  YAML `false`, or the strings `"false"`, `"0"`, `"no"`, `"off"`.
+    ///
+    /// Any other value is a hard load-time error. Expression syntax (`${{ ... }}`)
+    /// is not yet supported; non-literal values are rejected on load.
+    #[serde(
+        rename = "if",
+        default,
+        deserialize_with = "deserialize_step_condition"
+    )]
+    pub(crate) condition: Option<bool>,
 }
 
 impl RunStep {
     pub(crate) fn sudo_enabled(&self) -> bool {
         self.sudo.unwrap_or(true)
+    }
+
+    /// Returns `true` when the step should run, `false` when it should be skipped.
+    /// Absent `if:` (stored as `None`) is treated as truthy — run as normal.
+    pub(crate) fn condition_enabled(&self) -> bool {
+        self.condition.unwrap_or(true)
     }
 }
 
@@ -201,6 +223,45 @@ where
         .map(parse_positive_seconds)
         .transpose()
         .map_err(de::Error::custom)
+}
+
+/// Deserialize the `if:` field into an `Option<bool>`.
+///
+/// Accepts:
+/// - YAML `true` / `false` booleans → `Some(true)` / `Some(false)`
+/// - YAML strings (case-insensitive): `"true"`, `"1"`, `"yes"`, `"on"` → `Some(true)`;
+///   `"false"`, `"0"`, `"no"`, `"off"` → `Some(false)`
+/// - YAML null → `None` (treated as absent = run)
+///
+/// Any other value — including expression placeholders like `"${{ expr }}"` that
+/// were not substituted — is a hard error. Expression support is reserved for a
+/// future iteration.
+fn deserialize_step_condition<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<bool>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    match &value {
+        Value::Null => Ok(None),
+        Value::Bool(b) => Ok(Some(*b)),
+        Value::String(s) => match s.to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" | "on" => Ok(Some(true)),
+            "false" | "0" | "no" | "off" => Ok(Some(false)),
+            _ => Err(de::Error::custom(format!(
+                "invalid `if:` value {s:?}: only literal true/false values are supported \
+                 (accepted: true, false, \"1\", \"0\", \"yes\", \"no\", \"on\", \"off\"); \
+                 expression support (e.g. `${{{{ ... }}}}`) is not yet available"
+            ))),
+        },
+        other => Err(de::Error::custom(format!(
+            "invalid `if:` value: only literal true/false values are supported \
+             (accepted: true, false, \"1\", \"0\", \"yes\", \"no\", \"on\", \"off\"); \
+             expression support (e.g. `${{{{ ... }}}}`) is not yet available; \
+             got: {other:?}"
+        ))),
+    }
 }
 
 /// Resolve a step's `shell:` value into an argv template with a `{0}` slot.
@@ -577,6 +638,132 @@ expect:
         assert!(
             err.to_string().contains("unknown field"),
             "should reject unknown field in stdout expect block: {err}"
+        );
+    }
+
+    // --- if: condition field ---
+
+    #[test]
+    fn test_if_absent_is_none() {
+        let step: RunStep = serde_yaml::from_str("name: s\nrun: echo ok\n").unwrap();
+        assert_eq!(step.condition, None);
+        assert!(
+            step.condition_enabled(),
+            "absent if: should default to enabled"
+        );
+    }
+
+    #[test]
+    fn test_if_bool_true_is_some_true() {
+        let step: RunStep = serde_yaml::from_str("name: s\nrun: echo ok\nif: true\n").unwrap();
+        assert_eq!(step.condition, Some(true));
+        assert!(step.condition_enabled());
+    }
+
+    #[test]
+    fn test_if_bool_false_is_some_false() {
+        let step: RunStep = serde_yaml::from_str("name: s\nrun: echo ok\nif: false\n").unwrap();
+        assert_eq!(step.condition, Some(false));
+        assert!(!step.condition_enabled());
+    }
+
+    #[test]
+    fn test_if_string_truthy_literals() {
+        for value in &["\"true\"", "\"1\"", "\"yes\"", "\"on\""] {
+            let yaml = format!("name: s\nrun: echo ok\nif: {value}\n");
+            let step: RunStep = serde_yaml::from_str(&yaml)
+                .unwrap_or_else(|e| panic!("should parse if: {value} as truthy: {e}"));
+            assert_eq!(
+                step.condition,
+                Some(true),
+                "if: {value} should be Some(true)"
+            );
+            assert!(step.condition_enabled(), "if: {value} should be enabled");
+        }
+    }
+
+    #[test]
+    fn test_if_string_falsy_literals() {
+        for value in &["\"false\"", "\"0\"", "\"no\"", "\"off\""] {
+            let yaml = format!("name: s\nrun: echo ok\nif: {value}\n");
+            let step: RunStep = serde_yaml::from_str(&yaml)
+                .unwrap_or_else(|e| panic!("should parse if: {value} as falsy: {e}"));
+            assert_eq!(
+                step.condition,
+                Some(false),
+                "if: {value} should be Some(false)"
+            );
+            assert!(!step.condition_enabled(), "if: {value} should be disabled");
+        }
+    }
+
+    #[test]
+    fn test_if_string_case_insensitive() {
+        let truthy_cases = ["\"True\"", "\"TRUE\"", "\"YES\"", "\"ON\"", "\"1\""];
+        for value in &truthy_cases {
+            let yaml = format!("name: s\nrun: echo ok\nif: {value}\n");
+            let step: RunStep = serde_yaml::from_str(&yaml)
+                .unwrap_or_else(|e| panic!("should accept if: {value}: {e}"));
+            assert_eq!(step.condition, Some(true), "if: {value} should be truthy");
+        }
+
+        let falsy_cases = ["\"False\"", "\"FALSE\"", "\"NO\"", "\"OFF\"", "\"0\""];
+        for value in &falsy_cases {
+            let yaml = format!("name: s\nrun: echo ok\nif: {value}\n");
+            let step: RunStep = serde_yaml::from_str(&yaml)
+                .unwrap_or_else(|e| panic!("should accept if: {value}: {e}"));
+            assert_eq!(step.condition, Some(false), "if: {value} should be falsy");
+        }
+    }
+
+    #[test]
+    fn test_if_invalid_string_is_hard_error() {
+        for value in &["maybe", "unknown", "2", "yes_ish"] {
+            let yaml = format!("name: s\nrun: echo ok\nif: \"{value}\"\n");
+            let err = serde_yaml::from_str::<RunStep>(&yaml)
+                .expect_err(&format!("if: \"{value}\" should be rejected"));
+            let msg = err.to_string();
+            assert!(
+                msg.contains("only literal true/false values are supported"),
+                "error for if: {value} should mention 'only literal': {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_if_expression_placeholder_is_hard_error() {
+        let err = serde_yaml::from_str::<RunStep>("name: s\nrun: echo ok\nif: \"${{ x }}\"\n")
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("only literal true/false values are supported"),
+            "error should explain only literals are accepted: {msg}"
+        );
+        assert!(
+            msg.contains("expression support") || msg.contains("not yet available"),
+            "error should mention expression support is not yet available: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_if_integer_is_hard_error() {
+        // YAML integers (e.g. `if: 2`) are not accepted — only booleans and strings.
+        let err = serde_yaml::from_str::<RunStep>("name: s\nrun: echo ok\nif: 2\n").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("only literal true/false values are supported"),
+            "if: 2 (integer) should be rejected with clear message: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_if_deny_unknown_fields_still_holds() {
+        let err =
+            serde_yaml::from_str::<RunStep>("name: s\nrun: echo ok\nif: true\nsurprise: nope\n")
+                .unwrap_err();
+        assert!(
+            err.to_string().contains("unknown field"),
+            "deny_unknown_fields should still reject extra fields: {err}"
         );
     }
 }

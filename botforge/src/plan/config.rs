@@ -882,9 +882,19 @@ fn expand_raw_step(step: Value) -> Result<Vec<TestStep>> {
         _ => anyhow::bail!("step entry must be a mapping"),
     };
 
+    // Extract step name for richer error context (best-effort; substituted values
+    // used for for:-expanded steps).
+    let name_key = Value::String("name".to_string());
+    let step_name_template = mapping
+        .get(&name_key)
+        .and_then(|v| v.as_str())
+        .unwrap_or("<unnamed>")
+        .to_string();
+
     let for_key = Value::String("for".to_string());
     let Some(items_value) = mapping.remove(&for_key) else {
-        let parsed: TestStep = serde_yaml::from_value(Value::Mapping(mapping))?;
+        let parsed: TestStep = serde_yaml::from_value(Value::Mapping(mapping))
+            .with_context(|| format!("step '{step_name_template}': invalid step definition"))?;
         return Ok(vec![parsed]);
     };
 
@@ -899,7 +909,19 @@ fn expand_raw_step(step: Value) -> Result<Vec<TestStep>> {
         let args = resolve_for_args(&item)?;
         let mut concrete = body.clone();
         substitute_args_in_value(&mut concrete, &args)?;
-        expanded.push(serde_yaml::from_value::<TestStep>(concrete)?);
+        // Use the post-substitution name for the error context.
+        let concrete_name = if let Value::Mapping(ref m) = concrete {
+            m.get(&name_key)
+                .and_then(|v| v.as_str())
+                .unwrap_or(&step_name_template)
+                .to_string()
+        } else {
+            step_name_template.clone()
+        };
+        expanded.push(
+            serde_yaml::from_value::<TestStep>(concrete)
+                .with_context(|| format!("step '{concrete_name}': invalid step definition"))?,
+        );
     }
     Ok(expanded)
 }
@@ -2923,6 +2945,7 @@ steps:
             sudo: None,
             id: None,
             expect: None,
+            condition: None,
         })
     }
 

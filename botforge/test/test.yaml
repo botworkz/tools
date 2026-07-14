@@ -75,6 +75,36 @@ steps:
       contains:
       - /
 
+# --- if: condition acceptance coverage ---------------------------------------
+# Proves that `if: false` skips a step whose `run:` would fail if executed,
+# and that `if: true` (explicit) still runs normally.
+
+- name: if-false skips failing step
+  if: false
+  run: exit 1
+
+- name: if-true runs normally
+  if: true
+  run: echo "if-true ran"
+  expect:
+    stdout:
+      contains:
+      - if-true ran
+
+# for: with if: — proves the condition is cloned per iteration and substitution
+# applies to if: before the literal check. Iteration 0 has if: "false" → skip,
+# iteration 1 has if: "true" → run.
+- name: for-if (${{ args.0 }})
+  for:
+  - ["skip-me", "false"]
+  - ["run-me", "true"]
+  if: "${{ args.1 }}"
+  run: echo "${{ args.0 }}"
+  expect:
+    stdout:
+      contains:
+      - run-me
+
 assert:
   files:
     /etc/botforge-ci-marker:

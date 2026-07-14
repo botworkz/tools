@@ -19,8 +19,9 @@ use super::assert::{
 use super::config::{AssertBlock, TestConfig, TestIsoBootstrap};
 use super::files::{stage_files, FileEntry};
 use super::log::{
-    join_output_forwarders, print_step_status, print_step_title, spawn_capturing_forwarder,
-    spawn_output_forwarder, step_log_path, StepLogWriter, StepOutputStream,
+    join_output_forwarders, print_step_skipped, print_step_status, print_step_title,
+    spawn_capturing_forwarder, spawn_output_forwarder, step_log_path, StepLogWriter,
+    StepOutputStream,
 };
 use super::step::{
     resolve_shell, ArchiveStep, ExpectBlock, RunStep, StdioExpect, StepTarget, TestStep,
@@ -242,6 +243,16 @@ pub(crate) fn run_step_flow(
 
     for (step_idx, step) in plan.steps.iter().enumerate() {
         ensure_overall_budget(overall_deadline, timeouts.overall_timeout)?;
+
+        // Evaluate the `if:` condition before doing any work. Only RunStep carries
+        // a condition; Archive steps always run (no `if:` field).
+        if let TestStep::Run(run) = step {
+            if !run.condition_enabled() {
+                print_step_skipped(step_idx, step.display_name(), step.display_id());
+                continue;
+            }
+        }
+
         // The file is created by StepLogWriter::create inside each step runner;
         // no pre-creation needed here (the directory was already created above).
         print_step_title(step_idx, step.display_name(), step.display_id());
@@ -1900,6 +1911,7 @@ run: echo ok
             sudo: None,
             id: None,
             expect: None,
+            condition: None,
         };
         assert_eq!(
             resolve_step_timeout(step.timeout, Duration::from_secs(300)),
@@ -1918,6 +1930,7 @@ run: echo ok
             sudo: None,
             id: None,
             expect: None,
+            condition: None,
         };
         assert_eq!(
             resolve_step_timeout(step.timeout, Duration::from_secs(1800)),
