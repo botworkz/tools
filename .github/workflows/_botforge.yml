@@ -143,6 +143,13 @@ jobs:
         filter: '. + {image: "@artifact://foo.qcow2"}'
         output-path: testrepo/assert-fail-rootfile.yaml
         input: botforge/test/assert-fail-rootfile.yaml
+    - name: Create assert-fail-groups config
+      uses: envoyproxy/toolshed/actions/jq@6a20085af231aba4c72d6866f94098343a8c5616
+      with:
+        input-format: yaml-path
+        filter: '. + {image: "@artifact://foo.qcow2"}'
+        output-path: testrepo/assert-fail-groups.yaml
+        input: botforge/test/assert-fail-groups.yaml
 
     - name: Print build config
       uses: envoyproxy/toolshed/actions/jq@6a20085af231aba4c72d6866f94098343a8c5616
@@ -186,6 +193,16 @@ jobs:
       run: |
         qemu-img check -r all -f qcow2 testrepo/build/artifact/foo-chained.qcow2
         sudo guestfish --ro -a testrepo/build/artifact/foo.qcow2 -i sh 'file /boot/vmlinuz*; ls -l /boot'
+
+    - name: Create ISO payload for acceptance tests
+      run: |
+        . .botforge.env
+        mkdir -p "$REPO_ROOT/build/artifact/ci-probe-iso-src"
+        echo "botforge-iso-ci-payload" > "$REPO_ROOT/build/artifact/ci-probe-iso-src/payload.txt"
+        botforge iso \
+          --src "$REPO_ROOT/build/artifact/ci-probe-iso-src" \
+          --out "$REPO_ROOT/build/artifact/ci-probe.iso" \
+          --volume-id CI_PROBE
 
     - name: Run acceptance tests (cloud-init + assert + expect)
       run: |
@@ -238,3 +255,18 @@ jobs:
           exit 1
         fi
         echo "Negative-control passed: botforge correctly rejected wrong root-only file assertion"
+
+    - name: Negative-control — wrong group membership must fail
+      run: |
+        set -euo pipefail
+        . .botforge.env
+        # Regression guard for assert.users: groups membership checks.
+        # ci-probe-user is only in ci-probe-grp; asserting ci-probe-wrong-grp
+        # MUST fail and prove group-membership assertions bite.
+        if botforge test \
+             --test-config assert-fail-groups.yaml \
+             --repo-root "$REPO_ROOT"; then
+          echo "ERROR: botforge should have exited non-zero for wrong group membership assertion" >&2
+          exit 1
+        fi
+        echo "Negative-control passed: botforge correctly rejected wrong group membership assertion"

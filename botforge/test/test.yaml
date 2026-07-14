@@ -1,6 +1,8 @@
 type: test
 ports:
 - 80
+isos:
+- "@artifact://ci-probe.iso"
 
 steps:
 - uses: "@://hello.steps.yaml"
@@ -56,6 +58,10 @@ assert:
     root:
       exists: true
       shell: /bin/bash
+    ci-probe-user:
+      exists: true
+      groups:
+      - ci-probe-grp
     botforge-*:
       exists: false
   groups:
