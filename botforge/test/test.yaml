@@ -4,6 +4,7 @@ ports:
 
 steps:
 - uses: "@://hello.steps.yaml"
+- uses: "@://for-fragment-test.steps.yaml"
 - name: Base install test
   run: |
     whoami | grep root
