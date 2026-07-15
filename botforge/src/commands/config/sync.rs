@@ -224,7 +224,7 @@ fn do_out(context: &Path, delete: bool) -> Result<()> {
     Ok(())
 }
 
-// ─── helpers ─────────────────────────────────────────────────────────────────
+// ─── helpers ──────────────────────────────────────────────────────────────────
 
 /// Collect spec files that are discoverable on disk but not referenced by the
 /// committed registry (i.e. the set that `--out --delete` would remove).
@@ -520,7 +520,7 @@ fn compute_drift(
     items
 }
 
-// ─── tests ───────────────────────────────────────────────────────────────────
+// ─── tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -538,6 +538,7 @@ mod tests {
         fs::write(dir.join(filename), content).unwrap();
     }
 
+    #[allow(dead_code)]
     fn write_test_doc(dir: &Path, filename: &str, name: &str) {
         let content = format!("type: botforge/test\nname: {name}\n");
         fs::write(dir.join(filename), content).unwrap();
@@ -616,10 +617,7 @@ mod tests {
     fn check_clean_exits_zero() {
         let root = TempDir::new().unwrap();
         write_build_doc(root.path(), "foo.yaml", "foo");
-        write_marker(
-            root.path(),
-            &format!("build:\n  foo:\n    spec: foo.yaml\n"),
-        );
+        write_marker(root.path(), "build:\n  foo:\n    spec: foo.yaml\n");
 
         let args = SyncArgs {
             context: Some(root.path().to_path_buf()),
@@ -850,7 +848,7 @@ mod tests {
     #[test]
     fn drift_detected_discovered_unregistered() {
         let context = TempDir::new().unwrap();
-        let mut comm = BTreeMap::new();
+        let comm = BTreeMap::new();
         let mut disc = BTreeMap::new();
         disc.insert("foo".to_string(), context.path().join("foo.yaml"));
         let drift = compute_drift(
