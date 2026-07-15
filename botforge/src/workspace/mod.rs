@@ -2,17 +2,53 @@ pub(crate) mod discover;
 pub(crate) mod registry;
 
 use anyhow::{bail, Context, Result};
+use serde::Deserialize;
+use shasset::manifest::{Asset, Manifest, Settings};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-const MARKER: &str = "botforge.yaml";
+pub(crate) const MARKER_NAMES: [&str; 5] = [
+    "botforge.yaml",
+    "botforge.yml",
+    ".botforge.yaml",
+    ".botforge.yml",
+    "BOTFORGE",
+];
+
+const MARKER_DISPLAY: &str = "botforge.yaml, botforge.yml, .botforge.yaml, .botforge.yml, BOTFORGE";
+
+#[derive(Debug, Deserialize, Default)]
+struct RawWorkspaceManifestDoc {
+    #[serde(default)]
+    settings: Settings,
+    #[serde(default)]
+    assets: BTreeMap<String, Asset>,
+}
+
+pub(crate) fn is_marker_name(name: &str) -> bool {
+    MARKER_NAMES.contains(&name)
+}
+
+pub(crate) fn find_marker_path(dir: &Path) -> Option<PathBuf> {
+    MARKER_NAMES.iter().map(|name| dir.join(name)).find(|path| path.is_file())
+}
+
+pub(crate) fn marker_path(dir: &Path) -> Result<PathBuf> {
+    find_marker_path(dir).ok_or_else(|| {
+        anyhow::anyhow!(
+            "no botforge marker found in '{}'; expected one of: {MARKER_DISPLAY}",
+            dir.display()
+        )
+    })
+}
 
 /// Discover the botforge workspace context root.
 ///
 /// - When `explicit` is `None`: walk up from the current working directory looking
-///   for a file named `botforge.yaml`.  The first directory (cwd or any ancestor)
+///   for a botforge marker file. The first directory (cwd or any ancestor)
 ///   that contains the marker is returned as the canonicalized context root.  If the
 ///   walk reaches the filesystem root without finding one, a hard error is returned.
-/// - When `explicit` is `Some(dir)`: `dir` **must** contain a `botforge.yaml`.
+/// - When `explicit` is `Some(dir)`: `dir` **must** contain a botforge marker.
 ///   If it does, the canonicalized `dir` is returned.  If not, a hard error is
 ///   returned.  The walk-up is **not** applied to an explicit path.
 pub(crate) fn discover_context(explicit: Option<&Path>) -> Result<PathBuf> {
@@ -24,12 +60,12 @@ fn discover_context_from(explicit: Option<&Path>, start_dir: &Path) -> Result<Pa
     if let Some(dir) = explicit {
         let canonical = std::fs::canonicalize(dir)
             .with_context(|| format!("--context '{}': cannot resolve directory", dir.display()))?;
-        if canonical.join(MARKER).is_file() {
-            load_botforge_yaml(&canonical.join(MARKER))?;
+        if let Some(marker) = find_marker_path(&canonical) {
+            load_botforge_yaml(&marker)?;
             return Ok(canonical);
         }
         bail!(
-            "--context '{}': no botforge.yaml found in that directory",
+            "--context '{}': no botforge marker found in that directory (expected one of: {MARKER_DISPLAY})",
             dir.display()
         );
     }
@@ -37,8 +73,8 @@ fn discover_context_from(explicit: Option<&Path>, start_dir: &Path) -> Result<Pa
     // Walk up from the provided start directory.
     let mut dir: &Path = start_dir;
     loop {
-        if dir.join(MARKER).is_file() {
-            load_botforge_yaml(&dir.join(MARKER))?;
+        if let Some(marker) = find_marker_path(dir) {
+            load_botforge_yaml(&marker)?;
             let canonical = std::fs::canonicalize(dir)
                 .with_context(|| format!("cannot canonicalize context root: {}", dir.display()))?;
             return Ok(canonical);
@@ -50,12 +86,12 @@ fn discover_context_from(explicit: Option<&Path>, start_dir: &Path) -> Result<Pa
     }
 
     bail!(
-        "not inside a botforge workspace: no botforge.yaml found in the current directory or any parent"
+        "not inside a botforge workspace: no marker found in the current directory or any parent (expected one of: {MARKER_DISPLAY})"
     );
 }
 
-/// Load and validate `botforge.yaml`.  The file must exist and must parse as valid
-/// YAML.  An empty file or `{}` is fine — the marker is presence-only for now.
+/// Load and validate a botforge marker file. The file must exist and must parse as
+/// valid YAML. An empty file or `{}` is fine.
 fn load_botforge_yaml(path: &Path) -> Result<()> {
     let contents =
         std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
@@ -64,14 +100,33 @@ fn load_botforge_yaml(path: &Path) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn load_inline_manifest(context_root: &Path) -> Result<Manifest> {
+    let marker = marker_path(context_root)?;
+    let contents =
+        std::fs::read_to_string(&marker).with_context(|| format!("cannot read {}", marker.display()))?;
+    if contents.trim().is_empty() {
+        return Ok(Manifest::default());
+    }
+    let doc: RawWorkspaceManifestDoc = serde_yaml::from_str(&contents)
+        .with_context(|| format!("invalid YAML in {}", marker.display()))?;
+    Ok(Manifest {
+        settings: doc.settings,
+        assets: doc.assets,
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{discover_context, discover_context_from};
+    use super::{discover_context, discover_context_from, find_marker_path, load_inline_manifest};
     use std::path::Path;
     use tempfile::TempDir;
 
     fn write_marker(dir: &Path) {
         std::fs::write(dir.join("botforge.yaml"), "").unwrap();
+    }
+
+    fn write_named_marker(dir: &Path, name: &str, contents: &str) {
+        std::fs::write(dir.join(name), contents).unwrap();
     }
 
     // ── discover_context(None) ────────────────────────────────────────────────
@@ -121,7 +176,7 @@ mod tests {
         let root = TempDir::new().unwrap();
         let err = discover_context(Some(root.path())).unwrap_err();
         assert!(
-            format!("{err:#}").contains("no botforge.yaml found in that directory"),
+            format!("{err:#}").contains("no botforge marker found in that directory"),
             "expected marker-absent error, got: {err:#}"
         );
     }
@@ -135,7 +190,7 @@ mod tests {
         std::fs::create_dir_all(&subdir).unwrap();
         let err = discover_context(Some(&subdir)).unwrap_err();
         assert!(
-            format!("{err:#}").contains("no botforge.yaml found in that directory"),
+            format!("{err:#}").contains("no botforge marker found in that directory"),
             "explicit context must not walk up: {err:#}"
         );
     }
@@ -167,5 +222,59 @@ mod tests {
             format!("{err:#}").contains("invalid YAML"),
             "expected invalid YAML error, got: {err:#}"
         );
+    }
+
+    #[test]
+    fn discover_context_accepts_all_marker_names() {
+        for marker in [
+            "botforge.yaml",
+            "botforge.yml",
+            ".botforge.yaml",
+            ".botforge.yml",
+            "BOTFORGE",
+        ] {
+            let root = TempDir::new().unwrap();
+            write_named_marker(root.path(), marker, "");
+            let result = discover_context(Some(root.path())).unwrap();
+            assert_eq!(
+                result,
+                root.path().canonicalize().unwrap(),
+                "marker {marker} should be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn find_marker_path_prefers_existing_priority_order() {
+        let root = TempDir::new().unwrap();
+        write_named_marker(root.path(), ".botforge.yaml", "");
+        write_named_marker(root.path(), "botforge.yml", "");
+        let marker = find_marker_path(root.path()).unwrap();
+        assert_eq!(marker.file_name().and_then(|name| name.to_str()), Some("botforge.yml"));
+    }
+
+    #[test]
+    fn load_inline_manifest_reads_assets_and_settings_from_marker() {
+        let root = TempDir::new().unwrap();
+        write_named_marker(
+            root.path(),
+            ".botforge.yaml",
+            "settings:\n  retries: 9\nassets:\n  base:\n    uri: https://example.com/base.qcow2\n    version: \"1\"\n",
+        );
+        let manifest = load_inline_manifest(root.path()).unwrap();
+        assert_eq!(manifest.settings.retries, 9);
+        assert_eq!(manifest.assets.len(), 1);
+        assert!(manifest.assets.contains_key("base"));
+    }
+
+    #[test]
+    fn load_inline_manifest_defaults_when_assets_block_is_absent() {
+        let root = TempDir::new().unwrap();
+        write_named_marker(root.path(), "BOTFORGE", "build: {}\n");
+        let manifest = load_inline_manifest(root.path()).unwrap();
+        assert!(manifest.assets.is_empty());
+        assert_eq!(manifest.settings.retries, 3);
+        assert_eq!(manifest.settings.concurrency, 4);
+        assert_eq!(manifest.settings.backoff.base_ms, 500);
     }
 }

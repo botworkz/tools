@@ -8,6 +8,9 @@ use crate::util::{create_temp_dir, normalize_path, validate_flat_filename};
 
 #[derive(Args, Debug)]
 pub(crate) struct PayloadArgs {
+    /// Payload plan YAML file.
+    #[arg(long, required = true)]
+    spec: PathBuf,
     /// Output payload ISO file path.
     #[arg(long, required = true)]
     out: PathBuf,
@@ -56,12 +59,10 @@ fn default_payload_file_mode() -> String {
     "0644".to_string()
 }
 
-pub(crate) fn cmd_payload(config: Option<&Path>, args: PayloadArgs) -> Result<()> {
-    let config_path = config.ok_or_else(|| {
-        anyhow::anyhow!("payload requires an explicit config file; pass -c <file>")
-    })?;
-    let payload = load_payload_config(config_path)?;
-    let config_dir = config_path
+pub(crate) fn cmd_payload(args: PayloadArgs) -> Result<()> {
+    let payload = load_payload_config(&args.spec)?;
+    let config_dir = args
+        .spec
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
@@ -290,8 +291,20 @@ mod tests {
         validate_payload_install_path, validate_relative_staging_path, PayloadConfig, PayloadFile,
         PayloadImage, PayloadServices,
     };
+    use crate::cli::Cli;
+    use clap::Parser;
     use std::path::Path;
     use tempfile::TempDir;
+
+    #[test]
+    fn payload_cli_requires_spec_flag() {
+        let err = Cli::try_parse_from(["botforge", "payload", "--out", "payload.iso"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+        assert!(
+            err.to_string().contains("--spec"),
+            "missing payload spec error should mention --spec: {err}"
+        );
+    }
 
     #[test]
     fn validate_relative_staging_path_rejects_non_relative_values() {

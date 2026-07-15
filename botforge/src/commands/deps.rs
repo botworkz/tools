@@ -1,14 +1,19 @@
 use anyhow::{Context, Result};
 use clap::Args;
 use shasset::fetch::{fetch_asset, FetchParams, MaterializeMode, Transport};
-use shasset::manifest::{load, Asset};
+use shasset::manifest::{Asset, Manifest};
 use shasset::prune::{format_prune_summary, prune_cache};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::util::{default_cache_dir, materialize_flat, validate_flat_filename};
+use crate::workspace::{discover_context, load_inline_manifest};
 
 #[derive(Args, Debug)]
 pub(crate) struct DepsArgs {
+    /// Workspace context root. When provided, must contain a botforge marker. When
+    /// omitted, botforge walks up from the current directory to find one.
+    #[arg(long)]
+    context: Option<PathBuf>,
     /// Asset name to fetch (all assets if omitted; ignored when `--prune` is set).
     #[arg(conflicts_with = "prune")]
     name: Option<String>,
@@ -34,23 +39,26 @@ pub(crate) struct DepsArgs {
     dry_run: bool,
 }
 
-pub(crate) fn cmd_deps(config: Option<&Path>, args: DepsArgs) -> Result<()> {
-    let config = config.unwrap_or_else(|| Path::new("shasset.yaml"));
+pub(crate) fn cmd_deps(args: DepsArgs) -> Result<()> {
+    let context = discover_context(args.context.as_deref())?;
+    let manifest = load_inline_manifest(&context)?;
     if args.prune {
-        let manifest = load(config)?;
         let cache_dir = args.cache_dir.unwrap_or_else(default_cache_dir);
         let summary = prune_cache(&cache_dir, &manifest, args.dry_run)?;
         println!("{}", format_prune_summary(&summary, args.dry_run));
         return Ok(());
     }
-    cmd_deps_with_transport(config, args, || None)
+    cmd_deps_with_transport(&manifest, args, || None)
 }
 
-fn cmd_deps_with_transport<F>(config: &Path, args: DepsArgs, mut transport_factory: F) -> Result<()>
+fn cmd_deps_with_transport<F>(
+    manifest: &Manifest,
+    args: DepsArgs,
+    mut transport_factory: F,
+) -> Result<()>
 where
     F: FnMut() -> Option<Box<dyn Transport>>,
 {
-    let manifest = load(config)?;
     let cache_dir = args.cache_dir.unwrap_or_else(default_cache_dir);
     let out = args
         .out
@@ -133,8 +141,9 @@ fn oci_or_default_filename(asset_key: &str, asset: &Asset) -> Result<String> {
 mod tests {
     use super::{cmd_deps, cmd_deps_with_transport, oci_or_default_filename, DepsArgs};
     use shasset::fetch::{DownloadResponse, FetchError, Transport};
-    use shasset::manifest::Asset;
+    use shasset::manifest::{Asset, Manifest};
     use std::io::Cursor;
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
     struct MockTransport {
@@ -158,20 +167,32 @@ mod tests {
         }
     }
 
+    fn args_for_out(out: PathBuf, cache_dir: PathBuf) -> DepsArgs {
+        DepsArgs {
+            context: None,
+            name: None,
+            out: Some(out),
+            cache_dir: Some(cache_dir),
+            no_reverify: false,
+            executable: false,
+            prune: false,
+            dry_run: false,
+        }
+    }
+
     #[test]
     fn deps_fetches_https_asset_to_flat_output_with_executable_mode() {
         let tmp = TempDir::new().unwrap();
-        let manifest = tmp.path().join("shasset.yaml");
         let out = tmp.path().join("out");
         let cache = tmp.path().join("cache");
         let body = b"hello world".to_vec();
         let uri = "https://example.com/v1/launcher".to_string();
         let checksum = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
-        std::fs::write(
-            &manifest,
+        let manifest: Manifest = serde_yaml::from_str(
             format!(
                 "settings:\n  retries: 0\nassets:\n  botwork-launcher:\n    uri: {uri}\n    version: \"1\"\n    checksum: sha256:{checksum}\n    filename: launcher\n"
-            ),
+            )
+            .as_str(),
         )
         .unwrap();
 
@@ -183,13 +204,8 @@ mod tests {
         cmd_deps_with_transport(
             &manifest,
             DepsArgs {
-                name: None,
-                out: Some(out.clone()),
-                cache_dir: Some(cache.clone()),
-                no_reverify: false,
                 executable: true,
-                prune: false,
-                dry_run: false,
+                ..args_for_out(out.clone(), cache.clone())
             },
             || transport.take(),
         )
@@ -213,16 +229,15 @@ mod tests {
     #[test]
     fn deps_fails_on_https_checksum_mismatch() {
         let tmp = TempDir::new().unwrap();
-        let manifest = tmp.path().join("shasset.yaml");
         let out = tmp.path().join("out");
         let cache = tmp.path().join("cache");
         let uri = "https://example.com/v1/launcher".to_string();
-        std::fs::write(
-            &manifest,
+        let manifest: Manifest = serde_yaml::from_str(
             format!(
                 "settings:\n  retries: 0\nassets:\n  botwork-launcher:\n    uri: {uri}\n    version: \"1\"\n    checksum: sha256:{}\n    filename: launcher\n",
                 "0".repeat(64)
-            ),
+            )
+            .as_str(),
         )
         .unwrap();
 
@@ -233,15 +248,7 @@ mod tests {
 
         let err = cmd_deps_with_transport(
             &manifest,
-            DepsArgs {
-                name: None,
-                out: Some(out.clone()),
-                cache_dir: Some(cache),
-                no_reverify: false,
-                executable: false,
-                prune: false,
-                dry_run: false,
-            },
+            args_for_out(out.clone(), cache),
             || transport.take(),
         )
         .unwrap_err();
@@ -307,7 +314,6 @@ mod tests {
     #[test]
     fn deps_prune_removes_unreferenced_blob_and_keeps_referenced_blob() {
         let tmp = TempDir::new().unwrap();
-        let manifest_path = tmp.path().join("shasset.yaml");
         let cache = tmp.path().join("cache");
         let kept_hex = "a".repeat(64);
         let removed_hex = "b".repeat(64);
@@ -317,25 +323,23 @@ mod tests {
         std::fs::write(blobs_dir.join(&removed_hex), b"gone!").unwrap();
 
         std::fs::write(
-            &manifest_path,
+            tmp.path().join("botforge.yaml"),
             format!(
                 "settings:\n  retries: 0\nassets:\n  kept:\n    uri: https://example.com/v1/tool\n    version: \"1\"\n    checksum: sha256:{kept_hex}\n    filename: tool.bin\n"
             ),
         )
         .unwrap();
 
-        cmd_deps(
-            Some(&manifest_path),
-            DepsArgs {
-                name: None,
-                out: None,
-                cache_dir: Some(cache.clone()),
-                no_reverify: false,
-                executable: false,
-                prune: true,
-                dry_run: false,
-            },
-        )
+        cmd_deps(DepsArgs {
+            context: Some(tmp.path().to_path_buf()),
+            name: None,
+            out: None,
+            cache_dir: Some(cache.clone()),
+            no_reverify: false,
+            executable: false,
+            prune: true,
+            dry_run: false,
+        })
         .unwrap();
 
         assert!(
@@ -351,7 +355,6 @@ mod tests {
     #[test]
     fn deps_prune_dry_run_removes_nothing() {
         let tmp = TempDir::new().unwrap();
-        let manifest_path = tmp.path().join("shasset.yaml");
         let cache = tmp.path().join("cache");
         let kept_hex = "a".repeat(64);
         let removed_hex = "b".repeat(64);
@@ -361,29 +364,36 @@ mod tests {
         std::fs::write(blobs_dir.join(&removed_hex), b"gone!").unwrap();
 
         std::fs::write(
-            &manifest_path,
+            tmp.path().join("botforge.yaml"),
             format!(
                 "settings:\n  retries: 0\nassets:\n  kept:\n    uri: https://example.com/v1/tool\n    version: \"1\"\n    checksum: sha256:{kept_hex}\n    filename: tool.bin\n"
             ),
         )
         .unwrap();
 
-        cmd_deps(
-            Some(&manifest_path),
-            DepsArgs {
-                name: None,
-                out: None,
-                cache_dir: Some(cache.clone()),
-                no_reverify: false,
-                executable: false,
-                prune: true,
-                dry_run: true,
-            },
-        )
+        cmd_deps(DepsArgs {
+            context: Some(tmp.path().to_path_buf()),
+            name: None,
+            out: None,
+            cache_dir: Some(cache.clone()),
+            no_reverify: false,
+            executable: false,
+            prune: true,
+            dry_run: true,
+        })
         .unwrap();
 
         // dry-run: both blobs must still exist
         assert!(blobs_dir.join(&kept_hex).exists());
         assert!(blobs_dir.join(&removed_hex).exists());
+    }
+
+    #[test]
+    fn deps_fetch_with_no_assets_succeeds() {
+        let tmp = TempDir::new().unwrap();
+        let manifest = Manifest::default();
+        let out = tmp.path().join("out");
+        let cache = tmp.path().join("cache");
+        cmd_deps_with_transport(&manifest, args_for_out(out, cache), || None).unwrap();
     }
 }

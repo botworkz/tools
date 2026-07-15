@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use shasset::manifest::Manifest;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
@@ -40,8 +41,8 @@ pub(crate) struct StepFlowPlan<'a> {
     pub(crate) files: &'a [FileEntry],
     pub(crate) steps: &'a [TestStep],
     pub(crate) bootstraps: &'a [TestIsoBootstrap],
-    /// Shasset manifest path, forwarded to the resolver for `@`-reference srcs in files.
-    pub(crate) manifest_path: &'a Path,
+    /// Parsed inline asset manifest, forwarded to the resolver for `@` references.
+    pub(crate) manifest: &'a Manifest,
     /// Optional cache directory override, forwarded to the resolver.
     pub(crate) cache_dir_override: Option<&'a Path>,
 }
@@ -78,7 +79,7 @@ pub(crate) fn run_test_flow(
     config: &TestConfig,
     ssh: &SshOptions,
     bootstraps: &[TestIsoBootstrap],
-    manifest_path: &Path,
+    manifest: &Manifest,
     cache_dir_override: Option<&Path>,
     installer_username: Option<&str>,
 ) -> Result<()> {
@@ -96,7 +97,7 @@ pub(crate) fn run_test_flow(
             files: &config.files,
             steps: &config.steps,
             bootstraps,
-            manifest_path,
+            manifest,
             cache_dir_override,
         },
         ssh,
@@ -219,7 +220,7 @@ pub(crate) fn run_step_flow(
         ensure_overall_budget(overall_deadline, timeouts.overall_timeout)?;
         let resolve_context = ResolveFileContext {
             context,
-            manifest_path: plan.manifest_path,
+            manifest: plan.manifest,
             cache_dir_override: plan.cache_dir_override,
         };
         stage_files(plan.files, &resolve_context, ssh)?;

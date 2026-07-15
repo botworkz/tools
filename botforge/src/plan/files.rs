@@ -209,15 +209,16 @@ pub(crate) fn stage_files(
 mod tests {
     use super::{resolve_file_mappings, FileEntry, FileMapping};
     use crate::resolver::ResolveFileContext;
+    use shasset::manifest::Manifest;
     use tempfile::TempDir;
 
     fn make_context<'a>(
         repo: &'a TempDir,
-        manifest: &'a std::path::Path,
+        manifest: &'a Manifest,
     ) -> ResolveFileContext<'a> {
         ResolveFileContext {
             context: repo.path(),
-            manifest_path: manifest,
+            manifest,
             cache_dir_override: None,
         }
     }
@@ -225,7 +226,7 @@ mod tests {
     #[test]
     fn test_resolve_file_mappings_repo_glob_preserves_relative_paths() {
         let repo = TempDir::new().unwrap();
-        let manifest = repo.path().join("shasset.yaml");
+        let manifest = Manifest::default();
         let ecds = repo.path().join("images/botspace/envoy/ecds");
         std::fs::create_dir_all(&ecds).unwrap();
         let file = ecds.join("ext_authz.yaml");
@@ -254,7 +255,7 @@ mod tests {
     #[test]
     fn test_resolve_file_mappings_artifact_glob_preserves_flat_matches() {
         let repo = TempDir::new().unwrap();
-        let manifest = repo.path().join("shasset.yaml");
+        let manifest = Manifest::default();
         let artifact_dir = repo.path().join("build/artifact/payload");
         std::fs::create_dir_all(&artifact_dir).unwrap();
         let file = artifact_dir.join("mcp-fs.tar");
@@ -283,7 +284,7 @@ mod tests {
     #[test]
     fn test_resolve_file_mappings_repo_literal_dest_uses_relative_path() {
         let repo = TempDir::new().unwrap();
-        let manifest = repo.path().join("shasset.yaml");
+        let manifest = Manifest::default();
         let local = repo.path().join("scripts/setup.sh");
         std::fs::create_dir_all(local.parent().unwrap()).unwrap();
         std::fs::write(&local, "#!/bin/sh\n").unwrap();
@@ -311,7 +312,7 @@ mod tests {
     #[test]
     fn test_resolve_file_mappings_repo_literal_dir_dest_appends_basename() {
         let repo = TempDir::new().unwrap();
-        let manifest = repo.path().join("shasset.yaml");
+        let manifest = Manifest::default();
         let local = repo.path().join("scripts/setup.sh");
         std::fs::create_dir_all(local.parent().unwrap()).unwrap();
         std::fs::write(&local, "#!/bin/sh\n").unwrap();
@@ -339,7 +340,7 @@ mod tests {
     #[test]
     fn test_resolve_file_mappings_zero_match_is_error() {
         let repo = TempDir::new().unwrap();
-        let manifest = repo.path().join("shasset.yaml");
+        let manifest = Manifest::default();
         let ctx = make_context(&repo, &manifest);
         let err = resolve_file_mappings(
             &FileEntry {
@@ -361,7 +362,7 @@ mod tests {
     #[test]
     fn test_resolve_file_mappings_rejects_bare_path() {
         let repo = TempDir::new().unwrap();
-        let manifest = repo.path().join("shasset.yaml");
+        let manifest = Manifest::default();
         let ctx = make_context(&repo, &manifest);
         let err = resolve_file_mappings(
             &FileEntry {

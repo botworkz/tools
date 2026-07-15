@@ -5,7 +5,7 @@
 
 use anyhow::{Context, Result};
 use shasset::fetch::{fetch_asset, FetchParams, MaterializeMode, Transport};
-use shasset::manifest::load;
+use shasset::manifest::Manifest;
 use std::path::{Path, PathBuf};
 
 use crate::util::{default_cache_dir, materialize_flat};
@@ -30,23 +30,16 @@ pub(super) fn fetch_asset_blob<F>(
 where
     F: FnMut() -> Option<Box<dyn Transport>>,
 {
-    let manifest = load(context.manifest_path).with_context(|| {
-        format!(
-            "cannot load shasset manifest: {}",
-            context.manifest_path.display()
-        )
-    })?;
+    let manifest = context.manifest;
     let cache_dir: PathBuf = context
         .cache_dir_override
         .map(Path::to_path_buf)
         .unwrap_or_else(default_cache_dir);
 
-    let asset = manifest.assets.get(name).with_context(|| {
-        format!(
-            "asset '{name}' not found in manifest {}",
-            context.manifest_path.display()
-        )
-    })?;
+    let asset = manifest
+        .assets
+        .get(name)
+        .with_context(|| format!("asset '{name}' not found"))?;
 
     // Pre-fetch validation: kind and labels (both read from the manifest, no I/O).
     let uri = asset.expanded_uri();
@@ -115,12 +108,12 @@ mod tests {
 
     fn resolve_context<'a>(
         context: &'a std::path::Path,
-        manifest_path: &'a std::path::Path,
+        manifest: &'a Manifest,
         cache_dir: Option<&'a std::path::Path>,
     ) -> ResolveFileContext<'a> {
         ResolveFileContext {
             context,
-            manifest_path,
+            manifest,
             cache_dir_override: cache_dir,
         }
     }
@@ -130,18 +123,16 @@ mod tests {
     #[test]
     fn resolve_to_file_fetches_and_materializes_asset_default() {
         let tmp = TempDir::new().unwrap();
-        let manifest = tmp.path().join("shasset.yaml");
-        let cache = tmp.path().join("cache");
-        let body = b"fake-qcow2-content".to_vec();
         let uri = "https://example.com/v1/base.qcow2".to_string();
         let checksum = "34cb20b33d115697e75baf0d12172c7c3b42a5f04b047c64f38d0aa2b57c988f";
-        std::fs::write(
-            &manifest,
-            format!(
+        let manifest: Manifest = serde_yaml::from_str(
+            &format!(
                 "settings:\n  retries: 0\nassets:\n  debian-base:\n    uri: {uri}\n    version: \"13\"\n    checksum: sha256:{checksum}\n    filename: debian-13.qcow2\n"
             ),
         )
         .unwrap();
+        let cache = tmp.path().join("cache");
+        let body = b"fake-qcow2-content".to_vec();
 
         let mut transport = Some(Box::new(MockTransport {
             expected_uri: uri,
@@ -174,9 +165,7 @@ mod tests {
     #[test]
     fn resolve_to_file_fails_on_unknown_asset() {
         let tmp = TempDir::new().unwrap();
-        let manifest = tmp.path().join("shasset.yaml");
-        std::fs::write(
-            &manifest,
+        let manifest: Manifest = serde_yaml::from_str(
             "settings:\n  retries: 0\nassets:\n  other-asset:\n    uri: https://example.com/img.qcow2\n    version: \"1\"\n",
         )
         .unwrap();
@@ -200,9 +189,7 @@ mod tests {
         // base-image/qcow2 contract error — it may fail for other reasons (e.g.
         // no network in tests) but that's a different failure path.
         let tmp = TempDir::new().unwrap();
-        let manifest = tmp.path().join("shasset.yaml");
-        std::fs::write(
-            &manifest,
+        let manifest: Manifest = serde_yaml::from_str(
             "settings:\n  retries: 0\nassets:\n  session-broker:\n    uri: oci://ghcr.io/example/session-broker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n    version: \"1\"\n",
         )
         .unwrap();
@@ -223,9 +210,7 @@ mod tests {
     #[test]
     fn resolve_validated_deny_oci_rejects_oci_asset() {
         let tmp = TempDir::new().unwrap();
-        let manifest = tmp.path().join("shasset.yaml");
-        std::fs::write(
-            &manifest,
+        let manifest: Manifest = serde_yaml::from_str(
             "settings:\n  retries: 0\nassets:\n  my-image:\n    uri: oci://ghcr.io/example/img@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n    version: \"1\"\n",
         )
         .unwrap();
@@ -254,9 +239,7 @@ mod tests {
         // "image must resolve to a qcow2 file asset" message.  It may still fail (e.g.
         // fetch error) but not because of the base-image contract.
         let tmp = TempDir::new().unwrap();
-        let manifest = tmp.path().join("shasset.yaml");
-        std::fs::write(
-            &manifest,
+        let manifest: Manifest = serde_yaml::from_str(
             "settings:\n  retries: 0\nassets:\n  session-broker:\n    uri: oci://ghcr.io/example/session-broker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n    version: \"1\"\n",
         )
         .unwrap();
@@ -277,9 +260,7 @@ mod tests {
     #[test]
     fn resolve_validated_labels_deny_rejected() {
         let tmp = TempDir::new().unwrap();
-        let manifest = tmp.path().join("shasset.yaml");
-        std::fs::write(
-            &manifest,
+        let manifest: Manifest = serde_yaml::from_str(
             "settings:\n  retries: 0\nassets:\n  secret-img:\n    uri: https://example.com/img.qcow2\n    version: \"1\"\n    labels:\n      - internal\n",
         )
         .unwrap();
@@ -305,9 +286,7 @@ mod tests {
     #[test]
     fn resolve_validated_labels_require_missing_rejected() {
         let tmp = TempDir::new().unwrap();
-        let manifest = tmp.path().join("shasset.yaml");
-        std::fs::write(
-            &manifest,
+        let manifest: Manifest = serde_yaml::from_str(
             "settings:\n  retries: 0\nassets:\n  my-img:\n    uri: https://example.com/img.qcow2\n    version: \"1\"\n",
         )
         .unwrap();
@@ -333,7 +312,7 @@ mod tests {
     #[test]
     fn resolve_to_file_rejects_directory_roots() {
         let tmp = TempDir::new().unwrap();
-        let manifest = tmp.path().join("shasset.yaml");
+        let manifest = Manifest::default();
 
         let repo_err = Reference::Repo { path: None }
             .resolve_to_file(&resolve_context(tmp.path(), &manifest, None))
@@ -355,7 +334,7 @@ mod tests {
     #[test]
     fn resolve_to_file_rejects_unsupported_asset_traversal() {
         let tmp = TempDir::new().unwrap();
-        let manifest = tmp.path().join("shasset.yaml");
+        let manifest = Manifest::default();
         let err = Reference::Asset {
             name: "tool".to_string(),
             path: Some(std::path::PathBuf::from("bin/tool")),
@@ -371,7 +350,7 @@ mod tests {
     #[test]
     fn resolve_to_file_returns_repo_file() {
         let tmp = TempDir::new().unwrap();
-        let manifest = tmp.path().join("shasset.yaml");
+        let manifest = Manifest::default();
         let file = tmp.path().join("build/artifact/base.qcow2");
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         std::fs::write(&file, "qcow2").unwrap();
@@ -388,7 +367,7 @@ mod tests {
     #[test]
     fn resolve_to_file_rejects_missing_repo_file() {
         let tmp = TempDir::new().unwrap();
-        let manifest = tmp.path().join("shasset.yaml");
+        let manifest = Manifest::default();
         let err = Reference::Repo {
             path: Some(std::path::PathBuf::from("missing.qcow2")),
         }
@@ -404,7 +383,7 @@ mod tests {
     fn resolve_to_file_returns_artifact_file() {
         use super::super::ARTIFACT_DIR;
         let tmp = TempDir::new().unwrap();
-        let manifest = tmp.path().join("shasset.yaml");
+        let manifest = Manifest::default();
         let file = tmp.path().join(ARTIFACT_DIR).join("foo.qcow2");
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         std::fs::write(&file, "qcow2").unwrap();
@@ -421,7 +400,7 @@ mod tests {
     #[test]
     fn resolve_to_file_rejects_missing_artifact_file() {
         let tmp = TempDir::new().unwrap();
-        let manifest = tmp.path().join("shasset.yaml");
+        let manifest = Manifest::default();
         let err = Reference::Artifact {
             path: Some(std::path::PathBuf::from("foo.qcow2")),
         }
