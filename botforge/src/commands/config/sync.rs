@@ -641,7 +641,7 @@ mod tests {
     fn check_clean_exits_zero() {
         let root = TempDir::new().unwrap();
         write_build_doc(root.path(), "foo.yaml", "foo");
-        write_marker(root.path(), "build:\n  foo:\n    spec: foo.yaml\n");
+        write_marker(root.path(), "plans:\n  foo:\n    build: foo.yaml\n");
 
         let args = SyncArgs {
             context: Some(root.path().to_path_buf()),
@@ -673,7 +673,7 @@ mod tests {
     #[test]
     fn check_registered_but_missing_fails() {
         let root = TempDir::new().unwrap();
-        write_marker(root.path(), "build:\n  ghost:\n    spec: ghost.yaml\n");
+        write_marker(root.path(), "plans:\n  ghost:\n    build: ghost.yaml\n");
         // ghost.yaml not on disk → not discoverable → drift.
         let args = SyncArgs {
             context: Some(root.path().to_path_buf()),
@@ -694,7 +694,7 @@ mod tests {
         // Registry says `bar` → baz.yaml; baz.yaml currently has name: foo.
         let spec_path = root.path().join("baz.yaml");
         write_build_doc(root.path(), "baz.yaml", "foo");
-        write_marker(root.path(), "build:\n  bar:\n    spec: baz.yaml\n");
+        write_marker(root.path(), "plans:\n  bar:\n    build: baz.yaml\n");
 
         let args = SyncArgs {
             context: Some(root.path().to_path_buf()),
@@ -716,7 +716,7 @@ mod tests {
     fn out_no_rewrite_when_already_correct() {
         let root = TempDir::new().unwrap();
         write_build_doc(root.path(), "foo.yaml", "foo");
-        write_marker(root.path(), "build:\n  foo:\n    spec: foo.yaml\n");
+        write_marker(root.path(), "plans:\n  foo:\n    build: foo.yaml\n");
 
         let args = SyncArgs {
             context: Some(root.path().to_path_buf()),
@@ -731,7 +731,7 @@ mod tests {
     #[test]
     fn out_errors_when_spec_file_missing() {
         let root = TempDir::new().unwrap();
-        write_marker(root.path(), "build:\n  missing:\n    spec: missing.yaml\n");
+        write_marker(root.path(), "plans:\n  missing:\n    build: missing.yaml\n");
         // missing.yaml does not exist on disk.
         let args = SyncArgs {
             context: Some(root.path().to_path_buf()),
@@ -750,7 +750,7 @@ mod tests {
         write_build_doc(root.path(), "shared.yaml", "x");
         write_marker(
             root.path(),
-            "build:\n  a:\n    spec: shared.yaml\n  b:\n    spec: shared.yaml\n",
+            "plans:\n  a:\n    build: shared.yaml\n  b:\n    build: shared.yaml\n",
         );
         let args = SyncArgs {
             context: Some(root.path().to_path_buf()),
@@ -771,7 +771,7 @@ mod tests {
         // Config references only "bar"; "old.yaml" is discoverable but not registered.
         write_build_doc(root.path(), "bar.yaml", "foo");
         write_build_doc(root.path(), "old.yaml", "old");
-        write_marker(root.path(), "build:\n  bar:\n    spec: bar.yaml\n");
+        write_marker(root.path(), "plans:\n  bar:\n    build: bar.yaml\n");
 
         let args = SyncArgs {
             context: Some(root.path().to_path_buf()),
@@ -796,7 +796,7 @@ mod tests {
         let root = TempDir::new().unwrap();
         write_build_doc(root.path(), "kept.yaml", "kept");
         write_build_doc(root.path(), "dropped.yaml", "dropped");
-        write_marker(root.path(), "build:\n  kept:\n    spec: kept.yaml\n");
+        write_marker(root.path(), "plans:\n  kept:\n    build: kept.yaml\n");
 
         let args = SyncArgs {
             context: Some(root.path().to_path_buf()),
@@ -826,7 +826,7 @@ mod tests {
         // never appear as unreferenced.
         write_build_doc(&build_dir, "artifact.yaml", "artifact");
         write_build_doc(root.path(), "real.yaml", "real");
-        write_marker(root.path(), "build:\n  real:\n    spec: real.yaml\n");
+        write_marker(root.path(), "plans:\n  real:\n    build: real.yaml\n");
 
         let args = SyncArgs {
             context: Some(root.path().to_path_buf()),
