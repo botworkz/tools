@@ -45,18 +45,13 @@ This produces the stable local tag `botwork/botforge:local`.
 
 ## Commands
 
-The `--config / -c` flag (default `shasset.yaml`) is global; it points `deps`
-at the shasset manifest, `payload` at the payload config, and `build` at the
-shasset manifest used to resolve `image:` assets.
-
 | Command | Summary |
 |---|---|
-| `botforge build --spec <file> --output <qcow2> [--source <qcow2>] [--cache-dir <dir>] [--repo-root <dir>] [--memory <MiB>] [--cpus <N\|auto>]` | Resolve `image:` from the shasset manifest (`--config`), fetch + verify + cache the qcow2, boot it under qemu, inject an ephemeral in-harness SSH keypair via cloud-init, run `type: build` plan steps, and commit the result on clean shutdown. `--source` is an optional local override that bypasses shasset resolution. `--memory` (default 4096 MiB) and `--cpus` (default 4, or `auto` for host core count) control the runner VM and do not affect the output image. |
-| `botforge build --spec <file> [--source <qcow2>] [--cache-dir <dir>] [--repo-root <dir>]` | Resolve `image:` from the shasset manifest (`--config`), fetch + verify + cache the qcow2, boot it under qemu, inject an ephemeral in-harness SSH keypair via cloud-init, run `type: build` plan steps, and commit the result on clean shutdown. `--source` is an optional local override that bypasses shasset resolution. Output is declared in the spec via top-level `output:` and materialized at `build/artifact/<spec-dir>/<output>`. |
-| `botforge deps --out <dir> [name ...]` | Fetch + stage shasset assets into a flat output directory. `--cache-dir`, `--no-reverify`, and `--executable` (set 0o755) are optional. |
-| `botforge deps --prune [--dry-run] [--cache-dir <dir>]` | Prune the shasset cache: remove blobs not referenced by the current manifest (`--config`) and clear stale quarantine/oci-index entries. `--dry-run` previews what would be removed without deleting. `--prune` and `--out` are mutually exclusive; `--out` is required only in fetch mode. Example: `botforge deps --prune --cache-dir .shasset-cache` (add `--dry-run` to preview first). |
+| `botforge build --spec <file> [--source <qcow2>] [--cache-dir <dir>] [--repo-root <dir>] [--memory <MiB>] [--cpus <N\|auto>]` | Resolve `image:` from the inline `assets:` block in the botforge workspace marker, fetch + verify + cache the qcow2, boot it under qemu, inject an ephemeral in-harness SSH keypair via cloud-init, run `type: build` plan steps, and commit the result on clean shutdown. `--source` is an optional local override that bypasses asset resolution. Output is declared in the spec via top-level `output:` and materialized at `build/artifact/<spec-dir>/<output>`. `--memory` (default 4096 MiB) and `--cpus` (default 4, or `auto` for host core count) control the runner VM and do not affect the output image. |
+| `botforge deps [--context <dir>] --out <dir> [name ...]` | Fetch + stage assets from the inline `assets:` block in the workspace marker. `--context` selects the workspace (otherwise botforge walks up from cwd), and `--cache-dir`, `--no-reverify`, and `--executable` (set 0o755) are optional. |
+| `botforge deps [--context <dir>] --prune [--dry-run] [--cache-dir <dir>]` | Prune the shasset cache using assets referenced by the workspace marker's inline manifest. `--dry-run` previews what would be removed without deleting. `--prune` and `--out` are mutually exclusive; `--out` is required only in fetch mode. Example: `botforge deps --prune --cache-dir .shasset-cache` (add `--dry-run` to preview first). |
 | `botforge iso --src <dir> --out <file> [--volume-id <id>]` | Build an ISO image from a source tree. Also supports generating a cidata seed ISO with an injected SSH key. |
-| `botforge payload --out <file>` | Build a payload ISO from a config-driven staging plan. |
+| `botforge payload --spec <file> --out <file>` | Build a payload ISO from a spec-driven staging plan. |
 | `botforge run …` | Launch a VM with qemu (KVM-only). Accepts `--memory <MiB>` (default 4096) and `--cpus <N\|auto>` (default 4). |
 | `botforge test …` | Boot a packed qcow2 with a cloud-init cidata seed, SSH in, and execute the steps in a `test-packed.yaml` plan. Accepts `--memory <MiB>` (default 4096) and `--cpus <N\|auto>` (default 4) to control the runner VM. |
 
