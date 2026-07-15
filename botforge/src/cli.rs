@@ -25,7 +25,16 @@ pub(crate) struct Cli {
 pub(crate) enum Commands {
     /// Build a qcow2 image by booting the source image and provisioning it via plan steps.
     Build(commands::build::BuildArgs),
-    /// Fetch and stage one or all assets from the shasset manifest into a flat output directory.
+    /// Manage workspace configuration: registry sync, drift detection.
+    Config {
+        /// Workspace context root. When provided, must contain a botforge.yaml. When
+        /// omitted, botforge walks up from the current directory to find one.
+        #[arg(long, global = true)]
+        context: Option<PathBuf>,
+        #[command(subcommand)]
+        sub: commands::config::ConfigCommands,
+    },
+    /// Fetch and stage one or all assets from shasset.yaml into a flat output directory.
     Deps(commands::deps::DepsArgs),
     /// Build an ISO image from a source directory.
     Iso(commands::iso::IsoArgs),

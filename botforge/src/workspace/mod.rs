@@ -1,4 +1,5 @@
 pub(crate) mod discover;
+pub(crate) mod registry;
 
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
