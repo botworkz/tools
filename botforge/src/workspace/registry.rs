@@ -1,16 +1,17 @@
 //! Committed registry I/O — B4.
 //!
-//! Reads and writes the `build:` / `test:` registry blocks in `botforge.yaml`.
-//! Each block is a map from spec **name** to a single-key map `{ spec: <relative-path> }`.
+//! Reads and writes the `plans:` registry block in `botforge.yaml`.
+//! The block is a map from plan **name** to an object with optional scalar
+//! `build:` and `test:` values (spec file paths, context-relative).
 //!
 //! Example:
 //! ```yaml
-//! build:
-//!   foo:
-//!     spec: specs/foo.yaml
-//! test:
-//!   foo:
-//!     spec: specs/foo-test.yaml
+//! plans:
+//!   botwork:
+//!     build: botwork/build.yaml
+//!     test: botwork/test/test.yaml
+//!   botwork-base:
+//!     build: botwork-base/build.yaml
 //! ```
 //!
 //! Paths are stored relative to the context root and are validated to ensure they
@@ -19,38 +20,37 @@
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
 use super::marker_path;
 
 // ─── raw deserialization types ────────────────────────────────────────────────
 
-/// A single registry entry as stored in `botforge.yaml`.
-#[derive(Debug, Deserialize, Clone)]
-pub(crate) struct RawRegistryEntry {
-    pub(crate) spec: String,
+/// A single plan entry as stored in `botforge.yaml`.
+#[derive(Debug, Deserialize, Default)]
+struct RawPlan {
+    pub(crate) build: Option<String>,
+    pub(crate) test: Option<String>,
 }
 
-/// The `botforge.yaml` root document — only the registry blocks are consumed here.
+/// The `botforge.yaml` root document — only the registry block is consumed here.
 #[derive(Debug, Deserialize, Default)]
 struct RawWorkspaceRegistryDoc {
     #[serde(default)]
-    pub(crate) build: BTreeMap<String, RawRegistryEntry>,
-    #[serde(default)]
-    pub(crate) test: BTreeMap<String, RawRegistryEntry>,
+    pub(crate) plans: BTreeMap<String, RawPlan>,
 }
 
 // ─── CommittedRegistry ───────────────────────────────────────────────────────
 
-/// The in-memory representation of the committed `build:` / `test:` registry.
+/// The in-memory representation of the committed `plans:` registry.
 ///
 /// Paths are **absolute** (resolved relative to the context root at load time).
 #[derive(Debug, Default)]
 pub(crate) struct CommittedRegistry {
-    /// Maps spec name → absolute path for `type: botforge/build` entries.
+    /// Maps plan name → absolute path for `type: botforge/build` entries.
     pub(crate) builds: BTreeMap<String, PathBuf>,
-    /// Maps spec name → absolute path for `type: botforge/test` entries.
+    /// Maps plan name → absolute path for `type: botforge/test` entries.
     pub(crate) tests: BTreeMap<String, PathBuf>,
 }
 
@@ -82,9 +82,9 @@ impl CommittedRegistry {
     }
 }
 
-// ─── path validation ──────────────────────────────────────────────────────────
+// ─── path validation ─────────────────────────────────────────────────────────
 
-/// Validate that a registry `spec:` path is safe: must be relative, must not
+/// Validate that a registry spec path is safe: must be relative, must not
 /// contain `..` components, and must not be absolute.
 pub(crate) fn validate_spec_path(spec: &str) -> Result<()> {
     let p = Path::new(spec);
@@ -102,12 +102,12 @@ pub(crate) fn validate_spec_path(spec: &str) -> Result<()> {
     Ok(())
 }
 
-// ─── load ─────────────────────────────────────────────────────────────────────
+// ─── load ────────────────────────────────────────────────────────────────────
 
 /// Load the committed registry from `<context_root>/botforge.yaml`.
 ///
 /// Returns a `CommittedRegistry` with absolute spec paths.  If `botforge.yaml`
-/// has no `build:` or `test:` blocks, the respective maps are empty (not an error).
+/// has no `plans:` block, the respective maps are empty (not an error).
 pub(crate) fn load_committed_registry(context_root: &Path) -> Result<CommittedRegistry> {
     let marker_path = marker_path(context_root)?;
     let contents = std::fs::read_to_string(&marker_path)
@@ -122,37 +122,38 @@ pub(crate) fn load_committed_registry(context_root: &Path) -> Result<CommittedRe
 
     let mut reg = CommittedRegistry::default();
 
-    for (name, entry) in doc.build {
-        validate_spec_path(&entry.spec).with_context(|| {
-            format!(
-                "invalid spec path for build entry '{name}' in {}",
-                marker_path.display()
-            )
-        })?;
-        let abs = context_root.join(&entry.spec);
-        reg.builds.insert(name, abs);
-    }
-
-    for (name, entry) in doc.test {
-        validate_spec_path(&entry.spec).with_context(|| {
-            format!(
-                "invalid spec path for test entry '{name}' in {}",
-                marker_path.display()
-            )
-        })?;
-        let abs = context_root.join(&entry.spec);
-        reg.tests.insert(name, abs);
+    for (name, plan) in doc.plans {
+        if let Some(spec) = plan.build {
+            validate_spec_path(&spec).with_context(|| {
+                format!(
+                    "invalid build spec path for plan '{name}' in {}",
+                    marker_path.display()
+                )
+            })?;
+            let abs = context_root.join(&spec);
+            reg.builds.insert(name.clone(), abs);
+        }
+        if let Some(spec) = plan.test {
+            validate_spec_path(&spec).with_context(|| {
+                format!(
+                    "invalid test spec path for plan '{name}' in {}",
+                    marker_path.display()
+                )
+            })?;
+            let abs = context_root.join(&spec);
+            reg.tests.insert(name, abs);
+        }
     }
 
     Ok(reg)
 }
 
-// ─── save ─────────────────────────────────────────────────────────────────────
+// ─── save ────────────────────────────────────────────────────────────────────
 
-/// Rewrite the `build:` and `test:` registry blocks in `<context_root>/botforge.yaml`,
+/// Rewrite the `plans:` registry block in `<context_root>/botforge.yaml`,
 /// preserving all other keys (e.g. `config:`, `assets:`) unchanged.
 ///
-/// `builds` and `tests` map spec names → **absolute** paths.  Paths are stored
+/// `builds` and `tests` map plan names → **absolute** paths.  Paths are stored
 /// as relative-to-context-root in the YAML.
 pub(crate) fn save_registry(
     context_root: &Path,
@@ -176,14 +177,11 @@ pub(crate) fn save_registry(
         .as_mapping_mut()
         .ok_or_else(|| anyhow::anyhow!("{} is not a YAML mapping", marker_path.display()))?;
 
-    // Build the new `build:` block.
-    let build_block = registry_map_to_yaml(context_root, builds)?;
-    // Build the new `test:` block.
-    let test_block = registry_map_to_yaml(context_root, tests)?;
+    // Build the new `plans:` block.
+    let plans_block = build_plans_yaml(context_root, builds, tests)?;
 
-    // Insert or overwrite — we always write both keys so the file is complete.
-    map.insert(serde_yaml::Value::String("build".to_string()), build_block);
-    map.insert(serde_yaml::Value::String("test".to_string()), test_block);
+    // Insert or overwrite the `plans:` key.
+    map.insert(serde_yaml::Value::String("plans".to_string()), plans_block);
 
     let yaml_str =
         serde_yaml::to_string(&doc).context("failed to serialize updated botforge.yaml")?;
@@ -194,41 +192,59 @@ pub(crate) fn save_registry(
     Ok(())
 }
 
-/// Convert a `BTreeMap<String, PathBuf>` (absolute paths) into a YAML value
-/// of the form `{ <name>: { spec: <relative-path> } }`.
-fn registry_map_to_yaml(
+/// Build a `plans:` YAML value from two plan-name → absolute-path maps.
+fn build_plans_yaml(
     context_root: &Path,
-    map: &BTreeMap<String, PathBuf>,
+    builds: &BTreeMap<String, PathBuf>,
+    tests: &BTreeMap<String, PathBuf>,
 ) -> Result<serde_yaml::Value> {
-    let mut out = serde_yaml::Mapping::new();
-    for (name, abs_path) in map {
-        let rel = abs_path.strip_prefix(context_root).with_context(|| {
-            format!(
-                "spec path '{}' is outside context root '{}'",
-                abs_path.display(),
-                context_root.display()
-            )
-        })?;
-        // Convert to forward-slash string (portable YAML).
-        let rel_str = rel
-            .to_str()
-            .ok_or_else(|| anyhow::anyhow!("spec path is not valid UTF-8: {}", abs_path.display()))?
-            .to_string();
+    // Collect the union of all plan names in sorted order.
+    let names: BTreeSet<&String> = builds.keys().chain(tests.keys()).collect();
 
-        let mut entry = serde_yaml::Mapping::new();
-        entry.insert(
-            serde_yaml::Value::String("spec".to_string()),
-            serde_yaml::Value::String(rel_str),
-        );
-        out.insert(
+    let mut plans = serde_yaml::Mapping::new();
+
+    for name in names {
+        let mut plan = serde_yaml::Mapping::new();
+
+        if let Some(abs_path) = builds.get(name) {
+            let rel_str = abs_to_rel_str(context_root, abs_path)?;
+            plan.insert(
+                serde_yaml::Value::String("build".to_string()),
+                serde_yaml::Value::String(rel_str),
+            );
+        }
+        if let Some(abs_path) = tests.get(name) {
+            let rel_str = abs_to_rel_str(context_root, abs_path)?;
+            plan.insert(
+                serde_yaml::Value::String("test".to_string()),
+                serde_yaml::Value::String(rel_str),
+            );
+        }
+
+        plans.insert(
             serde_yaml::Value::String(name.clone()),
-            serde_yaml::Value::Mapping(entry),
+            serde_yaml::Value::Mapping(plan),
         );
     }
-    Ok(serde_yaml::Value::Mapping(out))
+
+    Ok(serde_yaml::Value::Mapping(plans))
 }
 
-// ─── tests ───────────────────────────────────────────────────────────────────
+/// Convert an absolute path to a context-root-relative UTF-8 string.
+fn abs_to_rel_str(context_root: &Path, abs_path: &Path) -> Result<String> {
+    let rel = abs_path.strip_prefix(context_root).with_context(|| {
+        format!(
+            "spec path '{}' is outside context root '{}'",
+            abs_path.display(),
+            context_root.display()
+        )
+    })?;
+    rel.to_str()
+        .ok_or_else(|| anyhow::anyhow!("spec path is not valid UTF-8: {}", abs_path.display()))
+        .map(str::to_string)
+}
+
+// ─── tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -298,7 +314,7 @@ mod tests {
         let root = TempDir::new().unwrap();
         write_marker(
             root.path(),
-            "build:\n  foo:\n    spec: specs/foo.yaml\ntest:\n  bar:\n    spec: specs/bar-test.yaml\n",
+            "plans:\n  foo:\n    build: specs/foo.yaml\n  bar:\n    test: specs/bar-test.yaml\n",
         );
         let reg = load_committed_registry(root.path()).unwrap();
         assert_eq!(reg.builds.len(), 1);
@@ -313,7 +329,7 @@ mod tests {
         write_named_marker(
             root.path(),
             ".botforge.yml",
-            "build:\n  foo:\n    spec: specs/foo.yaml\n",
+            "plans:\n  foo:\n    build: specs/foo.yaml\n",
         );
         let reg = load_committed_registry(root.path()).unwrap();
         assert_eq!(reg.builds["foo"], root.path().join("specs/foo.yaml"));
@@ -322,7 +338,10 @@ mod tests {
     #[test]
     fn load_registry_rejects_dotdot_spec_path() {
         let root = TempDir::new().unwrap();
-        write_marker(root.path(), "build:\n  evil:\n    spec: ../../etc/passwd\n");
+        write_marker(
+            root.path(),
+            "plans:\n  evil:\n    build: ../../etc/passwd\n",
+        );
         let err = load_committed_registry(root.path()).unwrap_err();
         assert!(format!("{err:#}").contains(".."), "{err:#}");
     }
@@ -332,7 +351,7 @@ mod tests {
         let root = TempDir::new().unwrap();
         write_marker(
             root.path(),
-            "build:\n  foo:\n    spec: specs/foo.yaml\ntest:\n  foo:\n    spec: specs/foo-test.yaml\n",
+            "plans:\n  foo:\n    build: specs/foo.yaml\n    test: specs/foo-test.yaml\n",
         );
         let reg = load_committed_registry(root.path()).unwrap();
         assert!(reg.build("foo").is_ok());
@@ -407,7 +426,7 @@ mod tests {
     #[test]
     fn save_registry_overwrites_existing_registry() {
         let root = TempDir::new().unwrap();
-        write_marker(root.path(), "build:\n  old:\n    spec: old.yaml\n");
+        write_marker(root.path(), "plans:\n  old:\n    build: old.yaml\n");
 
         let mut builds = BTreeMap::new();
         builds.insert("new".to_string(), root.path().join("new.yaml"));
