@@ -4,7 +4,7 @@ use flate2::write::DeflateEncoder;
 use flate2::Compression;
 use std::io::{Read, Write};
 
-use crate::plan::config::CompressionType;
+use crate::plan::compress::CompressionType;
 
 pub(crate) trait Compressor: Sync {
     fn id(&self) -> &str;
