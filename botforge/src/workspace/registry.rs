@@ -82,7 +82,7 @@ impl CommittedRegistry {
     }
 }
 
-// ─── path validation ──────────────────────────────────────────────────────────
+// ─── path validation ─────────────────────────────────────────────────────────
 
 /// Validate that a registry spec path is safe: must be relative, must not
 /// contain `..` components, and must not be absolute.
@@ -102,7 +102,7 @@ pub(crate) fn validate_spec_path(spec: &str) -> Result<()> {
     Ok(())
 }
 
-// ─── load ─────────────────────────────────────────────────────────────────────
+// ─── load ────────────────────────────────────────────────────────────────────
 
 /// Load the committed registry from `<context_root>/botforge.yaml`.
 ///
@@ -148,7 +148,7 @@ pub(crate) fn load_committed_registry(context_root: &Path) -> Result<CommittedRe
     Ok(reg)
 }
 
-// ─── save ─────────────────────────────────────────────────────────────────────
+// ─── save ────────────────────────────────────────────────────────────────────
 
 /// Rewrite the `plans:` registry block in `<context_root>/botforge.yaml`,
 /// preserving all other keys (e.g. `config:`, `assets:`) unchanged.
@@ -244,7 +244,7 @@ fn abs_to_rel_str(context_root: &Path, abs_path: &Path) -> Result<String> {
         .map(str::to_string)
 }
 
-// ─── tests ───────────────────────────────────────────────────────────────────
+// ─── tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -329,7 +329,7 @@ mod tests {
         write_named_marker(
             root.path(),
             ".botforge.yml",
-            "build:\n  foo:\n    spec: specs/foo.yaml\n",
+            "plans:\n  foo:\n    build: specs/foo.yaml\n",
         );
         let reg = load_committed_registry(root.path()).unwrap();
         assert_eq!(reg.builds["foo"], root.path().join("specs/foo.yaml"));
