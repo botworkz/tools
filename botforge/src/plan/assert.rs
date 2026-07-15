@@ -9,14 +9,253 @@
 //! dump; service entries are probed via `systemctl is-enabled` / `systemctl is-active`.
 
 use anyhow::Result;
+use serde::Deserialize;
 use std::collections::BTreeMap;
+use std::fmt;
 use std::time::Duration;
 
 use crate::ssh::{ssh_capture_stdout, SshOptions};
 use crate::util::shell_single_quote;
 
-use super::config::{AssertBlock, AssertFile, AssertGroup, AssertPackage, AssertUser};
+use super::config::{validate_mode_string, validate_owner_group_string};
 use super::log::print_phase_status;
+
+// ---------------------------------------------------------------------------
+// assert: block types  (schema / parse section)
+// ---------------------------------------------------------------------------
+
+/// Expected file type for an `assert.files:` entry.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum AssertFileType {
+    File,
+    Directory,
+    Symlink,
+}
+
+impl AssertFileType {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::File => "file",
+            Self::Directory => "directory",
+            Self::Symlink => "symlink",
+        }
+    }
+}
+
+impl fmt::Display for AssertFileType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+fn default_assert_exists() -> bool {
+    true
+}
+
+/// A single file-existence/attribute expectation inside `assert.files:`.
+///
+/// When `exists: false`, all other attribute fields must be absent (rejected
+/// at config-load time).
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+pub(crate) struct AssertFile {
+    /// When `false`, the path must not exist on the guest.  Defaults to `true`.
+    #[serde(default = "default_assert_exists")]
+    pub(crate) exists: bool,
+    /// Expected file type (`file`, `directory`, or `symlink`).
+    /// Only meaningful when `exists: true`.
+    #[serde(default)]
+    pub(crate) filetype: Option<AssertFileType>,
+    /// Expected owning user name or numeric uid.
+    /// Only meaningful when `exists: true`.
+    #[serde(default)]
+    pub(crate) owner: Option<String>,
+    /// Expected owning group name or numeric gid.
+    /// Only meaningful when `exists: true`.
+    #[serde(default)]
+    pub(crate) group: Option<String>,
+    /// Expected permission mode (3–4 octal digits, e.g. `"0755"`).
+    /// Only meaningful when `exists: true`.
+    #[serde(default)]
+    pub(crate) mode: Option<String>,
+}
+
+/// A single user expectation inside `assert.users:`.
+///
+/// When `exists: false`, the `shell` and `groups` fields must be absent
+/// (rejected at config-load time).  The key may be an exact name **or** a
+/// glob pattern (e.g. `botforge-*`); pattern negatives enumerate
+/// `getent passwd` output and match against each user name.
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+pub(crate) struct AssertUser {
+    /// When `false`, the user must not exist on the guest.  Defaults to `true`.
+    #[serde(default = "default_assert_exists")]
+    pub(crate) exists: bool,
+    /// Expected login shell (e.g. `/bin/bash`).
+    /// Only meaningful when `exists: true`.
+    #[serde(default)]
+    pub(crate) shell: Option<String>,
+    /// All listed groups must be present in the user's supplementary groups
+    /// (checked via `id -nG <user>`).  Only meaningful when `exists: true`.
+    #[serde(default)]
+    pub(crate) groups: Vec<String>,
+}
+
+/// A single group expectation inside `assert.groups:`.
+///
+/// When `exists: false`, no other attribute fields are supported.
+/// The key may be an exact name **or** a glob pattern.
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+pub(crate) struct AssertGroup {
+    /// When `false`, the group must not exist on the guest.  Defaults to `true`.
+    #[serde(default = "default_assert_exists")]
+    pub(crate) exists: bool,
+}
+
+/// A single package expectation inside `assert.packages:`.
+///
+/// The only supported attribute is `installed:`.  Unknown attributes are
+/// rejected at config-load time via `#[serde(deny_unknown_fields)]`.
+/// The key may be an exact package name **or** a glob pattern (e.g. `*-dev`).
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AssertPackage {
+    /// When `true`, the package must be installed (`install ok installed` via
+    /// `dpkg-query`).  When `false`, the package must not be installed.
+    /// Defaults to `true`.
+    #[serde(default = "default_assert_exists")]
+    pub(crate) installed: bool,
+}
+
+/// A single service expectation inside `assert.services:`.
+///
+/// Both `enabled:` and `active:` are optional — omitting either means that
+/// aspect is not checked.  Unknown attributes are rejected at config-load
+/// time via `#[serde(deny_unknown_fields)]`.
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AssertService {
+    /// When `true`, the service must report `enabled` from `systemctl is-enabled`.
+    /// When `false`, the service must not report `enabled`.
+    /// When absent, the enabled state is not checked.
+    #[serde(default)]
+    pub(crate) enabled: Option<bool>,
+    /// When `true`, the service must report `active` from `systemctl is-active`.
+    /// When `false`, the service must not report `active`.
+    /// When absent, the active state is not checked.
+    #[serde(default)]
+    pub(crate) active: Option<bool>,
+}
+
+/// Validated `assert:` block from a `type: botforge/test` document.
+#[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
+pub(crate) struct AssertBlock {
+    /// Map of absolute guest path → file expectation.
+    #[serde(default)]
+    pub(crate) files: BTreeMap<String, AssertFile>,
+    /// Map of user name (or glob pattern) → user expectation.
+    #[serde(default)]
+    pub(crate) users: BTreeMap<String, AssertUser>,
+    /// Map of group name (or glob pattern) → group expectation.
+    #[serde(default)]
+    pub(crate) groups: BTreeMap<String, AssertGroup>,
+    /// Map of package name (or glob pattern) → package expectation.
+    #[serde(default)]
+    pub(crate) packages: BTreeMap<String, AssertPackage>,
+    /// Map of service name → service expectation.
+    #[serde(default)]
+    pub(crate) services: BTreeMap<String, AssertService>,
+}
+
+// ---------------------------------------------------------------------------
+// Config-load-time validation
+// ---------------------------------------------------------------------------
+
+pub(crate) fn validate_assert_block(block: &AssertBlock) -> Result<()> {
+    for (guest_path, expectation) in &block.files {
+        validate_assert_file_entry(guest_path, expectation)?;
+    }
+    for (name_or_pattern, expectation) in &block.users {
+        validate_assert_user_entry(name_or_pattern, expectation)?;
+    }
+    for (name_or_pattern, expectation) in &block.groups {
+        validate_assert_group_entry(name_or_pattern, expectation)?;
+    }
+    for (name_or_pattern, expectation) in &block.packages {
+        validate_assert_package_entry(name_or_pattern, expectation)?;
+    }
+    for (name, expectation) in &block.services {
+        validate_assert_service_entry(name, expectation)?;
+    }
+    Ok(())
+}
+
+fn validate_assert_file_entry(guest_path: &str, expectation: &AssertFile) -> Result<()> {
+    if !guest_path.starts_with('/') {
+        anyhow::bail!(
+            "assert.files: path '{guest_path}' must be an absolute guest path (must start with '/')"
+        );
+    }
+    if !expectation.exists {
+        // When exists: false, attribute fields are meaningless — reject them.
+        if expectation.filetype.is_some()
+            || expectation.owner.is_some()
+            || expectation.group.is_some()
+            || expectation.mode.is_some()
+        {
+            anyhow::bail!(
+                "assert.files: path '{guest_path}': attribute fields \
+                 (filetype/owner/group/mode) must not be set when `exists: false`"
+            );
+        }
+        return Ok(());
+    }
+    if let Some(ref mode) = expectation.mode {
+        validate_mode_string(mode, guest_path, "assert")?;
+    }
+    if let Some(ref owner) = expectation.owner {
+        validate_owner_group_string(owner, "owner", guest_path, "assert")?;
+    }
+    if let Some(ref group) = expectation.group {
+        validate_owner_group_string(group, "group", guest_path, "assert")?;
+    }
+    Ok(())
+}
+
+fn validate_assert_user_entry(name_or_pattern: &str, expectation: &AssertUser) -> Result<()> {
+    if !expectation.exists {
+        // When exists: false, attribute fields are meaningless — reject them.
+        if expectation.shell.is_some() || !expectation.groups.is_empty() {
+            anyhow::bail!(
+                "assert.users: entry '{name_or_pattern}': attribute fields \
+                 (shell/groups) must not be set when `exists: false`"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_assert_group_entry(_name_or_pattern: &str, _expectation: &AssertGroup) -> Result<()> {
+    // Currently no additional validation beyond deserialization for groups.
+    Ok(())
+}
+
+fn validate_assert_package_entry(
+    _name_or_pattern: &str,
+    _expectation: &AssertPackage,
+) -> Result<()> {
+    // Unknown attributes are already rejected at deserialization time via
+    // `#[serde(deny_unknown_fields)]` on `AssertPackage`.  No further
+    // validation is required in v1.
+    Ok(())
+}
+
+fn validate_assert_service_entry(_name: &str, _expectation: &AssertService) -> Result<()> {
+    // Unknown attributes are already rejected at deserialization time via
+    // `#[serde(deny_unknown_fields)]` on `AssertService`.  No further
+    // validation is required in v1.
+    Ok(())
+}
 
 const ASSERT_TRANSPORT_RETRIES: usize = 3;
 const ASSERT_TRANSPORT_RETRY_DELAY: Duration = Duration::from_secs(2);
@@ -937,8 +1176,7 @@ pub(crate) fn run_assert_services(ssh: &SshOptions, assert_block: &AssertBlock) 
 
 #[cfg(test)]
 mod tests {
-    use super::{check_one_path, normalize_mode};
-    use crate::plan::config::{AssertFile, AssertFileType};
+    use super::{check_one_path, normalize_mode, AssertFile, AssertFileType};
 
     fn file_expectation(
         exists: bool,
@@ -1093,8 +1331,7 @@ mod tests {
     // check_one_user tests
     // ---------------------------------------------------------------------------
 
-    use super::{check_one_user, check_user_groups, is_glob_pattern};
-    use crate::plan::config::AssertUser;
+    use super::{check_one_user, check_user_groups, is_glob_pattern, AssertUser};
 
     fn user_expectation(exists: bool, shell: Option<&str>, groups: Vec<&str>) -> AssertUser {
         AssertUser {
@@ -1401,5 +1638,497 @@ mod tests {
         let raw = "botforge-abc123:x:999:999::/:/nologin\nbot:x:1000:1000::/home/bot:/bin/bash\n__END_PASSWD__\n";
         let names = parse_names_from_dump(&mut raw.lines(), "__END_PASSWD__", None);
         assert_eq!(names, vec!["botforge-abc123", "bot"]);
+    }
+
+    mod assert_block {
+        use super::super::AssertFileType;
+        use crate::plan::config::load_test_config;
+        use std::fs;
+        use tempfile::TempDir;
+
+        // --- assert: block ---
+
+        #[test]
+        fn test_load_test_config_assert_absent_is_none() {
+            let repo = TempDir::new().unwrap();
+            fs::write(
+                repo.path().join("test.yaml"),
+                "type: botforge/test\nname: test\nsteps: []\n",
+            )
+            .unwrap();
+            let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+            assert!(config.assert.is_none(), "assert should default to None");
+        }
+
+        #[test]
+        fn test_load_test_config_assert_files_parses_exists_true() {
+            let repo = TempDir::new().unwrap();
+            fs::write(
+                repo.path().join("test.yaml"),
+                r#"
+type: botforge/test
+name: test
+steps: []
+assert:
+  files:
+    /usr/local/bin/tool:
+      exists: true
+      filetype: file
+      owner: root
+      group: root
+      mode: "0755"
+"#,
+            )
+            .unwrap();
+            let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+            let assert_block = config.assert.unwrap();
+            let entry = assert_block.files.get("/usr/local/bin/tool").unwrap();
+            assert!(entry.exists);
+            assert_eq!(entry.filetype, Some(AssertFileType::File));
+            assert_eq!(entry.owner.as_deref(), Some("root"));
+            assert_eq!(entry.group.as_deref(), Some("root"));
+            assert_eq!(entry.mode.as_deref(), Some("0755"));
+        }
+
+        #[test]
+        fn test_load_test_config_assert_files_parses_exists_false() {
+            let repo = TempDir::new().unwrap();
+            fs::write(
+                repo.path().join("test.yaml"),
+                r#"
+type: botforge/test
+name: test
+steps: []
+assert:
+  files:
+    /tmp/should-be-gone:
+      exists: false
+"#,
+            )
+            .unwrap();
+            let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+            let assert_block = config.assert.unwrap();
+            let entry = assert_block.files.get("/tmp/should-be-gone").unwrap();
+            assert!(!entry.exists);
+            assert!(entry.filetype.is_none());
+            assert!(entry.owner.is_none());
+            assert!(entry.group.is_none());
+            assert!(entry.mode.is_none());
+        }
+
+        #[test]
+        fn test_load_test_config_assert_files_rejects_exists_false_with_attributes() {
+            let repo = TempDir::new().unwrap();
+            fs::write(
+                repo.path().join("test.yaml"),
+                r#"
+type: botforge/test
+name: test
+steps: []
+assert:
+  files:
+    /some/path:
+      exists: false
+      mode: "0755"
+"#,
+            )
+            .unwrap();
+            let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("exists: false") || msg.contains("attribute"),
+                "error should mention exists:false and attributes: {msg}"
+            );
+        }
+
+        #[test]
+        fn test_load_test_config_assert_files_rejects_relative_path() {
+            let repo = TempDir::new().unwrap();
+            fs::write(
+                repo.path().join("test.yaml"),
+                r#"
+type: botforge/test
+name: test
+steps: []
+assert:
+  files:
+    relative/path:
+      exists: true
+"#,
+            )
+            .unwrap();
+            let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("absolute"),
+                "error should mention absolute path: {msg}"
+            );
+        }
+
+        #[test]
+        fn test_load_test_config_assert_files_rejects_invalid_mode() {
+            let repo = TempDir::new().unwrap();
+            fs::write(
+                repo.path().join("test.yaml"),
+                r#"
+type: botforge/test
+name: test
+steps: []
+assert:
+  files:
+    /some/path:
+      exists: true
+      mode: "rwxr-xr-x"
+"#,
+            )
+            .unwrap();
+            let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("mode") || msg.contains("octal"),
+                "error should mention mode: {msg}"
+            );
+        }
+
+        #[test]
+        fn test_load_test_config_assert_files_multiple_entries() {
+            let repo = TempDir::new().unwrap();
+            fs::write(
+                repo.path().join("test.yaml"),
+                r#"
+type: botforge/test
+name: test
+steps: []
+assert:
+  files:
+    /usr/bin/tool:
+      exists: true
+      filetype: file
+    /var/data:
+      exists: true
+      filetype: directory
+    /tmp/gone.tar:
+      exists: false
+"#,
+            )
+            .unwrap();
+            let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+            let assert_block = config.assert.unwrap();
+            assert_eq!(assert_block.files.len(), 3);
+            assert_eq!(
+                assert_block.files.get("/usr/bin/tool").unwrap().filetype,
+                Some(AssertFileType::File)
+            );
+            assert_eq!(
+                assert_block.files.get("/var/data").unwrap().filetype,
+                Some(AssertFileType::Directory)
+            );
+            assert!(!assert_block.files.get("/tmp/gone.tar").unwrap().exists);
+        }
+
+        #[test]
+        fn test_load_test_config_assert_users_basic() {
+            let repo = TempDir::new().unwrap();
+            fs::write(
+                repo.path().join("test.yaml"),
+                r#"
+type: botforge/test
+name: test
+steps: []
+assert:
+  users:
+    bot:
+      exists: true
+      shell: /bin/bash
+      groups: [bot, docker]
+    mallory:
+      exists: false
+"#,
+            )
+            .unwrap();
+            let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+            let assert_block = config.assert.unwrap();
+            assert_eq!(assert_block.users.len(), 2);
+            let bot = assert_block.users.get("bot").unwrap();
+            assert!(bot.exists);
+            assert_eq!(bot.shell.as_deref(), Some("/bin/bash"));
+            assert_eq!(bot.groups, vec!["bot", "docker"]);
+            let mallory = assert_block.users.get("mallory").unwrap();
+            assert!(!mallory.exists);
+        }
+
+        #[test]
+        fn test_load_test_config_assert_users_pattern_negative() {
+            let repo = TempDir::new().unwrap();
+            fs::write(
+                repo.path().join("test.yaml"),
+                r#"
+type: botforge/test
+name: test
+steps: []
+assert:
+  users:
+    "botforge-*":
+      exists: false
+"#,
+            )
+            .unwrap();
+            let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+            let assert_block = config.assert.unwrap();
+            let pat = assert_block.users.get("botforge-*").unwrap();
+            assert!(!pat.exists);
+        }
+
+        #[test]
+        fn test_load_test_config_assert_users_rejects_attrs_with_exists_false() {
+            let repo = TempDir::new().unwrap();
+            fs::write(
+                repo.path().join("test.yaml"),
+                r#"
+type: botforge/test
+name: test
+steps: []
+assert:
+  users:
+    mallory:
+      exists: false
+      shell: /bin/bash
+"#,
+            )
+            .unwrap();
+            let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("shell") || msg.contains("exists: false"),
+                "error should mention shell/exists: {msg}"
+            );
+        }
+
+        #[test]
+        fn test_load_test_config_assert_groups_basic() {
+            let repo = TempDir::new().unwrap();
+            fs::write(
+                repo.path().join("test.yaml"),
+                r#"
+type: botforge/test
+name: test
+steps: []
+assert:
+  groups:
+    docker:
+      exists: true
+    evilusers:
+      exists: false
+"#,
+            )
+            .unwrap();
+            let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+            let assert_block = config.assert.unwrap();
+            assert_eq!(assert_block.groups.len(), 2);
+            assert!(assert_block.groups.get("docker").unwrap().exists);
+            assert!(!assert_block.groups.get("evilusers").unwrap().exists);
+        }
+
+        #[test]
+        fn test_load_test_config_assert_users_and_groups_combined() {
+            let repo = TempDir::new().unwrap();
+            fs::write(
+                repo.path().join("test.yaml"),
+                r#"
+type: botforge/test
+name: test
+steps: []
+assert:
+  users:
+    bot:
+      exists: true
+      shell: /bin/bash
+  groups:
+    docker:
+      exists: true
+"#,
+            )
+            .unwrap();
+            let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+            let assert_block = config.assert.unwrap();
+            assert_eq!(assert_block.users.len(), 1);
+            assert_eq!(assert_block.groups.len(), 1);
+        }
+
+        #[test]
+        fn test_load_test_config_assert_packages_basic() {
+            let repo = TempDir::new().unwrap();
+            fs::write(
+                repo.path().join("test.yaml"),
+                r#"
+type: botforge/test
+name: test
+steps: []
+assert:
+  packages:
+    git:
+      installed: true
+    telnet:
+      installed: false
+"#,
+            )
+            .unwrap();
+            let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+            let assert_block = config.assert.unwrap();
+            assert_eq!(assert_block.packages.len(), 2);
+            assert!(assert_block.packages.get("git").unwrap().installed);
+            assert!(!assert_block.packages.get("telnet").unwrap().installed);
+        }
+
+        #[test]
+        fn test_load_test_config_assert_packages_pattern_negative() {
+            let repo = TempDir::new().unwrap();
+            fs::write(
+                repo.path().join("test.yaml"),
+                r#"
+type: botforge/test
+name: test
+steps: []
+assert:
+  packages:
+    "*-dev":
+      installed: false
+"#,
+            )
+            .unwrap();
+            let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+            let assert_block = config.assert.unwrap();
+            let pat = assert_block.packages.get("*-dev").unwrap();
+            assert!(!pat.installed);
+        }
+
+        #[test]
+        fn test_load_test_config_assert_packages_pattern_positive() {
+            let repo = TempDir::new().unwrap();
+            fs::write(
+                repo.path().join("test.yaml"),
+                r#"
+type: botforge/test
+name: test
+steps: []
+assert:
+  packages:
+    "linux-image-*":
+      installed: true
+"#,
+            )
+            .unwrap();
+            let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+            let assert_block = config.assert.unwrap();
+            let pat = assert_block.packages.get("linux-image-*").unwrap();
+            assert!(pat.installed);
+        }
+
+        #[test]
+        fn test_load_test_config_assert_packages_rejects_unknown_field() {
+            let repo = TempDir::new().unwrap();
+            fs::write(
+                repo.path().join("test.yaml"),
+                r#"
+type: botforge/test
+name: test
+steps: []
+assert:
+  packages:
+    git:
+      installed: true
+      version: "2.40"
+"#,
+            )
+            .unwrap();
+            let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("version") || msg.contains("unknown field"),
+                "error should mention unknown field: {msg}"
+            );
+        }
+
+        // ---------------------------------------------------------------------------
+        // assert.services: tests
+        // ---------------------------------------------------------------------------
+
+        #[test]
+        fn test_load_test_config_assert_services_basic() {
+            let repo = TempDir::new().unwrap();
+            fs::write(
+                repo.path().join("test.yaml"),
+                r#"
+type: botforge/test
+name: test
+steps: []
+assert:
+  services:
+    ssh:
+      enabled: true
+      active: true
+    nginx:
+      enabled: false
+"#,
+            )
+            .unwrap();
+            let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+            let assert_block = config.assert.unwrap();
+            assert_eq!(assert_block.services.len(), 2);
+            let ssh = assert_block.services.get("ssh").unwrap();
+            assert_eq!(ssh.enabled, Some(true));
+            assert_eq!(ssh.active, Some(true));
+            let nginx = assert_block.services.get("nginx").unwrap();
+            assert_eq!(nginx.enabled, Some(false));
+            assert!(nginx.active.is_none());
+        }
+
+        #[test]
+        fn test_load_test_config_assert_services_partial_fields() {
+            let repo = TempDir::new().unwrap();
+            fs::write(
+                repo.path().join("test.yaml"),
+                r#"
+type: botforge/test
+name: test
+steps: []
+assert:
+  services:
+    cron:
+      active: true
+"#,
+            )
+            .unwrap();
+            let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+            let assert_block = config.assert.unwrap();
+            let cron = assert_block.services.get("cron").unwrap();
+            assert!(cron.enabled.is_none(), "enabled should be absent");
+            assert_eq!(cron.active, Some(true));
+        }
+
+        #[test]
+        fn test_load_test_config_assert_services_rejects_unknown_field() {
+            let repo = TempDir::new().unwrap();
+            fs::write(
+                repo.path().join("test.yaml"),
+                r#"
+type: botforge/test
+name: test
+steps: []
+assert:
+  services:
+    ssh:
+      enabled: true
+      version: "3.0"
+"#,
+            )
+            .unwrap();
+            let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("version") || msg.contains("unknown field"),
+                "error should mention unknown field: {msg}"
+            );
+        }
     }
 }

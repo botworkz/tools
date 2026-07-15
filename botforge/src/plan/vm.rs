@@ -14,9 +14,10 @@ use crate::ssh::{
 use crate::util::unique_suffix;
 
 use super::assert::{
-    run_assert_files, run_assert_groups, run_assert_packages, run_assert_services, run_assert_users,
+    run_assert_files, run_assert_groups, run_assert_packages, run_assert_services,
+    run_assert_users, AssertBlock,
 };
-use super::config::{AssertBlock, TestConfig, TestIsoBootstrap};
+use super::config::{TestConfig, TestIsoBootstrap};
 use super::files::{stage_files, FileEntry};
 use super::log::{
     join_output_forwarders, print_step_skipped, print_step_status, print_step_title,
