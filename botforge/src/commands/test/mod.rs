@@ -10,12 +10,13 @@ use crate::qemu::{create_overlay_image, qemu_run_args, require_kvm, spawn_qemu_w
 use crate::resolver::{AssetKind, Reference, ResolveFileContext, ResolveSpec};
 use crate::ssh::{SshOptions, TemporarySshKeypair};
 use crate::util::{create_temp_dir, ensure_command, resolve_under_root};
-use crate::workspace::discover_context;
+use crate::workspace::discover_workspace;
 
 use crate::config::{
     load_test_config, validate_test_ports, validate_test_steps, TestIso, TestIsoBootstrap,
 };
 use crate::plan::{cleanup_test, collect_test_diagnostics, print_log_tail, run_test_flow};
+use shasset::manifest::Manifest;
 
 #[derive(Args, Debug)]
 pub(crate) struct TestArgs {
@@ -57,19 +58,21 @@ pub(crate) struct TestArgs {
     cpus: CpusArg,
 }
 
-pub(crate) fn cmd_test(config: &Path, args: TestArgs) -> Result<()> {
+pub(crate) fn cmd_test(args: TestArgs) -> Result<()> {
     require_kvm()?;
     ensure_command("qemu-system-x86_64")?;
     ensure_command("qemu-img")?;
     detect_iso_tool()?;
 
-    let context = discover_context(args.context.as_deref())?;
+    let ws = discover_workspace(args.context.as_deref())?;
+    let context = ws.root;
+    let manifest = ws.manifest;
     let test_config_path = resolve_under_root(&context, args.test_config);
 
     let test_config = load_test_config(&context, &test_config_path)?;
     let base_image = resolve_test_base_image(
         &context,
-        config,
+        &manifest,
         args.base_image,
         test_config.image.as_ref(),
     )?;
@@ -156,7 +159,7 @@ pub(crate) fn cmd_test(config: &Path, args: TestArgs) -> Result<()> {
     for iso in &test_config.isos {
         match iso {
             TestIso::Attach(path) => {
-                extra_isos.push(resolve_test_iso_path(&context, config, path)?);
+                extra_isos.push(resolve_test_iso_path(&context, &manifest, path)?);
             }
             TestIso::Bootstrap {
                 path,
@@ -164,7 +167,7 @@ pub(crate) fn cmd_test(config: &Path, args: TestArgs) -> Result<()> {
                 mount,
                 bootstrap,
             } => {
-                extra_isos.push(resolve_test_iso_path(&context, config, path)?);
+                extra_isos.push(resolve_test_iso_path(&context, &manifest, path)?);
                 bootstraps.push(TestIsoBootstrap {
                     label: label.clone(),
                     mount: mount.clone(),
@@ -204,7 +207,7 @@ pub(crate) fn cmd_test(config: &Path, args: TestArgs) -> Result<()> {
         &test_config,
         &ssh_options,
         &bootstraps,
-        config,
+        &manifest,
         None,
         installer_username.as_deref(),
     );
@@ -227,7 +230,7 @@ pub(crate) fn cmd_test(config: &Path, args: TestArgs) -> Result<()> {
 
 fn resolve_test_base_image(
     context: &Path,
-    manifest_path: &Path,
+    manifest: &Manifest,
     base_image_arg: Option<PathBuf>,
     config_image: Option<&Reference>,
 ) -> Result<PathBuf> {
@@ -237,7 +240,7 @@ fn resolve_test_base_image(
     };
     let resolve_context = ResolveFileContext {
         context,
-        manifest_path,
+        manifest,
         cache_dir_override: None,
     };
 
@@ -256,7 +259,7 @@ fn resolve_test_base_image(
     image.resolve_one_validated(&resolve_context, &base_image_spec)
 }
 
-fn resolve_test_iso_path(context: &Path, manifest_path: &Path, path: &Path) -> Result<PathBuf> {
+fn resolve_test_iso_path(context: &Path, manifest: &Manifest, path: &Path) -> Result<PathBuf> {
     if let Some(raw) = path.to_str().filter(|raw| raw.starts_with('@')) {
         let iso_spec = ResolveSpec {
             deny_kinds: vec![AssetKind::OciImage],
@@ -264,7 +267,7 @@ fn resolve_test_iso_path(context: &Path, manifest_path: &Path, path: &Path) -> R
         };
         let resolve_context = ResolveFileContext {
             context,
-            manifest_path,
+            manifest,
             cache_dir_override: None,
         };
         let reference = Reference::parse(raw)
@@ -280,8 +283,39 @@ mod tests {
     use crate::cli::Cli;
     use crate::resolver::Reference;
     use clap::Parser;
+    use shasset::manifest::{Asset, Manifest, Settings};
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
     use tempfile::TempDir;
+
+    fn empty_manifest() -> Manifest {
+        Manifest::default()
+    }
+
+    fn manifest_with_oci_asset(name: &str, oci_uri: &str) -> Manifest {
+        let mut assets = BTreeMap::new();
+        assets.insert(
+            name.to_string(),
+            Asset {
+                uri: oci_uri.to_string(),
+                version: "1".to_string(),
+                checksum: None,
+                digest: None,
+                filename: None,
+                auth: None,
+                platform: None,
+                archive: false,
+                labels: Default::default(),
+            },
+        );
+        Manifest {
+            settings: Settings {
+                retries: 0,
+                ..Settings::default()
+            },
+            assets,
+        }
+    }
 
     #[test]
     fn test_test_cli_no_context_parses_ok() {
@@ -392,7 +426,7 @@ mod tests {
     #[test]
     fn test_resolve_test_base_image_uses_cli_override_before_config_image() {
         let repo = TempDir::new().unwrap();
-        let manifest = repo.path().join("shasset.yaml");
+        let manifest = empty_manifest();
         let cli_image = repo.path().join("cli.qcow2");
         let config_image = repo.path().join("config.qcow2");
         std::fs::write(&cli_image, "cli").unwrap();
@@ -414,7 +448,7 @@ mod tests {
     #[test]
     fn test_resolve_test_base_image_uses_config_image_when_cli_absent() {
         let repo = TempDir::new().unwrap();
-        let manifest = repo.path().join("shasset.yaml");
+        let manifest = empty_manifest();
         let artifact = repo.path().join("build/artifact/base.qcow2");
         std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
         std::fs::write(&artifact, "base").unwrap();
@@ -435,7 +469,7 @@ mod tests {
     #[test]
     fn test_resolve_test_base_image_requires_cli_or_config_image() {
         let repo = TempDir::new().unwrap();
-        let manifest = repo.path().join("shasset.yaml");
+        let manifest = empty_manifest();
         let err = resolve_test_base_image(repo.path(), &manifest, None, None).unwrap_err();
         assert!(
             format!("{err:#}").contains("no base image provided"),
@@ -448,7 +482,7 @@ mod tests {
     #[test]
     fn test_resolve_iso_path_at_context_root_ref_resolves_to_absolute_path() {
         let repo = TempDir::new().unwrap();
-        let manifest = repo.path().join("shasset.yaml");
+        let manifest = empty_manifest();
         let iso = repo.path().join("build/foo.iso");
         std::fs::create_dir_all(iso.parent().unwrap()).unwrap();
         std::fs::write(&iso, "").unwrap();
@@ -466,7 +500,7 @@ mod tests {
     #[test]
     fn test_resolve_iso_path_plain_relative_resolves_under_root() {
         let repo = TempDir::new().unwrap();
-        let manifest = repo.path().join("shasset.yaml");
+        let manifest = empty_manifest();
 
         // Does not require the file to exist — regression guard for plain paths.
         let resolved = resolve_test_iso_path(
@@ -482,7 +516,7 @@ mod tests {
     #[test]
     fn test_resolve_iso_path_absolute_path_returned_unchanged() {
         let repo = TempDir::new().unwrap();
-        let manifest = repo.path().join("shasset.yaml");
+        let manifest = empty_manifest();
         let abs = std::path::PathBuf::from("/tmp/some.iso");
 
         let resolved = resolve_test_iso_path(repo.path(), &manifest, &abs).unwrap();
@@ -493,12 +527,10 @@ mod tests {
     #[test]
     fn test_resolve_iso_path_at_ref_rejects_oci_asset() {
         let repo = TempDir::new().unwrap();
-        let manifest = repo.path().join("shasset.yaml");
-        std::fs::write(
-            &manifest,
-            "settings:\n  retries: 0\nassets:\n  my-image:\n    uri: oci://ghcr.io/example/img@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n    version: \"1\"\n",
-        )
-        .unwrap();
+        let manifest = manifest_with_oci_asset(
+            "my-image",
+            "oci://ghcr.io/example/img@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        );
 
         let err = resolve_test_iso_path(repo.path(), &manifest, std::path::Path::new("@my-image"))
             .unwrap_err();

@@ -8,6 +8,9 @@ use crate::util::{create_temp_dir, normalize_path, validate_flat_filename};
 
 #[derive(Args, Debug)]
 pub(crate) struct PayloadArgs {
+    /// Path to the payload config YAML file.
+    #[arg(long, short = 'c', required = true)]
+    config: PathBuf,
     /// Output payload ISO file path.
     #[arg(long, required = true)]
     out: PathBuf,
@@ -56,7 +59,8 @@ fn default_payload_file_mode() -> String {
     "0644".to_string()
 }
 
-pub(crate) fn cmd_payload(config_path: &Path, args: PayloadArgs) -> Result<()> {
+pub(crate) fn cmd_payload(args: PayloadArgs) -> Result<()> {
+    let config_path = &args.config;
     let payload = load_payload_config(config_path)?;
     let config_dir = config_path
         .parent()

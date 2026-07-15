@@ -48,6 +48,7 @@ pub(crate) use validate::{Arity, AssetKind, ResolveSpec};
 
 use anyhow::{bail, Context, Result};
 use shasset::fetch::Transport;
+use shasset::manifest::Manifest;
 use std::path::{Path, PathBuf};
 
 pub(crate) const ARTIFACT_DIR: &str = "build/artifact";
@@ -55,7 +56,9 @@ pub(crate) const ARTIFACT_DIR: &str = "build/artifact";
 /// Context required to resolve a parsed [`Reference`] to a concrete local file or files.
 pub(crate) struct ResolveFileContext<'a> {
     pub(crate) context: &'a Path,
-    pub(crate) manifest_path: &'a Path,
+    /// The shasset manifest sourced from `botforge.yaml`'s `assets:` section.
+    /// Used for `@<name>` asset references.
+    pub(crate) manifest: &'a Manifest,
     pub(crate) cache_dir_override: Option<&'a Path>,
 }
 

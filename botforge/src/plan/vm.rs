@@ -6,6 +6,8 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use shasset::manifest::Manifest;
+
 use crate::resolver::ResolveFileContext;
 use crate::ssh::{
     journalctl_command, scp_with_retry, ssh_capture_stdout, ssh_exec_logged, ssh_with_retry,
@@ -40,8 +42,9 @@ pub(crate) struct StepFlowPlan<'a> {
     pub(crate) files: &'a [FileEntry],
     pub(crate) steps: &'a [TestStep],
     pub(crate) bootstraps: &'a [TestIsoBootstrap],
-    /// Shasset manifest path, forwarded to the resolver for `@`-reference srcs in files.
-    pub(crate) manifest_path: &'a Path,
+    /// Shasset manifest sourced from `botforge.yaml`'s `assets:` section,
+    /// forwarded to the resolver for `@`-reference srcs in files.
+    pub(crate) manifest: &'a Manifest,
     /// Optional cache directory override, forwarded to the resolver.
     pub(crate) cache_dir_override: Option<&'a Path>,
 }
@@ -78,7 +81,7 @@ pub(crate) fn run_test_flow(
     config: &TestConfig,
     ssh: &SshOptions,
     bootstraps: &[TestIsoBootstrap],
-    manifest_path: &Path,
+    manifest: &Manifest,
     cache_dir_override: Option<&Path>,
     installer_username: Option<&str>,
 ) -> Result<()> {
@@ -96,7 +99,7 @@ pub(crate) fn run_test_flow(
             files: &config.files,
             steps: &config.steps,
             bootstraps,
-            manifest_path,
+            manifest,
             cache_dir_override,
         },
         ssh,
@@ -219,7 +222,7 @@ pub(crate) fn run_step_flow(
         ensure_overall_budget(overall_deadline, timeouts.overall_timeout)?;
         let resolve_context = ResolveFileContext {
             context,
-            manifest_path: plan.manifest_path,
+            manifest: plan.manifest,
             cache_dir_override: plan.cache_dir_override,
         };
         stage_files(plan.files, &resolve_context, ssh)?;

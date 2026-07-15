@@ -1,7 +1,22 @@
 use anyhow::{bail, Context, Result};
+use serde::Deserialize;
+use shasset::manifest::{Asset, Manifest, Settings};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 const MARKER: &str = "botforge.yaml";
+
+/// Parsed workspace context: the resolved root directory and the shasset manifest
+/// sourced from the `assets:` section of `botforge.yaml`.
+///
+/// When `botforge.yaml` has no `assets:` section the manifest is empty
+/// (`Manifest::default()`).  That is valid — it simply means no shasset assets
+/// are available in this workspace.
+#[derive(Debug)]
+pub(crate) struct WorkspaceContext {
+    pub(crate) root: PathBuf,
+    pub(crate) manifest: Manifest,
+}
 
 /// Discover the botforge workspace context root.
 ///
@@ -12,18 +27,26 @@ const MARKER: &str = "botforge.yaml";
 /// - When `explicit` is `Some(dir)`: `dir` **must** contain a `botforge.yaml`.
 ///   If it does, the canonicalized `dir` is returned.  If not, a hard error is
 ///   returned.  The walk-up is **not** applied to an explicit path.
-pub(crate) fn discover_context(explicit: Option<&Path>) -> Result<PathBuf> {
+///
+/// Returns a [`WorkspaceContext`] containing both the root path and the shasset
+/// [`Manifest`] parsed from the `assets:` section of `botforge.yaml` (empty if
+/// the section is absent).
+pub(crate) fn discover_workspace(explicit: Option<&Path>) -> Result<WorkspaceContext> {
     let cwd = std::env::current_dir().context("failed to determine current directory")?;
-    discover_context_from(explicit, &cwd)
+    discover_workspace_from(explicit, &cwd)
 }
 
-fn discover_context_from(explicit: Option<&Path>, start_dir: &Path) -> Result<PathBuf> {
+fn discover_workspace_from(explicit: Option<&Path>, start_dir: &Path) -> Result<WorkspaceContext> {
     if let Some(dir) = explicit {
         let canonical = std::fs::canonicalize(dir)
             .with_context(|| format!("--context '{}': cannot resolve directory", dir.display()))?;
-        if canonical.join(MARKER).is_file() {
-            load_botforge_yaml(&canonical.join(MARKER))?;
-            return Ok(canonical);
+        let marker = canonical.join(MARKER);
+        if marker.is_file() {
+            let manifest = load_botforge_yaml(&marker)?;
+            return Ok(WorkspaceContext {
+                root: canonical,
+                manifest,
+            });
         }
         bail!(
             "--context '{}': no botforge.yaml found in that directory",
@@ -34,11 +57,15 @@ fn discover_context_from(explicit: Option<&Path>, start_dir: &Path) -> Result<Pa
     // Walk up from the provided start directory.
     let mut dir: &Path = start_dir;
     loop {
-        if dir.join(MARKER).is_file() {
-            load_botforge_yaml(&dir.join(MARKER))?;
+        let marker = dir.join(MARKER);
+        if marker.is_file() {
+            let manifest = load_botforge_yaml(&marker)?;
             let canonical = std::fs::canonicalize(dir)
                 .with_context(|| format!("cannot canonicalize context root: {}", dir.display()))?;
-            return Ok(canonical);
+            return Ok(WorkspaceContext {
+                root: canonical,
+                manifest,
+            });
         }
         match dir.parent() {
             Some(parent) => dir = parent,
@@ -51,19 +78,40 @@ fn discover_context_from(explicit: Option<&Path>, start_dir: &Path) -> Result<Pa
     );
 }
 
-/// Load and validate `botforge.yaml`.  The file must exist and must parse as valid
-/// YAML.  An empty file or `{}` is fine — the marker is presence-only for now.
-fn load_botforge_yaml(path: &Path) -> Result<()> {
+/// Raw deserialization target for `botforge.yaml`.
+///
+/// Only the `assets:` section is extracted here; other top-level keys (e.g.
+/// the `config:` block added by B3) are unknown and silently ignored via
+/// `serde_yaml`'s default behaviour.
+#[derive(Debug, Deserialize, Default)]
+struct BotforgeYaml {
+    /// The shasset asset entries, keyed by asset name.
+    ///
+    /// Absent in the file → empty map (no assets).  Present → handed to the
+    /// shasset library as a [`Manifest`] with default settings.
+    #[serde(default)]
+    assets: BTreeMap<String, Asset>,
+}
+
+/// Parse `botforge.yaml` and extract the shasset [`Manifest`] from the
+/// optional `assets:` section.
+///
+/// Returns `Manifest::default()` (empty assets, default settings) when the
+/// `assets:` key is absent.  An invalid YAML file is a hard error.
+fn load_botforge_yaml(path: &Path) -> Result<Manifest> {
     let contents =
         std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
-    let _: serde_yaml::Value = serde_yaml::from_str(&contents)
+    let bf: BotforgeYaml = serde_yaml::from_str(&contents)
         .with_context(|| format!("invalid YAML in {}", path.display()))?;
-    Ok(())
+    Ok(Manifest {
+        settings: Settings::default(),
+        assets: bf.assets,
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{discover_context, discover_context_from};
+    use super::{discover_workspace, discover_workspace_from};
     use std::path::Path;
     use tempfile::TempDir;
 
@@ -71,7 +119,7 @@ mod tests {
         std::fs::write(dir.join("botforge.yaml"), "").unwrap();
     }
 
-    // ── discover_context(None) ────────────────────────────────────────────────
+    // ── discover_workspace(None) ──────────────────────────────────────────────
 
     #[test]
     fn discover_context_none_walks_up_to_ancestor_with_marker() {
@@ -80,43 +128,43 @@ mod tests {
         let subdir = root.path().join("a/b/c");
         std::fs::create_dir_all(&subdir).unwrap();
 
-        let result = discover_context_from(None, &subdir).unwrap();
-        assert_eq!(result, root.path().canonicalize().unwrap());
+        let ws = discover_workspace_from(None, &subdir).unwrap();
+        assert_eq!(ws.root, root.path().canonicalize().unwrap());
     }
 
     #[test]
     fn discover_context_none_finds_marker_in_cwd() {
         let root = TempDir::new().unwrap();
         write_marker(root.path());
-        let result = discover_context_from(None, root.path()).unwrap();
-        assert_eq!(result, root.path().canonicalize().unwrap());
+        let ws = discover_workspace_from(None, root.path()).unwrap();
+        assert_eq!(ws.root, root.path().canonicalize().unwrap());
     }
 
     #[test]
     fn discover_context_none_errors_when_no_marker_found() {
         // Use a temp directory with no marker anywhere in its ancestor chain.
         let root = TempDir::new().unwrap();
-        let err = discover_context_from(None, root.path()).unwrap_err();
+        let err = discover_workspace_from(None, root.path()).unwrap_err();
         assert!(
             format!("{err:#}").contains("not inside a botforge workspace"),
             "expected 'not inside a botforge workspace' error, got: {err:#}"
         );
     }
 
-    // ── discover_context(Some(dir)) ───────────────────────────────────────────
+    // ── discover_workspace(Some(dir)) ────────────────────────────────────────
 
     #[test]
     fn discover_context_explicit_with_marker_returns_canonical() {
         let root = TempDir::new().unwrap();
         write_marker(root.path());
-        let result = discover_context(Some(root.path())).unwrap();
-        assert_eq!(result, root.path().canonicalize().unwrap());
+        let ws = discover_workspace(Some(root.path())).unwrap();
+        assert_eq!(ws.root, root.path().canonicalize().unwrap());
     }
 
     #[test]
     fn discover_context_explicit_without_marker_errors() {
         let root = TempDir::new().unwrap();
-        let err = discover_context(Some(root.path())).unwrap_err();
+        let err = discover_workspace(Some(root.path())).unwrap_err();
         assert!(
             format!("{err:#}").contains("no botforge.yaml found in that directory"),
             "expected marker-absent error, got: {err:#}"
@@ -130,7 +178,7 @@ mod tests {
         write_marker(root.path());
         let subdir = root.path().join("sub");
         std::fs::create_dir_all(&subdir).unwrap();
-        let err = discover_context(Some(&subdir)).unwrap_err();
+        let err = discover_workspace(Some(&subdir)).unwrap_err();
         assert!(
             format!("{err:#}").contains("no botforge.yaml found in that directory"),
             "explicit context must not walk up: {err:#}"
@@ -143,26 +191,80 @@ mod tests {
     fn discover_context_empty_marker_is_valid() {
         let root = TempDir::new().unwrap();
         std::fs::write(root.path().join("botforge.yaml"), "").unwrap();
-        let result = discover_context(Some(root.path())).unwrap();
-        assert_eq!(result, root.path().canonicalize().unwrap());
+        let ws = discover_workspace(Some(root.path())).unwrap();
+        assert_eq!(ws.root, root.path().canonicalize().unwrap());
+        assert!(
+            ws.manifest.assets.is_empty(),
+            "empty marker yields empty manifest"
+        );
     }
 
     #[test]
     fn discover_context_empty_map_marker_is_valid() {
         let root = TempDir::new().unwrap();
         std::fs::write(root.path().join("botforge.yaml"), "{}").unwrap();
-        let result = discover_context(Some(root.path())).unwrap();
-        assert_eq!(result, root.path().canonicalize().unwrap());
+        let ws = discover_workspace(Some(root.path())).unwrap();
+        assert_eq!(ws.root, root.path().canonicalize().unwrap());
     }
 
     #[test]
     fn discover_context_invalid_yaml_marker_errors() {
         let root = TempDir::new().unwrap();
         std::fs::write(root.path().join("botforge.yaml"), ": invalid: [yaml").unwrap();
-        let err = discover_context(Some(root.path())).unwrap_err();
+        let err = discover_workspace(Some(root.path())).unwrap_err();
         assert!(
             format!("{err:#}").contains("invalid YAML"),
             "expected invalid YAML error, got: {err:#}"
+        );
+    }
+
+    // ── assets: section ───────────────────────────────────────────────────────
+
+    #[test]
+    fn assets_section_parsed_into_manifest() {
+        let root = TempDir::new().unwrap();
+        std::fs::write(
+            root.path().join("botforge.yaml"),
+            "assets:\n  my-tool:\n    uri: https://example.com/v1/tool\n    version: \"1.0\"\n",
+        )
+        .unwrap();
+        let ws = discover_workspace(Some(root.path())).unwrap();
+        assert!(
+            ws.manifest.assets.contains_key("my-tool"),
+            "assets section should be parsed into manifest"
+        );
+        assert_eq!(
+            ws.manifest.assets["my-tool"].uri,
+            "https://example.com/v1/tool"
+        );
+    }
+
+    #[test]
+    fn absent_assets_section_yields_empty_manifest() {
+        let root = TempDir::new().unwrap();
+        std::fs::write(root.path().join("botforge.yaml"), "{}").unwrap();
+        let ws = discover_workspace(Some(root.path())).unwrap();
+        assert!(
+            ws.manifest.assets.is_empty(),
+            "absent assets: should yield empty manifest, not an error"
+        );
+    }
+
+    #[test]
+    fn stray_shasset_yaml_is_ignored() {
+        // A shasset.yaml next to botforge.yaml must NOT affect the workspace manifest.
+        let root = TempDir::new().unwrap();
+        std::fs::write(root.path().join("botforge.yaml"), "{}").unwrap();
+        std::fs::write(
+            root.path().join("shasset.yaml"),
+            "assets:\n  stray-tool:\n    uri: https://example.com/stray\n    version: \"1\"\n",
+        )
+        .unwrap();
+        let ws = discover_workspace(Some(root.path())).unwrap();
+        assert!(
+            ws.manifest.assets.is_empty(),
+            "stray shasset.yaml must be ignored; manifest should be empty: {:?}",
+            ws.manifest.assets.keys().collect::<Vec<_>>()
         );
     }
 }

@@ -5,7 +5,7 @@
 
 use anyhow::{Context, Result};
 use shasset::fetch::{fetch_asset, FetchParams, MaterializeMode, Transport};
-use shasset::manifest::load;
+use shasset::manifest::Manifest;
 use std::path::{Path, PathBuf};
 
 use crate::util::{default_cache_dir, materialize_flat};
@@ -30,22 +30,31 @@ pub(super) fn fetch_asset_blob<F>(
 where
     F: FnMut() -> Option<Box<dyn Transport>>,
 {
-    let manifest = load(context.manifest_path).with_context(|| {
-        format!(
-            "cannot load shasset manifest: {}",
-            context.manifest_path.display()
-        )
-    })?;
-    let cache_dir: PathBuf = context
-        .cache_dir_override
+    fetch_asset_blob_from_manifest(
+        name,
+        context.manifest,
+        context.cache_dir_override,
+        spec,
+        transport_factory,
+    )
+}
+
+pub(super) fn fetch_asset_blob_from_manifest<F>(
+    name: &str,
+    manifest: &Manifest,
+    cache_dir_override: Option<&Path>,
+    spec: &ResolveSpec,
+    transport_factory: &mut F,
+) -> Result<PathBuf>
+where
+    F: FnMut() -> Option<Box<dyn Transport>>,
+{
+    let cache_dir: PathBuf = cache_dir_override
         .map(Path::to_path_buf)
         .unwrap_or_else(default_cache_dir);
 
     let asset = manifest.assets.get(name).with_context(|| {
-        format!(
-            "asset '{name}' not found in manifest {}",
-            context.manifest_path.display()
-        )
+        format!("asset '{name}' not found in workspace assets (botforge.yaml `assets:` section)")
     })?;
 
     // Pre-fetch validation: kind and labels (both read from the manifest, no I/O).
@@ -89,6 +98,8 @@ mod tests {
     use crate::resolver::validate::AssetKind;
     use crate::resolver::Reference;
     use shasset::fetch::{DownloadResponse, FetchError, Transport};
+    use shasset::manifest::{Asset, Manifest, Settings};
+    use std::collections::BTreeMap;
     use std::io::Cursor;
     use tempfile::TempDir;
 
@@ -115,13 +126,59 @@ mod tests {
 
     fn resolve_context<'a>(
         context: &'a std::path::Path,
-        manifest_path: &'a std::path::Path,
+        manifest: &'a Manifest,
         cache_dir: Option<&'a std::path::Path>,
     ) -> ResolveFileContext<'a> {
         ResolveFileContext {
             context,
-            manifest_path,
+            manifest,
             cache_dir_override: cache_dir,
+        }
+    }
+
+    fn empty_manifest() -> Manifest {
+        Manifest::default()
+    }
+
+    fn manifest_with_assets(entries: Vec<(&str, Asset)>) -> Manifest {
+        let mut assets = BTreeMap::new();
+        for (name, asset) in entries {
+            assets.insert(name.to_string(), asset);
+        }
+        Manifest {
+            settings: Settings {
+                retries: 0,
+                ..Settings::default()
+            },
+            assets,
+        }
+    }
+
+    fn https_asset(uri: &str, checksum: &str, filename: &str) -> Asset {
+        Asset {
+            uri: uri.to_string(),
+            version: "1".to_string(),
+            checksum: Some(format!("sha256:{checksum}")),
+            digest: None,
+            filename: Some(filename.to_string()),
+            auth: None,
+            platform: None,
+            archive: false,
+            labels: Default::default(),
+        }
+    }
+
+    fn oci_asset(uri: &str) -> Asset {
+        Asset {
+            uri: uri.to_string(),
+            version: "1".to_string(),
+            checksum: None,
+            digest: None,
+            filename: None,
+            auth: None,
+            platform: None,
+            archive: false,
+            labels: Default::default(),
         }
     }
 
@@ -130,21 +187,18 @@ mod tests {
     #[test]
     fn resolve_to_file_fetches_and_materializes_asset_default() {
         let tmp = TempDir::new().unwrap();
-        let manifest = tmp.path().join("shasset.yaml");
         let cache = tmp.path().join("cache");
         let body = b"fake-qcow2-content".to_vec();
-        let uri = "https://example.com/v1/base.qcow2".to_string();
+        let uri = "https://example.com/v1/base.qcow2";
         let checksum = "34cb20b33d115697e75baf0d12172c7c3b42a5f04b047c64f38d0aa2b57c988f";
-        std::fs::write(
-            &manifest,
-            format!(
-                "settings:\n  retries: 0\nassets:\n  debian-base:\n    uri: {uri}\n    version: \"13\"\n    checksum: sha256:{checksum}\n    filename: debian-13.qcow2\n"
-            ),
-        )
-        .unwrap();
+
+        let manifest = manifest_with_assets(vec![(
+            "debian-base",
+            https_asset(uri, checksum, "debian-13.qcow2"),
+        )]);
 
         let mut transport = Some(Box::new(MockTransport {
-            expected_uri: uri,
+            expected_uri: uri.to_string(),
             body: body.clone(),
         }) as Box<dyn Transport>);
 
@@ -174,12 +228,14 @@ mod tests {
     #[test]
     fn resolve_to_file_fails_on_unknown_asset() {
         let tmp = TempDir::new().unwrap();
-        let manifest = tmp.path().join("shasset.yaml");
-        std::fs::write(
-            &manifest,
-            "settings:\n  retries: 0\nassets:\n  other-asset:\n    uri: https://example.com/img.qcow2\n    version: \"1\"\n",
-        )
-        .unwrap();
+        let manifest = manifest_with_assets(vec![(
+            "other-asset",
+            https_asset(
+                "https://example.com/img.qcow2",
+                &"0".repeat(64),
+                "img.qcow2",
+            ),
+        )]);
         let err = Reference::Asset {
             name: "nonexistent-key".to_string(),
             path: None,
@@ -200,12 +256,10 @@ mod tests {
         // base-image/qcow2 contract error — it may fail for other reasons (e.g.
         // no network in tests) but that's a different failure path.
         let tmp = TempDir::new().unwrap();
-        let manifest = tmp.path().join("shasset.yaml");
-        std::fs::write(
-            &manifest,
-            "settings:\n  retries: 0\nassets:\n  session-broker:\n    uri: oci://ghcr.io/example/session-broker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n    version: \"1\"\n",
-        )
-        .unwrap();
+        let manifest = manifest_with_assets(vec![(
+            "session-broker",
+            oci_asset("oci://ghcr.io/example/session-broker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        )]);
         let err = Reference::Asset {
             name: "session-broker".to_string(),
             path: None,
@@ -223,12 +277,10 @@ mod tests {
     #[test]
     fn resolve_validated_deny_oci_rejects_oci_asset() {
         let tmp = TempDir::new().unwrap();
-        let manifest = tmp.path().join("shasset.yaml");
-        std::fs::write(
-            &manifest,
-            "settings:\n  retries: 0\nassets:\n  my-image:\n    uri: oci://ghcr.io/example/img@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n    version: \"1\"\n",
-        )
-        .unwrap();
+        let manifest = manifest_with_assets(vec![(
+            "my-image",
+            oci_asset("oci://ghcr.io/example/img@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        )]);
         let err = Reference::Asset {
             name: "my-image".to_string(),
             path: None,
@@ -254,12 +306,10 @@ mod tests {
         // "image must resolve to a qcow2 file asset" message.  It may still fail (e.g.
         // fetch error) but not because of the base-image contract.
         let tmp = TempDir::new().unwrap();
-        let manifest = tmp.path().join("shasset.yaml");
-        std::fs::write(
-            &manifest,
-            "settings:\n  retries: 0\nassets:\n  session-broker:\n    uri: oci://ghcr.io/example/session-broker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n    version: \"1\"\n",
-        )
-        .unwrap();
+        let manifest = manifest_with_assets(vec![(
+            "session-broker",
+            oci_asset("oci://ghcr.io/example/session-broker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        )]);
         let err = Reference::Asset {
             name: "session-broker".to_string(),
             path: None,
@@ -277,12 +327,19 @@ mod tests {
     #[test]
     fn resolve_validated_labels_deny_rejected() {
         let tmp = TempDir::new().unwrap();
-        let manifest = tmp.path().join("shasset.yaml");
-        std::fs::write(
-            &manifest,
-            "settings:\n  retries: 0\nassets:\n  secret-img:\n    uri: https://example.com/img.qcow2\n    version: \"1\"\n    labels:\n      - internal\n",
-        )
-        .unwrap();
+        let mut asset = Asset {
+            uri: "https://example.com/img.qcow2".to_string(),
+            version: "1".to_string(),
+            checksum: None,
+            digest: None,
+            filename: None,
+            auth: None,
+            platform: None,
+            archive: false,
+            labels: Default::default(),
+        };
+        asset.labels.insert("internal".to_string());
+        let manifest = manifest_with_assets(vec![("secret-img", asset)]);
         let err = Reference::Asset {
             name: "secret-img".to_string(),
             path: None,
@@ -305,12 +362,14 @@ mod tests {
     #[test]
     fn resolve_validated_labels_require_missing_rejected() {
         let tmp = TempDir::new().unwrap();
-        let manifest = tmp.path().join("shasset.yaml");
-        std::fs::write(
-            &manifest,
-            "settings:\n  retries: 0\nassets:\n  my-img:\n    uri: https://example.com/img.qcow2\n    version: \"1\"\n",
-        )
-        .unwrap();
+        let manifest = manifest_with_assets(vec![(
+            "my-img",
+            https_asset(
+                "https://example.com/img.qcow2",
+                &"0".repeat(64),
+                "img.qcow2",
+            ),
+        )]);
         let err = Reference::Asset {
             name: "my-img".to_string(),
             path: None,
@@ -333,7 +392,7 @@ mod tests {
     #[test]
     fn resolve_to_file_rejects_directory_roots() {
         let tmp = TempDir::new().unwrap();
-        let manifest = tmp.path().join("shasset.yaml");
+        let manifest = empty_manifest();
 
         let repo_err = Reference::Repo { path: None }
             .resolve_to_file(&resolve_context(tmp.path(), &manifest, None))
@@ -355,7 +414,7 @@ mod tests {
     #[test]
     fn resolve_to_file_rejects_unsupported_asset_traversal() {
         let tmp = TempDir::new().unwrap();
-        let manifest = tmp.path().join("shasset.yaml");
+        let manifest = empty_manifest();
         let err = Reference::Asset {
             name: "tool".to_string(),
             path: Some(std::path::PathBuf::from("bin/tool")),
@@ -371,7 +430,7 @@ mod tests {
     #[test]
     fn resolve_to_file_returns_repo_file() {
         let tmp = TempDir::new().unwrap();
-        let manifest = tmp.path().join("shasset.yaml");
+        let manifest = empty_manifest();
         let file = tmp.path().join("build/artifact/base.qcow2");
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         std::fs::write(&file, "qcow2").unwrap();
@@ -388,7 +447,7 @@ mod tests {
     #[test]
     fn resolve_to_file_rejects_missing_repo_file() {
         let tmp = TempDir::new().unwrap();
-        let manifest = tmp.path().join("shasset.yaml");
+        let manifest = empty_manifest();
         let err = Reference::Repo {
             path: Some(std::path::PathBuf::from("missing.qcow2")),
         }
@@ -404,7 +463,7 @@ mod tests {
     fn resolve_to_file_returns_artifact_file() {
         use super::super::ARTIFACT_DIR;
         let tmp = TempDir::new().unwrap();
-        let manifest = tmp.path().join("shasset.yaml");
+        let manifest = empty_manifest();
         let file = tmp.path().join(ARTIFACT_DIR).join("foo.qcow2");
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         std::fs::write(&file, "qcow2").unwrap();
@@ -421,7 +480,7 @@ mod tests {
     #[test]
     fn resolve_to_file_rejects_missing_artifact_file() {
         let tmp = TempDir::new().unwrap();
-        let manifest = tmp.path().join("shasset.yaml");
+        let manifest = empty_manifest();
         let err = Reference::Artifact {
             path: Some(std::path::PathBuf::from("foo.qcow2")),
         }

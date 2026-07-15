@@ -173,16 +173,17 @@ pub(super) fn resolve_ref_path_to_files(
 mod tests {
     use super::super::{ResolveFileContext, ResolvedFile, ARTIFACT_DIR};
     use crate::resolver::Reference;
+    use shasset::manifest::Manifest;
     use std::path::PathBuf;
     use tempfile::TempDir;
 
     fn resolve_context<'a>(
         context: &'a std::path::Path,
-        manifest_path: &'a std::path::Path,
+        manifest: &'a Manifest,
     ) -> ResolveFileContext<'a> {
         ResolveFileContext {
             context,
-            manifest_path,
+            manifest,
             cache_dir_override: None,
         }
     }
@@ -192,7 +193,7 @@ mod tests {
     #[test]
     fn resolve_to_file_rejects_artifact_symlink_escaping_root() {
         let tmp = TempDir::new().unwrap();
-        let manifest = tmp.path().join("shasset.yaml");
+        let manifest = Manifest::default();
         // Create a target file outside the repo root.
         let outside = TempDir::new().unwrap();
         let target = outside.path().join("secret.qcow2");
@@ -217,7 +218,7 @@ mod tests {
     #[test]
     fn resolve_to_file_rejects_repo_symlink_escaping_root() {
         let tmp = TempDir::new().unwrap();
-        let manifest = tmp.path().join("shasset.yaml");
+        let manifest = Manifest::default();
         // Create a target file outside the repo root.
         let outside = TempDir::new().unwrap();
         let target = outside.path().join("secret.qcow2");
@@ -242,7 +243,7 @@ mod tests {
     #[test]
     fn resolve_to_files_repo_literal_path_returns_single_entry() {
         let tmp = TempDir::new().unwrap();
-        let manifest = tmp.path().join("shasset.yaml");
+        let manifest = Manifest::default();
         let file = tmp.path().join("some/dir/file.yaml");
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         std::fs::write(&file, "content").unwrap();
@@ -261,7 +262,7 @@ mod tests {
     #[test]
     fn resolve_to_files_artifact_literal_path_returns_single_entry() {
         let tmp = TempDir::new().unwrap();
-        let manifest = tmp.path().join("shasset.yaml");
+        let manifest = Manifest::default();
         let file = tmp.path().join(ARTIFACT_DIR).join("foo.qcow2");
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         std::fs::write(&file, "qcow2").unwrap();
@@ -280,7 +281,7 @@ mod tests {
     #[test]
     fn resolve_to_files_repo_glob_returns_matching_files_with_relative_paths() {
         let tmp = TempDir::new().unwrap();
-        let manifest = tmp.path().join("shasset.yaml");
+        let manifest = Manifest::default();
         let ecds = tmp.path().join("images/botspace/envoy/ecds");
         std::fs::create_dir_all(&ecds).unwrap();
         let file = ecds.join("ext_authz.yaml");
@@ -300,7 +301,7 @@ mod tests {
     #[test]
     fn resolve_to_files_artifact_glob_returns_matching_files_with_relative_paths() {
         let tmp = TempDir::new().unwrap();
-        let manifest = tmp.path().join("shasset.yaml");
+        let manifest = Manifest::default();
         let artifact_dir = tmp.path().join(ARTIFACT_DIR);
         let subdir = artifact_dir.join("images/payload");
         std::fs::create_dir_all(&subdir).unwrap();
@@ -321,7 +322,7 @@ mod tests {
     #[test]
     fn resolve_to_files_repo_double_star_glob_matches_entire_tree() {
         let tmp = TempDir::new().unwrap();
-        let manifest = tmp.path().join("shasset.yaml");
+        let manifest = Manifest::default();
         let a = tmp.path().join("a/b/c.txt");
         let d = tmp.path().join("a/d.txt");
         std::fs::create_dir_all(a.parent().unwrap()).unwrap();
@@ -355,7 +356,7 @@ mod tests {
     #[test]
     fn resolve_to_files_glob_zero_matches_is_hard_error() {
         let tmp = TempDir::new().unwrap();
-        let manifest = tmp.path().join("shasset.yaml");
+        let manifest = Manifest::default();
         let err = Reference::Repo {
             path: Some(PathBuf::from("images/**/*.yaml")),
         }
@@ -370,7 +371,7 @@ mod tests {
     #[test]
     fn resolve_to_files_glob_skips_directories() {
         let tmp = TempDir::new().unwrap();
-        let manifest = tmp.path().join("shasset.yaml");
+        let manifest = Manifest::default();
         // Create a directory that matches the glob but no regular files.
         std::fs::create_dir_all(tmp.path().join("images/botspace/envoy/ecds")).unwrap();
         let err = Reference::Repo {
@@ -387,7 +388,7 @@ mod tests {
     #[test]
     fn resolve_to_files_bare_context_root_is_error() {
         let tmp = TempDir::new().unwrap();
-        let manifest = tmp.path().join("shasset.yaml");
+        let manifest = Manifest::default();
         let err = Reference::Repo { path: None }
             .resolve_to_files(&resolve_context(tmp.path(), &manifest))
             .unwrap_err();
@@ -400,7 +401,7 @@ mod tests {
     #[test]
     fn resolve_to_files_bare_artifact_root_is_error() {
         let tmp = TempDir::new().unwrap();
-        let manifest = tmp.path().join("shasset.yaml");
+        let manifest = Manifest::default();
         let err = Reference::Artifact { path: None }
             .resolve_to_files(&resolve_context(tmp.path(), &manifest))
             .unwrap_err();
@@ -413,7 +414,7 @@ mod tests {
     #[test]
     fn resolve_to_files_asset_traversal_remains_unsupported() {
         let tmp = TempDir::new().unwrap();
-        let manifest = tmp.path().join("shasset.yaml");
+        let manifest = Manifest::default();
         let err = Reference::Asset {
             name: "tool".to_string(),
             path: Some(PathBuf::from("bin/**")),
@@ -429,7 +430,7 @@ mod tests {
     #[test]
     fn resolve_to_files_glob_symlink_escape_is_rejected() {
         let tmp = TempDir::new().unwrap();
-        let manifest = tmp.path().join("shasset.yaml");
+        let manifest = Manifest::default();
         // Create a target file outside the repo root.
         let outside = TempDir::new().unwrap();
         let target = outside.path().join("secret.txt");

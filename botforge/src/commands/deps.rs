@@ -1,11 +1,12 @@
 use anyhow::{Context, Result};
 use clap::Args;
 use shasset::fetch::{fetch_asset, FetchParams, MaterializeMode, Transport};
-use shasset::manifest::{load, Asset};
+use shasset::manifest::{load, Asset, Manifest};
 use shasset::prune::{format_prune_summary, prune_cache};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::util::{default_cache_dir, materialize_flat, validate_flat_filename};
+use crate::workspace::discover_workspace;
 
 #[derive(Args, Debug)]
 pub(crate) struct DepsArgs {
@@ -32,24 +33,47 @@ pub(crate) struct DepsArgs {
     /// Report what would be removed without actually deleting (only meaningful with `--prune`).
     #[arg(long, requires = "prune")]
     dry_run: bool,
+    /// Workspace context root. When provided, must contain a botforge.yaml. When
+    /// omitted, botforge walks up from the current directory to find one.
+    #[arg(long)]
+    context: Option<PathBuf>,
+    /// Explicit shasset manifest file override.  When provided, this manifest is
+    /// used instead of the `assets:` section in `botforge.yaml`.  This is an
+    /// opt-in override only — NOT a default, and NOT auto-discovered.
+    #[arg(long)]
+    manifest: Option<PathBuf>,
 }
 
-pub(crate) fn cmd_deps(config: &Path, args: DepsArgs) -> Result<()> {
+pub(crate) fn cmd_deps(args: DepsArgs) -> Result<()> {
+    let manifest = resolve_manifest(&args)?;
     if args.prune {
-        let manifest = load(config)?;
         let cache_dir = args.cache_dir.unwrap_or_else(default_cache_dir);
         let summary = prune_cache(&cache_dir, &manifest, args.dry_run)?;
         println!("{}", format_prune_summary(&summary, args.dry_run));
         return Ok(());
     }
-    cmd_deps_with_transport(config, args, || None)
+    cmd_deps_with_transport(manifest, args, || None)
 }
 
-fn cmd_deps_with_transport<F>(config: &Path, args: DepsArgs, mut transport_factory: F) -> Result<()>
+/// Resolve the shasset manifest: explicit `--manifest` file wins; otherwise
+/// source from the workspace `botforge.yaml` `assets:` section.
+fn resolve_manifest(args: &DepsArgs) -> Result<Manifest> {
+    if let Some(ref manifest_path) = args.manifest {
+        return load(manifest_path)
+            .with_context(|| format!("cannot load manifest: {}", manifest_path.display()));
+    }
+    let ws = discover_workspace(args.context.as_deref())?;
+    Ok(ws.manifest)
+}
+
+fn cmd_deps_with_transport<F>(
+    manifest: Manifest,
+    args: DepsArgs,
+    mut transport_factory: F,
+) -> Result<()>
 where
     F: FnMut() -> Option<Box<dyn Transport>>,
 {
-    let manifest = load(config)?;
     let cache_dir = args.cache_dir.unwrap_or_else(default_cache_dir);
     let out = args
         .out
@@ -132,7 +156,8 @@ fn oci_or_default_filename(asset_key: &str, asset: &Asset) -> Result<String> {
 mod tests {
     use super::{cmd_deps, cmd_deps_with_transport, oci_or_default_filename, DepsArgs};
     use shasset::fetch::{DownloadResponse, FetchError, Transport};
-    use shasset::manifest::Asset;
+    use shasset::manifest::{Asset, Manifest, Settings};
+    use std::collections::BTreeMap;
     use std::io::Cursor;
     use tempfile::TempDir;
 
@@ -157,30 +182,54 @@ mod tests {
         }
     }
 
+    fn manifest_with_https_asset(
+        name: &str,
+        uri: &str,
+        checksum: &str,
+        filename: &str,
+    ) -> Manifest {
+        let mut assets = BTreeMap::new();
+        assets.insert(
+            name.to_string(),
+            Asset {
+                uri: uri.to_string(),
+                version: "1".to_string(),
+                checksum: Some(format!("sha256:{checksum}")),
+                digest: None,
+                filename: Some(filename.to_string()),
+                auth: None,
+                platform: None,
+                archive: false,
+                labels: Default::default(),
+            },
+        );
+        Manifest {
+            settings: Settings {
+                retries: 0,
+                ..Settings::default()
+            },
+            assets,
+        }
+    }
+
     #[test]
     fn deps_fetches_https_asset_to_flat_output_with_executable_mode() {
         let tmp = TempDir::new().unwrap();
-        let manifest = tmp.path().join("shasset.yaml");
         let out = tmp.path().join("out");
         let cache = tmp.path().join("cache");
         let body = b"hello world".to_vec();
-        let uri = "https://example.com/v1/launcher".to_string();
+        let uri = "https://example.com/v1/launcher";
         let checksum = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
-        std::fs::write(
-            &manifest,
-            format!(
-                "settings:\n  retries: 0\nassets:\n  botwork-launcher:\n    uri: {uri}\n    version: \"1\"\n    checksum: sha256:{checksum}\n    filename: launcher\n"
-            ),
-        )
-        .unwrap();
+
+        let manifest = manifest_with_https_asset("botwork-launcher", uri, checksum, "launcher");
 
         let mut transport = Some(Box::new(MockTransport {
-            expected_uri: uri,
+            expected_uri: uri.to_string(),
             body: body.clone(),
         }) as Box<dyn Transport>);
 
         cmd_deps_with_transport(
-            &manifest,
+            manifest,
             DepsArgs {
                 name: None,
                 out: Some(out.clone()),
@@ -189,6 +238,8 @@ mod tests {
                 executable: true,
                 prune: false,
                 dry_run: false,
+                context: None,
+                manifest: None,
             },
             || transport.take(),
         )
@@ -212,26 +263,19 @@ mod tests {
     #[test]
     fn deps_fails_on_https_checksum_mismatch() {
         let tmp = TempDir::new().unwrap();
-        let manifest = tmp.path().join("shasset.yaml");
         let out = tmp.path().join("out");
         let cache = tmp.path().join("cache");
-        let uri = "https://example.com/v1/launcher".to_string();
-        std::fs::write(
-            &manifest,
-            format!(
-                "settings:\n  retries: 0\nassets:\n  botwork-launcher:\n    uri: {uri}\n    version: \"1\"\n    checksum: sha256:{}\n    filename: launcher\n",
-                "0".repeat(64)
-            ),
-        )
-        .unwrap();
+        let uri = "https://example.com/v1/launcher";
+        let manifest =
+            manifest_with_https_asset("botwork-launcher", uri, &"0".repeat(64), "launcher");
 
         let mut transport = Some(Box::new(MockTransport {
-            expected_uri: uri,
+            expected_uri: uri.to_string(),
             body: b"hello world".to_vec(),
         }) as Box<dyn Transport>);
 
         let err = cmd_deps_with_transport(
-            &manifest,
+            manifest,
             DepsArgs {
                 name: None,
                 out: Some(out.clone()),
@@ -240,6 +284,8 @@ mod tests {
                 executable: false,
                 prune: false,
                 dry_run: false,
+                context: None,
+                manifest: None,
             },
             || transport.take(),
         )
@@ -306,6 +352,7 @@ mod tests {
     #[test]
     fn deps_prune_removes_unreferenced_blob_and_keeps_referenced_blob() {
         let tmp = TempDir::new().unwrap();
+        // Use --manifest override so the test doesn't need a botforge.yaml workspace.
         let manifest_path = tmp.path().join("shasset.yaml");
         let cache = tmp.path().join("cache");
         let kept_hex = "a".repeat(64);
@@ -323,18 +370,17 @@ mod tests {
         )
         .unwrap();
 
-        cmd_deps(
-            &manifest_path,
-            DepsArgs {
-                name: None,
-                out: None,
-                cache_dir: Some(cache.clone()),
-                no_reverify: false,
-                executable: false,
-                prune: true,
-                dry_run: false,
-            },
-        )
+        cmd_deps(DepsArgs {
+            name: None,
+            out: None,
+            cache_dir: Some(cache.clone()),
+            no_reverify: false,
+            executable: false,
+            prune: true,
+            dry_run: false,
+            context: None,
+            manifest: Some(manifest_path),
+        })
         .unwrap();
 
         assert!(
@@ -350,6 +396,7 @@ mod tests {
     #[test]
     fn deps_prune_dry_run_removes_nothing() {
         let tmp = TempDir::new().unwrap();
+        // Use --manifest override so the test doesn't need a botforge.yaml workspace.
         let manifest_path = tmp.path().join("shasset.yaml");
         let cache = tmp.path().join("cache");
         let kept_hex = "a".repeat(64);
@@ -367,18 +414,17 @@ mod tests {
         )
         .unwrap();
 
-        cmd_deps(
-            &manifest_path,
-            DepsArgs {
-                name: None,
-                out: None,
-                cache_dir: Some(cache.clone()),
-                no_reverify: false,
-                executable: false,
-                prune: true,
-                dry_run: true,
-            },
-        )
+        cmd_deps(DepsArgs {
+            name: None,
+            out: None,
+            cache_dir: Some(cache.clone()),
+            no_reverify: false,
+            executable: false,
+            prune: true,
+            dry_run: true,
+            context: None,
+            manifest: Some(manifest_path),
+        })
         .unwrap();
 
         // dry-run: both blobs must still exist
