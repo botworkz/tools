@@ -1,4 +1,5 @@
-type: test
+type: botforge/test
+name: test
 ports:
 - 80
 

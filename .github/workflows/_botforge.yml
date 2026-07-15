@@ -177,7 +177,8 @@ jobs:
         input-format: yaml
         output-path: testrepo/chained.yaml
         input: |
-          type: build
+          type: botforge/build
+          name: chained
           image: "@artifact://foo.qcow2"
           output: "foo-chained.qcow2"
           steps: []

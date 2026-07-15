@@ -31,7 +31,7 @@ pub(crate) struct StdioExpect {
     pub(crate) not_contains: Vec<String>,
 }
 
-/// Declarative outcome assertions for a `type: test` or `type: build` run step.
+/// Declarative outcome assertions for a `type: botforge/test` or `type: botforge/build` run step.
 ///
 /// When present, the step captures stdout/stderr and validates exit/output expectations
 /// after execution; any mismatch aborts the run.
