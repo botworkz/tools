@@ -1,9 +1,8 @@
 mod cli;
 mod commands;
-mod compressor;
+mod compress;
 mod iso;
 mod plan;
-mod qcow2;
 mod qemu;
 mod resolver;
 mod ssh;

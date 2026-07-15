@@ -178,7 +178,7 @@ fn parse_config_image(raw: &str) -> Result<Reference> {
     Reference::parse(raw)
 }
 
-use super::compress::CompressConfig;
+use crate::compress::CompressConfig;
 
 /// Resolved configuration for a `botforge build` run.
 #[derive(Debug)]
