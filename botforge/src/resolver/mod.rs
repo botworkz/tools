@@ -54,7 +54,7 @@ pub(crate) const ARTIFACT_DIR: &str = "build/artifact";
 
 /// Context required to resolve a parsed [`Reference`] to a concrete local file or files.
 pub(crate) struct ResolveFileContext<'a> {
-    pub(crate) repo_root: &'a Path,
+    pub(crate) context: &'a Path,
     pub(crate) manifest_path: &'a Path,
     pub(crate) cache_dir_override: Option<&'a Path>,
 }
@@ -96,7 +96,7 @@ impl Reference {
             .into_iter()
             .next()
             .map(|f| f.local_path)
-            .unwrap_or_else(|| context.repo_root.to_path_buf()))
+            .unwrap_or_else(|| context.context.to_path_buf()))
     }
 
     /// Resolve this reference to a collection of local file paths.
@@ -197,7 +197,7 @@ impl Reference {
 
             // ── Directory roots → hard errors ─────────────────────────────────
             Reference::Repo { path: None } => bail!(
-                "reference '@' resolves to the repository root directory; \
+                "reference '@' resolves to the context root directory; \
                  a path or glob is required"
             ),
             Reference::Artifact { path: None } => bail!(
@@ -207,9 +207,9 @@ impl Reference {
 
             // ── Repo path / glob ──────────────────────────────────────────────
             Reference::Repo { path: Some(path) } => {
-                let canonical_root = canonicalize_root(context.repo_root)?;
+                let canonical_root = canonicalize_root(context.context)?;
                 paths::resolve_ref_path_to_files(
-                    context.repo_root,
+                    context.context,
                     path,
                     "repo reference",
                     &canonical_root,
@@ -218,8 +218,8 @@ impl Reference {
 
             // ── Artifact path / glob ──────────────────────────────────────────
             Reference::Artifact { path: Some(path) } => {
-                let canonical_root = canonicalize_root(context.repo_root)?;
-                let artifact_root = context.repo_root.join(ARTIFACT_DIR);
+                let canonical_root = canonicalize_root(context.context)?;
+                let artifact_root = context.context.join(ARTIFACT_DIR);
                 paths::resolve_ref_path_to_files(
                     &artifact_root,
                     path,
@@ -237,8 +237,8 @@ impl Reference {
     }
 }
 
-fn canonicalize_root(repo_root: &Path) -> Result<PathBuf> {
-    repo_root
+fn canonicalize_root(context: &Path) -> Result<PathBuf> {
+    context
         .canonicalize()
-        .with_context(|| format!("cannot canonicalize repo root: {}", repo_root.display()))
+        .with_context(|| format!("cannot canonicalize context root: {}", context.display()))
 }

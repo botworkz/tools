@@ -72,10 +72,10 @@ pub(crate) fn botforge_debug_enabled() -> bool {
 /// them.  On a failing exit we join the threads to collect the captured output for the
 /// error message — in the common case (tools that do not fork long-lived background
 /// processes) the threads have already reached EOF by the time the child has exited.
-/// Return `path` rendered relative to `repo_root` when possible, or just the
+/// Return `path` rendered relative to `context` when possible, or just the
 /// final file-name component otherwise.  An absolute path is **never** returned.
-pub(crate) fn repo_relative_display(repo_root: &Path, path: &Path) -> String {
-    if let Ok(rel) = path.strip_prefix(repo_root) {
+pub(crate) fn context_relative_display(context: &Path, path: &Path) -> String {
+    if let Ok(rel) = path.strip_prefix(context) {
         return rel.display().to_string();
     }
     path.file_name()
@@ -256,11 +256,11 @@ pub(crate) fn format_bytes_human(bytes: u64) -> String {
     }
 }
 
-pub(crate) fn resolve_under_root(repo_root: &Path, path: PathBuf) -> PathBuf {
+pub(crate) fn resolve_under_root(context: &Path, path: PathBuf) -> PathBuf {
     if path.is_absolute() {
         normalize_path(&path)
     } else {
-        normalize_path(&repo_root.join(path))
+        normalize_path(&context.join(path))
     }
 }
 
@@ -403,7 +403,9 @@ pub(crate) fn shell_single_quote(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_bytes_human, materialize_flat, repo_relative_display, run_command_capture};
+    use super::{
+        context_relative_display, format_bytes_human, materialize_flat, run_command_capture,
+    };
     use std::path::Path;
     use tempfile::TempDir;
 
@@ -566,27 +568,27 @@ mod tests {
         assert_eq!(format_bytes_human(12 * 1024 * 1024 * 1024), "12.0 GiB");
     }
 
-    // --- repo_relative_display ---
+    // --- context_relative_display ---
 
     #[test]
     fn repo_relative_display_under_root_returns_relative() {
         let root = Path::new("/repo/root");
         let path = Path::new("/repo/root/images/build.yaml");
-        assert_eq!(repo_relative_display(root, path), "images/build.yaml");
+        assert_eq!(context_relative_display(root, path), "images/build.yaml");
     }
 
     #[test]
     fn repo_relative_display_outside_root_returns_filename() {
         let root = Path::new("/repo/root");
         let path = Path::new("/other/dir/base.qcow2");
-        assert_eq!(repo_relative_display(root, path), "base.qcow2");
+        assert_eq!(context_relative_display(root, path), "base.qcow2");
     }
 
     #[test]
     fn repo_relative_display_root_itself_returns_empty_string() {
         let root = Path::new("/repo/root");
         // A path equal to the root strips to "" (the empty relative path).
-        let result = repo_relative_display(root, root);
+        let result = context_relative_display(root, root);
         assert_eq!(result, "");
     }
 }

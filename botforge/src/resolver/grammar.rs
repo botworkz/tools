@@ -118,7 +118,7 @@ mod tests {
     // ── Reference::parse ──────────────────────────────────────────────────────
 
     #[test]
-    fn parse_bare_at_is_repo_root() {
+    fn parse_bare_at_is_context_root() {
         assert_eq!(
             Reference::parse("@").unwrap(),
             Reference::Repo { path: None }
