@@ -1,4 +1,5 @@
-type: build
+type: botforge/build
+name: build
 image: >-
   @debian-base
 output: foo.qcow2

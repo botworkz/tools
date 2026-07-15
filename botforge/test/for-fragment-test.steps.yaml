@@ -1,4 +1,4 @@
-type: fragment
+type: botforge/fragment
 steps:
 - name: Fragment loop scalar (${{ args.0 }})
   for: [cp, cat, ls]

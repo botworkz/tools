@@ -1,4 +1,5 @@
-type: test
+type: botforge/test
+name: test
 
 # Negative-control fixture: regression guard for the assert.files:
 # privileged-probe bug (#352).

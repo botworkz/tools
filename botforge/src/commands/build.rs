@@ -1624,10 +1624,14 @@ mod tests {
     fn output_filename_clash_check_allows_distinct_outputs() {
         let tmp = TempDir::new().unwrap();
         let spec = tmp.path().join("build.yaml");
-        std::fs::write(&spec, "type: build\noutput: one.qcow2\n").unwrap();
+        std::fs::write(
+            &spec,
+            "type: botforge/build\nname: build\noutput: one.qcow2\n",
+        )
+        .unwrap();
         std::fs::write(
             tmp.path().join("other.yaml"),
-            "type: build\noutput: two.qcow2\n",
+            "type: botforge/build\nname: build\noutput: two.qcow2\n",
         )
         .unwrap();
 
@@ -1639,8 +1643,16 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let spec = tmp.path().join("build.yaml");
         let sibling = tmp.path().join("other.yaml");
-        std::fs::write(&spec, "type: build\noutput: one.qcow2\n").unwrap();
-        std::fs::write(&sibling, "type: build\noutput: one.qcow2\n").unwrap();
+        std::fs::write(
+            &spec,
+            "type: botforge/build\nname: build\noutput: one.qcow2\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &sibling,
+            "type: botforge/build\nname: build\noutput: one.qcow2\n",
+        )
+        .unwrap();
 
         let err = check_same_directory_output_filename_clash(&spec, "one.qcow2").unwrap_err();
         let msg = format!("{err:#}");
@@ -1656,10 +1668,14 @@ mod tests {
     fn output_filename_clash_check_ignores_sibling_without_output() {
         let tmp = TempDir::new().unwrap();
         let spec = tmp.path().join("build.yaml");
-        std::fs::write(&spec, "type: build\noutput: one.qcow2\n").unwrap();
+        std::fs::write(
+            &spec,
+            "type: botforge/build\nname: build\noutput: one.qcow2\n",
+        )
+        .unwrap();
         std::fs::write(
             tmp.path().join("other.yaml"),
-            "type: build\nimage: \"@base\"\n",
+            "type: botforge/build\nname: build\nimage: \"@base\"\n",
         )
         .unwrap();
 
@@ -1670,7 +1686,11 @@ mod tests {
     fn output_filename_clash_check_ignores_invalid_yaml_sibling() {
         let tmp = TempDir::new().unwrap();
         let spec = tmp.path().join("build.yaml");
-        std::fs::write(&spec, "type: build\noutput: one.qcow2\n").unwrap();
+        std::fs::write(
+            &spec,
+            "type: botforge/build\nname: build\noutput: one.qcow2\n",
+        )
+        .unwrap();
         std::fs::write(tmp.path().join("other.yaml"), "type: [\n").unwrap();
 
         check_same_directory_output_filename_clash(&spec, "one.qcow2").unwrap();

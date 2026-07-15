@@ -1,4 +1,4 @@
-type: fragment
+type: botforge/fragment
 steps:
 - on: host
   name: Host hello

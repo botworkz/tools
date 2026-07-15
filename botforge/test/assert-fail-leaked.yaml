@@ -1,4 +1,5 @@
-type: test
+type: botforge/test
+name: test
 
 # Negative-control fixture: regression guard for the installer-exclusion bug
 # (#351) and proves that negative assert.users:/assert.groups: checks bite when
