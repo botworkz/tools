@@ -8,6 +8,7 @@ mod qemu;
 mod resolver;
 mod ssh;
 mod util;
+mod workspace;
 
 use anyhow::Result;
 use clap::Parser;

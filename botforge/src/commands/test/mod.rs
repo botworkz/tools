@@ -10,6 +10,7 @@ use crate::qemu::{create_overlay_image, qemu_run_args, require_kvm, spawn_qemu_w
 use crate::resolver::{AssetKind, Reference, ResolveFileContext, ResolveSpec};
 use crate::ssh::{SshOptions, TemporarySshKeypair};
 use crate::util::{create_temp_dir, ensure_command, resolve_under_root};
+use crate::workspace::discover_context;
 
 use crate::plan::{
     cleanup_test, collect_test_diagnostics, load_test_config, print_log_tail, run_test_flow,
@@ -40,9 +41,10 @@ pub(crate) struct TestArgs {
     /// user without creating it (the caller is responsible for the account and its key).
     #[arg(long)]
     ssh_user: Option<String>,
-    /// Repo root for resolving relative test paths and `uses:` step includes.
-    #[arg(long, required = true)]
-    repo_root: PathBuf,
+    /// Workspace context root. When provided, must contain a botforge.yaml. When
+    /// omitted, botforge walks up from the current directory to find one.
+    #[arg(long)]
+    context: Option<PathBuf>,
     /// Leave VM running and preserve overlay on exit.
     #[arg(long)]
     keep_running: bool,
@@ -61,18 +63,18 @@ pub(crate) fn cmd_test(config: &Path, args: TestArgs) -> Result<()> {
     ensure_command("qemu-img")?;
     detect_iso_tool()?;
 
-    let repo_root = std::fs::canonicalize(args.repo_root).context("failed to resolve repo root")?;
-    let test_config_path = resolve_under_root(&repo_root, args.test_config);
+    let context = discover_context(args.context.as_deref())?;
+    let test_config_path = resolve_under_root(&context, args.test_config);
 
-    let test_config = load_test_config(&repo_root, &test_config_path)?;
+    let test_config = load_test_config(&context, &test_config_path)?;
     let base_image = resolve_test_base_image(
-        &repo_root,
+        &context,
         config,
         args.base_image,
         test_config.image.as_ref(),
     )?;
     validate_test_steps(&test_config.steps, &test_config.ports)?;
-    let build_dir = repo_root.join("build");
+    let build_dir = context.join("build");
     std::fs::create_dir_all(&build_dir)
         .with_context(|| format!("cannot create build dir: {}", build_dir.display()))?;
     let overlay_image = build_dir.join("test-overlay.qcow2");
@@ -100,7 +102,7 @@ pub(crate) fn cmd_test(config: &Path, args: TestArgs) -> Result<()> {
     ) = match (args.ssh_user, args.ssh_key) {
         (Some(user), Some(key)) => {
             // Caller-supplied identity: user exists in the image with the given key.
-            let key_path = resolve_under_root(&repo_root, key);
+            let key_path = resolve_under_root(&context, key);
             let pub_path = PathBuf::from(format!("{}.pub", key_path.display()));
             let pub_key = std::fs::read_to_string(&pub_path)
                 .with_context(|| format!("cannot read SSH public key: {}", pub_path.display()))?;
@@ -154,7 +156,7 @@ pub(crate) fn cmd_test(config: &Path, args: TestArgs) -> Result<()> {
     for iso in &test_config.isos {
         match iso {
             TestIso::Attach(path) => {
-                extra_isos.push(resolve_test_iso_path(&repo_root, config, path)?);
+                extra_isos.push(resolve_test_iso_path(&context, config, path)?);
             }
             TestIso::Bootstrap {
                 path,
@@ -162,7 +164,7 @@ pub(crate) fn cmd_test(config: &Path, args: TestArgs) -> Result<()> {
                 mount,
                 bootstrap,
             } => {
-                extra_isos.push(resolve_test_iso_path(&repo_root, config, path)?);
+                extra_isos.push(resolve_test_iso_path(&context, config, path)?);
                 bootstraps.push(TestIsoBootstrap {
                     label: label.clone(),
                     mount: mount.clone(),
@@ -198,7 +200,7 @@ pub(crate) fn cmd_test(config: &Path, args: TestArgs) -> Result<()> {
     };
 
     let test_result = run_test_flow(
-        &repo_root,
+        &context,
         &test_config,
         &ssh_options,
         &bootstraps,
@@ -224,7 +226,7 @@ pub(crate) fn cmd_test(config: &Path, args: TestArgs) -> Result<()> {
 }
 
 fn resolve_test_base_image(
-    repo_root: &Path,
+    context: &Path,
     manifest_path: &Path,
     base_image_arg: Option<PathBuf>,
     config_image: Option<&Reference>,
@@ -234,7 +236,7 @@ fn resolve_test_base_image(
         ..Default::default()
     };
     let resolve_context = ResolveFileContext {
-        repo_root,
+        context,
         manifest_path,
         cache_dir_override: None,
     };
@@ -245,7 +247,7 @@ fn resolve_test_base_image(
                 .with_context(|| format!("invalid --base-image reference: {raw:?}"))?;
             return reference.resolve_one_validated(&resolve_context, &base_image_spec);
         }
-        return Ok(resolve_under_root(repo_root, base_image));
+        return Ok(resolve_under_root(context, base_image));
     }
 
     let image = config_image.context(
@@ -254,14 +256,14 @@ fn resolve_test_base_image(
     image.resolve_one_validated(&resolve_context, &base_image_spec)
 }
 
-fn resolve_test_iso_path(repo_root: &Path, manifest_path: &Path, path: &Path) -> Result<PathBuf> {
+fn resolve_test_iso_path(context: &Path, manifest_path: &Path, path: &Path) -> Result<PathBuf> {
     if let Some(raw) = path.to_str().filter(|raw| raw.starts_with('@')) {
         let iso_spec = ResolveSpec {
             deny_kinds: vec![AssetKind::OciImage],
             ..Default::default()
         };
         let resolve_context = ResolveFileContext {
-            repo_root,
+            context,
             manifest_path,
             cache_dir_override: None,
         };
@@ -269,7 +271,7 @@ fn resolve_test_iso_path(repo_root: &Path, manifest_path: &Path, path: &Path) ->
             .with_context(|| format!("invalid iso path reference: {raw:?}"))?;
         return reference.resolve_one_validated(&resolve_context, &iso_spec);
     }
-    Ok(resolve_under_root(repo_root, path.to_path_buf()))
+    Ok(resolve_under_root(context, path.to_path_buf()))
 }
 
 #[cfg(test)]
@@ -282,18 +284,42 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn test_test_cli_requires_repo_root() {
-        let err = Cli::try_parse_from([
+    fn test_test_cli_no_context_parses_ok() {
+        // --context is now optional; the CLI parses fine without it.
+        // Runtime context discovery is tested in workspace.rs.
+        let result = Cli::try_parse_from([
             "botforge",
             "test",
             "--test-config",
             "test.yaml",
             "--base-image",
             "base.qcow2",
-        ])
-        .unwrap_err();
-        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
-        assert!(err.to_string().contains("--repo-root"));
+        ]);
+        assert!(
+            result.is_ok(),
+            "CLI should parse without --context: {}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
+    fn test_test_cli_context_flag_accepted() {
+        // --context is accepted as an optional override.
+        let result = Cli::try_parse_from([
+            "botforge",
+            "test",
+            "--test-config",
+            "test.yaml",
+            "--base-image",
+            "base.qcow2",
+            "--context",
+            "/some/dir",
+        ]);
+        assert!(
+            result.is_ok(),
+            "CLI should parse with --context: {}",
+            result.unwrap_err()
+        );
     }
 
     #[test]
@@ -308,8 +334,6 @@ mod tests {
             "test.yaml",
             "--base-image",
             "base.qcow2",
-            "--repo-root",
-            "/repo",
         ]);
         // Should parse without a clap error (ssh-user and ssh-key are both optional).
         assert!(
@@ -328,8 +352,6 @@ mod tests {
             "test.yaml",
             "--base-image",
             "base.qcow2",
-            "--repo-root",
-            "/repo",
             "--memory",
             "8192",
             "--cpus",
@@ -344,14 +366,7 @@ mod tests {
 
     #[test]
     fn test_test_cli_accepts_config_image_without_base_image_flag() {
-        let result = Cli::try_parse_from([
-            "botforge",
-            "test",
-            "--test-config",
-            "test.yaml",
-            "--repo-root",
-            "/repo",
-        ]);
+        let result = Cli::try_parse_from(["botforge", "test", "--test-config", "test.yaml"]);
         assert!(
             result.is_ok(),
             "CLI should allow test-config image without --base-image: {}",
@@ -431,7 +446,7 @@ mod tests {
     // ── resolve_test_iso_path tests ───────────────────────────────────────────
 
     #[test]
-    fn test_resolve_iso_path_at_repo_root_ref_resolves_to_absolute_path() {
+    fn test_resolve_iso_path_at_context_root_ref_resolves_to_absolute_path() {
         let repo = TempDir::new().unwrap();
         let manifest = repo.path().join("shasset.yaml");
         let iso = repo.path().join("build/foo.iso");

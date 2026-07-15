@@ -114,12 +114,12 @@ mod tests {
     }
 
     fn resolve_context<'a>(
-        repo_root: &'a std::path::Path,
+        context: &'a std::path::Path,
         manifest_path: &'a std::path::Path,
         cache_dir: Option<&'a std::path::Path>,
     ) -> ResolveFileContext<'a> {
         ResolveFileContext {
-            repo_root,
+            context,
             manifest_path,
             cache_dir_override: cache_dir,
         }

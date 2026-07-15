@@ -18,8 +18,8 @@ use crate::qemu::{qemu_build_args, require_kvm, spawn_qemu_with_log};
 use crate::resolver::{AssetKind, ResolveFileContext, ResolveSpec, ARTIFACT_DIR};
 use crate::ssh::{scp_with_retry, ssh_with_retry, SshOptions, TemporarySshKeypair};
 use crate::util::{
-    botforge_debug_enabled, create_temp_dir, default_cache_dir, ensure_command, format_bytes_human,
-    repo_relative_display, resolve_under_root, unique_suffix,
+    botforge_debug_enabled, context_relative_display, create_temp_dir, default_cache_dir,
+    ensure_command, format_bytes_human, resolve_under_root, unique_suffix,
 };
 
 use crate::plan::compress::{CompressConfig, CompressionType, ReclaimMode};
@@ -31,6 +31,7 @@ use crate::plan::{
 use crate::qcow2::{
     compress_qcow2_image, read_qcow2_image_stats, read_virtual_sector0, sparsify_zero_clusters,
 };
+use crate::workspace::discover_context;
 
 /// Parsed `--cpus` value: either a specific positive count or `auto`.
 ///
@@ -81,9 +82,10 @@ pub(crate) struct BuildArgs {
     /// to <output>.partial before any modification.
     #[arg(long)]
     source: Option<PathBuf>,
-    /// Repo root for resolving relative spec/source/step paths (default: current dir).
+    /// Workspace context root. When provided, must contain a botforge.yaml. When
+    /// omitted, botforge walks up from the current directory to find one.
     #[arg(long)]
-    repo_root: Option<PathBuf>,
+    context: Option<PathBuf>,
     /// Cache directory for resolved shasset assets (default: ~/.cache/shasset).
     /// Honours SHASSET_CACHE / XDG_CACHE_HOME / HOME, same as `botforge deps`.
     #[arg(long)]
@@ -116,16 +118,12 @@ pub(crate) fn cmd_build(config: &Path, args: BuildArgs) -> Result<()> {
     ensure_command("qemu-img")?;
     detect_iso_tool()?;
 
-    let repo_root = std::fs::canonicalize(
-        args.repo_root
-            .unwrap_or(std::env::current_dir().context("failed to determine current directory")?),
-    )
-    .context("failed to resolve repo root")?;
+    let context = discover_context(args.context.as_deref())?;
 
-    let spec_path = resolve_under_root(&repo_root, args.spec.clone());
+    let spec_path = resolve_under_root(&context, args.spec.clone());
 
-    let build_config = load_build_config(&repo_root, &spec_path)?;
-    let output = derive_artifact_output_path(&repo_root, &spec_path, &build_config.output)?;
+    let build_config = load_build_config(&context, &spec_path)?;
+    let output = derive_artifact_output_path(&context, &spec_path, &build_config.output)?;
     check_same_directory_output_filename_clash(&spec_path, &build_config.output)?;
     let reclaim_mode = build_config
         .compress
@@ -147,11 +145,11 @@ pub(crate) fn cmd_build(config: &Path, args: BuildArgs) -> Result<()> {
 
     // Resolve the source qcow2: --source wins; otherwise resolve image: via the shared resolver.
     let source = if let Some(src) = args.source {
-        resolve_under_root(&repo_root, src)
+        resolve_under_root(&context, src)
     } else {
         build_config.image.resolve_one_validated(
             &ResolveFileContext {
-                repo_root: &repo_root,
+                context: &context,
                 manifest_path: config,
                 cache_dir_override: args.cache_dir.as_deref(),
             },
@@ -204,7 +202,7 @@ pub(crate) fn cmd_build(config: &Path, args: BuildArgs) -> Result<()> {
     // ---------------------------------------------------------------------------
     // Disk lifecycle step 3: boot <partial> read-write directly (no CoW overlay)
     // ---------------------------------------------------------------------------
-    let build_dir = repo_root.join("build");
+    let build_dir = context.join("build");
     std::fs::create_dir_all(&build_dir)
         .with_context(|| format!("cannot create build dir: {}", build_dir.display()))?;
     let output_stem = output_stem(&output);
@@ -255,8 +253,8 @@ pub(crate) fn cmd_build(config: &Path, args: BuildArgs) -> Result<()> {
         args.cpus.resolve(),
         guest_reclaim_uses_discard,
     );
-    let spec_display = repo_relative_display(&repo_root, &spec_path);
-    let source_display = repo_relative_display(&repo_root, &source);
+    let spec_display = context_relative_display(&context, &spec_path);
+    let source_display = context_relative_display(&context, &source);
     crate::plan::print_phase(
         "vm",
         &format!("Starting vm (spec: {spec_display}, image: {source_display})"),
@@ -283,7 +281,7 @@ pub(crate) fn cmd_build(config: &Path, args: BuildArgs) -> Result<()> {
         )
     };
     let step_result = run_step_flow(
-        &repo_root,
+        &context,
         StepFlowPlan {
             files: &build_config.files,
             steps: &build_config.steps,
@@ -1195,19 +1193,19 @@ fn reclaim_host_discard_offline(partial: &Path) -> Result<()> {
 }
 
 fn derive_artifact_output_path(
-    repo_root: &Path,
+    context: &Path,
     spec_path: &Path,
     output_filename: &str,
 ) -> Result<PathBuf> {
-    let spec_relative = spec_path.strip_prefix(repo_root).with_context(|| {
+    let spec_relative = spec_path.strip_prefix(context).with_context(|| {
         format!(
-            "spec path must be under repo root (spec: {}, repo_root: {})",
+            "spec path must be under context root (spec: {}, context: {})",
             spec_path.display(),
-            repo_root.display()
+            context.display()
         )
     })?;
     let spec_relative_dir = spec_relative.parent().unwrap_or_else(|| Path::new(""));
-    Ok(repo_root
+    Ok(context
         .join(ARTIFACT_DIR)
         .join(spec_relative_dir)
         .join(output_filename))
@@ -1478,7 +1476,7 @@ mod tests {
     }
 
     #[test]
-    fn build_cli_shows_spec_source_repo_root() {
+    fn build_cli_shows_spec_source_context() {
         // Verify --help includes all documented args.
         let help = Cli::try_parse_from(["botforge", "build", "--help"])
             .unwrap_err()
@@ -1489,8 +1487,12 @@ mod tests {
             "--source missing from help: {help}"
         );
         assert!(
-            help.contains("--repo-root"),
-            "--repo-root missing from help: {help}"
+            help.contains("--context"),
+            "--context missing from help: {help}"
+        );
+        assert!(
+            !help.contains("--repo-root"),
+            "--repo-root must not appear in help: {help}"
         );
         assert!(
             help.contains("--cache-dir"),
