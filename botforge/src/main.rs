@@ -27,11 +27,11 @@ fn main() {
 fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Build(args) => commands::build::cmd_build(&cli.config, args),
-        Commands::Deps(args) => commands::deps::cmd_deps(&cli.config, args),
+        Commands::Build(args) => commands::build::cmd_build(cli.config.as_deref(), args),
+        Commands::Deps(args) => commands::deps::cmd_deps(cli.config.as_deref(), args),
         Commands::Iso(args) => commands::iso::cmd_iso(args),
-        Commands::Payload(args) => commands::payload::cmd_payload(&cli.config, args),
+        Commands::Payload(args) => commands::payload::cmd_payload(cli.config.as_deref(), args),
         Commands::Run(args) => commands::run::cmd_run(args),
-        Commands::Test(args) => commands::test::cmd_test(&cli.config, args),
+        Commands::Test(args) => commands::test::cmd_test(cli.config.as_deref(), args),
     }
 }

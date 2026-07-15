@@ -117,7 +117,8 @@ pub(crate) struct BuildArgs {
     cpus: CpusArg,
 }
 
-pub(crate) fn cmd_build(config: &Path, args: BuildArgs) -> Result<()> {
+pub(crate) fn cmd_build(config: Option<&Path>, args: BuildArgs) -> Result<()> {
+    let config = config.unwrap_or_else(|| Path::new("shasset.yaml"));
     require_kvm()?;
     ensure_command("qemu-system-x86_64")?;
     ensure_command("qemu-img")?;
