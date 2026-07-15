@@ -4,7 +4,7 @@ use serde_yaml::Value;
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use super::step::TestStep;
+use crate::step::TestStep;
 
 const DEFAULT_SENTINEL: &str = "__default__";
 
@@ -514,7 +514,7 @@ mod tests {
         #[test]
         fn test_load_test_config_with_at_call_site_accepted() {
             use crate::plan::config::load_test_config;
-            use crate::plan::step::{RunStep, TestStep};
+            use crate::step::{RunStep, TestStep};
             use tempfile::TempDir;
 
             fn run_ref(step: &TestStep) -> &RunStep {
@@ -604,7 +604,7 @@ steps:
         #[test]
         fn test_load_test_config_declared_default_applied_via_fragment() {
             use crate::plan::config::load_test_config;
-            use crate::plan::step::{RunStep, TestStep};
+            use crate::step::{RunStep, TestStep};
             use tempfile::TempDir;
 
             fn run_ref(step: &TestStep) -> &RunStep {

@@ -7,6 +7,7 @@ mod qcow2;
 mod qemu;
 mod resolver;
 mod ssh;
+mod step;
 mod util;
 
 use anyhow::Result;

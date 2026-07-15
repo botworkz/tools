@@ -24,7 +24,7 @@ use super::log::{
     spawn_capturing_forwarder, spawn_output_forwarder, step_log_path, StepLogWriter,
     StepOutputStream,
 };
-use super::step::{
+use crate::step::{
     resolve_shell, ArchiveStep, ExpectBlock, RunStep, StdioExpect, StepTarget, TestStep,
 };
 
@@ -1354,7 +1354,7 @@ mod tests {
         build_guest_ssh_cmd, env_merge, parse_env_file, resolve_step_timeout, run_host_step,
         shell_single_quote, HostStepFiles, StepExecutionBudget,
     };
-    use crate::plan::step::{resolve_shell, RunStep, StepTarget};
+    use crate::step::{resolve_shell, RunStep, StepTarget};
     use crate::util::unique_suffix;
     use serde::Deserialize;
     use std::path::{Path, PathBuf};
@@ -2025,7 +2025,7 @@ run: echo ok
     // --- check_expect_block ---
 
     use super::{check_expect_block, check_stdio_expect, StepCapture};
-    use crate::plan::step::{ExpectBlock, StdioExpect};
+    use crate::step::{ExpectBlock, StdioExpect};
 
     fn make_capture(stdout: &str, stderr: &str) -> StepCapture {
         StepCapture {
