@@ -11,12 +11,9 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 use walkdir::WalkDir;
-
-// ─── marker filenames ─────────────────────────────────────────────────────────
-
-const MARKER_YAML: &str = "botforge.yaml";
-const MARKER_YML: &str = "botforge.yml";
 const BUILD_DIR: &str = "build";
+
+use super::{find_marker_path, is_marker_name, marker_path};
 
 // ─── botforge.yaml config block ──────────────────────────────────────────────
 
@@ -75,7 +72,7 @@ impl Default for WorkspaceConfig {
 /// Load and parse the `config:` block from `<context_root>/botforge.yaml`.
 /// Falls back to defaults if the file has no `config:` section.
 fn load_workspace_config(context_root: &Path) -> Result<WorkspaceConfig> {
-    let marker_path = context_root.join(MARKER_YAML);
+    let marker_path = marker_path(context_root)?;
     let contents = std::fs::read_to_string(&marker_path)
         .with_context(|| format!("cannot read {}", marker_path.display()))?;
     // Empty or pure-whitespace file → no config block.
@@ -305,12 +302,12 @@ fn insert_entry(
 // ─── nested-marker check ─────────────────────────────────────────────────────
 
 /// Returns `true` if `dir` is a nested workspace boundary (contains a
-/// `botforge.yaml` or `botforge.yml` but is NOT the context root itself).
+/// botforge marker file but is NOT the context root itself).
 fn is_nested_marker(dir: &Path, context_root: &Path) -> bool {
     if dir == context_root {
         return false;
     }
-    dir.join(MARKER_YAML).is_file() || dir.join(MARKER_YML).is_file()
+    find_marker_path(dir).is_some()
 }
 
 // ─── filesystem-walk discovery (repo-only: false) ────────────────────────────
@@ -415,7 +412,7 @@ fn discover_via_git_index(context_root: &Path, glob_set: &GlobSet) -> Result<Vec
         };
 
         let fname = relative_to_context.file_name().and_then(|f| f.to_str());
-        if matches!(fname, Some(MARKER_YAML) | Some(MARKER_YML)) {
+        if fname.is_some_and(is_marker_name) {
             // This marker is inside a subdirectory of the context root → nested workspace.
             if let Some(parent) = relative_to_context.parent() {
                 if !parent.as_os_str().is_empty() {
@@ -517,10 +514,17 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    const MARKER_YAML: &str = "botforge.yaml";
+    const MARKER_YML: &str = "botforge.yml";
+
     // ── helpers ───────────────────────────────────────────────────────────────
 
     fn write_marker(dir: &Path) {
         fs::write(dir.join(MARKER_YAML), "").unwrap();
+    }
+
+    fn write_named_marker(dir: &Path, name: &str) {
+        fs::write(dir.join(name), "").unwrap();
     }
 
     fn write_build_doc(dir: &Path, filename: &str, name: &str) {
@@ -718,6 +722,24 @@ mod tests {
         assert!(
             reg.build("sub-build", root.path()).is_err(),
             "nested subtree (yml marker) must be pruned"
+        );
+        assert!(reg.build("root", root.path()).is_ok());
+    }
+
+    #[test]
+    fn discover_prunes_nested_workspace_alt_marker_subtree() {
+        let root = TempDir::new().unwrap();
+        write_marker(root.path());
+        let nested = root.path().join("sub");
+        fs::create_dir_all(&nested).unwrap();
+        write_named_marker(&nested, ".botforge.yaml");
+        write_build_doc(&nested, "build.yaml", "sub-build");
+        write_build_doc(root.path(), "root.yaml", "root");
+
+        let reg = discover(root.path()).unwrap();
+        assert!(
+            reg.build("sub-build", root.path()).is_err(),
+            "nested subtree (alternate marker) must be pruned"
         );
         assert!(reg.build("root", root.path()).is_ok());
     }

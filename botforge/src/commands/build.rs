@@ -6,7 +6,7 @@ use anyhow::{bail, Context, Result};
 use clap::{ArgGroup, Args};
 use serde_yaml::Value;
 use shasset::fetch::{fetch_asset, FetchParams, MaterializeMode};
-use shasset::manifest::load;
+use shasset::manifest::Manifest;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -30,7 +30,7 @@ use crate::config::{load_build_config, validate_build_steps};
 use crate::plan::vm::{StepFlowPlan, StepTimeoutPolicy};
 use crate::plan::{preserve_failed_build_disk, print_log_tail, run_step_flow, shutdown_build_vm};
 use crate::step::{ArchiveStep, StepTarget, TestStep};
-use crate::workspace::{discover_context, registry::load_committed_registry};
+use crate::workspace::{discover_context, load_inline_manifest, registry::load_committed_registry};
 
 /// Parsed `--cpus` value: either a specific positive count or `auto`.
 ///
@@ -87,7 +87,7 @@ pub(crate) struct BuildArgs {
     /// to <output>.partial before any modification.
     #[arg(long)]
     source: Option<PathBuf>,
-    /// Workspace context root. When provided, must contain a botforge.yaml. When
+    /// Workspace context root. When provided, must contain a botforge marker. When
     /// omitted, botforge walks up from the current directory to find one.
     #[arg(long)]
     context: Option<PathBuf>,
@@ -117,14 +117,14 @@ pub(crate) struct BuildArgs {
     cpus: CpusArg,
 }
 
-pub(crate) fn cmd_build(config: Option<&Path>, args: BuildArgs) -> Result<()> {
-    let config = config.unwrap_or_else(|| Path::new("shasset.yaml"));
+pub(crate) fn cmd_build(args: BuildArgs) -> Result<()> {
     require_kvm()?;
     ensure_command("qemu-system-x86_64")?;
     ensure_command("qemu-img")?;
     detect_iso_tool()?;
 
     let context = discover_context(args.context.as_deref())?;
+    let manifest = load_inline_manifest(&context)?;
 
     // Resolve the spec path: either from an explicit --spec flag or by
     // looking up the named build in the committed registry.
@@ -165,7 +165,7 @@ pub(crate) fn cmd_build(config: Option<&Path>, args: BuildArgs) -> Result<()> {
         build_config.image.resolve_one_validated(
             &ResolveFileContext {
                 context: &context,
-                manifest_path: config,
+                manifest: &manifest,
                 cache_dir_override: args.cache_dir.as_deref(),
             },
             &ResolveSpec {
@@ -287,7 +287,7 @@ pub(crate) fn cmd_build(config: Option<&Path>, args: BuildArgs) -> Result<()> {
     // ---------------------------------------------------------------------------
     let mut archive_executor = |step_idx: usize, step: &ArchiveStep| -> Result<()> {
         run_archive_step(
-            config,
+            &manifest,
             &build_dir,
             args.cache_dir.as_deref(),
             step_idx,
@@ -301,7 +301,7 @@ pub(crate) fn cmd_build(config: Option<&Path>, args: BuildArgs) -> Result<()> {
             files: &build_config.files,
             steps: &build_config.steps,
             bootstraps: &[],
-            manifest_path: config,
+            manifest: &manifest,
             cache_dir_override: args.cache_dir.as_deref(),
         },
         &ssh_options,
@@ -593,7 +593,7 @@ fn commit_output(partial: &Path, output: &Path, compress: Option<&CompressConfig
 }
 
 fn run_archive_step(
-    manifest_path: &Path,
+    manifest: &Manifest,
     build_dir: &Path,
     cache_dir_override: Option<&Path>,
     step_idx: usize,
@@ -605,17 +605,14 @@ fn run_archive_step(
     let src = step.archive.src.trim();
     let asset_key = parse_archive_asset_key(src)?;
 
-    let manifest = load(manifest_path)
-        .with_context(|| format!("cannot load shasset manifest: {}", manifest_path.display()))?;
     let cache_dir = cache_dir_override
         .map(|p| p.to_path_buf())
         .unwrap_or_else(default_cache_dir);
     let asset = manifest.assets.get(asset_key).with_context(|| {
         format!(
-            "archive step '{}': asset '{}' not found in manifest {}",
+            "archive step '{}': asset '{}' not found",
             step.archive.name.as_deref().unwrap_or(src),
             asset_key,
-            manifest_path.display()
         )
     })?;
 

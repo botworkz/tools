@@ -84,12 +84,42 @@ jobs:
           echo "HOST_GID=$(id -g)"
           echo "HOST_KVM_GID=$(getent group kvm | cut -d: -f3)"
         } >> "$GITHUB_ENV"
-    - name: Create shasset
+    # Inline the shasset asset manifest INTO the workspace marker
+    # (testrepo/botforge.yaml). botforge no longer reads a standalone
+    # shasset.yaml — assets live under the marker's `assets:` block, located
+    # solely via --context / the marker walk-up. The base marker fixture
+    # (botforge/test/botforge.yaml) is an empty 0-byte file with nothing to
+    # preserve, so we simply transcode botforge/test/shasset.yaml straight
+    # into testrepo/botforge.yaml.
+    - name: Inline shasset assets into the workspace marker (botforge.yaml)
       uses: envoyproxy/toolshed/actions/jq@6a20085af231aba4c72d6866f94098343a8c5616
       with:
         input-format: yaml-path
-        output-path: testrepo/shasset.yaml
+        output-path: testrepo/botforge.yaml
         input: botforge/test/shasset.yaml
+    # Assert the fold actually happened: the marker MUST now carry the
+    # debian-base asset used as build `image: "@debian-base"`. If assets are
+    # missing here the whole acceptance run would fail later at image
+    # resolution — this turns that into an early, explicit failure instead of
+    # a confusing mid-build error.
+    - name: Assert inline assets landed in the marker
+      run: |
+        set -euo pipefail
+        if ! grep -q 'debian-base' testrepo/botforge.yaml; then
+          echo "ERROR: inline assets fold failed — 'debian-base' not present in testrepo/botforge.yaml" >&2
+          echo "----- testrepo/botforge.yaml -----" >&2
+          cat testrepo/botforge.yaml >&2
+          exit 1
+        fi
+        # Guard against silent regression to the removed standalone-file model:
+        # there must be NO shasset.yaml in the workspace, and botforge must
+        # resolve assets purely from the inline marker.
+        if [[ -e testrepo/shasset.yaml ]]; then
+          echo "ERROR: testrepo/shasset.yaml exists — botforge must resolve" \
+               "assets inline from the marker, not a standalone file" >&2
+          exit 1
+        fi
+        echo "Inline assets OK: debian-base present in marker; no standalone shasset.yaml"
     - name: Create build config
       uses: envoyproxy/toolshed/actions/jq@6a20085af231aba4c72d6866f94098343a8c5616
       id: build-config
@@ -150,6 +180,13 @@ jobs:
         output-path: testrepo/assert-fail-rootfile.yaml
         input: botforge/test/assert-fail-rootfile.yaml
 
+    - name: Print marker (botforge.yaml with inline assets)
+      uses: envoyproxy/toolshed/actions/jq@6a20085af231aba4c72d6866f94098343a8c5616
+      with:
+        input-format: yaml-path
+        options: -C
+        input: testrepo/botforge.yaml
+        print-output: true
     - name: Print build config
       uses: envoyproxy/toolshed/actions/jq@6a20085af231aba4c72d6866f94098343a8c5616
       with:

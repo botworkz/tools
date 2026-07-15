@@ -20,13 +20,11 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::workspace::{
     discover::discover,
-    discover_context,
+    discover_context, find_marker_path,
     registry::{load_committed_registry, save_registry},
 };
 
 const BUILD_DIR: &str = "build";
-const MARKER_YAML: &str = "botforge.yaml";
-const MARKER_YML: &str = "botforge.yml";
 
 #[derive(Args, Debug)]
 pub(crate) struct SyncArgs {
@@ -258,7 +256,7 @@ fn is_inside_build_dir(context: &Path, path: &Path) -> bool {
 }
 
 /// Returns `true` if `path` is inside a nested workspace (a subdirectory with
-/// its own `botforge.yaml` or `botforge.yml`).
+/// its own botforge marker).
 fn is_nested_workspace(context: &Path, path: &Path) -> bool {
     if let Ok(rel) = path.strip_prefix(context) {
         let mut check = PathBuf::new();
@@ -268,9 +266,7 @@ fn is_nested_workspace(context: &Path, path: &Path) -> bool {
             }
             check.push(component);
             let candidate = context.join(&check);
-            if candidate != *context
-                && (candidate.join(MARKER_YAML).is_file() || candidate.join(MARKER_YML).is_file())
-            {
+            if candidate != *context && find_marker_path(&candidate).is_some() {
                 return true;
             }
         }
@@ -528,8 +524,14 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    const MARKER_YAML: &str = "botforge.yaml";
+
     fn write_marker(dir: &Path, content: &str) {
         fs::write(dir.join(MARKER_YAML), content).unwrap();
+    }
+
+    fn write_named_marker(dir: &Path, name: &str, content: &str) {
+        fs::write(dir.join(name), content).unwrap();
     }
 
     fn write_build_doc(dir: &Path, filename: &str, name: &str) {
@@ -608,6 +610,28 @@ mod tests {
         assert!(
             committed.builds.contains_key("foo"),
             "registry should contain 'foo'"
+        );
+    }
+
+    #[test]
+    fn inward_write_updates_alternate_marker_file() {
+        let root = TempDir::new().unwrap();
+        write_named_marker(root.path(), ".botforge.yaml", "");
+        write_build_doc(root.path(), "foo.yaml", "foo");
+
+        let args = SyncArgs {
+            context: Some(root.path().to_path_buf()),
+            write: true,
+            check: false,
+            out: false,
+            delete: false,
+        };
+        cmd_sync(None, args).unwrap();
+
+        let contents = fs::read_to_string(root.path().join(".botforge.yaml")).unwrap();
+        assert!(
+            contents.contains("foo.yaml"),
+            "alternate marker should be updated"
         );
     }
 

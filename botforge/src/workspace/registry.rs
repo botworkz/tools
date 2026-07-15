@@ -22,7 +22,7 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
-const MARKER_YAML: &str = "botforge.yaml";
+use super::marker_path;
 
 // ─── raw deserialization types ────────────────────────────────────────────────
 
@@ -109,7 +109,7 @@ pub(crate) fn validate_spec_path(spec: &str) -> Result<()> {
 /// Returns a `CommittedRegistry` with absolute spec paths.  If `botforge.yaml`
 /// has no `build:` or `test:` blocks, the respective maps are empty (not an error).
 pub(crate) fn load_committed_registry(context_root: &Path) -> Result<CommittedRegistry> {
-    let marker_path = context_root.join(MARKER_YAML);
+    let marker_path = marker_path(context_root)?;
     let contents = std::fs::read_to_string(&marker_path)
         .with_context(|| format!("cannot read {}", marker_path.display()))?;
 
@@ -159,7 +159,7 @@ pub(crate) fn save_registry(
     builds: &BTreeMap<String, PathBuf>,
     tests: &BTreeMap<String, PathBuf>,
 ) -> Result<()> {
-    let marker_path = context_root.join(MARKER_YAML);
+    let marker_path = marker_path(context_root)?;
 
     // Read the existing file so we can merge (preserving other keys).
     let existing = std::fs::read_to_string(&marker_path)
@@ -236,8 +236,14 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    const MARKER_YAML: &str = "botforge.yaml";
+
     fn write_marker(dir: &Path, content: &str) {
         fs::write(dir.join(MARKER_YAML), content).unwrap();
+    }
+
+    fn write_named_marker(dir: &Path, name: &str, content: &str) {
+        fs::write(dir.join(name), content).unwrap();
     }
 
     // ── validate_spec_path ────────────────────────────────────────────────────
@@ -299,6 +305,18 @@ mod tests {
         assert_eq!(reg.tests.len(), 1);
         assert_eq!(reg.builds["foo"], root.path().join("specs/foo.yaml"));
         assert_eq!(reg.tests["bar"], root.path().join("specs/bar-test.yaml"));
+    }
+
+    #[test]
+    fn load_registry_from_alternate_marker_name() {
+        let root = TempDir::new().unwrap();
+        write_named_marker(
+            root.path(),
+            ".botforge.yml",
+            "build:\n  foo:\n    spec: specs/foo.yaml\n",
+        );
+        let reg = load_committed_registry(root.path()).unwrap();
+        assert_eq!(reg.builds["foo"], root.path().join("specs/foo.yaml"));
     }
 
     #[test]
@@ -375,11 +393,11 @@ mod tests {
     #[test]
     fn save_registry_preserves_config_block() {
         let root = TempDir::new().unwrap();
-        write_marker(root.path(), "config:\n  repo-only: true\n");
+        write_named_marker(root.path(), "BOTFORGE", "config:\n  repo-only: true\n");
 
         save_registry(root.path(), &BTreeMap::new(), &BTreeMap::new()).unwrap();
 
-        let contents = fs::read_to_string(root.path().join(MARKER_YAML)).unwrap();
+        let contents = fs::read_to_string(root.path().join("BOTFORGE")).unwrap();
         assert!(
             contents.contains("repo-only") || contents.contains("repo_only"),
             "config block should be preserved: {contents}"
