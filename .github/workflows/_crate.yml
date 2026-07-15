@@ -193,6 +193,12 @@ jobs:
             sleep 0.1
           done
           curl -fsS "$ASSET_URL" -o /dev/null
+
+          # botforge no longer loads a standalone shasset.yaml (the -c/--config
+          # flag was removed). `deps` resolves assets from the inline `assets:`
+          # block of the workspace marker (botforge.yaml), located via
+          # --context. Write the manifest INLINE into a botforge.yaml marker and
+          # drive deps with `--context .`.
           {
             printf '%s\n' 'settings:'
             printf '%s\n' '  retries: 0'
@@ -202,18 +208,36 @@ jobs:
             printf '%s\n' '    version: "1"'
             printf '%s\n' "    checksum: sha256:${ASSET_SHA}"
             printf '%s\n' '    filename: fixture.bin'
-          } > .ci-deps-smoke/shasset.yaml
+          } > .ci-deps-smoke/botforge.yaml
+
+          # Guard: the removed -c/--config flag must be gone. If botforge still
+          # accepts `-c`, the smoke below would silently keep exercising the old
+          # file-based path — assert the flag is rejected so this can't regress.
+          if docker run --rm \
+            -v "$PWD/.ci-deps-smoke:/work" \
+            -w /work \
+            "botwork/botforge:ci" \
+            -c botforge.yaml deps --context . --out out fixture 2>/dev/null; then
+            echo "ERROR: botforge still accepts the removed -c/--config flag" >&2
+            exit 1
+          fi
 
           docker run --rm \
             --network host \
             -v "$PWD/.ci-deps-smoke:/work" \
             -w /work \
             "botwork/botforge:ci" \
-            -c shasset.yaml deps --out out --executable fixture
+            deps --context . --out out --executable fixture
 
           cmp -s .ci-deps-smoke/fixture.bin .ci-deps-smoke/out/fixture.bin
           test -x .ci-deps-smoke/out/fixture.bin
 
+          # Negative control: a bad checksum in the inline marker MUST fail. To
+          # prove the failure is a genuine checksum mismatch (not, say, a missing
+          # marker or an arg-parse error masquerading as success-by-nonzero-exit),
+          # capture output and assert on the mismatch message.
+          rm -rf .ci-deps-smoke-bad
+          mkdir -p .ci-deps-smoke-bad/out
           {
             printf '%s\n' 'settings:'
             printf '%s\n' '  retries: 0'
@@ -223,17 +247,21 @@ jobs:
             printf '%s\n' '    version: "1"'
             printf '%s\n' '    checksum: sha256:0000000000000000000000000000000000000000000000000000000000000000'
             printf '%s\n' '    filename: fixture.bin'
-          } > .ci-deps-smoke/shasset-bad.yaml
+          } > .ci-deps-smoke-bad/botforge.yaml
 
           if docker run --rm \
             --network host \
-            -v "$PWD/.ci-deps-smoke:/work" \
+            -v "$PWD/.ci-deps-smoke-bad:/work" \
             -w /work \
             "botwork/botforge:ci" \
-            -c shasset-bad.yaml deps --out out fixture; then
-            echo "expected checksum mismatch failure"
+            deps --context . --out out fixture \
+            2>&1 | tee /tmp/deps-bad-smoke.log; then
+            echo "ERROR: expected checksum mismatch failure" >&2
             exit 1
           fi
+          grep -qi "checksum mismatch" /tmp/deps-bad-smoke.log \
+            || { echo "ERROR: deps failed but not on a checksum mismatch — negative control is not biting" >&2; \
+                 cat /tmp/deps-bad-smoke.log >&2; exit 1; }
         fi
 
     - uses: actions/upload-artifact@v4
