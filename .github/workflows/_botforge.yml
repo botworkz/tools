@@ -90,7 +90,9 @@ jobs:
     # solely via --context / the marker walk-up. This merges the `assets:`
     # (and any `settings:`) from botforge/test/shasset.yaml into the existing
     # testrepo/botforge.yaml, preserving whatever the marker already declares
-    # (config:/build:/test: etc).
+    # (config:/build:/test: etc). The base marker fixture is an empty 0-byte
+    # file, which yaml-path parses to null; coalesce BOTH sides so the merge
+    # is well-defined over an empty (or partially-populated) marker.
     - name: Fold shasset assets into the workspace marker (botforge.yaml)
       uses: envoyproxy/toolshed/actions/jq@6a20085af231aba4c72d6866f94098343a8c5616
       with:
@@ -98,7 +100,7 @@ jobs:
         output-path: testrepo/botforge.yaml
         input: botforge/test/botforge.yaml
         filter: |
-          . * (input)
+          (. // {}) * (input // {})
         args: botforge/test/shasset.yaml
     # Assert the fold actually happened: the marker MUST now carry the
     # debian-base asset used as build `image: "@debian-base"`. If assets are
@@ -118,7 +120,8 @@ jobs:
         # there must be NO shasset.yaml in the workspace, and botforge must
         # resolve assets purely from the inline marker.
         if [[ -e testrepo/shasset.yaml ]]; then
-          echo "ERROR: testrepo/shasset.yaml exists — botforge must resolve assets inline from the marker, not a standalone file" >&2
+          echo "ERROR: testrepo/shasset.yaml exists — botforge must resolve" \
+               "assets inline from the marker, not a standalone file" >&2
           exit 1
         fi
         echo "Inline assets OK: debian-base present in marker; no standalone shasset.yaml"
