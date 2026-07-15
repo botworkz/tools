@@ -84,24 +84,19 @@ jobs:
           echo "HOST_GID=$(id -g)"
           echo "HOST_KVM_GID=$(getent group kvm | cut -d: -f3)"
         } >> "$GITHUB_ENV"
-    # Fold the shasset asset manifest INLINE into the workspace marker
+    # Inline the shasset asset manifest INTO the workspace marker
     # (testrepo/botforge.yaml). botforge no longer reads a standalone
     # shasset.yaml — assets live under the marker's `assets:` block, located
-    # solely via --context / the marker walk-up. This merges the `assets:`
-    # (and any `settings:`) from botforge/test/shasset.yaml into the existing
-    # testrepo/botforge.yaml, preserving whatever the marker already declares
-    # (config:/build:/test: etc). The base marker fixture is an empty 0-byte
-    # file, which yaml-path parses to null; coalesce BOTH sides so the merge
-    # is well-defined over an empty (or partially-populated) marker.
-    - name: Fold shasset assets into the workspace marker (botforge.yaml)
+    # solely via --context / the marker walk-up. The base marker fixture
+    # (botforge/test/botforge.yaml) is an empty 0-byte file with nothing to
+    # preserve, so we simply transcode botforge/test/shasset.yaml straight
+    # into testrepo/botforge.yaml.
+    - name: Inline shasset assets into the workspace marker (botforge.yaml)
       uses: envoyproxy/toolshed/actions/jq@6a20085af231aba4c72d6866f94098343a8c5616
       with:
         input-format: yaml-path
         output-path: testrepo/botforge.yaml
-        input: botforge/test/botforge.yaml
-        filter: |
-          (. // {}) * (input // {})
-        args: botforge/test/shasset.yaml
+        input: botforge/test/shasset.yaml
     # Assert the fold actually happened: the marker MUST now carry the
     # debian-base asset used as build `image: "@debian-base"`. If assets are
     # missing here the whole acceptance run would fail later at image
