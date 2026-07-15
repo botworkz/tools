@@ -22,13 +22,13 @@ use crate::util::{
     repo_relative_display, resolve_under_root, unique_suffix,
 };
 
-use crate::plan::compress::{CompressConfig, CompressionType, ReclaimMode};
+use crate::compress::{
+    compress_qcow2_image, read_qcow2_image_stats, read_virtual_sector0, sparsify_zero_clusters,
+};
+use crate::compress::{CompressConfig, CompressionType, ReclaimMode};
 use crate::plan::{
     load_build_config, preserve_failed_build_disk, print_log_tail, run_step_flow,
     shutdown_build_vm, validate_build_steps, vm::StepFlowPlan, vm::StepTimeoutPolicy,
-};
-use crate::qcow2::{
-    compress_qcow2_image, read_qcow2_image_stats, read_virtual_sector0, sparsify_zero_clusters,
 };
 use crate::step::{ArchiveStep, StepTarget, TestStep};
 
@@ -1348,7 +1348,7 @@ mod tests {
         unpack_archive_to_dir,
     };
     use crate::cli::Cli;
-    use crate::plan::compress::ReclaimMode;
+    use crate::compress::ReclaimMode;
     use clap::Parser;
     use std::path::{Path, PathBuf};
     use std::process::Command;
