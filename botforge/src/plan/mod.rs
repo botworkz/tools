@@ -1,4 +1,3 @@
-pub(crate) mod assert;
 pub(crate) mod cloud_init;
 pub(crate) mod config;
 pub(crate) mod files;
