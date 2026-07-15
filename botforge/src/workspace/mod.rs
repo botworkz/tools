@@ -1,3 +1,5 @@
+pub(crate) mod discover;
+
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 
