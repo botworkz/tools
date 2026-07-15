@@ -22,7 +22,7 @@ use crate::util::{
     repo_relative_display, resolve_under_root, unique_suffix,
 };
 
-use crate::plan::config::{CompressConfig, CompressionType, ReclaimMode};
+use crate::plan::compress::{CompressConfig, CompressionType, ReclaimMode};
 use crate::plan::step::{ArchiveStep, StepTarget, TestStep};
 use crate::plan::{
     load_build_config, preserve_failed_build_disk, print_log_tail, run_step_flow,
@@ -1348,7 +1348,7 @@ mod tests {
         unpack_archive_to_dir,
     };
     use crate::cli::Cli;
-    use crate::plan::config::ReclaimMode;
+    use crate::plan::compress::ReclaimMode;
     use clap::Parser;
     use std::path::{Path, PathBuf};
     use std::process::Command;
