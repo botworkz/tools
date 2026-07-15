@@ -1,4 +1,4 @@
-//! Declarative `assert:` phase — run before `steps:` in a `type: test` document
+//! Declarative `assert:` phase — run before `steps:` in a `type: botforge/test` document
 //! (after boot/SSH/cloud-init, on the fresh-boot image state).
 //!
 //! Currently implements the `assert.files:`, `assert.users:`, `assert.groups:`,

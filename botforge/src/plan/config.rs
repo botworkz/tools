@@ -27,24 +27,26 @@ pub(super) const MAX_INCLUDE_DEPTH: usize = 32;
 /// dispatches on it to enforce command-boundary separation and per-kind presence
 /// rules.
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
 enum DocumentType {
     /// An entrypoint document consumed directly by `botforge test`.
+    #[serde(rename = "botforge/test")]
     Test,
     /// An entrypoint document consumed directly by `botforge build`.
+    #[serde(rename = "botforge/build")]
     Build,
     /// A reusable document spliced in via `uses:`.  May not carry
     /// entrypoint-only sections (`ports:`, `isos:`, `diagnostics_units:`,
     /// `disk_size:`, `memsize:`, `smp:`).
+    #[serde(rename = "botforge/fragment")]
     Fragment,
 }
 
 impl DocumentType {
     fn as_str(self) -> &'static str {
         match self {
-            DocumentType::Test => "test",
-            DocumentType::Build => "build",
-            DocumentType::Fragment => "fragment",
+            DocumentType::Test => "botforge/test",
+            DocumentType::Build => "botforge/build",
+            DocumentType::Fragment => "botforge/fragment",
         }
     }
 
@@ -208,7 +210,7 @@ pub(crate) struct AssertService {
     pub(crate) active: Option<bool>,
 }
 
-/// Validated `assert:` block from a `type: test` document.
+/// Validated `assert:` block from a `type: botforge/test` document.
 #[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
 pub(crate) struct AssertBlock {
     /// Map of absolute guest path → file expectation.
@@ -230,6 +232,9 @@ pub(crate) struct AssertBlock {
 
 #[derive(Debug, Deserialize, Default)]
 pub(crate) struct TestConfig {
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub(crate) name: String,
     #[serde(default)]
     pub(crate) image: Option<Reference>,
     #[serde(default)]
@@ -270,6 +275,8 @@ pub(crate) struct TestConfig {
 struct RawTestDocument {
     #[serde(rename = "type")]
     doc_type: DocumentType,
+    #[serde(default)]
+    name: Option<String>,
     #[serde(default)]
     image: Option<String>,
     #[serde(default)]
@@ -424,6 +431,8 @@ pub(crate) struct CompressConfig {
 /// Resolved configuration for a `botforge build` run.
 #[derive(Debug)]
 pub(crate) struct BuildConfig {
+    #[allow(dead_code)]
+    pub(crate) name: String,
     /// Parsed `image:` reference naming the source qcow2 to boot from.
     pub(crate) image: Reference,
     /// Declared artifact filename (no directories). The output directory is derived from
@@ -449,6 +458,8 @@ pub(crate) struct BuildConfig {
 struct RawBuildDocument {
     #[serde(rename = "type")]
     doc_type: DocumentType,
+    #[serde(default)]
+    name: Option<String>,
     /// Raw `image:` reference (e.g. `@debian-base`). Required.
     #[serde(rename = "image", default)]
     image: Option<String>,
@@ -486,7 +497,7 @@ struct RawTestStepFragment {
     steps: Vec<RawTestStep>,
     #[serde(default, alias = "files")]
     files: Vec<FileEntry>,
-    /// Optional cloud-config fragment contributed by this `type: fragment` document.
+    /// Optional cloud-config fragment contributed by this `type: botforge/fragment` document.
     /// Deep-merged with the parent's cloud_init under the same precedence rules.
     #[serde(default)]
     cloud_init: Option<serde_yaml::Mapping>,
@@ -565,10 +576,11 @@ pub(crate) fn load_test_config(repo_root: &Path, path: &Path) -> Result<TestConf
         .with_context(|| format!("invalid test config: {}", path.display()))?;
     if !raw.doc_type.is_test_entrypoint() {
         anyhow::bail!(
-            "botforge test requires a 'type: test' document, got 'type: {}'",
+            "botforge test requires a 'type: botforge/test' document, got 'type: {}'",
             raw.doc_type.as_str()
         );
     }
+    let name = validate_entrypoint_name(raw.name, path, DocumentType::Test)?;
     let root_cloud_init = raw.cloud_init.clone();
     // Seed the stack with the root document so that a fragment including the root
     // is caught by the cycle check (A → B → A).
@@ -576,10 +588,11 @@ pub(crate) fn load_test_config(repo_root: &Path, path: &Path) -> Result<TestConf
     let mut cloud_init_acc = raw.cloud_init;
     let mut files_acc = Vec::new();
     let config = TestConfig {
+        name,
         image: match raw.image {
             None => None,
             Some(s) if s.trim().is_empty() => anyhow::bail!(
-                "'image' in a 'type: test' document ({}) must not be blank",
+                "'image' in a 'type: botforge/test' document ({}) must not be blank",
                 path.display()
             ),
             Some(s) => Some(parse_config_image(&s).with_context(|| {
@@ -638,18 +651,19 @@ pub(crate) fn load_build_config(repo_root: &Path, path: &Path) -> Result<BuildCo
         .with_context(|| format!("invalid build config: {}", path.display()))?;
     if !raw.doc_type.is_build_entrypoint() {
         anyhow::bail!(
-            "botforge build requires a 'type: build' document, got 'type: {}'",
+            "botforge build requires a 'type: botforge/build' document, got 'type: {}'",
             raw.doc_type.as_str()
         );
     }
+    let name = validate_entrypoint_name(raw.name, path, DocumentType::Build)?;
     let image = match raw.image {
         None => anyhow::bail!(
-            "'image' is required in a 'type: build' document ({}): \
+            "'image' is required in a 'type: botforge/build' document ({}): \
              set it to an `@…` reference, e.g. `image: \"@debian-base\"`",
             path.display()
         ),
         Some(s) if s.trim().is_empty() => anyhow::bail!(
-            "'image' is required in a 'type: build' document ({}): \
+            "'image' is required in a 'type: botforge/build' document ({}): \
              set it to an `@…` reference, e.g. `image: \"@debian-base\"`",
             path.display()
         ),
@@ -659,12 +673,12 @@ pub(crate) fn load_build_config(repo_root: &Path, path: &Path) -> Result<BuildCo
     };
     let output = match raw.output {
         None => anyhow::bail!(
-            "'output' is required in a 'type: build' document ({}): \
+            "'output' is required in a 'type: botforge/build' document ({}): \
              set it to a bare artifact filename, e.g. `output: \"image.qcow2\"`",
             path.display()
         ),
         Some(s) if s.trim().is_empty() => anyhow::bail!(
-            "'output' is required in a 'type: build' document ({}): \
+            "'output' is required in a 'type: botforge/build' document ({}): \
              set it to a bare artifact filename, e.g. `output: \"image.qcow2\"`",
             path.display()
         ),
@@ -675,6 +689,7 @@ pub(crate) fn load_build_config(repo_root: &Path, path: &Path) -> Result<BuildCo
     let mut cloud_init_acc = raw.cloud_init;
     let mut files_acc = Vec::new();
     let config = BuildConfig {
+        name,
         image,
         output,
         disk_size: raw.disk_size,
@@ -708,6 +723,38 @@ pub(crate) fn load_build_config(repo_root: &Path, path: &Path) -> Result<BuildCo
         files: &config.files,
     })?;
     Ok(config)
+}
+
+fn validate_entrypoint_name(
+    raw_name: Option<String>,
+    path: &Path,
+    doc_type: DocumentType,
+) -> Result<String> {
+    let name = match raw_name {
+        None => anyhow::bail!(
+            "'name' is required in a 'type: {}' document ({})",
+            doc_type.as_str(),
+            path.display()
+        ),
+        Some(name) => name,
+    };
+    if name.trim().is_empty() {
+        anyhow::bail!(
+            "'name' is required in a 'type: {}' document ({})",
+            doc_type.as_str(),
+            path.display()
+        );
+    }
+    if !name.is_ascii() || name.chars().any(|c| c.is_ascii_control()) {
+        anyhow::bail!(
+            "'name' in a 'type: {}' document ({}) must be printable ASCII",
+            doc_type.as_str(),
+            path.display()
+        );
+    }
+    // NOTE: uniqueness is intentionally deferred; it will be enforced per-type
+    // during the later discovery/registry work.
+    Ok(name)
 }
 
 fn validate_build_output_filename(output: &str) -> Result<&str> {
@@ -979,7 +1026,7 @@ fn load_test_steps_fragment(
         ))
         .with_context(|| format!("invalid test step include: {}", path.display()));
     }
-    // Enforce `type: fragment` — entrypoint documents must not be used as fragments.
+    // Enforce `type: botforge/fragment` — entrypoint documents must not be used as fragments.
     check_fragment_document_type(uses, &value)?;
     // Entrypoint-only sections are not valid in fragment documents.
     check_no_entrypoint_sections_in_fragment(path, &value)?;
@@ -997,9 +1044,10 @@ fn load_test_steps_fragment(
     Ok((fragment.steps, fragment.cloud_init, fragment.files))
 }
 
-/// Verify that a `uses:` target is a `type: fragment` document.
+/// Verify that a `uses:` target is a `type: botforge/fragment` document.
 ///
-/// A missing `type:` field or a non-fragment kind (e.g. `type: test`) is a hard
+/// A missing `type:` field or a non-fragment kind (e.g. `type: botforge/test`)
+/// is a hard
 /// load-time error.  The `uses` string (the original `@://...` value) is used in
 /// the error message so the caller can pinpoint the offending include.
 fn check_fragment_document_type(uses: &str, value: &Value) -> Result<()> {
@@ -1030,7 +1078,7 @@ fn check_fragment_document_type(uses: &str, value: &Value) -> Result<()> {
 
 /// Reject entrypoint-only sections (`ports:`, `isos:`, `diagnostics_units:`,
 /// `disk_size:`, `memsize:`, `smp:`, `step_timeout:`, `timeout:`, `image:`,
-/// `output:`, `compress:`) inside a `type: fragment` document.
+/// `output:`, `compress:`, `name:`) inside a `type: botforge/fragment` document.
 /// Serde would silently ignore them; this turns a misplaced key into an explicit
 /// load-time error.
 fn check_no_entrypoint_sections_in_fragment(path: &Path, value: &Value) -> Result<()> {
@@ -1050,10 +1098,11 @@ fn check_no_entrypoint_sections_in_fragment(path: &Path, value: &Value) -> Resul
         "image",
         "output",
         "compress",
+        "name",
     ] {
         if mapping.contains_key(Value::String(section.to_string())) {
             anyhow::bail!(
-                "{}: is not valid in a 'type: fragment' document ({})",
+                "{}: is not valid in a 'type: botforge/fragment' document ({})",
                 section,
                 path.display()
             );
@@ -1064,7 +1113,7 @@ fn check_no_entrypoint_sections_in_fragment(path: &Path, value: &Value) -> Resul
 
 /// Reject build-only sections (`disk_size:`, `memsize:`, `smp:`,
 /// `output:`, `compress:`) inside a
-/// `type: test` document.  Serde would silently ignore them; this turns a
+/// `type: botforge/test` document.  Serde would silently ignore them; this turns a
 /// misplaced key into an explicit load-time error.
 fn check_no_build_sections_in_test_doc(path: &Path, value: &Value) -> Result<()> {
     let mapping = match value {
@@ -1074,7 +1123,7 @@ fn check_no_build_sections_in_test_doc(path: &Path, value: &Value) -> Result<()>
     for section in &["disk_size", "memsize", "smp", "output", "compress"] {
         if mapping.contains_key(Value::String(section.to_string())) {
             anyhow::bail!(
-                "{}: is not valid in a 'type: test' document ({})",
+                "{}: is not valid in a 'type: botforge/test' document ({})",
                 section,
                 path.display()
             );
@@ -1084,7 +1133,8 @@ fn check_no_build_sections_in_test_doc(path: &Path, value: &Value) -> Result<()>
 }
 
 /// Reject test-entrypoint-only sections (`ports:`, `isos:`, `diagnostics_units:`)
-/// and runner-resource keys (`memsize:`, `smp:`) inside a `type: build` document.
+/// and runner-resource keys (`memsize:`, `smp:`) inside a
+/// `type: botforge/build` document.
 /// Serde would silently ignore them; this turns a misplaced key into an explicit
 /// load-time error.
 fn check_no_test_entrypoint_sections_in_build_doc(path: &Path, value: &Value) -> Result<()> {
@@ -1095,7 +1145,7 @@ fn check_no_test_entrypoint_sections_in_build_doc(path: &Path, value: &Value) ->
     for section in &["ports", "isos", "diagnostics_units", "memsize", "smp"] {
         if mapping.contains_key(Value::String(section.to_string())) {
             anyhow::bail!(
-                "{}: is not valid in a 'type: build' document ({})",
+                "{}: is not valid in a 'type: botforge/build' document ({})",
                 section,
                 path.display()
             );
@@ -1844,7 +1894,7 @@ pub(crate) fn validate_test_steps(steps: &[TestStep], ports: &[PortSpec]) -> Res
             }
             TestStep::Archive(step) => {
                 anyhow::bail!(
-                    "test step '{}': `archive` steps are only supported in `type: build` documents",
+                    "test step '{}': `archive` steps are only supported in `type: botforge/build` documents",
                     step.archive
                         .name
                         .as_deref()
@@ -2373,7 +2423,7 @@ steps:
         std::fs::write(
             repo.path().join("shared/narrative.yaml"),
             r#"
-type: fragment
+type: botforge/fragment
 inputs:
   target:
     type: string
@@ -2394,7 +2444,8 @@ steps:
         std::fs::write(
             repo.path().join("test.yaml"),
             r#"
-type: test
+type: botforge/test
+name: test
 steps:
   - uses: "@://shared/narrative.yaml"
     with:
@@ -2419,7 +2470,7 @@ steps:
         std::fs::write(
             repo.path().join("frag.yaml"),
             r#"
-type: fragment
+type: botforge/fragment
 steps:
   - on: guest
     name: frag-root-step
@@ -2431,7 +2482,8 @@ steps:
         std::fs::write(
             repo.path().join("test.yaml"),
             r#"
-type: test
+type: botforge/test
+name: test
 steps:
   - uses: "@://frag.yaml"
 "#,
@@ -2451,7 +2503,8 @@ steps:
         std::fs::write(
             repo.path().join("test.yaml"),
             r#"
-type: test
+type: botforge/test
+name: test
 steps:
   - name: "check-${{ args.0 }}"
     for: [auth-broker, api]
@@ -2474,7 +2527,8 @@ steps:
         std::fs::write(
             repo.path().join("test.yaml"),
             r#"
-type: test
+type: botforge/test
+name: test
 steps:
   - name: "check-${{ args.0 }}"
     for:
@@ -2499,7 +2553,8 @@ steps:
         std::fs::write(
             repo.path().join("test.yaml"),
             r#"
-type: test
+type: botforge/test
+name: test
 steps:
   - name: "check-${{ args.label }}"
     for:
@@ -2524,7 +2579,8 @@ steps:
         std::fs::write(
             repo.path().join("test.yaml"),
             r#"
-type: test
+type: botforge/test
+name: test
 steps:
   - name: check-${{ args.0 }}
     for: [alpha, beta]
@@ -2569,7 +2625,7 @@ steps:
         std::fs::write(
             repo.path().join("frag.yaml"),
             r#"
-type: fragment
+type: botforge/fragment
 steps:
   - on: guest
     name: frag-step
@@ -2580,7 +2636,8 @@ steps:
         std::fs::write(
             repo.path().join("test.yaml"),
             r#"
-type: test
+type: botforge/test
+name: test
 steps:
   - name: check-${{ args.0 }}
     for: [one, two]
@@ -2603,7 +2660,7 @@ steps:
         std::fs::write(
             repo.path().join("frag.yaml"),
             r#"
-type: fragment
+type: botforge/fragment
 steps:
   - name: "frag-${{ args.0 }}"
     for: [alpha, beta]
@@ -2613,7 +2670,7 @@ steps:
         .unwrap();
         std::fs::write(
             repo.path().join("test.yaml"),
-            "type: test\nsteps:\n  - uses: \"@://frag.yaml\"\n",
+            "type: botforge/test\nname: test\nsteps:\n  - uses: \"@://frag.yaml\"\n",
         )
         .unwrap();
 
@@ -2632,7 +2689,7 @@ steps:
         std::fs::write(
             repo.path().join("frag.yaml"),
             r#"
-type: fragment
+type: botforge/fragment
 steps:
   - name: "pair-${{ args.0 }}"
     for:
@@ -2644,7 +2701,7 @@ steps:
         .unwrap();
         std::fs::write(
             repo.path().join("test.yaml"),
-            "type: test\nsteps:\n  - uses: \"@://frag.yaml\"\n",
+            "type: botforge/test\nname: test\nsteps:\n  - uses: \"@://frag.yaml\"\n",
         )
         .unwrap();
 
@@ -2663,7 +2720,7 @@ steps:
         std::fs::write(
             repo.path().join("frag.yaml"),
             r#"
-type: fragment
+type: botforge/fragment
 steps:
   - name: "svc-${{ args.name }}"
     for:
@@ -2675,7 +2732,7 @@ steps:
         .unwrap();
         std::fs::write(
             repo.path().join("test.yaml"),
-            "type: test\nsteps:\n  - uses: \"@://frag.yaml\"\n",
+            "type: botforge/test\nname: test\nsteps:\n  - uses: \"@://frag.yaml\"\n",
         )
         .unwrap();
 
@@ -2694,7 +2751,7 @@ steps:
         std::fs::write(
             repo.path().join("frag.yaml"),
             r#"
-type: fragment
+type: botforge/fragment
 inputs:
   svc:
     type: string
@@ -2709,7 +2766,8 @@ steps:
         std::fs::write(
             repo.path().join("test.yaml"),
             r#"
-type: test
+type: botforge/test
+name: test
 steps:
   - uses: "@://frag.yaml"
     with:
@@ -2733,7 +2791,7 @@ steps:
         std::fs::write(
             repo.path().join("frag.yaml"),
             r#"
-type: fragment
+type: botforge/fragment
 inputs:
   svc:
     type: string
@@ -2747,7 +2805,8 @@ steps:
         std::fs::write(
             repo.path().join("test.yaml"),
             r#"
-type: test
+type: botforge/test
+name: test
 steps:
   - uses: "@://frag.yaml"
     with:
@@ -2766,7 +2825,7 @@ steps:
         std::fs::write(
             repo.path().join("frag.yaml"),
             r#"
-type: fragment
+type: botforge/fragment
 steps:
   - name: broken
     run: echo ${{ bogus.x }}
@@ -2775,7 +2834,7 @@ steps:
         .unwrap();
         std::fs::write(
             repo.path().join("test.yaml"),
-            "type: test\nsteps:\n  - uses: \"@://frag.yaml\"\n",
+            "type: botforge/test\nname: test\nsteps:\n  - uses: \"@://frag.yaml\"\n",
         )
         .unwrap();
 
@@ -2791,7 +2850,7 @@ steps:
         std::fs::write(
             repo.path().join("frag.yaml"),
             r#"
-type: fragment
+type: botforge/fragment
 steps:
   - name: "check-${{ args.0 }}"
     for: [alpha, beta]
@@ -2805,7 +2864,7 @@ steps:
         .unwrap();
         std::fs::write(
             repo.path().join("test.yaml"),
-            "type: test\nsteps:\n  - uses: \"@://frag.yaml\"\n",
+            "type: botforge/test\nname: test\nsteps:\n  - uses: \"@://frag.yaml\"\n",
         )
         .unwrap();
 
@@ -2842,7 +2901,8 @@ steps:
         std::fs::write(
             repo.path().join("test.yaml"),
             r#"
-type: test
+type: botforge/test
+name: test
 steps:
   - uses: "file://shared/narrative.yaml"
 "#,
@@ -2860,7 +2920,7 @@ steps:
         std::fs::write(
             repo.path().join("shared/narrative.yaml"),
             r#"
-type: fragment
+type: botforge/fragment
 inputs:
   target:
     type: string
@@ -2875,7 +2935,8 @@ steps:
         std::fs::write(
             repo.path().join("test.yaml"),
             r#"
-type: test
+type: botforge/test
+name: test
 steps:
   - uses: "@://shared/narrative.yaml"
 "#,
@@ -2902,7 +2963,8 @@ steps:
         std::fs::write(
             repo.path().join("test.yaml"),
             r#"
-type: test
+type: botforge/test
+name: test
 steps:
   - uses: "@://shared/narrative.yaml"
 "#,
@@ -2922,7 +2984,8 @@ steps:
         std::fs::write(
             repo.path().join("test.yaml"),
             r#"
-type: test
+type: botforge/test
+name: test
 steps:
   - uses: "@://shared/../narrative.yaml"
 "#,
@@ -3116,7 +3179,7 @@ steps:
         std::fs::write(
             repo.path().join("shared/frag.yaml"),
             r#"
-type: fragment
+type: botforge/fragment
 steps:
   - on: guest
     name: frag-step
@@ -3128,7 +3191,8 @@ steps:
         std::fs::write(
             repo.path().join("test.yaml"),
             r#"
-type: test
+type: botforge/test
+name: test
 steps:
   - uses: "@://shared/frag.yaml"
 "#,
@@ -3339,7 +3403,7 @@ steps:
         std::fs::write(
             repo.path().join("shared/frag.yaml"),
             r#"
-type: fragment
+type: botforge/fragment
 inputs:
   msg:
     type: string
@@ -3354,7 +3418,8 @@ steps:
         std::fs::write(
             repo.path().join("test.yaml"),
             r#"
-type: test
+type: botforge/test
+name: test
 steps:
   - uses: "@://shared/frag.yaml"
     with:
@@ -3375,7 +3440,7 @@ steps:
         std::fs::write(
             repo.path().join("shared/frag.yaml"),
             r#"
-type: fragment
+type: botforge/fragment
 inputs:
   msg:
     type: string
@@ -3390,7 +3455,8 @@ steps:
         std::fs::write(
             repo.path().join("test.yaml"),
             r#"
-type: test
+type: botforge/test
+name: test
 steps:
   - uses: "@://shared/frag.yaml"
     inputs:
@@ -3413,7 +3479,7 @@ steps:
         std::fs::write(
             repo.path().join("shared/frag.yaml"),
             r#"
-type: fragment
+type: botforge/fragment
 inputs:
   shell:
     type: string
@@ -3429,7 +3495,8 @@ steps:
         std::fs::write(
             repo.path().join("test.yaml"),
             r#"
-type: test
+type: botforge/test
+name: test
 steps:
   - uses: "@://shared/frag.yaml"
 "#,
@@ -3447,7 +3514,7 @@ steps:
         std::fs::write(
             repo.path().join("shared/frag.yaml"),
             r#"
-type: fragment
+type: botforge/fragment
 steps:
   - on: guest
     name: step
@@ -3458,7 +3525,8 @@ steps:
         std::fs::write(
             repo.path().join("test.yaml"),
             r#"
-type: test
+type: botforge/test
+name: test
 steps:
   - uses: "@://shared/frag.yaml"
     with:
@@ -3516,7 +3584,7 @@ steps: []
         std::fs::write(
             repo.path().join("test.yaml"),
             r#"
-type: fragment
+type: botforge/fragment
 steps: []
 "#,
         )
@@ -3524,7 +3592,7 @@ steps: []
         let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("botforge test requires a 'type: test' document")
+            msg.contains("botforge test requires a 'type: botforge/test' document")
                 && msg.contains("fragment"),
             "unexpected error: {msg}"
         );
@@ -3548,7 +3616,8 @@ steps:
         std::fs::write(
             repo.path().join("test.yaml"),
             r#"
-type: test
+type: botforge/test
+name: test
 steps:
   - uses: "@://frag.yaml"
 "#,
@@ -3568,7 +3637,8 @@ steps:
         std::fs::write(
             repo.path().join("frag.yaml"),
             r#"
-type: test
+type: botforge/test
+name: test
 steps:
   - on: guest
     name: step
@@ -3579,7 +3649,8 @@ steps:
         std::fs::write(
             repo.path().join("test.yaml"),
             r#"
-type: test
+type: botforge/test
+name: test
 steps:
   - uses: "@://frag.yaml"
 "#,
@@ -3601,7 +3672,7 @@ steps:
         std::fs::write(
             repo.path().join("frag.yaml"),
             r#"
-type: fragment
+type: botforge/fragment
 ports:
   - 80
 steps:
@@ -3614,7 +3685,8 @@ steps:
         std::fs::write(
             repo.path().join("test.yaml"),
             r#"
-type: test
+type: botforge/test
+name: test
 steps:
   - uses: "@://frag.yaml"
 "#,
@@ -3634,7 +3706,7 @@ steps:
         std::fs::write(
             repo.path().join("frag.yaml"),
             r#"
-type: fragment
+type: botforge/fragment
 isos:
   - some/payload.iso
 steps:
@@ -3647,7 +3719,8 @@ steps:
         std::fs::write(
             repo.path().join("test.yaml"),
             r#"
-type: test
+type: botforge/test
+name: test
 steps:
   - uses: "@://frag.yaml"
 "#,
@@ -3667,7 +3740,7 @@ steps:
         std::fs::write(
             repo.path().join("frag.yaml"),
             r#"
-type: fragment
+type: botforge/fragment
 diagnostics_units:
   - some-service.service
 steps:
@@ -3680,7 +3753,8 @@ steps:
         std::fs::write(
             repo.path().join("test.yaml"),
             r#"
-type: test
+type: botforge/test
+name: test
 steps:
   - uses: "@://frag.yaml"
 "#,
@@ -3700,7 +3774,8 @@ steps:
         std::fs::write(
             repo.path().join("test.yaml"),
             r#"
-type: test
+type: botforge/test
+name: test
 isos:
   - some/payload.iso
 ports:
@@ -3730,7 +3805,7 @@ steps:
         std::fs::write(
             repo.path().join("frag_a.yaml"),
             r#"
-type: fragment
+type: botforge/fragment
 steps:
   - uses: "@://frag_b.yaml"
 "#,
@@ -3739,7 +3814,7 @@ steps:
         std::fs::write(
             repo.path().join("frag_b.yaml"),
             r#"
-type: fragment
+type: botforge/fragment
 steps:
   - uses: "@://frag_a.yaml"
 "#,
@@ -3748,7 +3823,8 @@ steps:
         std::fs::write(
             repo.path().join("test.yaml"),
             r#"
-type: test
+type: botforge/test
+name: test
 steps:
   - uses: "@://frag_a.yaml"
 "#,
@@ -3769,7 +3845,8 @@ steps:
         std::fs::write(
             repo.path().join("test.yaml"),
             r#"
-type: test
+type: botforge/test
+name: test
 steps:
   - uses: "@://test.yaml"
 "#,
@@ -3777,7 +3854,7 @@ steps:
         .unwrap();
         let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
         let msg = format!("{err:#}");
-        // The root is a type: test document, so the fragment type check fires first.
+        // The root is a type: botforge/test document, so the fragment type check fires first.
         // Either "cyclic" or "not a consumable fragment" is an acceptable error here —
         // both prevent the self-include.
         assert!(
@@ -3793,7 +3870,7 @@ steps:
         std::fs::write(
             repo.path().join("frag.yaml"),
             r#"
-type: fragment
+type: botforge/fragment
 steps:
   - on: guest
     name: reused-step
@@ -3804,7 +3881,8 @@ steps:
         std::fs::write(
             repo.path().join("test.yaml"),
             r#"
-type: test
+type: botforge/test
+name: test
 steps:
   - uses: "@://frag.yaml"
   - uses: "@://frag.yaml"
@@ -3837,7 +3915,7 @@ steps:
             let next = format!("frag{:02}.yaml", i + 1);
             std::fs::write(
                 repo.path().join(&name),
-                format!("type: fragment\nsteps:\n  - uses: \"@://{next}\"\n"),
+                format!("type: botforge/fragment\nsteps:\n  - uses: \"@://{next}\"\n"),
             )
             .unwrap();
         }
@@ -3845,12 +3923,12 @@ steps:
         // before loading it.  Write it anyway as a leaf so the test is self-contained.
         std::fs::write(
             repo.path().join(format!("frag{:02}.yaml", depth - 1)),
-            "type: fragment\nsteps: []\n",
+            "type: botforge/fragment\nsteps: []\n",
         )
         .unwrap();
         std::fs::write(
             repo.path().join("test.yaml"),
-            "type: test\nsteps:\n  - uses: \"@://frag00.yaml\"\n",
+            "type: botforge/test\nname: test\nsteps:\n  - uses: \"@://frag00.yaml\"\n",
         )
         .unwrap();
         let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
@@ -3878,7 +3956,8 @@ steps:
             &repo,
             "build.yaml",
             r#"
-type: build
+type: botforge/build
+name: build
 image: "@debian-base"
 output: "built.qcow2"
 steps:
@@ -3911,7 +3990,8 @@ steps:
             &repo,
             "build.yaml",
             r#"
-type: build
+type: botforge/build
+name: build
 image: "@my-base"
 output: "out.qcow2"
 disk_size: "20G"
@@ -3944,7 +4024,7 @@ steps: []
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nimage: >-\n  @://build/artifact/foo.qcow2\noutput: \"out.qcow2\"\nsteps: []\n",
+            "type: botforge/build\nname: build\nimage: >-\n  @://build/artifact/foo.qcow2\noutput: \"out.qcow2\"\nsteps: []\n",
         );
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
         assert_eq!(
@@ -3961,7 +4041,7 @@ steps: []
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nimage: \"@artifact://foo.qcow2\"\noutput: \"out.qcow2\"\nsteps: []\n",
+            "type: botforge/build\nname: build\nimage: \"@artifact://foo.qcow2\"\noutput: \"out.qcow2\"\nsteps: []\n",
         );
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
         assert_eq!(
@@ -3978,12 +4058,12 @@ steps: []
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nimage: \"@base\"\nmemsize: 8192\nsteps: []\n",
+            "type: botforge/build\nname: build\nimage: \"@base\"\nmemsize: 8192\nsteps: []\n",
         );
         let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("memsize") && msg.contains("type: build"),
+            msg.contains("memsize") && msg.contains("type: botforge/build"),
             "error should mention memsize and document type: {msg}"
         );
     }
@@ -3994,12 +4074,12 @@ steps: []
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nimage: \"@base\"\nsmp: 8\nsteps: []\n",
+            "type: botforge/build\nname: build\nimage: \"@base\"\nsmp: 8\nsteps: []\n",
         );
         let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("smp") && msg.contains("type: build"),
+            msg.contains("smp") && msg.contains("type: botforge/build"),
             "error should mention smp and document type: {msg}"
         );
     }
@@ -4010,7 +4090,7 @@ steps: []
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\n",
+            "type: botforge/build\nname: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\n",
         );
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
         assert!(config.files.is_empty(), "files should default to empty");
@@ -4023,7 +4103,8 @@ steps: []
             &repo,
             "build.yaml",
             r#"
-type: build
+type: botforge/build
+name: build
 image: "@base"
 output: "out.qcow2"
 files:
@@ -4059,7 +4140,8 @@ steps: []
             &repo,
             "build.yaml",
             r#"
-type: build
+type: botforge/build
+name: build
 image: "@base"
 output: "out.qcow2"
 files:
@@ -4083,7 +4165,8 @@ steps: []
             &repo,
             "build.yaml",
             r#"
-type: build
+type: botforge/build
+name: build
 image: "@base"
 output: "out.qcow2"
 files:
@@ -4107,7 +4190,8 @@ steps: []
             &repo,
             "build.yaml",
             r#"
-type: build
+type: botforge/build
+name: build
 image: "@base"
 output: "out.qcow2"
 files:
@@ -4131,7 +4215,8 @@ steps: []
             &repo,
             "build.yaml",
             r#"
-type: build
+type: botforge/build
+name: build
 image: "@base"
 output: "out.qcow2"
 files:
@@ -4155,7 +4240,8 @@ steps: []
             &repo,
             "build.yaml",
             r#"
-type: build
+type: botforge/build
+name: build
 image: "@base"
 output: "out.qcow2"
 files:
@@ -4177,7 +4263,8 @@ steps: []
             &repo,
             "build.yaml",
             r#"
-type: build
+type: botforge/build
+name: build
 image: "@base"
 output: "out.qcow2"
 files:
@@ -4208,7 +4295,8 @@ steps: []
             &repo,
             "build.yaml",
             r#"
-type: build
+type: botforge/build
+name: build
 image: "@base"
 output: "out.qcow2"
 files:
@@ -4233,7 +4321,8 @@ steps: []
             &repo,
             "build.yaml",
             r#"
-type: build
+type: botforge/build
+name: build
 image: "@base"
 output: "out.qcow2"
 files:
@@ -4258,7 +4347,8 @@ steps: []
             &repo,
             "build.yaml",
             r#"
-type: build
+type: botforge/build
+name: build
 image: "@base"
 output: "out.qcow2"
 files:
@@ -4283,7 +4373,7 @@ steps: []
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\n",
+            "type: botforge/build\nname: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\n",
         );
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
         assert!(
@@ -4299,7 +4389,8 @@ steps: []
             &repo,
             "build.yaml",
             r#"
-type: build
+type: botforge/build
+name: build
 image: "@base"
 output: "out.qcow2"
 steps: []
@@ -4327,7 +4418,8 @@ cloud_init:
             &repo,
             "build.yaml",
             r#"
-type: build
+type: botforge/build
+name: build
 image: "@base"
 output: "out.qcow2"
 steps: []
@@ -4358,7 +4450,8 @@ cloud_init:
             &repo,
             "build.yaml",
             r#"
-type: build
+type: botforge/build
+name: build
 image: "@base"
 output: "out.qcow2"
 steps: []
@@ -4386,7 +4479,8 @@ bootcmd:
             &repo,
             "test.yaml",
             r#"
-type: test
+type: botforge/test
+name: test
 steps: []
 bootcmd:
   - echo hello
@@ -4407,7 +4501,8 @@ bootcmd:
             &repo,
             "build.yaml",
             r#"
-type: build
+type: botforge/build
+name: build
 image: "@base"
 output: "out.qcow2"
 steps: []
@@ -4431,13 +4526,14 @@ cloud_init:
 
     #[test]
     fn test_load_test_config_cloud_init_mounts_accepted() {
-        // type: test also accepts cloud_init: (motivating tmpfs-on-test example).
+        // type: botforge/test also accepts cloud_init: (motivating tmpfs-on-test example).
         let repo = TempDir::new().unwrap();
         write_test_config(
             &repo,
             "test.yaml",
             r#"
-type: test
+type: botforge/test
+name: test
 steps: []
 cloud_init:
   mounts:
@@ -4462,7 +4558,8 @@ cloud_init:
             &repo,
             "build.yaml",
             r#"
-type: build
+type: botforge/build
+name: build
 image: "@base"
 output: "out.qcow2"
 steps: []
@@ -4492,7 +4589,8 @@ cloud_init:
             &repo,
             "build.yaml",
             r#"
-type: build
+type: botforge/build
+name: build
 image: "@base"
 output: "out.qcow2"
 steps: []
@@ -4514,7 +4612,8 @@ cloud_init:
             &repo,
             "build.yaml",
             r#"
-type: build
+type: botforge/build
+name: build
 image: "@base"
 output: "out.qcow2"
 steps: []
@@ -4537,7 +4636,8 @@ cloud_init:
             &repo,
             "build.yaml",
             r#"
-type: build
+type: botforge/build
+name: build
 image: "@base"
 output: "out.qcow2"
 steps: []
@@ -4568,7 +4668,8 @@ cloud_init:
             &repo,
             "build.yaml",
             r#"
-type: build
+type: botforge/build
+name: build
 image: "@base"
 output: "out.qcow2"
 steps: []
@@ -4602,7 +4703,8 @@ cloud_init:
             &repo,
             "test.yaml",
             r#"
-type: test
+type: botforge/test
+name: test
 steps: []
 cloud_init:
   user: typo
@@ -4632,7 +4734,8 @@ cloud_init:
                 &repo,
                 "test.yaml",
                 r#"
-type: test
+type: botforge/test
+name: test
 steps: []
 cloud_init:
   users:
@@ -4664,7 +4767,8 @@ cloud_init:
             &repo,
             "build.yaml",
             r#"
-type: build
+type: botforge/build
+name: build
 image: "@base"
 output: "out.qcow2"
 steps: []
@@ -4691,7 +4795,8 @@ cloud_init:
             &repo,
             "build.yaml",
             r#"
-type: build
+type: botforge/build
+name: build
 image: "@base"
 output: "out.qcow2"
 steps: []
@@ -4715,7 +4820,8 @@ files:
             &repo,
             "test.yaml",
             r#"
-type: test
+type: botforge/test
+name: test
 steps:
   - on: host
     name: host-step
@@ -4740,7 +4846,7 @@ steps:
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\n",
+            "type: botforge/build\nname: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\n",
         );
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
         assert!(
@@ -4755,7 +4861,7 @@ steps:
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\ncompress:\n  enabled: true\n",
+            "type: botforge/build\nname: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\ncompress:\n  enabled: true\n",
         );
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
         let compress = config.compress.expect("compress should be Some");
@@ -4786,7 +4892,7 @@ steps:
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\ncompress:\n  enabled: true\n  compressor_args:\n    cluster_size: \"1M\"\n",
+            "type: botforge/build\nname: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\ncompress:\n  enabled: true\n  compressor_args:\n    cluster_size: \"1M\"\n",
         );
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
         let compress = config.compress.expect("compress should be Some");
@@ -4808,7 +4914,7 @@ steps:
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\ncompress:\n  enabled: true\n  compressor: zstd\n",
+            "type: botforge/build\nname: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\ncompress:\n  enabled: true\n  compressor: zstd\n",
         );
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
         let compress = config.compress.expect("compress should be Some");
@@ -4822,7 +4928,7 @@ steps:
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\ncompress:\n  enabled: true\n  compressor: zlib\n",
+            "type: botforge/build\nname: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\ncompress:\n  enabled: true\n  compressor: zlib\n",
         );
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
         let compress = config.compress.expect("compress should be Some");
@@ -4836,7 +4942,7 @@ steps:
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\ncompress:\n  enabled: true\n  compressor_args:\n    cluster_size: \"1M\"\n",
+            "type: botforge/build\nname: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\ncompress:\n  enabled: true\n  compressor_args:\n    cluster_size: \"1M\"\n",
         );
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
         let compress = config.compress.expect("compress should be Some");
@@ -4856,7 +4962,7 @@ steps:
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\ncompress:\n  enabled: true\n  compressor_opts: \"-19 -T0\"\n",
+            "type: botforge/build\nname: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\ncompress:\n  enabled: true\n  compressor_opts: \"-19 -T0\"\n",
         );
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
         let compress = config.compress.expect("compress should be Some");
@@ -4869,7 +4975,7 @@ steps:
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\ncompress:\n  enabled: false\n",
+            "type: botforge/build\nname: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\ncompress:\n  enabled: false\n",
         );
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
         let compress = config.compress.expect("compress should be Some");
@@ -4884,7 +4990,7 @@ steps:
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\ncompress:\n  enabled: true\n  reclaim: fstrim\n",
+            "type: botforge/build\nname: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\ncompress:\n  enabled: true\n  reclaim: fstrim\n",
         );
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
         let compress = config.compress.expect("compress should be Some");
@@ -4898,7 +5004,7 @@ steps:
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\ncompress:\n  enabled: true\n  reclaim: discard\n",
+            "type: botforge/build\nname: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\ncompress:\n  enabled: true\n  reclaim: discard\n",
         );
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
         let compress = config.compress.expect("compress should be Some");
@@ -4912,7 +5018,7 @@ steps:
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\ncompress:\n  enabled: true\n  reclaim: none\n",
+            "type: botforge/build\nname: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\ncompress:\n  enabled: true\n  reclaim: none\n",
         );
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
         let compress = config.compress.expect("compress should be Some");
@@ -4926,7 +5032,7 @@ steps:
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\ncompress:\n  enabled: true\n  reclaim: sparsify\n",
+            "type: botforge/build\nname: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\ncompress:\n  enabled: true\n  reclaim: sparsify\n",
         );
         let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
         let msg = format!("{err:#}");
@@ -4942,7 +5048,7 @@ steps:
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\ncompress:\n  enabled: false\n  reclaim: fstrim\n",
+            "type: botforge/build\nname: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\ncompress:\n  enabled: false\n  reclaim: fstrim\n",
         );
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
         let compress = config.compress.expect("compress should be Some");
@@ -4956,7 +5062,7 @@ steps:
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\ncompress:\n  reclaim: fstrim\n",
+            "type: botforge/build\nname: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\ncompress:\n  reclaim: fstrim\n",
         );
         let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
         let msg = format!("{err:#}");
@@ -4972,7 +5078,7 @@ steps:
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\ncompress:\n  reclaim: fstrim\n",
+            "type: botforge/build\nname: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\ncompress:\n  reclaim: fstrim\n",
         );
         let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
         let msg = format!("{err:#}");
@@ -4988,7 +5094,7 @@ steps:
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\ncompress:\n  enabled: true\n  bogus: 1\n",
+            "type: botforge/build\nname: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\ncompress:\n  enabled: true\n  bogus: 1\n",
         );
         let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
         let msg = format!("{err:#}");
@@ -5004,7 +5110,7 @@ steps:
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\ncompress:\n  enabled: true\n  reclaim: bogus\n",
+            "type: botforge/build\nname: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\ncompress:\n  enabled: true\n  reclaim: bogus\n",
         );
         let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
         let msg = format!("{err:#}");
@@ -5020,7 +5126,7 @@ steps:
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\ncompress:\n  enabled: true\n  compressor: bogus\n",
+            "type: botforge/build\nname: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\ncompress:\n  enabled: true\n  compressor: bogus\n",
         );
         let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
         let msg = format!("{err:#}");
@@ -5036,7 +5142,7 @@ steps:
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\ncompress:\n  enabled: true\n  compression_type: zstd\n",
+            "type: botforge/build\nname: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\ncompress:\n  enabled: true\n  compression_type: zstd\n",
         );
         let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
         let msg = format!("{err:#}");
@@ -5052,7 +5158,7 @@ steps:
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\ncompress:\n  enabled: true\n  cluster_size: \"1M\"\n",
+            "type: botforge/build\nname: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\ncompress:\n  enabled: true\n  cluster_size: \"1M\"\n",
         );
         let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
         let msg = format!("{err:#}");
@@ -5068,7 +5174,7 @@ steps:
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\ncompress:\n  enabled: true\n  recliam: fstrim\n",
+            "type: botforge/build\nname: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\ncompress:\n  enabled: true\n  recliam: fstrim\n",
         );
         let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
         let msg = format!("{err:#}");
@@ -5083,13 +5189,13 @@ steps:
         let repo = TempDir::new().unwrap();
         std::fs::write(
             repo.path().join("test.yaml"),
-            "type: test\ncompress:\n  enabled: true\nsteps: []\n",
+            "type: botforge/test\nname: test\ncompress:\n  enabled: true\nsteps: []\n",
         )
         .unwrap();
         let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("compress") && msg.contains("type: test"),
+            msg.contains("compress") && msg.contains("type: botforge/test"),
             "error should reject compress in test doc: {msg}"
         );
     }
@@ -5099,12 +5205,12 @@ steps:
         let repo = TempDir::new().unwrap();
         std::fs::write(
             repo.path().join("frag.yaml"),
-            "type: fragment\ncompress:\n  enabled: true\nsteps: []\n",
+            "type: botforge/fragment\ncompress:\n  enabled: true\nsteps: []\n",
         )
         .unwrap();
         std::fs::write(
             repo.path().join("test.yaml"),
-            "type: test\nsteps:\n  - uses: \"@://frag.yaml\"\n",
+            "type: botforge/test\nname: test\nsteps:\n  - uses: \"@://frag.yaml\"\n",
         )
         .unwrap();
         let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
@@ -5122,7 +5228,7 @@ steps:
             &repo,
             "frag.yaml",
             r#"
-type: fragment
+type: botforge/fragment
 files:
   - src: "@://payload/file.txt"
     dest: /tmp/file.txt
@@ -5132,7 +5238,7 @@ steps: []
         write_test_config(
             &repo,
             "test.yaml",
-            "type: test\nsteps:\n  - uses: \"@://frag.yaml\"\n",
+            "type: botforge/test\nname: test\nsteps:\n  - uses: \"@://frag.yaml\"\n",
         );
         let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
         assert_eq!(
@@ -5152,7 +5258,7 @@ steps: []
             &repo,
             "frag.yaml",
             r#"
-type: fragment
+type: botforge/fragment
 files:
   - src: "@://payload/build.txt"
     dest: /tmp/build.txt
@@ -5163,7 +5269,8 @@ steps: []
             &repo,
             "build.yaml",
             r#"
-type: build
+type: botforge/build
+name: build
 image: "@base"
 output: "out.qcow2"
 steps:
@@ -5188,7 +5295,7 @@ steps:
             &repo,
             "frag-a.yaml",
             r#"
-type: fragment
+type: botforge/fragment
 files:
   - src: "@://frag/a.txt"
     dest: /tmp/frag-a.txt
@@ -5199,7 +5306,7 @@ steps: []
             &repo,
             "frag-b.yaml",
             r#"
-type: fragment
+type: botforge/fragment
 files:
   - src: "@://frag/b.txt"
     dest: /tmp/frag-b.txt
@@ -5210,7 +5317,8 @@ steps: []
             &repo,
             "test.yaml",
             r#"
-type: test
+type: botforge/test
+name: test
 files:
   - src: "@://root/first.txt"
     dest: /tmp/root-first.txt
@@ -5256,7 +5364,7 @@ steps:
             &repo,
             "frag-b.yaml",
             r#"
-type: fragment
+type: botforge/fragment
 files:
   - src: "@://nested/b.txt"
     dest: /tmp/nested-b.txt
@@ -5267,7 +5375,7 @@ steps: []
             &repo,
             "frag-a.yaml",
             r#"
-type: fragment
+type: botforge/fragment
 files:
   - src: "@://nested/a.txt"
     dest: /tmp/nested-a.txt
@@ -5279,7 +5387,8 @@ steps:
             &repo,
             "test.yaml",
             r#"
-type: test
+type: botforge/test
+name: test
 steps:
   - uses: "@://frag-a.yaml"
 "#,
@@ -5309,7 +5418,7 @@ steps:
             &repo,
             "frag-a.yaml",
             r#"
-type: fragment
+type: botforge/fragment
 files:
   - src: "@://same/file.txt"
     dest: /tmp/same.txt
@@ -5320,7 +5429,7 @@ steps: []
             &repo,
             "frag-b.yaml",
             r#"
-type: fragment
+type: botforge/fragment
 files:
   - src: "@://same/file.txt"
     dest: /tmp/same.txt
@@ -5331,7 +5440,8 @@ steps: []
             &repo,
             "test.yaml",
             r#"
-type: test
+type: botforge/test
+name: test
 steps:
   - uses: "@://frag-a.yaml"
   - uses: "@://frag-b.yaml"
@@ -5355,7 +5465,7 @@ steps:
             &repo,
             "frag-a.yaml",
             r#"
-type: fragment
+type: botforge/fragment
 files:
   - src: "@://same/file.txt"
     dest: /tmp/same.txt
@@ -5367,7 +5477,7 @@ steps: []
             &repo,
             "frag-b.yaml",
             r#"
-type: fragment
+type: botforge/fragment
 files:
   - src: "@://same/file.txt"
     dest: /tmp/same.txt
@@ -5379,7 +5489,8 @@ steps: []
             &repo,
             "test.yaml",
             r#"
-type: test
+type: botforge/test
+name: test
 steps:
   - uses: "@://frag-a.yaml"
   - uses: "@://frag-b.yaml"
@@ -5412,7 +5523,7 @@ steps:
             &repo,
             "frag.yaml",
             r#"
-type: fragment
+type: botforge/fragment
 files:
   - src: payload/file.txt
     dest: /tmp/file.txt
@@ -5423,7 +5534,8 @@ steps: []
             &repo,
             "test.yaml",
             r#"
-type: test
+type: botforge/test
+name: test
 steps:
   - uses: "@://frag.yaml"
 "#,
@@ -5443,7 +5555,7 @@ steps:
             &repo,
             "frag.yaml",
             r#"
-type: fragment
+type: botforge/fragment
 files:
   - src: "@://payload/file.txt"
     dest: /tmp/file.txt
@@ -5455,7 +5567,8 @@ steps: []
             &repo,
             "test.yaml",
             r#"
-type: test
+type: botforge/test
+name: test
 steps:
   - uses: "@://frag.yaml"
 "#,
@@ -5471,7 +5584,11 @@ steps:
     #[test]
     fn test_load_test_config_files_absent_is_empty() {
         let repo = TempDir::new().unwrap();
-        std::fs::write(repo.path().join("test.yaml"), "type: test\nsteps: []\n").unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            "type: botforge/test\nname: test\nsteps: []\n",
+        )
+        .unwrap();
         let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
         assert!(config.files.is_empty(), "files should default to empty");
     }
@@ -5482,7 +5599,8 @@ steps:
         std::fs::write(
             repo.path().join("test.yaml"),
             r#"
-type: test
+type: botforge/test
+name: test
 files:
   - src: "@://fixtures/envoy/**/*.yaml"
     dest: /tmp/envoy/
@@ -5504,7 +5622,11 @@ steps: []
     #[test]
     fn test_load_test_config_defaults_timeouts() {
         let repo = TempDir::new().unwrap();
-        std::fs::write(repo.path().join("test.yaml"), "type: test\nsteps: []\n").unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            "type: botforge/test\nname: test\nsteps: []\n",
+        )
+        .unwrap();
         let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
         assert_eq!(config.step_timeout, 300);
         assert_eq!(config.timeout, 1800);
@@ -5516,7 +5638,7 @@ steps: []
         let repo = TempDir::new().unwrap();
         std::fs::write(
             repo.path().join("test.yaml"),
-            "type: test\nstep_timeout: 600\ntimeout: 2400\nsteps: []\n",
+            "type: botforge/test\nname: test\nstep_timeout: 600\ntimeout: 2400\nsteps: []\n",
         )
         .unwrap();
         let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
@@ -5528,10 +5650,14 @@ steps: []
     #[test]
     fn test_load_build_config_rejects_wrong_type() {
         let repo = TempDir::new().unwrap();
-        write_build_config(&repo, "build.yaml", "type: test\nsteps: []\n");
+        write_build_config(
+            &repo,
+            "build.yaml",
+            "type: botforge/test\nname: test\nsteps: []\n",
+        );
         let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
         assert!(
-            format!("{err:#}").contains("type: test"),
+            format!("{err:#}").contains("type: botforge/test"),
             "error should mention the actual type: {err:#}"
         );
     }
@@ -5539,9 +5665,207 @@ steps: []
     #[test]
     fn test_load_build_config_rejects_fragment_type() {
         let repo = TempDir::new().unwrap();
-        write_build_config(&repo, "build.yaml", "type: fragment\nsteps: []\n");
+        write_build_config(&repo, "build.yaml", "type: botforge/fragment\nsteps: []\n");
         let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
-        assert!(format!("{err:#}").contains("type: fragment"));
+        assert!(format!("{err:#}").contains("type: botforge/fragment"));
+    }
+
+    #[test]
+    fn test_load_build_config_rejects_legacy_bare_type_as_unknown() {
+        let repo = TempDir::new().unwrap();
+        let bare_type = "build";
+        write_build_config(
+            &repo,
+            "build.yaml",
+            &format!("type: {bare_type}\nname: build\nsteps: []\n"),
+        );
+        let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("unknown variant")
+                || msg.contains("unknown")
+                || msg.contains("did not match any variant"),
+            "legacy bare type should be rejected as unknown type: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_load_test_config_rejects_legacy_bare_type_as_unknown() {
+        let repo = TempDir::new().unwrap();
+        let bare_type = "test";
+        write_test_config(
+            &repo,
+            "test.yaml",
+            &format!("type: {bare_type}\nname: test\nsteps: []\n"),
+        );
+        let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("unknown variant")
+                || msg.contains("unknown")
+                || msg.contains("did not match any variant"),
+            "legacy bare type should be rejected as unknown type: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_fragment_include_rejects_legacy_bare_type_as_unknown() {
+        let repo = TempDir::new().unwrap();
+        let bare_type = "fragment";
+        write_test_config(
+            &repo,
+            "frag.yaml",
+            &format!("type: {bare_type}\nsteps: []\n"),
+        );
+        write_test_config(
+            &repo,
+            "test.yaml",
+            "type: botforge/test\nname: test\nsteps:\n  - uses: \"@://frag.yaml\"\n",
+        );
+        let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("not a consumable fragment"),
+            "legacy bare fragment type should be rejected: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_load_build_config_sets_document_name() {
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            "type: botforge/build\nname: foo\nimage: \"@base\"\noutput: out.qcow2\nsteps: []\n",
+        );
+        let cfg = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
+        assert_eq!(cfg.name, "foo");
+    }
+
+    #[test]
+    fn test_load_test_config_sets_document_name() {
+        let repo = TempDir::new().unwrap();
+        write_test_config(
+            &repo,
+            "test.yaml",
+            "type: botforge/test\nname: foo\nsteps: []\n",
+        );
+        let cfg = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+        assert_eq!(cfg.name, "foo");
+    }
+
+    #[test]
+    fn test_load_build_config_requires_name() {
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            "type: botforge/build\nimage: \"@base\"\noutput: out.qcow2\nsteps: []\n",
+        );
+        let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("'name' is required in a 'type: botforge/build' document"),
+            "missing name should produce required-field error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn test_load_test_config_requires_name() {
+        let repo = TempDir::new().unwrap();
+        write_test_config(&repo, "test.yaml", "type: botforge/test\nsteps: []\n");
+        let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("'name' is required in a 'type: botforge/test' document"),
+            "missing name should produce required-field error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn test_load_build_config_accepts_name_separators() {
+        let repo = TempDir::new().unwrap();
+        for (idx, name) in ["foo/bar", "foo.bar", "foo>bar"].iter().enumerate() {
+            write_build_config(
+                &repo,
+                &format!("build-{idx}.yaml"),
+                &format!(
+                    "type: botforge/build\nname: {name}\nimage: \"@base\"\noutput: out-{idx}.qcow2\nsteps: []\n"
+                ),
+            );
+            let cfg =
+                load_build_config(repo.path(), &repo.path().join(format!("build-{idx}.yaml")))
+                    .unwrap();
+            assert_eq!(cfg.name, *name);
+        }
+    }
+
+    #[test]
+    fn test_load_test_config_rejects_non_ascii_name() {
+        let repo = TempDir::new().unwrap();
+        write_test_config(
+            &repo,
+            "test.yaml",
+            "type: botforge/test\nname: café\nsteps: []\n",
+        );
+        let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("'name' in a 'type: botforge/test' document")
+                && format!("{err:#}").contains("printable ASCII"),
+            "non-ASCII name should be rejected: {err:#}"
+        );
+    }
+
+    #[test]
+    fn test_load_build_config_rejects_blank_name() {
+        let repo = TempDir::new().unwrap();
+        write_build_config(
+            &repo,
+            "build.yaml",
+            "type: botforge/build\nname: \"   \"\nimage: \"@base\"\noutput: out.qcow2\nsteps: []\n",
+        );
+        let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("'name' is required in a 'type: botforge/build' document"),
+            "blank name should be rejected as required-field error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn test_fragment_rejects_top_level_name() {
+        let repo = TempDir::new().unwrap();
+        write_test_config(
+            &repo,
+            "frag.yaml",
+            "type: botforge/fragment\nname: nope\nsteps: []\n",
+        );
+        write_test_config(
+            &repo,
+            "test.yaml",
+            "type: botforge/test\nname: test\nsteps:\n  - uses: \"@://frag.yaml\"\n",
+        );
+        let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("name: is not valid in a 'type: botforge/fragment' document"),
+            "fragment should reject top-level name section: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_fragment_step_name_is_still_allowed() {
+        let repo = TempDir::new().unwrap();
+        write_test_config(
+            &repo,
+            "frag.yaml",
+            "type: botforge/fragment\nsteps:\n  - on: guest\n    name: still-ok\n    run: echo hi\n",
+        );
+        write_test_config(
+            &repo,
+            "test.yaml",
+            "type: botforge/test\nname: test\nsteps:\n  - uses: \"@://frag.yaml\"\n",
+        );
+        let cfg = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+        assert_eq!(cfg.steps.len(), 1);
+        assert_eq!(run_ref(&cfg.steps[0]).name, "still-ok");
     }
 
     #[test]
@@ -5550,12 +5874,12 @@ steps: []
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nports:\n  - 80\nsteps: []\n",
+            "type: botforge/build\nname: build\nports:\n  - 80\nsteps: []\n",
         );
         let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("ports") && msg.contains("type: build"),
+            msg.contains("ports") && msg.contains("type: botforge/build"),
             "error should mention the offending key and document type: {msg}"
         );
     }
@@ -5566,7 +5890,7 @@ steps: []
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nisos:\n  - some.iso\nsteps: []\n",
+            "type: botforge/build\nname: build\nisos:\n  - some.iso\nsteps: []\n",
         );
         let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
         assert!(format!("{err:#}").contains("isos"));
@@ -5578,7 +5902,7 @@ steps: []
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\ndiagnostics_units:\n  - foo\nsteps: []\n",
+            "type: botforge/build\nname: build\ndiagnostics_units:\n  - foo\nsteps: []\n",
         );
         let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
         assert!(format!("{err:#}").contains("diagnostics_units"));
@@ -5590,7 +5914,7 @@ steps: []
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\noutput: \"out.qcow2\"\nsteps: []\n",
+            "type: botforge/build\nname: build\noutput: \"out.qcow2\"\nsteps: []\n",
         );
         let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
         let msg = format!("{err:#}");
@@ -5606,7 +5930,7 @@ steps: []
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nimage: \"@base\"\nsteps: []\n",
+            "type: botforge/build\nname: build\nimage: \"@base\"\nsteps: []\n",
         );
         let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
         let msg = format!("{err:#}");
@@ -5622,7 +5946,7 @@ steps: []
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nimage: \"@base\"\noutput: \"foo/bar.qcow2\"\nsteps: []\n",
+            "type: botforge/build\nname: build\nimage: \"@base\"\noutput: \"foo/bar.qcow2\"\nsteps: []\n",
         );
         let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
         let msg = format!("{err:#}");
@@ -5634,7 +5958,7 @@ steps: []
         write_build_config(
             &repo,
             "build-dotdot.yaml",
-            "type: build\nimage: \"@base\"\noutput: \"../bar.qcow2\"\nsteps: []\n",
+            "type: botforge/build\nname: build\nimage: \"@base\"\noutput: \"../bar.qcow2\"\nsteps: []\n",
         );
         let err =
             load_build_config(repo.path(), &repo.path().join("build-dotdot.yaml")).unwrap_err();
@@ -5651,7 +5975,7 @@ steps: []
         write_build_config(
             &repo,
             "build.yaml",
-            "type: build\nimage: \"\"\noutput: \"out.qcow2\"\nsteps: []\n",
+            "type: botforge/build\nname: build\nimage: \"\"\noutput: \"out.qcow2\"\nsteps: []\n",
         );
         let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
         let msg = format!("{err:#}");
@@ -5666,12 +5990,12 @@ steps: []
         let repo = TempDir::new().unwrap();
         std::fs::write(
             repo.path().join("frag.yaml"),
-            "type: fragment\nimage: \"@debian-base\"\nsteps: []\n",
+            "type: botforge/fragment\nimage: \"@debian-base\"\nsteps: []\n",
         )
         .unwrap();
         std::fs::write(
             repo.path().join("test.yaml"),
-            "type: test\nsteps:\n  - uses: \"@://frag.yaml\"\n",
+            "type: botforge/test\nname: test\nsteps:\n  - uses: \"@://frag.yaml\"\n",
         )
         .unwrap();
         let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
@@ -5684,7 +6008,7 @@ steps: []
         let repo = TempDir::new().unwrap();
         std::fs::write(
             repo.path().join("test.yaml"),
-            "type: test\nimage: \"@artifact://foo.qcow2\"\nsteps: []\n",
+            "type: botforge/test\nname: test\nimage: \"@artifact://foo.qcow2\"\nsteps: []\n",
         )
         .unwrap();
         let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
@@ -5701,7 +6025,7 @@ steps: []
         let repo = TempDir::new().unwrap();
         std::fs::write(
             repo.path().join("test.yaml"),
-            "type: test\noutput: \"out.qcow2\"\nsteps: []\n",
+            "type: botforge/test\nname: test\noutput: \"out.qcow2\"\nsteps: []\n",
         )
         .unwrap();
         let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
@@ -5714,12 +6038,12 @@ steps: []
         let repo = TempDir::new().unwrap();
         std::fs::write(
             repo.path().join("frag.yaml"),
-            "type: fragment\noutput: \"out.qcow2\"\nsteps: []\n",
+            "type: botforge/fragment\noutput: \"out.qcow2\"\nsteps: []\n",
         )
         .unwrap();
         std::fs::write(
             repo.path().join("test.yaml"),
-            "type: test\nsteps:\n  - uses: \"@://frag.yaml\"\n",
+            "type: botforge/test\nname: test\nsteps:\n  - uses: \"@://frag.yaml\"\n",
         )
         .unwrap();
         let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
@@ -5732,13 +6056,13 @@ steps: []
         let repo = TempDir::new().unwrap();
         std::fs::write(
             repo.path().join("test.yaml"),
-            "type: test\ndisk_size: \"20G\"\nsteps: []\n",
+            "type: botforge/test\nname: test\ndisk_size: \"20G\"\nsteps: []\n",
         )
         .unwrap();
         let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("disk_size") && msg.contains("type: test"),
+            msg.contains("disk_size") && msg.contains("type: botforge/test"),
             "error should mention the offending key and document type: {msg}"
         );
     }
@@ -5748,7 +6072,7 @@ steps: []
         let repo = TempDir::new().unwrap();
         std::fs::write(
             repo.path().join("test.yaml"),
-            "type: test\nmemsize: 8192\nsteps: []\n",
+            "type: botforge/test\nname: test\nmemsize: 8192\nsteps: []\n",
         )
         .unwrap();
         let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
@@ -5760,7 +6084,7 @@ steps: []
         let repo = TempDir::new().unwrap();
         std::fs::write(
             repo.path().join("test.yaml"),
-            "type: test\nsmp: 8\nsteps: []\n",
+            "type: botforge/test\nname: test\nsmp: 8\nsteps: []\n",
         )
         .unwrap();
         let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
@@ -5772,12 +6096,12 @@ steps: []
         let repo = TempDir::new().unwrap();
         std::fs::write(
             repo.path().join("frag.yaml"),
-            "type: fragment\ndisk_size: \"20G\"\nsteps: []\n",
+            "type: botforge/fragment\ndisk_size: \"20G\"\nsteps: []\n",
         )
         .unwrap();
         std::fs::write(
             repo.path().join("test.yaml"),
-            "type: test\nsteps:\n  - uses: \"@://frag.yaml\"\n",
+            "type: botforge/test\nname: test\nsteps:\n  - uses: \"@://frag.yaml\"\n",
         )
         .unwrap();
         let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
@@ -5789,12 +6113,12 @@ steps: []
         let repo = TempDir::new().unwrap();
         std::fs::write(
             repo.path().join("frag.yaml"),
-            "type: fragment\nmemsize: 8192\nsteps: []\n",
+            "type: botforge/fragment\nmemsize: 8192\nsteps: []\n",
         )
         .unwrap();
         std::fs::write(
             repo.path().join("test.yaml"),
-            "type: test\nsteps:\n  - uses: \"@://frag.yaml\"\n",
+            "type: botforge/test\nname: test\nsteps:\n  - uses: \"@://frag.yaml\"\n",
         )
         .unwrap();
         let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
@@ -5806,12 +6130,12 @@ steps: []
         let repo = TempDir::new().unwrap();
         std::fs::write(
             repo.path().join("frag.yaml"),
-            "type: fragment\nsmp: 8\nsteps: []\n",
+            "type: botforge/fragment\nsmp: 8\nsteps: []\n",
         )
         .unwrap();
         std::fs::write(
             repo.path().join("test.yaml"),
-            "type: test\nsteps:\n  - uses: \"@://frag.yaml\"\n",
+            "type: botforge/test\nname: test\nsteps:\n  - uses: \"@://frag.yaml\"\n",
         )
         .unwrap();
         let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
@@ -5823,12 +6147,12 @@ steps: []
         let repo = TempDir::new().unwrap();
         std::fs::write(
             repo.path().join("frag.yaml"),
-            "type: fragment\nstep_timeout: 600\nsteps: []\n",
+            "type: botforge/fragment\nstep_timeout: 600\nsteps: []\n",
         )
         .unwrap();
         std::fs::write(
             repo.path().join("test.yaml"),
-            "type: test\nsteps:\n  - uses: \"@://frag.yaml\"\n",
+            "type: botforge/test\nname: test\nsteps:\n  - uses: \"@://frag.yaml\"\n",
         )
         .unwrap();
         let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
@@ -5840,12 +6164,12 @@ steps: []
         let repo = TempDir::new().unwrap();
         std::fs::write(
             repo.path().join("frag.yaml"),
-            "type: fragment\ntimeout: 600\nsteps: []\n",
+            "type: botforge/fragment\ntimeout: 600\nsteps: []\n",
         )
         .unwrap();
         std::fs::write(
             repo.path().join("test.yaml"),
-            "type: test\nsteps:\n  - uses: \"@://frag.yaml\"\n",
+            "type: botforge/test\nname: test\nsteps:\n  - uses: \"@://frag.yaml\"\n",
         )
         .unwrap();
         let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
@@ -5858,7 +6182,7 @@ steps: []
         std::fs::write(
             repo.path().join("frag.yaml"),
             r#"
-type: fragment
+type: botforge/fragment
 steps:
   - on: guest
     name: frag-step
@@ -5871,7 +6195,8 @@ steps:
             &repo,
             "build.yaml",
             r#"
-type: build
+type: botforge/build
+name: build
 image: "@debian-base"
 output: "out.qcow2"
 steps:
@@ -5891,7 +6216,8 @@ steps:
             &repo,
             "build.yaml",
             r#"
-type: build
+type: botforge/build
+name: build
 image: "@debian-base"
 output: "out.qcow2"
 steps:
@@ -5914,7 +6240,7 @@ steps:
         std::fs::write(
             repo.path().join("frag.yaml"),
             r#"
-type: fragment
+type: botforge/fragment
 steps:
   - name: "build-${{ args.0 }}"
     for: [alpha, beta]
@@ -5926,7 +6252,8 @@ steps:
             &repo,
             "build.yaml",
             r#"
-type: build
+type: botforge/build
+name: build
 image: "@debian-base"
 output: "out.qcow2"
 steps:
@@ -5949,7 +6276,7 @@ steps:
         std::fs::write(
             repo.path().join("frag.yaml"),
             r#"
-type: fragment
+type: botforge/fragment
 steps:
   - on: guest
     name: frag-step
@@ -5962,7 +6289,8 @@ steps:
             &repo,
             "build.yaml",
             r#"
-type: build
+type: botforge/build
+name: build
 image: "@debian-base"
 output: "out.qcow2"
 steps:
@@ -5982,7 +6310,8 @@ steps:
             &repo,
             "build.yaml",
             r#"
-type: build
+type: botforge/build
+name: build
 image: "@debian-base"
 output: "out.qcow2"
 steps:
@@ -6016,7 +6345,7 @@ steps:
         std::fs::write(
             repo.path().join("frag.yaml"),
             r#"
-type: fragment
+type: botforge/fragment
 steps:
   - on: guest
     name: frag-step
@@ -6032,7 +6361,8 @@ steps:
             &repo,
             "build.yaml",
             r#"
-type: build
+type: botforge/build
+name: build
 image: "@debian-base"
 output: "out.qcow2"
 steps:
@@ -6061,7 +6391,7 @@ steps:
         std::fs::write(
             repo.path().join("frag.yaml"),
             r#"
-type: fragment
+type: botforge/fragment
 inputs:
   seconds:
     type: number
@@ -6078,7 +6408,8 @@ steps:
             &repo,
             "build.yaml",
             r#"
-type: build
+type: botforge/build
+name: build
 image: "@debian-base"
 output: "out.qcow2"
 steps:
@@ -6097,12 +6428,12 @@ steps:
         for (name, content, needle) in [
             (
                 "test-zero-step-timeout.yaml",
-                "type: test\nstep_timeout: 0\nsteps: []\n",
+                "type: botforge/test\nname: test\nstep_timeout: 0\nsteps: []\n",
                 "positive integer",
             ),
             (
                 "test-negative-timeout.yaml",
-                "type: test\ntimeout: -1\nsteps: []\n",
+                "type: botforge/test\nname: test\ntimeout: -1\nsteps: []\n",
                 "positive integer",
             ),
         ] {
@@ -6121,12 +6452,12 @@ steps:
         for (name, content, needle) in [
             (
                 "build-zero-step-timeout.yaml",
-                "type: build\nimage: \"@debian-base\"\noutput: \"out.qcow2\"\nstep_timeout: 0\nsteps: []\n",
+                "type: botforge/build\nname: build\nimage: \"@debian-base\"\noutput: \"out.qcow2\"\nstep_timeout: 0\nsteps: []\n",
                 "positive integer",
             ),
             (
                 "build-negative-step-timeout.yaml",
-                "type: build\nimage: \"@debian-base\"\noutput: \"out.qcow2\"\nsteps:\n  - on: host\n    name: slow\n    timeout: -5\n    run: echo ok\n",
+                "type: botforge/build\nname: build\nimage: \"@debian-base\"\noutput: \"out.qcow2\"\nsteps:\n  - on: host\n    name: slow\n    timeout: -5\n    run: echo ok\n",
                 "positive integer",
             ),
         ] {
@@ -6145,11 +6476,11 @@ steps:
         write_build_config(
             &repo,
             "build-base.yaml",
-            "type: build\nsteps:\n  - on: guest\n    name: s\n    run: echo ok\n",
+            "type: botforge/build\nname: build\nsteps:\n  - on: guest\n    name: s\n    run: echo ok\n",
         );
         std::fs::write(
             repo.path().join("test.yaml"),
-            "type: test\nsteps:\n  - uses: \"@://build-base.yaml\"\n",
+            "type: botforge/test\nname: test\nsteps:\n  - uses: \"@://build-base.yaml\"\n",
         )
         .unwrap();
         let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
@@ -6530,7 +6861,8 @@ archive:
             &repo,
             "build.yaml",
             r#"
-type: build
+type: botforge/build
+name: build
 base-image: @debian-base
 steps:
   - archive:
@@ -6560,7 +6892,11 @@ steps:
     #[test]
     fn test_load_test_config_assert_absent_is_none() {
         let repo = TempDir::new().unwrap();
-        std::fs::write(repo.path().join("test.yaml"), "type: test\nsteps: []\n").unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            "type: botforge/test\nname: test\nsteps: []\n",
+        )
+        .unwrap();
         let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
         assert!(config.assert.is_none(), "assert should default to None");
     }
@@ -6571,7 +6907,8 @@ steps:
         std::fs::write(
             repo.path().join("test.yaml"),
             r#"
-type: test
+type: botforge/test
+name: test
 steps: []
 assert:
   files:
@@ -6600,7 +6937,8 @@ assert:
         std::fs::write(
             repo.path().join("test.yaml"),
             r#"
-type: test
+type: botforge/test
+name: test
 steps: []
 assert:
   files:
@@ -6625,7 +6963,8 @@ assert:
         std::fs::write(
             repo.path().join("test.yaml"),
             r#"
-type: test
+type: botforge/test
+name: test
 steps: []
 assert:
   files:
@@ -6649,7 +6988,8 @@ assert:
         std::fs::write(
             repo.path().join("test.yaml"),
             r#"
-type: test
+type: botforge/test
+name: test
 steps: []
 assert:
   files:
@@ -6672,7 +7012,8 @@ assert:
         std::fs::write(
             repo.path().join("test.yaml"),
             r#"
-type: test
+type: botforge/test
+name: test
 steps: []
 assert:
   files:
@@ -6696,7 +7037,8 @@ assert:
         std::fs::write(
             repo.path().join("test.yaml"),
             r#"
-type: test
+type: botforge/test
+name: test
 steps: []
 assert:
   files:
@@ -6731,7 +7073,8 @@ assert:
         std::fs::write(
             repo.path().join("test.yaml"),
             r#"
-type: test
+type: botforge/test
+name: test
 steps: []
 assert:
   users:
@@ -6761,7 +7104,8 @@ assert:
         std::fs::write(
             repo.path().join("test.yaml"),
             r#"
-type: test
+type: botforge/test
+name: test
 steps: []
 assert:
   users:
@@ -6782,7 +7126,8 @@ assert:
         std::fs::write(
             repo.path().join("test.yaml"),
             r#"
-type: test
+type: botforge/test
+name: test
 steps: []
 assert:
   users:
@@ -6806,7 +7151,8 @@ assert:
         std::fs::write(
             repo.path().join("test.yaml"),
             r#"
-type: test
+type: botforge/test
+name: test
 steps: []
 assert:
   groups:
@@ -6830,7 +7176,8 @@ assert:
         std::fs::write(
             repo.path().join("test.yaml"),
             r#"
-type: test
+type: botforge/test
+name: test
 steps: []
 assert:
   users:
@@ -6855,7 +7202,8 @@ assert:
         std::fs::write(
             repo.path().join("test.yaml"),
             r#"
-type: test
+type: botforge/test
+name: test
 steps: []
 assert:
   packages:
@@ -6879,7 +7227,8 @@ assert:
         std::fs::write(
             repo.path().join("test.yaml"),
             r#"
-type: test
+type: botforge/test
+name: test
 steps: []
 assert:
   packages:
@@ -6900,7 +7249,8 @@ assert:
         std::fs::write(
             repo.path().join("test.yaml"),
             r#"
-type: test
+type: botforge/test
+name: test
 steps: []
 assert:
   packages:
@@ -6921,7 +7271,8 @@ assert:
         std::fs::write(
             repo.path().join("test.yaml"),
             r#"
-type: test
+type: botforge/test
+name: test
 steps: []
 assert:
   packages:
@@ -6949,7 +7300,8 @@ assert:
         std::fs::write(
             repo.path().join("test.yaml"),
             r#"
-type: test
+type: botforge/test
+name: test
 steps: []
 assert:
   services:
@@ -6978,7 +7330,8 @@ assert:
         std::fs::write(
             repo.path().join("test.yaml"),
             r#"
-type: test
+type: botforge/test
+name: test
 steps: []
 assert:
   services:
@@ -7000,7 +7353,8 @@ assert:
         std::fs::write(
             repo.path().join("test.yaml"),
             r#"
-type: test
+type: botforge/test
+name: test
 steps: []
 assert:
   services:
