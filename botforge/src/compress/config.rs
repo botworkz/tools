@@ -92,7 +92,7 @@ pub(crate) struct CompressConfig {
 #[cfg(test)]
 mod tests {
     use super::{CompressionType, ReclaimMode};
-    use crate::plan::config::load_build_config;
+    use crate::config::load_build_config;
     use tempfile::TempDir;
 
     fn write_build_config(repo: &TempDir, name: &str, content: &str) {
@@ -455,9 +455,8 @@ mod tests {
             "type: botforge/test\nname: test\ncompress:\n  enabled: true\nsteps: []\n",
         )
         .unwrap();
-        let err =
-            crate::plan::config::load_test_config(repo.path(), &repo.path().join("test.yaml"))
-                .unwrap_err();
+        let err = crate::config::load_test_config(repo.path(), &repo.path().join("test.yaml"))
+            .unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("compress") && msg.contains("type: botforge/test"),
@@ -478,9 +477,8 @@ mod tests {
             "type: botforge/test\nname: test\nsteps:\n  - uses: \"@://frag.yaml\"\n",
         )
         .unwrap();
-        let err =
-            crate::plan::config::load_test_config(repo.path(), &repo.path().join("test.yaml"))
-                .unwrap_err();
+        let err = crate::config::load_test_config(repo.path(), &repo.path().join("test.yaml"))
+            .unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("compress"),

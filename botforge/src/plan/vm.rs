@@ -13,7 +13,6 @@ use crate::ssh::{
 };
 use crate::util::unique_suffix;
 
-use super::config::{TestConfig, TestIsoBootstrap};
 use super::files::{stage_files, FileEntry};
 use super::log::{
     join_output_forwarders, print_step_skipped, print_step_status, print_step_title,
@@ -24,6 +23,7 @@ use crate::assert::{
     run_assert_files, run_assert_groups, run_assert_packages, run_assert_services,
     run_assert_users, AssertBlock,
 };
+use crate::config::{TestConfig, TestIsoBootstrap};
 use crate::step::{
     resolve_shell, ArchiveStep, ExpectBlock, RunStep, StdioExpect, StepTarget, TestStep,
 };

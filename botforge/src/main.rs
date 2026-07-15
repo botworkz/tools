@@ -2,6 +2,7 @@ mod assert;
 mod cli;
 mod commands;
 mod compress;
+mod config;
 mod iso;
 mod plan;
 mod qemu;
