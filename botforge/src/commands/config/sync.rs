@@ -20,8 +20,7 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::workspace::{
     discover::discover,
-    discover_context,
-    find_marker_path,
+    discover_context, find_marker_path,
     registry::{load_committed_registry, save_registry},
 };
 
@@ -630,7 +629,10 @@ mod tests {
         cmd_sync(None, args).unwrap();
 
         let contents = fs::read_to_string(root.path().join(".botforge.yaml")).unwrap();
-        assert!(contents.contains("foo.yaml"), "alternate marker should be updated");
+        assert!(
+            contents.contains("foo.yaml"),
+            "alternate marker should be updated"
+        );
     }
 
     // ── --check ───────────────────────────────────────────────────────────────

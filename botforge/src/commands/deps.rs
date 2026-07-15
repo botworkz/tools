@@ -246,11 +246,9 @@ mod tests {
             body: b"hello world".to_vec(),
         }) as Box<dyn Transport>);
 
-        let err = cmd_deps_with_transport(
-            &manifest,
-            args_for_out(out.clone(), cache),
-            || transport.take(),
-        )
+        let err = cmd_deps_with_transport(&manifest, args_for_out(out.clone(), cache), || {
+            transport.take()
+        })
         .unwrap_err();
 
         assert!(format!("{err:#}").contains("checksum mismatch"));

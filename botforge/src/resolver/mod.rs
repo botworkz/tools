@@ -47,8 +47,8 @@ pub(crate) use grammar::Reference;
 pub(crate) use validate::{Arity, AssetKind, ResolveSpec};
 
 use anyhow::{bail, Context, Result};
-use shasset::manifest::Manifest;
 use shasset::fetch::Transport;
+use shasset::manifest::Manifest;
 use std::path::{Path, PathBuf};
 
 pub(crate) const ARTIFACT_DIR: &str = "build/artifact";

@@ -5,7 +5,6 @@
 
 use anyhow::{Context, Result};
 use shasset::fetch::{fetch_asset, FetchParams, MaterializeMode, Transport};
-use shasset::manifest::Manifest;
 use std::path::{Path, PathBuf};
 
 use crate::util::{default_cache_dir, materialize_flat};
@@ -82,6 +81,7 @@ mod tests {
     use crate::resolver::validate::AssetKind;
     use crate::resolver::Reference;
     use shasset::fetch::{DownloadResponse, FetchError, Transport};
+    use shasset::manifest::Manifest;
     use std::io::Cursor;
     use tempfile::TempDir;
 

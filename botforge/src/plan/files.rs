@@ -212,10 +212,7 @@ mod tests {
     use shasset::manifest::Manifest;
     use tempfile::TempDir;
 
-    fn make_context<'a>(
-        repo: &'a TempDir,
-        manifest: &'a Manifest,
-    ) -> ResolveFileContext<'a> {
+    fn make_context<'a>(repo: &'a TempDir, manifest: &'a Manifest) -> ResolveFileContext<'a> {
         ResolveFileContext {
             context: repo.path(),
             manifest,

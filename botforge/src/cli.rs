@@ -48,7 +48,10 @@ mod tests {
         let err = Cli::try_parse_from(["botforge", "-c", "whatever", "deps", "--out", "out"])
             .unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
-        assert!(err.to_string().contains("-c"), "error should mention -c: {err}");
+        assert!(
+            err.to_string().contains("-c"),
+            "error should mention -c: {err}"
+        );
     }
 
     #[test]
@@ -64,10 +67,13 @@ mod tests {
 
     #[test]
     fn cli_rejects_removed_config_flag_after_subcommand() {
-        let err =
-            Cli::try_parse_from(["botforge", "deps", "-c", "whatever", "--out", "out"]).unwrap_err();
+        let err = Cli::try_parse_from(["botforge", "deps", "-c", "whatever", "--out", "out"])
+            .unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
-        assert!(err.to_string().contains("-c"), "error should mention -c: {err}");
+        assert!(
+            err.to_string().contains("-c"),
+            "error should mention -c: {err}"
+        );
     }
 
     #[test]

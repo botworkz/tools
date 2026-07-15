@@ -30,7 +30,10 @@ pub(crate) fn is_marker_name(name: &str) -> bool {
 }
 
 pub(crate) fn find_marker_path(dir: &Path) -> Option<PathBuf> {
-    MARKER_NAMES.iter().map(|name| dir.join(name)).find(|path| path.is_file())
+    MARKER_NAMES
+        .iter()
+        .map(|name| dir.join(name))
+        .find(|path| path.is_file())
 }
 
 pub(crate) fn marker_path(dir: &Path) -> Result<PathBuf> {
@@ -102,8 +105,8 @@ fn load_botforge_yaml(path: &Path) -> Result<()> {
 
 pub(crate) fn load_inline_manifest(context_root: &Path) -> Result<Manifest> {
     let marker = marker_path(context_root)?;
-    let contents =
-        std::fs::read_to_string(&marker).with_context(|| format!("cannot read {}", marker.display()))?;
+    let contents = std::fs::read_to_string(&marker)
+        .with_context(|| format!("cannot read {}", marker.display()))?;
     if contents.trim().is_empty() {
         return Ok(Manifest::default());
     }
@@ -250,7 +253,10 @@ mod tests {
         write_named_marker(root.path(), ".botforge.yaml", "");
         write_named_marker(root.path(), "botforge.yml", "");
         let marker = find_marker_path(root.path()).unwrap();
-        assert_eq!(marker.file_name().and_then(|name| name.to_str()), Some("botforge.yml"));
+        assert_eq!(
+            marker.file_name().and_then(|name| name.to_str()),
+            Some("botforge.yml")
+        );
     }
 
     #[test]
