@@ -325,7 +325,7 @@ fn capture_cloud_init_schema_warning_for_test(message: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plan::config::{load_build_config, load_test_config};
+    use crate::config::{load_build_config, load_test_config};
     use tempfile::TempDir;
 
     fn write_build_config(repo: &TempDir, name: &str, content: &str) {

@@ -26,10 +26,9 @@ use crate::compress::{
     compress_qcow2_image, read_qcow2_image_stats, read_virtual_sector0, sparsify_zero_clusters,
 };
 use crate::compress::{CompressConfig, CompressionType, ReclaimMode};
-use crate::plan::{
-    load_build_config, preserve_failed_build_disk, print_log_tail, run_step_flow,
-    shutdown_build_vm, validate_build_steps, vm::StepFlowPlan, vm::StepTimeoutPolicy,
-};
+use crate::config::{load_build_config, validate_build_steps};
+use crate::plan::vm::{StepFlowPlan, StepTimeoutPolicy};
+use crate::plan::{preserve_failed_build_disk, print_log_tail, run_step_flow, shutdown_build_vm};
 use crate::step::{ArchiveStep, StepTarget, TestStep};
 use crate::workspace::discover_context;
 

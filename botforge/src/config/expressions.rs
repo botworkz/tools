@@ -513,7 +513,7 @@ mod tests {
 
         #[test]
         fn test_load_test_config_with_at_call_site_accepted() {
-            use crate::plan::config::load_test_config;
+            use crate::config::load_test_config;
             use crate::step::{RunStep, TestStep};
             use tempfile::TempDir;
 
@@ -561,7 +561,7 @@ steps:
 
         #[test]
         fn test_load_test_config_inputs_at_call_site_is_rejected() {
-            use crate::plan::config::load_test_config;
+            use crate::config::load_test_config;
             use tempfile::TempDir;
 
             let repo = TempDir::new().unwrap();
@@ -603,7 +603,7 @@ steps:
 
         #[test]
         fn test_load_test_config_declared_default_applied_via_fragment() {
-            use crate::plan::config::load_test_config;
+            use crate::config::load_test_config;
             use crate::step::{RunStep, TestStep};
             use tempfile::TempDir;
 
@@ -649,7 +649,7 @@ steps:
 
         #[test]
         fn test_load_test_config_undeclared_with_key_errors() {
-            use crate::plan::config::load_test_config;
+            use crate::config::load_test_config;
             use tempfile::TempDir;
 
             let repo = TempDir::new().unwrap();
