@@ -87,7 +87,7 @@ pub(crate) fn read_ssh_public_key(
 ///   `mounts`, …) — botforge entries first, then user entries (concatenated).
 /// - **Scalar / mapping keys** — the user fragment wins, except for keys that
 ///   would lock the harness out (those are validated at config load time by
-///   [`crate::plan::config::validate_cloud_init_fragment`] and rejected before
+///   [`crate::config::validate_cloud_init_fragment`] and rejected before
 ///   reaching this function).
 pub(crate) fn render_user_data(
     template: Option<&str>,

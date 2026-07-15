@@ -12,10 +12,10 @@ use crate::ssh::{SshOptions, TemporarySshKeypair};
 use crate::util::{create_temp_dir, ensure_command, resolve_under_root};
 use crate::workspace::discover_context;
 
-use crate::plan::{
-    cleanup_test, collect_test_diagnostics, load_test_config, print_log_tail, run_test_flow,
-    validate_test_ports, validate_test_steps, TestIso, TestIsoBootstrap,
+use crate::config::{
+    load_test_config, validate_test_ports, validate_test_steps, TestIso, TestIsoBootstrap,
 };
+use crate::plan::{cleanup_test, collect_test_diagnostics, print_log_tail, run_test_flow};
 
 #[derive(Args, Debug)]
 pub(crate) struct TestArgs {

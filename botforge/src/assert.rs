@@ -17,7 +17,7 @@ use std::time::Duration;
 use crate::ssh::{ssh_capture_stdout, SshOptions};
 use crate::util::shell_single_quote;
 
-use crate::plan::config::{validate_mode_string, validate_owner_group_string};
+use crate::config::{validate_mode_string, validate_owner_group_string};
 use crate::plan::log::print_phase_status;
 
 // ---------------------------------------------------------------------------
@@ -1642,7 +1642,7 @@ mod tests {
 
     mod assert_block {
         use super::super::AssertFileType;
-        use crate::plan::config::load_test_config;
+        use crate::config::load_test_config;
         use std::fs;
         use tempfile::TempDir;
 
