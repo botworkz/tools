@@ -147,15 +147,15 @@ fn build_glob_set(patterns: &[String]) -> Result<GlobSet> {
 #[derive(Debug, Default)]
 pub(crate) struct Registry {
     /// Maps spec name → absolute path for `type: botforge/build` docs.
-    builds: BTreeMap<String, PathBuf>,
+    pub(crate) builds: BTreeMap<String, PathBuf>,
     /// Maps spec name → absolute path for `type: botforge/test` docs.
-    tests: BTreeMap<String, PathBuf>,
+    pub(crate) tests: BTreeMap<String, PathBuf>,
 }
 
+/// Methods used in tests to look up named entries in the discovered registry.
+#[cfg(test)]
 impl Registry {
-    /// Resolve a build spec by name.
-    ///
-    /// Returns the absolute path of the spec file, or an error if not found.
+    /// Resolve a build spec by name (test helper).
     pub(crate) fn build(&self, name: &str, context_root: &Path) -> Result<&PathBuf> {
         self.builds.get(name).ok_or_else(|| {
             anyhow::anyhow!(
@@ -166,9 +166,7 @@ impl Registry {
         })
     }
 
-    /// Resolve a test spec by name.
-    ///
-    /// Returns the absolute path of the spec file, or an error if not found.
+    /// Resolve a test spec by name (test helper).
     pub(crate) fn test(&self, name: &str, context_root: &Path) -> Result<&PathBuf> {
         self.tests.get(name).ok_or_else(|| {
             anyhow::anyhow!(

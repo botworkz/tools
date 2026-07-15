@@ -10,7 +10,7 @@ use crate::qemu::{create_overlay_image, qemu_run_args, require_kvm, spawn_qemu_w
 use crate::resolver::{AssetKind, Reference, ResolveFileContext, ResolveSpec};
 use crate::ssh::{SshOptions, TemporarySshKeypair};
 use crate::util::{create_temp_dir, ensure_command, resolve_under_root};
-use crate::workspace::{discover::discover, discover_context};
+use crate::workspace::{discover_context, registry::load_committed_registry};
 
 use crate::config::{
     load_test_config, validate_test_ports, validate_test_steps, TestIso, TestIsoBootstrap,
@@ -72,11 +72,11 @@ pub(crate) fn cmd_test(config: &Path, args: TestArgs) -> Result<()> {
     let context = discover_context(args.context.as_deref())?;
 
     // Resolve the test config path: either from an explicit --test-config flag
-    // or by discovering the named test in the workspace.
+    // or by looking up the named test in the committed registry.
     let test_config_path = match (args.name, args.test_config) {
         (Some(name), None) => {
-            let registry = discover(&context)?;
-            registry.test(&name, &context)?.clone()
+            let registry = load_committed_registry(&context)?;
+            registry.test(&name)?.clone()
         }
         (None, Some(tc)) => resolve_under_root(&context, tc),
         _ => bail!("exactly one of NAME or --test-config must be provided"),

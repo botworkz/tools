@@ -30,7 +30,7 @@ use crate::config::{load_build_config, validate_build_steps};
 use crate::plan::vm::{StepFlowPlan, StepTimeoutPolicy};
 use crate::plan::{preserve_failed_build_disk, print_log_tail, run_step_flow, shutdown_build_vm};
 use crate::step::{ArchiveStep, StepTarget, TestStep};
-use crate::workspace::{discover::discover, discover_context};
+use crate::workspace::{discover_context, registry::load_committed_registry};
 
 /// Parsed `--cpus` value: either a specific positive count or `auto`.
 ///
@@ -126,11 +126,11 @@ pub(crate) fn cmd_build(config: &Path, args: BuildArgs) -> Result<()> {
     let context = discover_context(args.context.as_deref())?;
 
     // Resolve the spec path: either from an explicit --spec flag or by
-    // discovering the named build in the workspace.
+    // looking up the named build in the committed registry.
     let spec_path = match (args.name, args.spec) {
         (Some(name), None) => {
-            let registry = discover(&context)?;
-            registry.build(&name, &context)?.clone()
+            let registry = load_committed_registry(&context)?;
+            registry.build(&name)?.clone()
         }
         (None, Some(spec)) => resolve_under_root(&context, spec),
         _ => bail!("exactly one of NAME or --spec must be provided"),
