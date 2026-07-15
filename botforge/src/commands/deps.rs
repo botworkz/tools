@@ -34,7 +34,8 @@ pub(crate) struct DepsArgs {
     dry_run: bool,
 }
 
-pub(crate) fn cmd_deps(config: &Path, args: DepsArgs) -> Result<()> {
+pub(crate) fn cmd_deps(config: Option<&Path>, args: DepsArgs) -> Result<()> {
+    let config = config.unwrap_or_else(|| Path::new("shasset.yaml"));
     if args.prune {
         let manifest = load(config)?;
         let cache_dir = args.cache_dir.unwrap_or_else(default_cache_dir);
@@ -324,7 +325,7 @@ mod tests {
         .unwrap();
 
         cmd_deps(
-            &manifest_path,
+            Some(&manifest_path),
             DepsArgs {
                 name: None,
                 out: None,
@@ -368,7 +369,7 @@ mod tests {
         .unwrap();
 
         cmd_deps(
-            &manifest_path,
+            Some(&manifest_path),
             DepsArgs {
                 name: None,
                 out: None,
