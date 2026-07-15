@@ -54,7 +54,7 @@ jobs:
         path: .ci-prebuilt/botforge
     - name: Make botforge binary executable
       run: chmod +x .ci-prebuilt/botforge/botforge
-    - name: Build botwork/botforge:ci runtime image
+    - name: Build botworkz/botforge:ci runtime image
       run: |
         set -euo pipefail
         docker buildx build \
