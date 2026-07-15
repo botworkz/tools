@@ -5,7 +5,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use crate::compressor::{build_compressor, decompress_cluster, Compressor};
-use crate::plan::config::CompressionType;
+use crate::plan::compress::CompressionType;
 
 const QCOW_MAGIC: u32 = 0x5146_49fb;
 const QCOW_OFLAG_COPIED: u64 = 1u64 << 63;
