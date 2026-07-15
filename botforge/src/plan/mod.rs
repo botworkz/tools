@@ -4,7 +4,6 @@ pub(crate) mod compress;
 pub(crate) mod config;
 pub(crate) mod files;
 pub(super) mod log;
-pub(crate) mod step;
 pub(super) mod template;
 pub(crate) mod vm;
 

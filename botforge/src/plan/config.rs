@@ -13,11 +13,11 @@ use super::cloud_init::{
     merge_cloud_init_mappings, validate_cloud_init_fragment, validate_cloud_init_schema_fragment,
 };
 use super::files::FileEntry;
-use super::step::{deserialize_optional_positive_seconds, resolve_shell, StepTarget, TestStep};
 use super::template::{
     expand_raw_step, extract_fragment_input_declarations, resolve_fragment_inputs,
     substitute_inputs_in_value,
 };
+use crate::step::{deserialize_optional_positive_seconds, resolve_shell, StepTarget, TestStep};
 
 /// Maximum number of active `uses:` includes on the call stack at any one time.
 /// Includes the root document, which is always on the stack; so this limits nesting
@@ -1061,9 +1061,9 @@ pub(crate) fn validate_build_steps(steps: &[TestStep]) -> Result<()> {
     Ok(())
 }
 
-fn validate_archive_build_step(step: &crate::plan::step::ArchiveStep) -> Result<()> {
-    use crate::plan::step::StepTarget;
+fn validate_archive_build_step(step: &crate::step::ArchiveStep) -> Result<()> {
     use crate::resolver::Reference;
+    use crate::step::StepTarget;
     let name = step
         .archive
         .name
@@ -1144,11 +1144,11 @@ mod tests {
         validate_test_ports, validate_test_steps, TestConfig, TestIso, MAX_INCLUDE_DEPTH,
     };
     use crate::plan::files::FileEntry;
-    use crate::plan::step::{
-        ArchiveStep, ArchiveStepSpec, ExpectBlock, RunStep, StdioExpect, StepTarget, TestStep,
-    };
     use crate::qemu::PortSpec;
     use crate::resolver::Reference;
+    use crate::step::{
+        ArchiveStep, ArchiveStepSpec, ExpectBlock, RunStep, StdioExpect, StepTarget, TestStep,
+    };
     use std::path::PathBuf;
     use tempfile::TempDir;
 
