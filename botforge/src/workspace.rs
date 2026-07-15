@@ -13,6 +13,11 @@ const MARKER: &str = "botforge.yaml";
 ///   If it does, the canonicalized `dir` is returned.  If not, a hard error is
 ///   returned.  The walk-up is **not** applied to an explicit path.
 pub(crate) fn discover_context(explicit: Option<&Path>) -> Result<PathBuf> {
+    let cwd = std::env::current_dir().context("failed to determine current directory")?;
+    discover_context_from(explicit, &cwd)
+}
+
+fn discover_context_from(explicit: Option<&Path>, start_dir: &Path) -> Result<PathBuf> {
     if let Some(dir) = explicit {
         let canonical = std::fs::canonicalize(dir)
             .with_context(|| format!("--context '{}': cannot resolve directory", dir.display()))?;
@@ -26,9 +31,8 @@ pub(crate) fn discover_context(explicit: Option<&Path>) -> Result<PathBuf> {
         );
     }
 
-    // Walk up from cwd.
-    let cwd = std::env::current_dir().context("failed to determine current directory")?;
-    let mut dir: &Path = &cwd;
+    // Walk up from the provided start directory.
+    let mut dir: &Path = start_dir;
     loop {
         if dir.join(MARKER).is_file() {
             load_botforge_yaml(&dir.join(MARKER))?;
@@ -59,7 +63,7 @@ fn load_botforge_yaml(path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::discover_context;
+    use super::{discover_context, discover_context_from};
     use std::path::Path;
     use tempfile::TempDir;
 
@@ -76,9 +80,7 @@ mod tests {
         let subdir = root.path().join("a/b/c");
         std::fs::create_dir_all(&subdir).unwrap();
 
-        // Temporarily change cwd to the subdir.
-        let _guard = CwdGuard::set(&subdir);
-        let result = discover_context(None).unwrap();
+        let result = discover_context_from(None, &subdir).unwrap();
         assert_eq!(result, root.path().canonicalize().unwrap());
     }
 
@@ -86,24 +88,15 @@ mod tests {
     fn discover_context_none_finds_marker_in_cwd() {
         let root = TempDir::new().unwrap();
         write_marker(root.path());
-        let _guard = CwdGuard::set(root.path());
-        let result = discover_context(None).unwrap();
+        let result = discover_context_from(None, root.path()).unwrap();
         assert_eq!(result, root.path().canonicalize().unwrap());
     }
 
     #[test]
     fn discover_context_none_errors_when_no_marker_found() {
-        // Use a directory that definitely has no botforge.yaml anywhere in the
-        // real ancestor chain — we create an isolated tmp tree with no marker.
-        // We can't guarantee the real root has no marker, but we can test the
-        // error message by setting cwd to a path with no marker upward.
-        //
-        // Create a temp dir, do NOT write marker, use it as cwd.
-        // The walk will reach the fs root without finding a marker.
-        // (In CI the real root almost certainly has no botforge.yaml.)
+        // Use a temp directory with no marker anywhere in its ancestor chain.
         let root = TempDir::new().unwrap();
-        let _guard = CwdGuard::set(root.path());
-        let err = discover_context(None).unwrap_err();
+        let err = discover_context_from(None, root.path()).unwrap_err();
         assert!(
             format!("{err:#}").contains("not inside a botforge workspace"),
             "expected 'not inside a botforge workspace' error, got: {err:#}"
@@ -171,27 +164,5 @@ mod tests {
             format!("{err:#}").contains("invalid YAML"),
             "expected invalid YAML error, got: {err:#}"
         );
-    }
-
-    // ── Helpers ───────────────────────────────────────────────────────────────
-
-    /// RAII guard that sets cwd and restores it on drop.
-    /// Tests that change cwd must be single-threaded (they are, per test binary).
-    struct CwdGuard {
-        original: std::path::PathBuf,
-    }
-
-    impl CwdGuard {
-        fn set(path: &Path) -> Self {
-            let original = std::env::current_dir().unwrap();
-            std::env::set_current_dir(path).unwrap();
-            CwdGuard { original }
-        }
-    }
-
-    impl Drop for CwdGuard {
-        fn drop(&mut self) {
-            let _ = std::env::set_current_dir(&self.original);
-        }
     }
 }
