@@ -3,7 +3,7 @@
 //! then gracefully shutting down and committing the disk as the output artifact.
 
 use anyhow::{bail, Context, Result};
-use clap::Args;
+use clap::{ArgGroup, Args};
 use serde_yaml::Value;
 use shasset::fetch::{fetch_asset, FetchParams, MaterializeMode};
 use shasset::manifest::load;
@@ -30,7 +30,7 @@ use crate::config::{load_build_config, validate_build_steps};
 use crate::plan::vm::{StepFlowPlan, StepTimeoutPolicy};
 use crate::plan::{preserve_failed_build_disk, print_log_tail, run_step_flow, shutdown_build_vm};
 use crate::step::{ArchiveStep, StepTarget, TestStep};
-use crate::workspace::discover_context;
+use crate::workspace::{discover::discover, discover_context};
 
 /// Parsed `--cpus` value: either a specific positive count or `auto`.
 ///
@@ -72,10 +72,16 @@ impl std::str::FromStr for CpusArg {
 }
 
 #[derive(Args, Debug)]
+#[command(group(ArgGroup::new("target").required(true).args(["name", "spec"])))]
 pub(crate) struct BuildArgs {
-    /// Path to type-build YAML spec.
-    #[arg(long, required = true)]
-    spec: PathBuf,
+    /// Name of the build to run, resolved via workspace discovery.
+    /// Mutually exclusive with --spec.
+    #[arg(value_name = "NAME")]
+    name: Option<String>,
+    /// Path to type-build YAML spec (explicit override).
+    /// Mutually exclusive with NAME.
+    #[arg(long)]
+    spec: Option<PathBuf>,
     /// Source qcow2 image path (optional local override). When provided, overrides the
     /// `image:` shasset resolution and boots this file directly. Read-only; copied
     /// to <output>.partial before any modification.
@@ -119,7 +125,16 @@ pub(crate) fn cmd_build(config: &Path, args: BuildArgs) -> Result<()> {
 
     let context = discover_context(args.context.as_deref())?;
 
-    let spec_path = resolve_under_root(&context, args.spec.clone());
+    // Resolve the spec path: either from an explicit --spec flag or by
+    // discovering the named build in the workspace.
+    let spec_path = match (args.name, args.spec) {
+        (Some(name), None) => {
+            let registry = discover(&context)?;
+            registry.build(&name, &context)?.clone()
+        }
+        (None, Some(spec)) => resolve_under_root(&context, spec),
+        _ => bail!("exactly one of NAME or --spec must be provided"),
+    };
 
     let build_config = load_build_config(&context, &spec_path)?;
     let output = derive_artifact_output_path(&context, &spec_path, &build_config.output)?;
@@ -1344,7 +1359,7 @@ mod tests {
         qemu_nbd_connect_args, qemu_nbd_disconnect_args, should_run_zero_cluster_sparsify,
         unpack_archive_to_dir,
     };
-    use crate::cli::Cli;
+    use crate::cli::{Cli, Commands};
     use crate::compress::ReclaimMode;
     use clap::Parser;
     use std::path::{Path, PathBuf};
@@ -1482,6 +1497,10 @@ mod tests {
             .to_string();
         assert!(help.contains("--spec"), "--spec missing from help: {help}");
         assert!(
+            help.contains("NAME") || help.contains("name"),
+            "positional NAME missing from help: {help}"
+        );
+        assert!(
             help.contains("--source"),
             "--source missing from help: {help}"
         );
@@ -1560,14 +1579,11 @@ mod tests {
     }
 
     #[test]
-    fn build_cli_requires_spec() {
+    fn build_cli_requires_name_or_spec() {
+        // Neither NAME nor --spec provided: should error.
         let err = Cli::try_parse_from(["botforge", "build"]).unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
         let err_text = err.to_string();
-        assert!(
-            err_text.contains("--spec"),
-            "expected --spec in error: {err_text}"
-        );
         // --source is now optional (overrides image: resolution); not required.
         assert!(
             !err_text.contains("--source"),
@@ -1577,6 +1593,28 @@ mod tests {
             !err_text.contains("--ssh-key"),
             "--ssh-key should not be required: {err_text}"
         );
+    }
+
+    #[test]
+    fn build_cli_name_and_spec_are_mutually_exclusive() {
+        let err = Cli::try_parse_from(["botforge", "build", "my-build", "--spec", "build.yaml"])
+            .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn build_cli_name_parses_positional() {
+        let result = Cli::try_parse_from(["botforge", "build", "my-build"]);
+        assert!(
+            result.is_ok(),
+            "build should parse with positional NAME: {result:?}"
+        );
+        if let Ok(cli) = result {
+            if let Commands::Build(args) = cli.command {
+                assert_eq!(args.name, Some("my-build".to_string()));
+                assert!(args.spec.is_none());
+            }
+        }
     }
 
     #[test]

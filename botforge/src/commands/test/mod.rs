@@ -1,5 +1,5 @@
 use anyhow::{bail, Context, Result};
-use clap::Args;
+use clap::{ArgGroup, Args};
 use std::path::{Path, PathBuf};
 
 use crate::commands::build::CpusArg;
@@ -10,7 +10,7 @@ use crate::qemu::{create_overlay_image, qemu_run_args, require_kvm, spawn_qemu_w
 use crate::resolver::{AssetKind, Reference, ResolveFileContext, ResolveSpec};
 use crate::ssh::{SshOptions, TemporarySshKeypair};
 use crate::util::{create_temp_dir, ensure_command, resolve_under_root};
-use crate::workspace::discover_context;
+use crate::workspace::{discover::discover, discover_context};
 
 use crate::config::{
     load_test_config, validate_test_ports, validate_test_steps, TestIso, TestIsoBootstrap,
@@ -18,10 +18,16 @@ use crate::config::{
 use crate::plan::{cleanup_test, collect_test_diagnostics, print_log_tail, run_test_flow};
 
 #[derive(Args, Debug)]
+#[command(group(ArgGroup::new("target").required(true).args(["name", "test_config"])))]
 pub(crate) struct TestArgs {
-    /// Path to test.yaml config.
-    #[arg(long = "test-config", required = true)]
-    test_config: PathBuf,
+    /// Name of the test to run, resolved via workspace discovery.
+    /// Mutually exclusive with --test-config.
+    #[arg(value_name = "NAME")]
+    name: Option<String>,
+    /// Path to test.yaml config (explicit override).
+    /// Mutually exclusive with NAME.
+    #[arg(long = "test-config")]
+    test_config: Option<PathBuf>,
     /// Base qcow2 image path or `@…` reference. Overrides `image:` in the test config.
     #[arg(long)]
     base_image: Option<PathBuf>,
@@ -64,7 +70,17 @@ pub(crate) fn cmd_test(config: &Path, args: TestArgs) -> Result<()> {
     detect_iso_tool()?;
 
     let context = discover_context(args.context.as_deref())?;
-    let test_config_path = resolve_under_root(&context, args.test_config);
+
+    // Resolve the test config path: either from an explicit --test-config flag
+    // or by discovering the named test in the workspace.
+    let test_config_path = match (args.name, args.test_config) {
+        (Some(name), None) => {
+            let registry = discover(&context)?;
+            registry.test(&name, &context)?.clone()
+        }
+        (None, Some(tc)) => resolve_under_root(&context, tc),
+        _ => bail!("exactly one of NAME or --test-config must be provided"),
+    };
 
     let test_config = load_test_config(&context, &test_config_path)?;
     let base_image = resolve_test_base_image(
@@ -277,7 +293,7 @@ fn resolve_test_iso_path(context: &Path, manifest_path: &Path, path: &Path) -> R
 #[cfg(test)]
 mod tests {
     use super::{resolve_test_base_image, resolve_test_iso_path};
-    use crate::cli::Cli;
+    use crate::cli::{Cli, Commands};
     use crate::resolver::Reference;
     use clap::Parser;
     use std::path::PathBuf;
@@ -300,6 +316,36 @@ mod tests {
             "CLI should parse without --context: {}",
             result.unwrap_err()
         );
+    }
+
+    #[test]
+    fn test_test_cli_requires_name_or_test_config() {
+        // Neither NAME nor --test-config provided: should error.
+        let err = Cli::try_parse_from(["botforge", "test"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn test_test_cli_name_parses_positional() {
+        let result = Cli::try_parse_from(["botforge", "test", "my-test"]);
+        assert!(
+            result.is_ok(),
+            "test should parse with positional NAME: {result:?}"
+        );
+        if let Ok(cli) = result {
+            if let Commands::Test(args) = cli.command {
+                assert_eq!(args.name, Some("my-test".to_string()));
+                assert!(args.test_config.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn test_test_cli_name_and_test_config_mutually_exclusive() {
+        let err =
+            Cli::try_parse_from(["botforge", "test", "my-test", "--test-config", "test.yaml"])
+                .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     #[test]
