@@ -317,7 +317,7 @@ pub(super) fn default_bootstrap_path() -> PathBuf {
     PathBuf::from("bootstrap.sh")
 }
 
-pub(crate) fn load_test_config(repo_root: &Path, path: &Path) -> Result<TestConfig> {
+pub(crate) fn load_test_config(context: &Path, path: &Path) -> Result<TestConfig> {
     let yaml = std::fs::read_to_string(path)
         .with_context(|| format!("cannot read test config: {}", path.display()))?;
     let value: Value = serde_yaml::from_str(&yaml)
@@ -354,7 +354,7 @@ pub(crate) fn load_test_config(repo_root: &Path, path: &Path) -> Result<TestConf
         isos: raw.isos,
         ports: raw.ports,
         steps: expand_test_steps(
-            repo_root,
+            context,
             path,
             raw.steps,
             &mut include_stack,
@@ -392,7 +392,7 @@ pub(crate) fn load_test_config(repo_root: &Path, path: &Path) -> Result<TestConf
     Ok(config)
 }
 
-pub(crate) fn load_build_config(repo_root: &Path, path: &Path) -> Result<BuildConfig> {
+pub(crate) fn load_build_config(context: &Path, path: &Path) -> Result<BuildConfig> {
     let yaml = std::fs::read_to_string(path)
         .with_context(|| format!("cannot read build config: {}", path.display()))?;
     let value: Value = serde_yaml::from_str(&yaml)
@@ -446,7 +446,7 @@ pub(crate) fn load_build_config(repo_root: &Path, path: &Path) -> Result<BuildCo
         output,
         disk_size: raw.disk_size,
         steps: expand_test_steps(
-            repo_root,
+            context,
             path,
             raw.steps,
             &mut include_stack,
@@ -605,7 +605,7 @@ fn run_semantic_validators(target: SemanticValidationTarget<'_>) -> Result<()> {
 }
 
 fn expand_test_steps(
-    repo_root: &Path,
+    context: &Path,
     current_file: &Path,
     steps: Vec<RawTestStep>,
     include_stack: &mut Vec<PathBuf>,
@@ -621,7 +621,7 @@ fn expand_test_steps(
             ),
             RawTestStep::Include(include) => {
                 let include_path =
-                    resolve_uses_path(repo_root, &include.uses).with_context(|| {
+                    resolve_uses_path(context, &include.uses).with_context(|| {
                         format!("invalid test step include in {}", current_file.display())
                     })?;
                 if include_stack.contains(&include_path) {
@@ -650,7 +650,7 @@ fn expand_test_steps(
                         files_acc.extend(files);
                         let mut ci_acc = ci;
                         let expanded_steps = expand_test_steps(
-                            repo_root,
+                            context,
                             &include_path,
                             steps,
                             include_stack,
@@ -852,7 +852,7 @@ fn check_no_top_level_bootcmd(path: &Path, value: &Value) -> Result<()> {
     Ok(())
 }
 
-fn resolve_uses_path(repo_root: &Path, uses: &str) -> Result<PathBuf> {
+fn resolve_uses_path(context: &Path, uses: &str) -> Result<PathBuf> {
     use crate::resolver::Reference;
 
     // Preserve backward-compatible error messages for schemes like `file://`
@@ -872,7 +872,7 @@ fn resolve_uses_path(repo_root: &Path, uses: &str) -> Result<PathBuf> {
         Reference::parse(uses).with_context(|| format!("invalid uses value '{uses}'"))?;
 
     match reference {
-        Reference::Repo { path: Some(p) } => Ok(resolve_under_root(repo_root, p)),
+        Reference::Repo { path: Some(p) } => Ok(resolve_under_root(context, p)),
         Reference::Repo { path: None } => {
             anyhow::bail!("invalid uses value '{uses}': expected @://<path>")
         }

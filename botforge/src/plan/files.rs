@@ -216,7 +216,7 @@ mod tests {
         manifest: &'a std::path::Path,
     ) -> ResolveFileContext<'a> {
         ResolveFileContext {
-            repo_root: repo.path(),
+            context: repo.path(),
             manifest_path: manifest,
             cache_dir_override: None,
         }
