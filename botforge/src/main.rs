@@ -1,3 +1,4 @@
+mod assert;
 mod cli;
 mod commands;
 mod compress;

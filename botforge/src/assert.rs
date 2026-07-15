@@ -17,8 +17,8 @@ use std::time::Duration;
 use crate::ssh::{ssh_capture_stdout, SshOptions};
 use crate::util::shell_single_quote;
 
-use super::config::{validate_mode_string, validate_owner_group_string};
-use super::log::print_phase_status;
+use crate::plan::config::{validate_mode_string, validate_owner_group_string};
+use crate::plan::log::print_phase_status;
 
 // ---------------------------------------------------------------------------
 // assert: block types  (schema / parse section)

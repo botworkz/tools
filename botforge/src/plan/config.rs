@@ -8,7 +8,6 @@ use crate::qemu::PortSpec;
 use crate::resolver::Reference;
 use crate::util::resolve_under_root;
 
-use super::assert::{validate_assert_block, AssertBlock};
 use super::cloud_init::{
     merge_cloud_init_mappings, validate_cloud_init_fragment, validate_cloud_init_schema_fragment,
 };
@@ -17,6 +16,7 @@ use super::template::{
     expand_raw_step, extract_fragment_input_declarations, resolve_fragment_inputs,
     substitute_inputs_in_value,
 };
+use crate::assert::{validate_assert_block, AssertBlock};
 use crate::step::{deserialize_optional_positive_seconds, resolve_shell, StepTarget, TestStep};
 
 /// Maximum number of active `uses:` includes on the call stack at any one time.
@@ -898,7 +898,7 @@ fn dedupe_identical_files(files: Vec<FileEntry>) -> Vec<FileEntry> {
 }
 
 /// Validate a `mode` string: must be 3–4 octal digits (same rule as `payload.rs`).
-pub(super) fn validate_mode_string(mode: &str, src: &str, kind: &str) -> Result<()> {
+pub(crate) fn validate_mode_string(mode: &str, src: &str, kind: &str) -> Result<()> {
     if mode.len() < 3 || mode.len() > 4 || !mode.chars().all(|ch| ('0'..='7').contains(&ch)) {
         anyhow::bail!("{kind} files entry '{src}': `mode` must be 3–4 octal digits, got '{mode}'");
     }
@@ -906,7 +906,7 @@ pub(super) fn validate_mode_string(mode: &str, src: &str, kind: &str) -> Result<
 }
 
 /// Validate an `owner` or `group` string: non-empty, no whitespace, no `/`, no shell metacharacters.
-pub(super) fn validate_owner_group_string(
+pub(crate) fn validate_owner_group_string(
     value: &str,
     field: &str,
     src: &str,
