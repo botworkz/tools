@@ -177,11 +177,11 @@ mod tests {
     use tempfile::TempDir;
 
     fn resolve_context<'a>(
-        repo_root: &'a std::path::Path,
+        context: &'a std::path::Path,
         manifest_path: &'a std::path::Path,
     ) -> ResolveFileContext<'a> {
         ResolveFileContext {
-            repo_root,
+            context,
             manifest_path,
             cache_dir_override: None,
         }
@@ -385,7 +385,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_to_files_bare_repo_root_is_error() {
+    fn resolve_to_files_bare_context_root_is_error() {
         let tmp = TempDir::new().unwrap();
         let manifest = tmp.path().join("shasset.yaml");
         let err = Reference::Repo { path: None }
@@ -393,7 +393,7 @@ mod tests {
             .unwrap_err();
         assert!(
             format!("{err:#}").contains("path or glob is required"),
-            "bare repo root should be rejected: {err:#}"
+            "bare context root should be rejected: {err:#}"
         );
     }
 

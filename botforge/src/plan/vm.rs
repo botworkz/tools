@@ -61,7 +61,7 @@ struct StepExecutionBudget {
 }
 
 struct RunStepContext<'a> {
-    repo_root: &'a Path,
+    context: &'a Path,
     ssh: &'a SshOptions,
     step_log_dir: &'a Path,
     overall_deadline: Instant,
@@ -74,7 +74,7 @@ struct RunStepContext<'a> {
 // ---------------------------------------------------------------------------
 
 pub(crate) fn run_test_flow(
-    repo_root: &Path,
+    context: &Path,
     config: &TestConfig,
     ssh: &SshOptions,
     bootstraps: &[TestIsoBootstrap],
@@ -91,7 +91,7 @@ pub(crate) fn run_test_flow(
     });
 
     run_step_flow(
-        repo_root,
+        context,
         StepFlowPlan {
             files: &config.files,
             steps: &config.steps,
@@ -150,7 +150,7 @@ fn run_assert_phase(
 /// staging but **before** the first step executes.  `botforge test` uses this to
 /// run the declarative `assert:` phase on the fresh-boot image state.
 pub(crate) fn run_step_flow(
-    repo_root: &Path,
+    context: &Path,
     plan: StepFlowPlan<'_>,
     ssh: &SshOptions,
     timeouts: StepTimeoutPolicy,
@@ -158,7 +158,7 @@ pub(crate) fn run_step_flow(
     pre_steps: Option<&PreStepsHook<'_>>,
 ) -> Result<Instant> {
     let overall_deadline = Instant::now() + timeouts.overall_timeout;
-    let step_log_dir = repo_root.join("build").join("logs");
+    let step_log_dir = context.join("build").join("logs");
     std::fs::create_dir_all(&step_log_dir).with_context(|| {
         format!(
             "cannot create test step log dir: {}",
@@ -218,7 +218,7 @@ pub(crate) fn run_step_flow(
     if !plan.files.is_empty() {
         ensure_overall_budget(overall_deadline, timeouts.overall_timeout)?;
         let resolve_context = ResolveFileContext {
-            repo_root,
+            context,
             manifest_path: plan.manifest_path,
             cache_dir_override: plan.cache_dir_override,
         };
@@ -228,7 +228,7 @@ pub(crate) fn run_step_flow(
     // Shared ordered env map threaded across all steps (both guest and host).
     let mut accumulated_env: Vec<(String, String)> = Vec::new();
     let run_context = RunStepContext {
-        repo_root,
+        context,
         ssh,
         step_log_dir: &step_log_dir,
         overall_deadline,
@@ -449,7 +449,7 @@ fn run_run_step(
                 let (capture, actual_exit) = run_host_step_capturing(
                     &step.name,
                     &step.run,
-                    context.repo_root,
+                    context.context,
                     step_budget,
                     &template,
                     accumulated_env,
@@ -474,7 +474,7 @@ fn run_run_step(
                 let result = run_host_step(
                     &step.name,
                     &step.run,
-                    context.repo_root,
+                    context.context,
                     step_budget,
                     &template,
                     accumulated_env,
@@ -606,7 +606,7 @@ fn run_ssh_step_capturing(
 fn run_host_step_capturing(
     name: &str,
     run: &str,
-    repo_root: &Path,
+    context: &Path,
     budget: StepExecutionBudget,
     template: &[String],
     accumulated_env: &[(String, String)],
@@ -635,7 +635,7 @@ fn run_host_step_capturing(
     let mut command = Command::new(&argv[0]);
     command
         .args(&argv[1..])
-        .current_dir(repo_root)
+        .current_dir(context)
         .env("BOTFORGE_ENV", files.env_file)
         .envs(
             accumulated_env
@@ -930,13 +930,13 @@ struct HostStepFiles<'a> {
 
 /// Run a step locally in the botforge container (harness) with a plain execution timeout.
 /// `run` is written to a temp file and executed via `template` (argv with `{0}` slot).
-/// The working directory is `repo_root`. Inherits the current process environment, with
+/// The working directory is `context`. Inherits the current process environment, with
 /// `accumulated_env` injected (overriding inherited values) and `BOTFORGE_ENV` pointing at
 /// `env_file` so the step can write new key-value pairs for later steps to consume.
 fn run_host_step(
     name: &str,
     run: &str,
-    repo_root: &Path,
+    context: &Path,
     budget: StepExecutionBudget,
     template: &[String],
     accumulated_env: &[(String, String)],
@@ -965,7 +965,7 @@ fn run_host_step(
     let mut command = Command::new(&argv[0]);
     command
         .args(&argv[1..])
-        .current_dir(repo_root)
+        .current_dir(context)
         .env("BOTFORGE_ENV", files.env_file)
         .envs(
             accumulated_env

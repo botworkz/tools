@@ -8,6 +8,7 @@ mod resolver;
 mod ssh;
 mod step;
 mod util;
+mod workspace;
 
 use anyhow::Result;
 use clap::Parser;

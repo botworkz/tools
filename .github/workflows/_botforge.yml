@@ -67,6 +67,9 @@ jobs:
 
     - run: |
         mkdir testrepo
+        cp -a botforge/test/botforge.yaml testrepo/
+        cp -a botforge/test/compose.yaml testrepo/
+        cp -a botforge/test/.botforge.env testrepo/
         cp -a botforge/test/hello.steps.yaml testrepo/
         cp -a botforge/test/assert-fail.yaml testrepo/
         cp -a botforge/test/for-fragment-build.steps.yaml testrepo/
@@ -80,7 +83,6 @@ jobs:
           echo "HOST_UID=$(id -u)"
           echo "HOST_GID=$(id -g)"
           echo "HOST_KVM_GID=$(getent group kvm | cut -d: -f3)"
-          echo "REPO_ROOT=$(realpath testrepo)"
         } >> "$GITHUB_ENV"
     - name: Create shasset
       uses: envoyproxy/toolshed/actions/jq@6a20085af231aba4c72d6866f94098343a8c5616
@@ -165,6 +167,7 @@ jobs:
     - run: |
         . .botforge.env
         botforge build --spec build.yaml
+      working-directory: testrepo
 
     - name: Sanity checks
       run: |
@@ -186,6 +189,7 @@ jobs:
       run: |
         . .botforge.env
         botforge build --spec chained.yaml
+      working-directory: testrepo
 
     - name: Sanity check chained output
       run: |
@@ -196,20 +200,20 @@ jobs:
       run: |
         . .botforge.env
         botforge test \
-          --test-config test.yaml \
-          --repo-root "$REPO_ROOT"
+          --test-config test.yaml
+      working-directory: testrepo
 
     - name: Negative-control — deliberate assert failure must exit non-zero
       run: |
         set -euo pipefail
         . .botforge.env
         if botforge test \
-             --test-config assert-fail.yaml \
-             --repo-root "$REPO_ROOT"; then
+             --test-config assert-fail.yaml; then
           echo "ERROR: botforge should have exited non-zero for a failing assertion" >&2
           exit 1
         fi
         echo "Negative-control passed: botforge correctly rejected the failing assertion"
+      working-directory: testrepo
 
     - name: Negative-control — leaked botforge-evil identity must fail
       run: |
@@ -221,12 +225,12 @@ jobs:
         # MUST fail, proving negatives bite and installer-exclusion is
         # exact-name only (botforge-evil is not the installer and is caught).
         if botforge test \
-             --test-config assert-fail-leaked.yaml \
-             --repo-root "$REPO_ROOT"; then
+             --test-config assert-fail-leaked.yaml
           echo "ERROR: botforge should have exited non-zero for leaked botforge-evil identity" >&2
           exit 1
         fi
         echo "Negative-control passed: botforge correctly rejected leaked botforge-evil identity"
+      working-directory: testrepo
 
     - name: Negative-control — wrong root-only file assertion must fail
       run: |
@@ -237,9 +241,9 @@ jobs:
         # botforge MUST fail, proving the privileged probe reads real state
         # rather than silently reporting absent or passing without checking.
         if botforge test \
-             --test-config assert-fail-rootfile.yaml \
-             --repo-root "$REPO_ROOT"; then
+             --test-config assert-fail-rootfile.yaml
           echo "ERROR: botforge should have exited non-zero for wrong root-only file assertion" >&2
           exit 1
         fi
         echo "Negative-control passed: botforge correctly rejected wrong root-only file assertion"
+      working-directory: testrepo
