@@ -23,7 +23,6 @@ use crate::util::{
 };
 
 use crate::plan::compress::{CompressConfig, CompressionType, ReclaimMode};
-use crate::plan::step::{ArchiveStep, StepTarget, TestStep};
 use crate::plan::{
     load_build_config, preserve_failed_build_disk, print_log_tail, run_step_flow,
     shutdown_build_vm, validate_build_steps, vm::StepFlowPlan, vm::StepTimeoutPolicy,
@@ -31,6 +30,7 @@ use crate::plan::{
 use crate::qcow2::{
     compress_qcow2_image, read_qcow2_image_stats, read_virtual_sector0, sparsify_zero_clusters,
 };
+use crate::step::{ArchiveStep, StepTarget, TestStep};
 
 /// Parsed `--cpus` value: either a specific positive count or `auto`.
 ///
