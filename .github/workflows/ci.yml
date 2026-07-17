@@ -238,6 +238,36 @@ jobs:
         pattern: '*-binary'
         path: .ci-artifacts
 
+    - name: Build CI toolchain image (rust:1-slim-bookworm + rustfmt + clippy)
+      if: steps.version.outputs.is_release == 'true'
+      run: |
+        docker build -t ci-tools:local - <<'EOF'
+        FROM rust:1-slim-bookworm
+        RUN rustup component add rustfmt clippy
+        EOF
+
+    - name: Build and stage botforge plugins for container build
+      if: steps.version.outputs.is_release == 'true'
+      run: |
+        set -euo pipefail
+        # Build libpigz.so and libgithub.so in the same bookworm container as
+        # the prebuilt binary so glibc/ABI versions match at dlopen time.
+        for plugin in botforge-plugin-pigz botforge-plugin-github; do
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -v "$GITHUB_WORKSPACE:/workspace" \
+            -v "$HOME/.cargo:/cargo" \
+            -w /workspace \
+            -e CARGO_HOME=/cargo \
+            ci-tools:local \
+            cargo build -p "$plugin" --release --locked
+        done
+        # Stage into .ci-plugins/ so the botforge/Dockerfile COPY finds them.
+        mkdir -p .ci-plugins
+        cp target/release/libpigz.so   .ci-plugins/libpigz.so
+        cp target/release/libgithub.so .ci-plugins/libgithub.so
+        echo "Staged plugins: $(ls -lh .ci-plugins/*.so)"
+
     - name: Publish container images
       if: steps.version.outputs.is_release == 'true'
       run: |
