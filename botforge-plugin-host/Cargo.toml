@@ -17,5 +17,12 @@ path = "src/lib.rs"
 libloading = "0.8"
 thiserror = "2"
 
+[dev-dependencies]
+# Minimal synchronous HTTP server used in plugin-host acceptance tests to
+# mock the GitHub Releases REST API without touching real github.com.
+tiny_http = "0.12"
+tempfile = "3"
+serde_json = "1"
+
 [lints]
 workspace = true
