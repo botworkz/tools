@@ -284,3 +284,75 @@ jobs:
         fi
         echo "Negative-control passed: botforge correctly rejected wrong root-only file assertion"
       working-directory: testrepo
+
+    # ── Publish acceptance ────────────────────────────────────────────────────
+    # MinIO provides a local S3-compatible endpoint so the real `aws s3 cp`
+    # code path is exercised in CI without any external cloud dependency.
+    - run: cp -a botforge/test/publish.yaml testrepo/
+
+    - name: Start MinIO (S3-compatible store for publish acceptance)
+      run: |
+        # testrepo_default is the Compose project network created by earlier
+        # `docker compose run` invocations in the testrepo/ working directory.
+        # Joining it lets the botforge container resolve "minio" by name.
+        docker run -d \
+          --name minio \
+          --network testrepo_default \
+          -p 9000:9000 \
+          -e MINIO_ROOT_USER=minioadmin \
+          -e MINIO_ROOT_PASSWORD=minioadmin \
+          quay.io/minio/minio server /data --console-address ":9001"
+
+    - name: Wait for MinIO to be healthy
+      run: |
+        set -euo pipefail
+        for i in $(seq 1 30); do
+          if curl -sf http://localhost:9000/minio/health/live; then
+            echo "MinIO is healthy"
+            break
+          fi
+          echo "Waiting for MinIO... attempt ${i}/30"
+          sleep 2
+        done
+        curl -sf http://localhost:9000/minio/health/live
+
+    - name: Create S3 bucket in MinIO
+      run: |
+        AWS_ACCESS_KEY_ID=minioadmin \
+        AWS_SECRET_ACCESS_KEY=minioadmin \
+        AWS_DEFAULT_REGION=us-east-1 \
+        aws --endpoint-url http://localhost:9000 s3 mb s3://botforge-ci
+
+    - name: Set AWS environment for publish acceptance
+      run: |
+        # AWS_ENDPOINT_URL uses the container name "minio" so that the botforge
+        # container (on the same testrepo_default Docker network) can reach it
+        # via Docker's internal DNS.  The host-side verification steps below use
+        # http://localhost:9000 instead (via the published port).
+        {
+          echo "AWS_ACCESS_KEY_ID=minioadmin"
+          echo "AWS_SECRET_ACCESS_KEY=minioadmin"
+          echo "AWS_DEFAULT_REGION=us-east-1"
+          echo "AWS_ENDPOINT_URL=http://minio:9000"
+        } >> "$GITHUB_ENV"
+
+    - name: Run publish acceptance (fs + S3 via MinIO)
+      run: |
+        . .botforge.env
+        botforge publish --spec publish.yaml
+      working-directory: testrepo
+
+    - name: Verify publish fs output
+      run: |
+        set -euo pipefail
+        ls -lh testrepo/build/publish/fs/foo.qcow2
+        echo "publish fs OK"
+
+    - name: Verify publish S3 upload
+      run: |
+        set -euo pipefail
+        AWS_ACCESS_KEY_ID=minioadmin \
+        AWS_SECRET_ACCESS_KEY=minioadmin \
+        AWS_DEFAULT_REGION=us-east-1 \
+        aws --endpoint-url http://localhost:9000 s3 ls s3://botforge-ci/publish/
+        echo "publish s3 OK"

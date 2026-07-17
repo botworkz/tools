@@ -25,7 +25,8 @@ serde_json = "1"
 serde_yaml = "0.9"
 shasset = { path = "../shasset" }
 time = { version = "0.3", features = ["formatting"] }
-tokio = { version = "1", features = ["rt", "net", "io-util", "time"] }
+object_store = { version = "0.14.1", features = ["aws"] }
+tokio = { version = "1", features = ["fs", "rt", "net", "io-util", "time"] }
 zstd = { version = "0.13.3", features = ["zstdmt"] }
 
 [dev-dependencies]

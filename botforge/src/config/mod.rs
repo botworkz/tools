@@ -48,6 +48,9 @@ enum DocumentType {
     /// `disk_size:`, `memsize:`, `smp:`).
     #[serde(rename = "botforge/fragment")]
     Fragment,
+    /// An entrypoint document consumed directly by `botforge publish`.
+    #[serde(rename = "botforge/publish")]
+    Publish,
 }
 
 impl DocumentType {
@@ -56,6 +59,7 @@ impl DocumentType {
             DocumentType::Test => "botforge/test",
             DocumentType::Build => "botforge/build",
             DocumentType::Fragment => "botforge/fragment",
+            DocumentType::Publish => "botforge/publish",
         }
     }
 
@@ -72,6 +76,11 @@ impl DocumentType {
     /// Returns `true` if this kind can be consumed via a `uses:` reference.
     fn is_consumable_fragment(self) -> bool {
         matches!(self, DocumentType::Fragment)
+    }
+
+    /// Returns `true` if this kind is the expected entrypoint for `botforge publish`.
+    fn is_publish_entrypoint(self) -> bool {
+        matches!(self, DocumentType::Publish)
     }
 }
 
@@ -490,6 +499,224 @@ pub(crate) fn load_build_config(repo_root: &Path, path: &Path) -> Result<BuildCo
         files: &config.files,
     })?;
     Ok(config)
+}
+
+// ─── publish config ───────────────────────────────────────────────────────────
+
+/// Filesystem target block in a `type: botforge/publish` document.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawFsTarget {
+    /// Source: an `@`-notation reference, e.g. `@artifact://images/vm.qcow2`.
+    src: String,
+    /// Destination directory on the local filesystem.  Created if absent.
+    dest: String,
+}
+
+/// S3 target block in a `type: botforge/publish` document.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawS3Target {
+    /// Source: an `@`-notation reference, e.g. `@artifact://images/vm.qcow2`.
+    src: String,
+    /// S3 destination URL, e.g. `s3://my-bucket/releases/`.
+    /// Credentials are read from the environment
+    /// (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION`,
+    /// and optionally `AWS_ENDPOINT_URL` for S3-compatible services).
+    dest: String,
+}
+
+/// Raw deserialization target for a top-level `botforge publish` document.
+///
+/// `deny_unknown_fields` ensures that unrecognised target blocks (e.g.
+/// `github:`, typo'd `s3x:`) produce a clear parse-time error.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPublishDocument {
+    #[serde(rename = "type")]
+    doc_type: DocumentType,
+    #[serde(default)]
+    name: Option<String>,
+    /// Ordered prepare-phase steps executed before any target.
+    /// Raw YAML values; expanded via `expand_raw_step` at load time.
+    #[serde(default)]
+    steps: Vec<Value>,
+    /// Zero or more filesystem targets.
+    #[serde(default)]
+    fs: Vec<RawFsTarget>,
+    /// Zero or more S3 targets.
+    #[serde(default)]
+    s3: Vec<RawS3Target>,
+}
+
+/// Filesystem publish target.
+#[derive(Debug)]
+pub(crate) struct FsTarget {
+    /// Resolved `@`-reference string (as written in the YAML).
+    pub(crate) src: String,
+    /// Local destination directory (a plain filesystem path; not `@`-resolved).
+    pub(crate) dest: String,
+}
+
+/// S3 publish target.
+#[derive(Debug)]
+pub(crate) struct S3Target {
+    /// Resolved `@`-reference string (as written in the YAML).
+    pub(crate) src: String,
+    /// S3 destination URL (`s3://bucket/prefix`).
+    pub(crate) dest: String,
+}
+
+/// Validated publish plan loaded from a `type: botforge/publish` document.
+///
+/// ## Schema contract
+///
+/// - `steps:` is an **ordered, sequential, fail-fast prepare phase** that runs
+///   BEFORE any targets.  Steps use plain shell only — no `@://` in step bodies,
+///   no `${{ }}` expressions, no input machinery.  cwd is the repo/context root
+///   in the container.  All pre-publish mangling (path versioning, changelog
+///   rewriting, checksum generation, staging/renaming) belongs here.
+/// - Each target kind (`fs`, `s3`) is a **list of instances**.  Multiple
+///   destinations of the same kind are expressed as multiple list entries.
+/// - Publish targets are **unordered** and MAY run in parallel; plans MUST NOT
+///   assume any ordering within a kind's list or across kinds.  The current
+///   implementation runs them serially, but the iteration order is an
+///   implementation detail that plans must not depend on.
+#[derive(Debug)]
+pub(crate) struct PublishConfig {
+    #[allow(dead_code)]
+    pub(crate) name: String,
+    /// Ordered prepare-phase steps; run sequentially before any target.
+    pub(crate) steps: Vec<TestStep>,
+    /// Filesystem targets (may be empty).
+    pub(crate) fs: Vec<FsTarget>,
+    /// S3 targets (may be empty; credentials from environment).
+    pub(crate) s3: Vec<S3Target>,
+}
+
+/// Load and validate a `type: botforge/publish` document from `path`.
+pub(crate) fn load_publish_config(path: &Path) -> Result<PublishConfig> {
+    let yaml = std::fs::read_to_string(path)
+        .with_context(|| format!("cannot read publish config: {}", path.display()))?;
+    let raw: RawPublishDocument = serde_yaml::from_str(&yaml)
+        .with_context(|| format!("invalid publish config: {}", path.display()))?;
+    if !raw.doc_type.is_publish_entrypoint() {
+        anyhow::bail!(
+            "botforge publish requires a 'type: botforge/publish' document, got 'type: {}'",
+            raw.doc_type.as_str()
+        );
+    }
+    let name = validate_entrypoint_name(raw.name, path, DocumentType::Publish)?;
+
+    // Expand `steps:` (handles `for:` expansion at load time).
+    let mut steps: Vec<TestStep> = Vec::new();
+    for (i, v) in raw.steps.into_iter().enumerate() {
+        let expanded = expand_raw_step(v)
+            .with_context(|| format!("invalid publish step [{}] in {}", i, path.display()))?;
+        steps.extend(expanded);
+    }
+    validate_publish_steps(&steps)?;
+
+    let fs: Vec<FsTarget> = raw
+        .fs
+        .into_iter()
+        .enumerate()
+        .map(|(i, t)| {
+            validate_publish_src(&t.src, path, &format!("fs[{i}]"))?;
+            Ok(FsTarget {
+                src: t.src,
+                dest: t.dest,
+            })
+        })
+        .collect::<Result<_>>()?;
+
+    let s3: Vec<S3Target> = raw
+        .s3
+        .into_iter()
+        .enumerate()
+        .map(|(i, t)| {
+            validate_publish_src(&t.src, path, &format!("s3[{i}]"))?;
+            validate_s3_dest(&t.dest, path)?;
+            Ok(S3Target {
+                src: t.src,
+                dest: t.dest,
+            })
+        })
+        .collect::<Result<_>>()?;
+
+    if fs.is_empty() && s3.is_empty() {
+        anyhow::bail!(
+            "publish plan '{}' ({}) has no targets; \
+             add at least one 'fs' or 's3' entry",
+            name,
+            path.display()
+        );
+    }
+
+    Ok(PublishConfig {
+        name,
+        steps,
+        fs,
+        s3,
+    })
+}
+
+/// Assert that a publish `src` value is an `@`-reference.
+fn validate_publish_src(src: &str, path: &Path, target: &str) -> Result<()> {
+    if !src.starts_with('@') {
+        anyhow::bail!(
+            "publish {target}.src must be an @-reference (e.g. @artifact://...), \
+             got '{src}' in {}",
+            path.display()
+        );
+    }
+    crate::resolver::Reference::parse(src).with_context(|| {
+        format!(
+            "invalid {target}.src reference '{src}' in {}",
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
+/// Validate publish prepare-phase steps.
+///
+/// Publish steps always run locally (no VM/SSH); only run-steps are permitted.
+pub(crate) fn validate_publish_steps(steps: &[TestStep]) -> Result<()> {
+    for step in steps {
+        match step {
+            TestStep::Run(step) => {
+                resolve_shell(step.shell.as_deref()).with_context(|| {
+                    format!("publish step '{}': invalid `shell:` value", step.name)
+                })?;
+            }
+            TestStep::Archive(step) => {
+                let name = step
+                    .archive
+                    .name
+                    .as_deref()
+                    .unwrap_or(step.archive.src.as_str());
+                anyhow::bail!(
+                    "publish step '{}': `archive` steps are not supported in the \
+                     publish prepare phase; only `run` steps are allowed",
+                    name
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Assert that a publish `s3.dest` value starts with `s3://`.
+fn validate_s3_dest(dest: &str, path: &Path) -> Result<()> {
+    if !dest.starts_with("s3://") {
+        anyhow::bail!(
+            "publish s3.dest must be an S3 URL starting with 's3://', \
+             got '{dest}' in {}",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 fn validate_entrypoint_name(
