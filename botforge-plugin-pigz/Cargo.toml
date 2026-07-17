@@ -1,0 +1,28 @@
+[package]
+name = "botforge-plugin-pigz"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "Pigz (parallel gzip) build/compressor plugin for the botforge plugin system"
+
+# This crate builds a cdylib (.so) for deployment in the botforge plugin system.
+#
+# `unsafe_code = "forbid"` is intentionally absent from this crate.
+# The extern "C" ABI exports require unsafe blocks for the FFI boundary.
+# See botforge-plugin-host/Cargo.toml for the workspace unsafe policy.
+[lib]
+name = "pigz"
+crate-type = ["cdylib"]
+
+[dependencies]
+# Reference the host's ABI version constant so the plugin can never drift.
+botforge-plugin-host = { path = "../botforge-plugin-host" }
+# Parallel gzip implementation. gzp provides multi-threaded gzip compression
+# analogous to the pigz command-line tool. Falls back to flate2 for
+# decompression (gzp's decompress API is single-threaded; flate2 is simpler
+# for buffer-in/buffer-out gunzip).
+gzp = { version = "2.0.2", default-features = false, features = ["deflate_rust"] }
+flate2 = "1.1.9"
+
+[lints]
+workspace = true

@@ -80,6 +80,25 @@ jobs:
           ci-tools:local \
           cargo build -p "$CRATE" --release --locked
 
+    - name: Build botforge-plugin-pigz and stage for container
+      if: env.CRATE == 'botforge'
+      run: |
+        set -euo pipefail
+        # Build libpigz.so in the same container/toolchain as the binary so
+        # ABI and glibc versions match exactly when dlopen'd at runtime.
+        docker run --rm \
+          --user "$(id -u):$(id -g)" \
+          -v "$GITHUB_WORKSPACE:/workspace" \
+          -v "$HOME/.cargo:/cargo" \
+          -w /workspace \
+          -e CARGO_HOME=/cargo \
+          ci-tools:local \
+          cargo build -p botforge-plugin-pigz --release --locked
+        # Stage into .ci-plugins/ so the Dockerfile COPY finds it.
+        mkdir -p .ci-plugins
+        cp target/release/libpigz.so .ci-plugins/libpigz.so
+        echo "Staged $(du -sh .ci-plugins/libpigz.so | cut -f1) libpigz.so"
+
     - name: qcow2 compressor qemu decode oracle – zlib and zstd
       if: env.CRATE == 'botforge'
       run: |

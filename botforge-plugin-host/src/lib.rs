@@ -81,6 +81,69 @@
 //! uint32_t plugin_core_ping(void);
 //! ```
 //!
+//! # `build/compressor` capability
+//!
+//! `build/compressor` exposes whole-artifact / stream compression via a plugin.
+//! This is **distinct** from the qcow2-internal cluster codec (`zstd`/`zlib`):
+//! a `build/compressor` plugin receives and returns raw byte buffers and is
+//! suitable for compressing complete artifact files (e.g. gzip-compressing an
+//! output `.qcow2`), not for qcow2-cluster-level encoding.
+//!
+//! ## Plugin ABI contract for `build/compressor`
+//!
+//! ### Memory-ownership contract
+//!
+//! On success (return value `0`):
+//! - The plugin allocates the output buffer and writes its address to `*out_ptr`.
+//! - The plugin writes the byte count of the output to `*out_len`.
+//! - The **host** is responsible for freeing the buffer by calling
+//!   `plugin_build_compressor_free(*out_ptr)` exactly once after use.
+//! - `*out_ptr` is guaranteed non-null and `*out_len > 0` on success.
+//!
+//! On error (return value non-zero):
+//! - `*out_ptr` and `*out_len` are **undefined** — the host must not read or
+//!   free them.
+//!
+//! Empty input (`in_len == 0`) is valid; the plugin may return an empty or
+//! format-only output (e.g. an empty gzip stream).
+//!
+//! `opts` may be `NULL`, which the plugin must treat identically to `""`.
+//!
+//! ```c
+//! // Compress `in_len` bytes at `in_ptr` with options from NUL-terminated
+//! // `opts` (may be NULL ≡ empty string).
+//! // Returns 0 on success; non-zero error code on failure.
+//! // On success: *out_ptr points to the allocated output, *out_len is its byte
+//! // count.  The caller MUST call plugin_build_compressor_free(*out_ptr) after
+//! // use.  On failure: *out_ptr and *out_len are undefined.
+//! int32_t plugin_build_compress(
+//!     const uint8_t *in_ptr, size_t  in_len,
+//!     const char    *opts,
+//!     uint8_t      **out_ptr, size_t *out_len
+//! );
+//!
+//! // Decompress `in_len` bytes at `in_ptr`.  Same ABI and memory-ownership
+//! // contract as plugin_build_compress.
+//! int32_t plugin_build_decompress(
+//!     const uint8_t *in_ptr, size_t  in_len,
+//!     const char    *opts,
+//!     uint8_t      **out_ptr, size_t *out_len
+//! );
+//!
+//! // Free a buffer previously returned by plugin_build_compress or
+//! // plugin_build_decompress.  Must be called exactly once per successful
+//! // call.  Calling with NULL is safe (no-op).
+//! void plugin_build_compressor_free(uint8_t *ptr);
+//! ```
+//!
+//! # ABI version history
+//!
+//! | Version | Change |
+//! |---------|--------|
+//! | 1 | Initial: `core/ping` capability only. |
+//! | 2 | Added `build/compressor` capability (`plugin_build_compress`, |
+//! |   | `plugin_build_decompress`, `plugin_build_compressor_free`). |
+//!
 //! # Safety policy
 //!
 //! This crate is the **sole sanctioned location** in the botforge workspace where
@@ -105,7 +168,9 @@ use thiserror::Error;
 /// constant is rejected with [`LoadError::AbiVersionMismatch`].  Increment
 /// this constant (and rebuild all plugins) whenever the plugin ABI changes in
 /// a backwards-incompatible way.
-pub const HOST_ABI_VERSION: u32 = 1;
+///
+/// Version 2 adds the `build/compressor` capability slot.
+pub const HOST_ABI_VERSION: u32 = 2;
 
 /// Sentinel value returned by a correct `core/ping` implementation.
 ///
@@ -177,6 +242,20 @@ pub enum LoadError {
          config provides: filter may be wrong"
     )]
     UnknownCapabilitySlot { plugin: String, slot: String },
+
+    /// A `build/compressor` compress or decompress operation returned a
+    /// non-zero error code from the plugin.
+    #[error("plugin '{plugin}' build/compressor operation failed with error code {code}")]
+    CompressorError { plugin: String, code: i32 },
+
+    /// The plugin returned an output length that exceeds `usize::MAX` on this
+    /// platform (should not happen in practice; guards against pathological
+    /// plugins on 32-bit hosts).
+    #[error(
+        "plugin '{plugin}' build/compressor returned output length {out_len} \
+         which overflows usize"
+    )]
+    CompressorOutputOverflow { plugin: String, out_len: usize },
 }
 
 // ── Capability handles ────────────────────────────────────────────────────────
@@ -208,6 +287,147 @@ impl PingHandle {
     }
 }
 
+/// A callable handle to a wired `build/compressor` capability.
+///
+/// Exposes safe `compress` and `decompress` methods that call across the C
+/// ABI boundary, manage the plugin-allocated output buffer, and return an
+/// owned `Vec<u8>`.
+///
+/// # Memory ownership
+///
+/// Internally, `compress` / `decompress` call the plugin's FFI functions and
+/// immediately copy the output into a Rust `Vec<u8>`, then call
+/// `plugin_build_compressor_free` to release the plugin-allocated buffer.
+/// The caller receives a purely Rust-owned `Vec<u8>` with no further
+/// lifetime coupling to the plugin.
+///
+/// # Safety
+///
+/// All function pointers are valid for as long as the originating
+/// [`LoadedPlugin`] (and hence its [`Library`]) stays alive.  Callers must
+/// not use a `CompressorHandle` after the plugin has been dropped.
+pub struct CompressorHandle {
+    /// Plugin name (for error messages).
+    plugin_name: String,
+    /// `plugin_build_compress` function pointer.
+    ///
+    /// SAFETY: see [`LoadedPlugin::load`].
+    compress_fn: unsafe extern "C" fn(
+        *const u8,
+        usize,
+        *const std::os::raw::c_char,
+        *mut *mut u8,
+        *mut usize,
+    ) -> i32,
+    /// `plugin_build_decompress` function pointer.
+    ///
+    /// SAFETY: see [`LoadedPlugin::load`].
+    decompress_fn: unsafe extern "C" fn(
+        *const u8,
+        usize,
+        *const std::os::raw::c_char,
+        *mut *mut u8,
+        *mut usize,
+    ) -> i32,
+    /// `plugin_build_compressor_free` function pointer.
+    ///
+    /// SAFETY: see [`LoadedPlugin::load`].
+    free_fn: unsafe extern "C" fn(*mut u8),
+}
+
+impl CompressorHandle {
+    /// Compress `data` using the plugin, passing `opts` as the options string.
+    ///
+    /// `opts` may be empty; `None` is treated identically to `""`.
+    ///
+    /// Returns a newly-allocated `Vec<u8>` containing the compressed output.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoadError::CompressorError`] if the plugin reports a non-zero
+    /// error code, or [`LoadError::CompressorOutputOverflow`] on pathological
+    /// output-length values.
+    pub fn compress(&self, data: &[u8], opts: &str) -> Result<Vec<u8>, LoadError> {
+        self.call_compressor_fn(self.compress_fn, data, opts)
+    }
+
+    /// Decompress `data` using the plugin, passing `opts` as the options
+    /// string.
+    ///
+    /// Returns a newly-allocated `Vec<u8>` containing the decompressed output.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`compress`](Self::compress).
+    pub fn decompress(&self, data: &[u8], opts: &str) -> Result<Vec<u8>, LoadError> {
+        self.call_compressor_fn(self.decompress_fn, data, opts)
+    }
+
+    /// Shared body for `compress` and `decompress`.
+    fn call_compressor_fn(
+        &self,
+        func: unsafe extern "C" fn(
+            *const u8,
+            usize,
+            *const std::os::raw::c_char,
+            *mut *mut u8,
+            *mut usize,
+        ) -> i32,
+        data: &[u8],
+        opts: &str,
+    ) -> Result<Vec<u8>, LoadError> {
+        // Build a NUL-terminated opts string for the C boundary.
+        let opts_cstring = std::ffi::CString::new(opts).unwrap_or_default();
+
+        let mut out_ptr: *mut u8 = std::ptr::null_mut();
+        let mut out_len: usize = 0;
+
+        // SAFETY: We call the plugin's compress/decompress function pointer,
+        // which was obtained from a live `Library` via `dlsym`.  The in-pointer
+        // and length come from a valid Rust slice.  `opts_cstring` is
+        // NUL-terminated.  `out_ptr` and `out_len` are valid stack addresses.
+        // The plugin contract guarantees that on success the returned pointer
+        // is a valid allocation of `out_len` bytes.  On failure the out-
+        // parameters are undefined and we do not read them.
+        let rc = unsafe {
+            func(
+                data.as_ptr(),
+                data.len(),
+                opts_cstring.as_ptr(),
+                &mut out_ptr,
+                &mut out_len,
+            )
+        };
+
+        if rc != 0 {
+            return Err(LoadError::CompressorError {
+                plugin: self.plugin_name.clone(),
+                code: rc,
+            });
+        }
+
+        // Guard: the plugin returned a suspiciously large length on a 32-bit
+        // host.  On 64-bit (the common case) `usize` is 8 bytes and this
+        // check is a no-op tautology.
+        #[allow(clippy::useless_conversion)]
+        let len = usize::try_from(out_len).map_err(|_| LoadError::CompressorOutputOverflow {
+            plugin: self.plugin_name.clone(),
+            out_len,
+        })?;
+
+        // SAFETY: The plugin returned rc == 0 so `out_ptr` points to a
+        // valid buffer of `len` bytes.  We copy the bytes into a Rust
+        // Vec before freeing.
+        let output = unsafe { std::slice::from_raw_parts(out_ptr, len) }.to_vec();
+
+        // SAFETY: `out_ptr` was allocated by the plugin and must be freed
+        // via `plugin_build_compressor_free`.  We call it exactly once here.
+        unsafe { (self.free_fn)(out_ptr) };
+
+        Ok(output)
+    }
+}
+
 // ── Loaded plugin ─────────────────────────────────────────────────────────────
 
 /// A plugin that has been successfully opened and version-checked.
@@ -227,6 +447,8 @@ pub struct LoadedPlugin {
     pub provides: Vec<(String, String)>,
     /// `core/ping` handle, present if the plugin wired that capability.
     pub ping: Option<PingHandle>,
+    /// `build/compressor` handle, present if the plugin wired that capability.
+    pub compressor: Option<CompressorHandle>,
     /// The open library handle.  Must stay alive as long as any capability
     /// handles derived from it are in use.
     _lib: Library,
@@ -239,6 +461,7 @@ impl std::fmt::Debug for LoadedPlugin {
             .field("abi_version", &self.abi_version)
             .field("provides", &self.provides)
             .field("ping", &self.ping.is_some())
+            .field("compressor", &self.compressor.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -304,10 +527,11 @@ impl LoadedPlugin {
 
         // ── Capability enumeration ────────────────────────────────────────
         //
-        // The plugin exports three symbols for capability self-declaration:
+        // The plugin exports three functions for capability enumeration:
         //
         //   extern "C" fn plugin_provides_count() -> u32
-        //     Returns the number of (slot, name) pairs this plugin provides.
+        //     Returns the total number of (slot, name) pairs this plugin
+        //     provides.  Indices are 0-based; must be stable across calls.
         //
         //   extern "C" fn plugin_provides_slot(index: u32) -> *const c_char
         //     Returns a NUL-terminated UTF-8 slot string for the given index.
@@ -396,6 +620,7 @@ impl LoadedPlugin {
 
         // ── Resolve capability handles ────────────────────────────────────
         let mut ping: Option<PingHandle> = None;
+        let mut compressor: Option<CompressorHandle> = None;
 
         for (slot, _cap_name) in &provides {
             match slot.as_str() {
@@ -420,6 +645,61 @@ impl LoadedPlugin {
                     let func = unsafe { sym.into_raw() };
                     ping = Some(PingHandle { func: *func });
                 }
+                "build/compressor" => {
+                    // Resolve all three compressor symbols.
+                    //
+                    // SAFETY: Each symbol is looked up with the exact signature
+                    // documented in the module-level `build/compressor` ABI
+                    // contract.  `Symbol::into_raw` detaches the lifetime from
+                    // `lib`; the raw pointers remain valid as long as `_lib`
+                    // (stored on the returned `LoadedPlugin`) is alive.
+
+                    type CompressFn = unsafe extern "C" fn(
+                        *const u8,
+                        usize,
+                        *const std::os::raw::c_char,
+                        *mut *mut u8,
+                        *mut usize,
+                    ) -> i32;
+
+                    let compress_sym: Symbol<CompressFn> = unsafe {
+                        lib.get(b"plugin_build_compress\0").map_err(|_| {
+                            LoadError::MissingSymbol {
+                                plugin: plugin_name.to_owned(),
+                                symbol: "plugin_build_compress",
+                            }
+                        })?
+                    };
+                    let compress_fn = *unsafe { compress_sym.into_raw() };
+
+                    let decompress_sym: Symbol<CompressFn> = unsafe {
+                        lib.get(b"plugin_build_decompress\0").map_err(|_| {
+                            LoadError::MissingSymbol {
+                                plugin: plugin_name.to_owned(),
+                                symbol: "plugin_build_decompress",
+                            }
+                        })?
+                    };
+                    let decompress_fn = *unsafe { decompress_sym.into_raw() };
+
+                    type FreeFn = unsafe extern "C" fn(*mut u8);
+                    let free_sym: Symbol<FreeFn> = unsafe {
+                        lib.get(b"plugin_build_compressor_free\0").map_err(|_| {
+                            LoadError::MissingSymbol {
+                                plugin: plugin_name.to_owned(),
+                                symbol: "plugin_build_compressor_free",
+                            }
+                        })?
+                    };
+                    let free_fn = *unsafe { free_sym.into_raw() };
+
+                    compressor = Some(CompressorHandle {
+                        plugin_name: plugin_name.to_owned(),
+                        compress_fn,
+                        decompress_fn,
+                        free_fn,
+                    });
+                }
                 other => {
                     return Err(LoadError::UnknownCapabilitySlot {
                         plugin: plugin_name.to_owned(),
@@ -434,6 +714,7 @@ impl LoadedPlugin {
             abi_version: plugin_ver,
             provides,
             ping,
+            compressor,
             _lib: lib,
         })
     }
@@ -529,6 +810,21 @@ impl PluginRegistry {
             .and_then(|p| p.ping.as_ref())
     }
 
+    /// Look up the `build/compressor` handle for a named capability
+    /// registration.
+    ///
+    /// Returns `None` if no plugin is loaded that registered
+    /// `build/compressor` under `name`.
+    pub fn get_compressor(&self, name: &str) -> Option<&CompressorHandle> {
+        let provider = self
+            .entries
+            .get(&("build/compressor".to_owned(), name.to_owned()))?;
+        self.plugins
+            .iter()
+            .find(|p| &p.name == provider)
+            .and_then(|p| p.compressor.as_ref())
+    }
+
     /// Returns `true` if `(slot, name)` is already registered (by a built-in or
     /// a previously-loaded plugin).
     pub fn is_registered(&self, slot: &str, name: &str) -> bool {
@@ -541,6 +837,21 @@ impl PluginRegistry {
         self.entries
             .get(&(slot.to_owned(), name.to_owned()))
             .map(String::as_str)
+    }
+
+    /// Returns the names of all `build/compressor` capabilities currently
+    /// registered in this registry (from all loaded plugins).
+    pub fn compressor_names(&self) -> Vec<&str> {
+        self.entries
+            .iter()
+            .filter_map(|((slot, name), _)| {
+                if slot == "build/compressor" {
+                    Some(name.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 }
 
@@ -606,5 +917,44 @@ mod tests {
         assert!(msg2.contains("hello"), "should name cap name: {msg2}");
         assert!(msg2.contains("plugin-a"), "should name existing: {msg2}");
         assert!(msg2.contains("plugin-b"), "should name new: {msg2}");
+    }
+
+    #[test]
+    fn compressor_error_variants_are_structured() {
+        let err = LoadError::CompressorError {
+            plugin: "pigz".to_owned(),
+            code: -1,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("pigz"), "should name plugin: {msg}");
+        assert!(msg.contains("-1"), "should show error code: {msg}");
+
+        let err2 = LoadError::CompressorOutputOverflow {
+            plugin: "pigz".to_owned(),
+            out_len: usize::MAX,
+        };
+        let msg2 = err2.to_string();
+        assert!(msg2.contains("pigz"), "should name plugin: {msg2}");
+        assert!(msg2.contains("overflow"), "should mention overflow: {msg2}");
+    }
+
+    #[test]
+    fn get_compressor_returns_none_when_not_loaded() {
+        let reg = PluginRegistry::new();
+        assert!(reg.get_compressor("pigz").is_none());
+    }
+
+    #[test]
+    fn compressor_names_empty_when_no_compressors() {
+        let reg = PluginRegistry::new();
+        assert!(reg.compressor_names().is_empty());
+    }
+
+    #[test]
+    fn compressor_names_includes_seeded_builtin() {
+        let mut reg = PluginRegistry::new();
+        reg.seed_builtin("build/compressor", "pigz");
+        let names = reg.compressor_names();
+        assert!(names.contains(&"pigz"), "pigz should appear: {names:?}");
     }
 }

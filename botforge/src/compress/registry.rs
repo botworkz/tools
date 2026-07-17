@@ -65,14 +65,47 @@ pub(crate) fn known_compressor_verbs() -> Vec<&'static str> {
     built_in_registry().registrations.keys().copied().collect()
 }
 
+/// Returns the built-in compressor verbs plus any extra plugin-registered verbs.
+///
+/// Used in error messages when plugin verbs have been loaded so that
+/// `unknown_compressor_verb_error` names all available verbs including plugins.
+pub(crate) fn known_compressor_verbs_with_extras(extra: &[&str]) -> Vec<String> {
+    let mut verbs: Vec<String> = built_in_registry()
+        .registrations
+        .keys()
+        .copied()
+        .map(str::to_owned)
+        .collect();
+    for v in extra {
+        verbs.push(v.to_string());
+    }
+    verbs.sort();
+    verbs
+}
+
 pub(crate) fn lookup_compressor(verb: &str) -> Result<&'static CompressorRegistration> {
     built_in_registry()
         .lookup(verb)
         .ok_or_else(|| unknown_compressor_verb_error(verb))
 }
 
-pub(crate) fn validate_compressor_verb(verb: &str) -> Result<()> {
-    lookup_compressor(verb).map(|_| ())
+/// Validate a compressor verb against the built-in registry plus any extra
+/// verbs supplied by loaded plugins.
+///
+/// Returns `Ok(())` if the verb is a built-in OR is in `extra_plugin_verbs`.
+/// Returns an error naming all known verbs (built-ins + extras) if not found.
+pub(crate) fn validate_compressor_verb_with_extras(
+    verb: &str,
+    extra_plugin_verbs: &[&str],
+) -> Result<()> {
+    if built_in_registry().lookup(verb).is_some() || extra_plugin_verbs.contains(&verb) {
+        return Ok(());
+    }
+    let known = known_compressor_verbs_with_extras(extra_plugin_verbs);
+    Err(anyhow!(
+        "unknown compressor verb '{verb}' (known: {})",
+        known.join(", ")
+    ))
 }
 
 fn unknown_compressor_verb_error(verb: &str) -> anyhow::Error {
