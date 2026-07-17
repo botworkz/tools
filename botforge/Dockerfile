@@ -68,6 +68,11 @@ RUN apt-get update \
 COPY --from=binary-source /botforge /usr/local/bin/botforge
 COPY --chmod=0755 botforge/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
+# Create the canonical home for container-shipped plugins.
+# System-installed plugins (.so files) live here so that botforge config can
+# reference them with absolute paths like /usr/share/botforge/plugins/libfoo.so.
+RUN mkdir -p /usr/share/botforge/plugins
+
 WORKDIR /work
 
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]

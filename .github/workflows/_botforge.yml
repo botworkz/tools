@@ -47,6 +47,14 @@ jobs:
         sudo apt-get update
         sudo apt-get -qq install -y guestfish qemu-utils --no-install-recommends
 
+    # ── Plugin host acceptance tests ─────────────────────────────────────────
+    # Build the hello-world fixture cdylib first, then run the plugin-host
+    # acceptance tests against the real compiled libhello.so.
+    - name: Build botforge-plugin-hello fixture (.so)
+      run: cargo build -p botforge-plugin-hello
+    - name: Run plugin-host acceptance tests
+      run: cargo test -p botforge-plugin-host
+
     - name: Download pre-built botforge binary
       uses: actions/download-artifact@v4
       with:
