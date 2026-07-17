@@ -3,10 +3,12 @@
 //! Supported targets (built-in, not plugins):
 //! - **`fs`**: copy resolved artifact(s) to a local filesystem directory.
 //! - **`s3`**: upload resolved artifact(s) to an S3 (or S3-compatible) URL
-//!   using the `aws` CLI.  Credentials are read from the environment
-//!   (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION`,
-//!   and optionally `AWS_ENDPOINT_URL` for S3-compatible services such as
-//!   Contabo Object Storage).
+//!   using a native Rust S3 client (`object_store`).  Credentials and region
+//!   are read from the environment (`AWS_ACCESS_KEY_ID`,
+//!   `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_REGION` /
+//!   `AWS_DEFAULT_REGION`).  When `AWS_ENDPOINT_URL` is set, that endpoint
+//!   is used (path-style, with `allow_http` when the scheme is plain `http`)
+//!   so MinIO and Contabo Object Storage work out of the box.
 //!
 //! ## Schema contract
 //!
@@ -55,7 +57,7 @@ use crate::config::{load_publish_config, FsTarget, PublishConfig, S3Target};
 use crate::plan::run_local_steps;
 use crate::resolver::{Reference, ResolveFileContext, ResolvedFile};
 use crate::step::TestStep;
-use crate::util::{ensure_command, resolve_under_root, run_command};
+use crate::util::resolve_under_root;
 use crate::workspace::{discover_context, load_inline_manifest, registry::load_committed_registry};
 
 #[derive(Args, Debug)]
@@ -210,18 +212,25 @@ fn copy_to_fs(file: &ResolvedFile, dest: &Path, dry_run: bool) -> Result<()> {
 
 // ─── s3 target ────────────────────────────────────────────────────────────────
 
+/// Parse `s3://bucket/key-prefix` into `(bucket, key_prefix)`.
+///
+/// The destination is validated at load time to start with `s3://`, so this
+/// function only needs to split the remainder.  The key prefix may be empty.
+fn parse_s3_dest(dest_prefix: &str) -> (&str, &str) {
+    let rest = dest_prefix
+        .strip_prefix("s3://")
+        .expect("s3 dest already validated to start with s3://");
+    match rest.split_once('/') {
+        Some((bucket, key_prefix)) => (bucket, key_prefix),
+        None => (rest, ""),
+    }
+}
+
 fn run_s3_target(
     target: &S3Target,
     resolve_ctx: &ResolveFileContext<'_>,
     dry_run: bool,
 ) -> Result<()> {
-    if !dry_run {
-        ensure_command("aws").context(
-            "publish: s3 target requires the AWS CLI ('aws'); \
-             install it or set PATH to include it",
-        )?;
-    }
-
     let reference = Reference::parse(&target.src)
         .with_context(|| format!("invalid s3.src reference '{}'", target.src))?;
     let files = reference
@@ -258,25 +267,104 @@ fn upload_to_s3(file: &ResolvedFile, dest_prefix: &str, dry_run: bool) -> Result
         return Ok(());
     }
 
-    let local = file
-        .local_path
-        .to_str()
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "s3: local path '{}' is not valid UTF-8",
-                file.local_path.display()
-            )
-        })?
-        .to_string();
+    let (bucket, key_prefix) = parse_s3_dest(dest_prefix);
+    let key = if key_prefix.is_empty() {
+        relative.to_string()
+    } else {
+        format!("{key_prefix}/{relative}")
+    };
 
-    run_command(
-        "aws",
-        &["s3".to_string(), "cp".to_string(), local, s3_dest.clone()],
-        &[],
-        &format!("s3: failed to upload to '{s3_dest}'"),
-    )?;
+    let endpoint = std::env::var("AWS_ENDPOINT_URL").ok();
+    let endpoint_ref = endpoint.as_deref();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("s3: failed to build tokio runtime for upload")?;
+
+    rt.block_on(upload_to_s3_async(
+        &file.local_path,
+        bucket,
+        &key,
+        endpoint_ref,
+    ))
+    .with_context(|| {
+        format!(
+            "s3: upload failed: {} → {s3_dest}",
+            file.local_path.display()
+        )
+    })?;
 
     eprintln!("publish: s3: {} → {}", file.local_path.display(), s3_dest);
+
+    Ok(())
+}
+
+async fn upload_to_s3_async(
+    local_path: &Path,
+    bucket: &str,
+    key: &str,
+    endpoint: Option<&str>,
+) -> Result<()> {
+    use object_store::aws::AmazonS3Builder;
+    use object_store::path::Path as ObjPath;
+    use object_store::{ObjectStoreExt, WriteMultipart};
+    use tokio::io::AsyncReadExt;
+
+    let mut builder = AmazonS3Builder::from_env().with_bucket_name(bucket);
+
+    if let Some(ep) = endpoint {
+        builder = builder
+            .with_endpoint(ep)
+            .with_virtual_hosted_style_request(false);
+        if ep.starts_with("http://") {
+            builder = builder.with_allow_http(true);
+        }
+    }
+
+    let store = builder
+        .build()
+        .with_context(|| format!("s3: failed to build S3 client for bucket '{bucket}'"))?;
+
+    let obj_path =
+        ObjPath::parse(key).with_context(|| format!("s3: invalid object key '{key}'"))?;
+
+    // Stream the file to S3 via multipart upload so large qcow2 images do not
+    // need to be loaded fully into memory.  WriteMultipart manages part
+    // boundaries and concurrency transparently.
+    let upload = store
+        .put_multipart(&obj_path)
+        .await
+        .with_context(|| format!("s3: failed to initiate upload to '{bucket}/{key}'"))?;
+
+    let mut writer = WriteMultipart::new(upload);
+
+    let mut src = tokio::fs::File::open(local_path)
+        .await
+        .with_context(|| format!("s3: cannot open source file '{}'", local_path.display()))?;
+
+    // 8 MiB read buffer — well above the S3 minimum part size (5 MiB).
+    let mut buf = vec![0u8; 8 * 1024 * 1024];
+    loop {
+        let n = src
+            .read(&mut buf)
+            .await
+            .with_context(|| format!("s3: read error on '{}'", local_path.display()))?;
+        if n == 0 {
+            break;
+        }
+        writer.write(&buf[..n]);
+        // Limit in-flight part concurrency to avoid unbounded memory growth.
+        writer
+            .wait_for_capacity(4)
+            .await
+            .with_context(|| format!("s3: upload error for '{bucket}/{key}'"))?;
+    }
+
+    writer
+        .finish()
+        .await
+        .with_context(|| format!("s3: failed to complete upload to '{bucket}/{key}'"))?;
 
     Ok(())
 }
@@ -489,7 +577,7 @@ mod tests {
     // ── s3 target dry-run ─────────────────────────────────────────────────────
 
     #[test]
-    fn s3_target_dry_run_does_not_invoke_aws() {
+    fn s3_target_dry_run_does_not_upload() {
         let workspace = TempDir::new().unwrap();
         let context = workspace.path();
         fs::write(context.join("botforge.yaml"), "").unwrap();
@@ -510,8 +598,31 @@ mod tests {
             dest: "s3://test-bucket/releases".to_string(),
         };
 
-        // dry_run=true: should succeed without calling the `aws` CLI.
+        // dry_run=true: must succeed without contacting S3 / building a client.
         run_s3_target(&target, &resolve_ctx, true).unwrap();
+    }
+
+    // ── parse_s3_dest ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_s3_dest_splits_bucket_and_prefix() {
+        let (bucket, prefix) = parse_s3_dest("s3://my-bucket/releases");
+        assert_eq!(bucket, "my-bucket");
+        assert_eq!(prefix, "releases");
+    }
+
+    #[test]
+    fn parse_s3_dest_nested_prefix() {
+        let (bucket, prefix) = parse_s3_dest("s3://my-bucket/a/b/c");
+        assert_eq!(bucket, "my-bucket");
+        assert_eq!(prefix, "a/b/c");
+    }
+
+    #[test]
+    fn parse_s3_dest_no_prefix() {
+        let (bucket, prefix) = parse_s3_dest("s3://my-bucket");
+        assert_eq!(bucket, "my-bucket");
+        assert_eq!(prefix, "");
     }
 
     // ── publish config: list-valued schema ────────────────────────────────────
