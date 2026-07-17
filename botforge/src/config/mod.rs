@@ -21,7 +21,7 @@ use self::expressions::{
     expand_raw_step, extract_fragment_input_declarations, resolve_fragment_inputs,
     substitute_inputs_in_value,
 };
-use crate::assert::{validate_assert_block, AssertBlock};
+use crate::assert::{parse_assert_block, validate_assert_block, AssertBlock};
 use crate::plan::files::FileEntry;
 use crate::step::{deserialize_optional_positive_seconds, resolve_shell, StepTarget, TestStep};
 
@@ -149,7 +149,7 @@ struct RawTestDocument {
     cloud_init: Option<serde_yaml::Mapping>,
     /// Declarative assertions to run as a pre-steps phase (before `steps:`).
     #[serde(default)]
-    assert: Option<AssertBlock>,
+    assert: Option<Value>,
 }
 
 fn default_disk_size() -> String {
@@ -345,6 +345,17 @@ pub(crate) fn load_test_config(repo_root: &Path, path: &Path) -> Result<TestConf
     let mut include_stack = vec![path.to_path_buf()];
     let mut cloud_init_acc = raw.cloud_init;
     let mut files_acc = Vec::new();
+    let assert_block = raw
+        .assert
+        .as_ref()
+        .map(parse_assert_block)
+        .transpose()
+        .with_context(|| format!("invalid test config: {}", path.display()))?;
+    if let Some(ref block) = assert_block {
+        validate_assert_block(block)
+            .with_context(|| format!("invalid test config: {}", path.display()))?;
+    }
+
     let config = TestConfig {
         name,
         image: match raw.image {
@@ -380,13 +391,7 @@ pub(crate) fn load_test_config(repo_root: &Path, path: &Path) -> Result<TestConf
         timeout: raw.timeout,
         cloud_init_timeout: default_test_cloud_init_timeout(),
         cloud_init: cloud_init_acc,
-        assert: {
-            if let Some(ref block) = raw.assert {
-                validate_assert_block(block)
-                    .with_context(|| format!("invalid test config: {}", path.display()))?;
-            }
-            raw.assert
-        },
+        assert: assert_block,
     };
     run_semantic_validators(SemanticValidationTarget::Test {
         path,
