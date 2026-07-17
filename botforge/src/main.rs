@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 mod assert;
 mod cli;
 mod commands;

@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! `viscous` — opinionated, agent-friendly directory template generator.
 //!
 //! The library exposes three pure layers:
