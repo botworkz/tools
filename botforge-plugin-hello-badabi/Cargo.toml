@@ -1,0 +1,19 @@
+[package]
+name = "botforge-plugin-hello-badabi"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "Wrong-ABI hello fixture plugin for botforge plugin host acceptance tests"
+
+# This crate builds a cdylib (.so) for acceptance tests.
+# `unsafe_code = "forbid"` is intentionally absent because extern "C"
+# exports are the fixture's whole purpose.
+[lib]
+name = "hello_badabi"
+crate-type = ["cdylib"]
+
+[dependencies]
+botforge-plugin-host = { path = "../botforge-plugin-host" }
+
+[lints]
+workspace = true

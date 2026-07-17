@@ -13,5 +13,12 @@ path = "src/lib.rs"
 # See the root Cargo.toml workspace-lint comment for the full policy
 # rationale: this is the designated blast-radius container for all
 # .so / FFI-loading code in the botforge plugin system.
+[dependencies]
+libloading = "0.8"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
+
 [lints]
 workspace = true
