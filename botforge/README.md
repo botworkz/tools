@@ -1069,3 +1069,71 @@ Compression matrix (runs in parallel):
 
 KVM is a **hard requirement** — the job fails immediately if `/dev/kvm` is
 unavailable; no TCG fallback.
+
+## Plugin system (`plugins:`)
+
+botforge supports a `.so`-based plugin system.  Plugins are loaded
+config-driven only — **no autoload**.
+
+### Plugin config schema
+
+Add a `plugins:` list to the workspace marker (`botforge.yaml`):
+
+```yaml
+plugins:
+  - name: hello              # unique instance name within this workspace
+    src: ./plugins/libhello.so   # repo-relative path (resolved against context root)
+    provides:                # OPTIONAL capability allow-list
+      - core/ping
+
+  - name: system-plugin
+    src: /usr/share/botforge/plugins/libplugin.so  # absolute / system path
+    # provides: absent → all capabilities the plugin declares are wired
+```
+
+#### Fields
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `name` | yes | Unique plugin instance name.  Duplicate names are a config error. |
+| `src` | yes | Path to the `.so`.  Relative paths are resolved against the context root; absolute paths are used as-is. |
+| `provides` | no | Capability allow-list (`<domain>/<capability>` strings).  When present, only the listed slots are wired; when absent, all slots the plugin's ABI declares are wired. |
+
+#### Path roots
+
+- **Repo-relative** — `./plugins/libfoo.so` resolves against the botforge
+  context root (the directory containing `botforge.yaml`).  Works inside the
+  container where the repo is mounted.
+- **Absolute / system dir** — `/usr/share/botforge/plugins/` is the canonical
+  home for container-shipped plugins.  Absolute paths are used as-is.
+
+### ABI contract
+
+Every plugin must export:
+
+```c
+uint32_t abi_version(void);           // must match HOST_ABI_VERSION exactly
+uint32_t plugin_provides_count(void); // number of (slot, name) pairs
+const char *plugin_provides_slot(uint32_t index);  // static string
+const char *plugin_provides_name(uint32_t index);  // static string
+```
+
+Plus one entrypoint per declared capability, e.g. for `core/ping`:
+
+```c
+uint32_t plugin_core_ping(void);  // host handshake self-test only; must return 42
+```
+
+### Capability slots
+
+| Slot | Description |
+|------|-------------|
+| `core/ping` | Host-level handshake/self-test seam (not a general-purpose capability). Must return `42` only to prove load→call round-trip. |
+
+More slots will be added in follow-up PRs (e.g. `build/compressor`).
+
+### Trust boundary
+
+The plugin knows nothing about the host environment.  No ambient access to
+env vars, secrets, or process state is granted.  The host is the sole broker
+of capabilities: anything a plugin needs is handed to it across the ABI.

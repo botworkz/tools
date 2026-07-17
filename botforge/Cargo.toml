@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+botforge-plugin-host = { path = "../botforge-plugin-host" }
 clap = { version = "4", features = ["derive", "env"] }
 flate2 = "1.1.9"
 getrandom = { version = "0.4", features = ["sys_rng"] }
@@ -31,6 +32,13 @@ zstd = { version = "0.13.3", features = ["zstdmt"] }
 
 [dev-dependencies]
 tempfile = "3"
+
+# botforge-plugin-host is a normal dependency declared here ahead of its first
+# real consumer (load_plugin_entries), which arrives in the compressor/pigz PR.
+# Remove this ignore block once that PR lands and the #[allow(dead_code)] on
+# load_plugin_entries / PluginEntry is retired.
+[package.metadata.cargo-udeps.ignore]
+normal = ["botforge-plugin-host"]
 
 [lints]
 workspace = true
