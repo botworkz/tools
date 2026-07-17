@@ -23,14 +23,17 @@ use crate::util::{
 };
 
 use crate::compress::{
-    compress_qcow2_image, read_qcow2_image_stats, read_virtual_sector0, sparsify_zero_clusters,
+    compress_qcow2_image, known_compressor_verbs_with_extras, read_qcow2_image_stats,
+    read_virtual_sector0, sparsify_zero_clusters, validate_compressor_verb_with_extras,
 };
 use crate::compress::{CompressConfig, ReclaimMode};
 use crate::config::{load_build_config, validate_build_steps};
 use crate::plan::vm::{StepFlowPlan, StepTimeoutPolicy};
 use crate::plan::{preserve_failed_build_disk, print_log_tail, run_step_flow, shutdown_build_vm};
 use crate::step::{ArchiveStep, StepTarget, TestStep};
-use crate::workspace::{discover_context, load_inline_manifest, registry::load_committed_registry};
+use crate::workspace::{
+    discover_context, load_inline_manifest, load_plugin_entries, registry::load_committed_registry,
+};
 
 /// Parsed `--cpus` value: either a specific positive count or `auto`.
 ///
@@ -126,6 +129,26 @@ pub(crate) fn cmd_build(args: BuildArgs) -> Result<()> {
     let context = discover_context(args.context.as_deref())?;
     let manifest = load_inline_manifest(&context)?;
 
+    // ── Load plugins from the workspace marker ────────────────────────────────
+    // Plugin entries are loaded here (before config validation) so that
+    // plugin-provided compressor verbs are available for validation below.
+    let plugin_entries = load_plugin_entries(&context)?;
+    let mut plugin_registry = botforge_plugin_host::PluginRegistry::new();
+    for entry in &plugin_entries {
+        let provides_filter: Option<Vec<String>> = entry.provides.clone();
+        plugin_registry
+            .load_plugin(&entry.name, &entry.src, provides_filter.as_deref())
+            .with_context(|| format!("failed to load plugin '{}'", entry.name))?;
+    }
+    // Collect plugin-registered compressor names for validation and error messages.
+    let plugin_compressor_names: Vec<String> = plugin_registry
+        .compressor_names()
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    let plugin_compressor_refs: Vec<&str> =
+        plugin_compressor_names.iter().map(String::as_str).collect();
+
     // Resolve the spec path: either from an explicit --spec flag or by
     // looking up the named build in the committed registry.
     let spec_path = match (args.name, args.spec) {
@@ -138,6 +161,26 @@ pub(crate) fn cmd_build(args: BuildArgs) -> Result<()> {
     };
 
     let build_config = load_build_config(&context, &spec_path)?;
+
+    // ── Validate compressor verb against built-ins + plugin verbs ─────────────
+    // Plugin verbs (e.g. "pigz") are valid here; unknown verbs are rejected with
+    // an error that lists all known verbs including plugins.
+    // A plugin-provided name that matches a built-in is a collision handled at
+    // plugin load time by the PluginRegistry reconciliation pass.
+    if let Some(compress) = build_config.compress.as_ref() {
+        if compress.enabled {
+            validate_compressor_verb_with_extras(&compress.compressor, &plugin_compressor_refs)
+                .with_context(|| {
+                    format!(
+                        "invalid compressor '{}' in {} (known: {})",
+                        compress.compressor,
+                        spec_path.display(),
+                        known_compressor_verbs_with_extras(&plugin_compressor_refs).join(", ")
+                    )
+                })?;
+        }
+    }
+
     let output = derive_artifact_output_path(&context, &spec_path, &build_config.output)?;
     check_same_directory_output_filename_clash(&spec_path, &build_config.output)?;
     let reclaim_mode = build_config
@@ -157,6 +200,15 @@ pub(crate) fn cmd_build(args: BuildArgs) -> Result<()> {
     if matches!(reclaim_mode, ReclaimMode::Discard) {
         ensure_command("qemu-nbd")?;
     }
+
+    // Determine whether the configured compressor is a plugin verb (i.e. not a
+    // built-in). Plugin verbs route to whole-artifact stream compression rather
+    // than qcow2-cluster-level compression.
+    let plugin_compressor_verb: Option<(String, String)> = build_config
+        .compress
+        .as_ref()
+        .filter(|c| c.enabled && plugin_compressor_refs.contains(&c.compressor.as_str()))
+        .map(|c| (c.compressor.clone(), c.compressor_opts.clone()));
 
     // Resolve the source qcow2: --source wins; otherwise resolve image: via the shared resolver.
     let source = if let Some(src) = args.source {
@@ -479,8 +531,58 @@ pub(crate) fn cmd_build(args: BuildArgs) -> Result<()> {
     // ---------------------------------------------------------------------------
     // Disk lifecycle step 8 (was 6): commit partial → output (plain rename or
     // compress-and-rename depending on the spec's `compress:` config).
+    //
+    // When a plugin compressor verb is configured (e.g. "pigz"), the qcow2
+    // commit uses NO internal cluster compression (plugin compressors are
+    // whole-artifact stream compressors, not qcow2-cluster codecs). The
+    // artifact is then stream-compressed in the next step.
     // ---------------------------------------------------------------------------
-    commit_output(&partial, &output, build_config.compress.as_ref())?;
+    let qcow2_compress = build_config
+        .compress
+        .as_ref()
+        .filter(|c| c.enabled && plugin_compressor_verb.is_none());
+    commit_output(&partial, &output, qcow2_compress)?;
+
+    // ── Plugin stream compression (artifact-level) ────────────────────────────
+    // When a plugin compressor verb is active, compress the committed output
+    // artifact as a whole file (stream compression). The result is written to
+    // `<output>.gz` alongside the original qcow2.
+    if let Some((verb, opts)) = &plugin_compressor_verb {
+        let handle = plugin_registry.get_compressor(verb).with_context(|| {
+            format!("plugin compressor '{verb}' was resolved but is not in the registry")
+        })?;
+        let output_gz = output.with_extension("qcow2.gz");
+        crate::plan::print_phase(
+            "compress",
+            &format!(
+                "Stream-compressing artifact with {verb} → {}",
+                output_gz.display()
+            ),
+        );
+        let input_data = std::fs::read(&output).with_context(|| {
+            format!(
+                "failed to read artifact for stream compression: {}",
+                output.display()
+            )
+        })?;
+        let compressed = handle
+            .compress(&input_data, opts)
+            .with_context(|| format!("plugin '{verb}' failed to compress artifact"))?;
+        std::fs::write(&output_gz, &compressed).with_context(|| {
+            format!(
+                "failed to write compressed artifact: {}",
+                output_gz.display()
+            )
+        })?;
+        crate::plan::print_phase(
+            "output",
+            &format!(
+                "Compressed artifact written to {} ({})",
+                output_gz.display(),
+                format_bytes_human(compressed.len() as u64)
+            ),
+        );
+    }
 
     let output_stats = read_qcow2_image_stats(&output)?;
     if botforge_debug_enabled() {

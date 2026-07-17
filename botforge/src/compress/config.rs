@@ -391,19 +391,32 @@ mod tests {
     }
 
     #[test]
-    fn test_load_build_config_compress_compressor_unknown_value_is_error() {
+    fn test_load_build_config_compress_compressor_validation_deferred_to_use_time() {
+        // Compressor verb validation is deferred from config load to use time
+        // so that plugin-provided verbs (e.g. "pigz") are accepted at load
+        // time.  Loading a config with an unknown verb SUCCEEDS; the error
+        // occurs at build time when validate_compressor_verb_with_extras is
+        // called against the combined built-in + plugin registry.
         let repo = TempDir::new().unwrap();
         write_build_config(
         &repo,
         "build.yaml",
         "type: botforge/build\nname: build\nimage: \"@base\"\noutput: \"out.qcow2\"\nsteps: []\ncompress:\n  enabled: true\n  compressor: bogus\n",
     );
-        let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
+        let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
+        let compress = config.compress.expect("compress should be Some");
+        assert_eq!(compress.compressor, "bogus");
+        // Verify that the use-time validation function does reject unknown verbs:
+        let err =
+            super::super::registry::validate_compressor_verb_with_extras("bogus", &[]).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("bogus") && msg.contains("unknown compressor"),
-            "error should mention unknown compressor verb validation: {msg}"
+            "use-time validation must reject unknown verb: {msg}"
         );
+        // And that plugin verbs can be accepted by the extras variant:
+        let ok = super::super::registry::validate_compressor_verb_with_extras("bogus", &["bogus"]);
+        assert!(ok.is_ok(), "verb in extras must be accepted");
     }
 
     #[test]

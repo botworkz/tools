@@ -73,6 +73,11 @@ COPY --chmod=0755 botforge/docker-entrypoint.sh /usr/local/bin/docker-entrypoint
 # reference them with absolute paths like /usr/share/botforge/plugins/libfoo.so.
 RUN mkdir -p /usr/share/botforge/plugins
 
+# Stage the pigz build/compressor plugin.  libpigz.so is built alongside the
+# binary (same toolchain / glibc) and staged to .ci-plugins/ by the CI job
+# before the docker buildx invocation so ABI and glibc versions match exactly.
+COPY .ci-plugins/libpigz.so /usr/share/botforge/plugins/libpigz.so
+
 WORKDIR /work
 
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]

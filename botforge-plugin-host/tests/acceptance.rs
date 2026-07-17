@@ -1,15 +1,16 @@
 //! Acceptance tests for the botforge plugin host.
 //!
 //! These tests exercise the full load → version → provides → reconcile → call
-//! path using the real compiled `libhello.so` fixture plugin.
+//! path using the real compiled `libhello.so` and `libpigz.so` fixture plugins.
 //!
 //! # Running
 //!
-//! Build the fixture `.so` first:
+//! Build the fixture `.so` files first:
 //!
 //! ```sh
 //! cargo build -p botforge-plugin-hello
 //! cargo build -p botforge-plugin-hello-badabi
+//! cargo build -p botforge-plugin-pigz
 //! ```
 //!
 //! Then run the tests:
@@ -85,6 +86,11 @@ fn hello_so_path() -> Option<PathBuf> {
 /// Returns the path to `libhello_badabi.so` if it has been built, else `None`.
 fn hello_badabi_so_path() -> Option<PathBuf> {
     find_fixture_so("libhello_badabi.so")
+}
+
+/// Returns the path to `libpigz.so` if it has been built, else `None`.
+fn pigz_so_path() -> Option<PathBuf> {
+    find_fixture_so("libpigz.so")
 }
 
 /// Require a fixture `.so` to exist before continuing.
@@ -314,4 +320,150 @@ fn no_autoload_so_on_disk_not_in_registry_unless_explicitly_loaded() {
     if hello_so_path().is_some() {
         assert!(!reg.is_registered("core/ping", "hello"));
     }
+}
+
+// ── pigz build/compressor acceptance ─────────────────────────────────────────
+
+/// Full pigz path: load → abi_version → provides → reconcile → wire → round-trip.
+///
+/// Verifies:
+/// - `libpigz.so` loads cleanly and is wired under `build/compressor` / `pigz`.
+/// - `get_compressor("pigz")` returns a valid `CompressorHandle`.
+/// - `compress(data) → decompress(compressed) == data` (round-trip correctness).
+/// - The compressed output is a valid gzip stream (starts with the gzip magic bytes).
+#[test]
+fn pigz_acceptance_full_path_and_round_trip() {
+    let so = require_fixture_so!(pigz_so_path(), "cargo build -p botforge-plugin-pigz");
+    let mut reg = PluginRegistry::new();
+    reg.load_plugin("pigz", &so, None)
+        .expect("pigz plugin should load cleanly");
+
+    // Plugin is wired under the correct slot and name.
+    assert!(reg.is_registered("build/compressor", "pigz"));
+    assert_eq!(reg.provider_of("build/compressor", "pigz"), Some("pigz"));
+
+    // Exactly one plugin loaded.
+    assert_eq!(reg.plugins.len(), 1);
+    assert_eq!(reg.plugins[0].name, "pigz");
+    assert_eq!(reg.plugins[0].abi_version, HOST_ABI_VERSION);
+    assert_eq!(
+        reg.plugins[0].provides,
+        vec![("build/compressor".to_owned(), "pigz".to_owned())]
+    );
+
+    // Retrieve the compressor handle.
+    let handle = reg
+        .get_compressor("pigz")
+        .expect("build/compressor handle must be wired");
+
+    // ── Round-trip test ───────────────────────────────────────────────────────
+    // Use a realistic artifact-sized input (~1 MiB) to exercise parallel gzip.
+    let original: Vec<u8> = (0u32..262144).flat_map(|i| i.to_le_bytes()).collect();
+
+    let compressed = handle
+        .compress(&original, "")
+        .expect("compress must succeed");
+
+    // The compressed output must be non-empty and smaller (or at least valid).
+    assert!(
+        !compressed.is_empty(),
+        "compressed output must not be empty"
+    );
+
+    // Verify gzip magic bytes (0x1F 0x8B).
+    assert_eq!(
+        &compressed[..2],
+        &[0x1F, 0x8B],
+        "compressed output must start with gzip magic"
+    );
+
+    let decompressed = handle
+        .decompress(&compressed, "")
+        .expect("decompress must succeed");
+
+    assert_eq!(
+        decompressed, original,
+        "round-trip must be byte-for-byte identical"
+    );
+}
+
+/// Pigz compressor with opts (`-1 -p1`) — fast compression, single thread.
+#[test]
+fn pigz_acceptance_with_opts() {
+    let so = require_fixture_so!(pigz_so_path(), "cargo build -p botforge-plugin-pigz");
+    let mut reg = PluginRegistry::new();
+    reg.load_plugin("pigz", &so, None)
+        .expect("pigz plugin should load");
+    let handle = reg.get_compressor("pigz").expect("compressor handle");
+
+    let data = b"hello from the pigz opts test, repeated many times"
+        .iter()
+        .copied()
+        .cycle()
+        .take(4096)
+        .collect::<Vec<u8>>();
+
+    let compressed = handle
+        .compress(&data, "-1 -p1")
+        .expect("compress with opts");
+    assert_eq!(&compressed[..2], &[0x1F, 0x8B], "must be gzip");
+
+    let decompressed = handle.decompress(&compressed, "").expect("decompress");
+    assert_eq!(decompressed, data, "round-trip with opts");
+}
+
+/// Pigz compressor names appear in `PluginRegistry::compressor_names()`.
+#[test]
+fn pigz_appears_in_compressor_names() {
+    let so = require_fixture_so!(pigz_so_path(), "cargo build -p botforge-plugin-pigz");
+    let mut reg = PluginRegistry::new();
+    reg.load_plugin("pigz", &so, None).expect("load");
+    let names = reg.compressor_names();
+    assert!(
+        names.contains(&"pigz"),
+        "pigz must appear in compressor_names(): {names:?}"
+    );
+}
+
+/// Loading pigz alongside hello must not collide — different slots.
+#[test]
+fn pigz_and_hello_coexist_no_collision() {
+    let hello_so = require_fixture_so!(hello_so_path(), "cargo build -p botforge-plugin-hello");
+    let pigz_so = require_fixture_so!(pigz_so_path(), "cargo build -p botforge-plugin-pigz");
+    let mut reg = PluginRegistry::new();
+    reg.load_plugin("hello", &hello_so, None)
+        .expect("hello should load");
+    reg.load_plugin("pigz", &pigz_so, None)
+        .expect("pigz should load alongside hello (different slots)");
+    assert!(reg.is_registered("core/ping", "hello"));
+    assert!(reg.is_registered("build/compressor", "pigz"));
+    assert_eq!(reg.plugins.len(), 2);
+}
+
+/// A `build/compressor` named `pigz` blocks a second `build/compressor` named
+/// `pigz` (same slot+name collision).
+#[test]
+fn pigz_collision_same_slot_name() {
+    let so = require_fixture_so!(pigz_so_path(), "cargo build -p botforge-plugin-pigz");
+    let mut reg = PluginRegistry::new();
+    reg.load_plugin("pigz", &so, None)
+        .expect("first pigz should load");
+    let err = reg
+        .load_plugin("pigz-2", &so, None)
+        .expect_err("second pigz under same slot+name must collide");
+    match &err {
+        LoadError::CapabilityCollision {
+            slot,
+            name,
+            existing_provider,
+            new_provider,
+        } => {
+            assert_eq!(slot, "build/compressor");
+            assert_eq!(name, "pigz");
+            assert_eq!(existing_provider, "pigz");
+            assert_eq!(new_provider, "pigz-2");
+        }
+        other => panic!("expected CapabilityCollision, got: {other}"),
+    }
+    assert_eq!(reg.plugins.len(), 1, "second plugin must not be wired");
 }

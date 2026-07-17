@@ -193,7 +193,7 @@ fn parse_config_image(raw: &str) -> Result<Reference> {
     Reference::parse(raw)
 }
 
-use crate::compress::{validate_compressor_verb, CompressConfig};
+use crate::compress::CompressConfig;
 
 /// Resolved configuration for a `botforge build` run.
 #[derive(Debug)]
@@ -457,10 +457,10 @@ pub(crate) fn load_build_config(repo_root: &Path, path: &Path) -> Result<BuildCo
         Some(s) => s,
     };
     let root_cloud_init = raw.cloud_init.clone();
-    if let Some(compress) = raw.compress.as_ref() {
-        validate_compressor_verb(&compress.compressor)
-            .with_context(|| format!("invalid build config: {}", path.display()))?;
-    }
+    // NOTE: compressor verb validation is intentionally deferred to use time
+    // (in the build command) so that plugin-provided verbs (e.g. "pigz") are
+    // accepted.  The build command validates against both built-in verbs and
+    // any loaded plugin verbs via validate_compressor_verb_with_extras.
     let mut include_stack = vec![path.to_path_buf()];
     let mut cloud_init_acc = raw.cloud_init;
     let mut files_acc = Vec::new();

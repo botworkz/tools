@@ -32,6 +32,10 @@ on:
     - shasset/**
     - botforge/**
     - viscous/**
+    - botforge-plugin-host/**
+    - botforge-plugin-hello/**
+    - botforge-plugin-hello-badabi/**
+    - botforge-plugin-pigz/**
   pull_request:
     branches: [main]
     paths:
@@ -48,6 +52,10 @@ on:
     - shasset/**
     - botforge/**
     - viscous/**
+    - botforge-plugin-host/**
+    - botforge-plugin-hello/**
+    - botforge-plugin-hello-badabi/**
+    - botforge-plugin-pigz/**
   workflow_dispatch:
   release:
     types: [published]
@@ -107,7 +115,7 @@ jobs:
       if: steps.tarpaulin_install.outcome != 'success'
       run: cargo install cargo-tarpaulin --locked
     - name: Build plugin fixture cdylibs
-      run: cargo build -p botforge-plugin-hello -p botforge-plugin-hello-badabi
+      run: cargo build -p botforge-plugin-hello -p botforge-plugin-hello-badabi -p botforge-plugin-pigz
     - name: Run unit test coverage
       run: cargo tarpaulin
     - name: Upload coverage report
@@ -139,6 +147,10 @@ jobs:
         - name: zlib
           compress_enabled: true
           compressor: zlib
+          compressor_opts: ''
+        - name: pigz
+          compress_enabled: true
+          compressor: pigz
           compressor_opts: ''
     uses: ./.github/workflows/_botforge.yml
     with:
