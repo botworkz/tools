@@ -25,7 +25,7 @@ use crate::util::{
 use crate::compress::{
     compress_qcow2_image, read_qcow2_image_stats, read_virtual_sector0, sparsify_zero_clusters,
 };
-use crate::compress::{CompressConfig, CompressionType, ReclaimMode};
+use crate::compress::{CompressConfig, ReclaimMode};
 use crate::config::{load_build_config, validate_build_steps};
 use crate::plan::vm::{StepFlowPlan, StepTimeoutPolicy};
 use crate::plan::{preserve_failed_build_disk, print_log_tail, run_step_flow, shutdown_build_vm};
@@ -539,17 +539,14 @@ fn commit_output(partial: &Path, output: &Path, compress: Option<&CompressConfig
             compress_qcow2_image(
                 partial,
                 &tmp,
-                c.compressor,
+                &c.compressor,
                 &c.compressor_args,
                 &c.compressor_opts,
             )
             .with_context(|| {
                 format!(
                     "failed to compress qcow2 output with {}",
-                    match c.compressor {
-                        CompressionType::Zstd => "zstd",
-                        CompressionType::Zlib => "zlib",
-                    }
+                    c.compressor.as_str()
                 )
             })?;
             let post_compress_sector0 = read_virtual_sector0(&tmp).with_context(|| {

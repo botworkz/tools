@@ -184,7 +184,7 @@ fn parse_config_image(raw: &str) -> Result<Reference> {
     Reference::parse(raw)
 }
 
-use crate::compress::CompressConfig;
+use crate::compress::{validate_compressor_verb, CompressConfig};
 
 /// Resolved configuration for a `botforge build` run.
 #[derive(Debug)]
@@ -443,6 +443,10 @@ pub(crate) fn load_build_config(repo_root: &Path, path: &Path) -> Result<BuildCo
         Some(s) => s,
     };
     let root_cloud_init = raw.cloud_init.clone();
+    if let Some(compress) = raw.compress.as_ref() {
+        validate_compressor_verb(&compress.compressor)
+            .with_context(|| format!("invalid build config: {}", path.display()))?;
+    }
     let mut include_stack = vec![path.to_path_buf()];
     let mut cloud_init_acc = raw.cloud_init;
     let mut files_acc = Vec::new();

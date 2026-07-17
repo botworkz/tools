@@ -5,7 +5,6 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use super::codec::{build_compressor, decompress_cluster, Compressor};
-use super::config::CompressionType;
 
 const QCOW_MAGIC: u32 = 0x5146_49fb;
 const QCOW_OFLAG_COPIED: u64 = 1u64 << 63;
@@ -79,13 +78,13 @@ impl Qcow2Header {
         1u64 << self.cluster_bits
     }
 
-    fn compression_type(self) -> Result<CompressionType> {
+    fn compression_type(self) -> Result<&'static str> {
         if (self.incompatible_features & QCOW2_INCOMPAT_COMPRESSION) == 0 {
-            return Ok(CompressionType::Zlib);
+            return Ok("zlib");
         }
         match self.compression_type {
-            QCOW2_COMPRESSION_TYPE_ZLIB => Ok(CompressionType::Zlib),
-            QCOW2_COMPRESSION_TYPE_ZSTD => Ok(CompressionType::Zstd),
+            QCOW2_COMPRESSION_TYPE_ZLIB => Ok("zlib"),
+            QCOW2_COMPRESSION_TYPE_ZSTD => Ok("zstd"),
             other => bail!("unsupported qcow2 compression type {other}"),
         }
     }
@@ -110,7 +109,7 @@ fn cluster_offset_mask(cluster_bits: u32) -> u64 {
 pub(crate) fn compress_qcow2_image(
     source: &Path,
     dest: &Path,
-    compression_type: CompressionType,
+    compressor_verb: &str,
     compressor_args: &BTreeMap<String, String>,
     compressor_opts: &str,
 ) -> Result<()> {
@@ -152,7 +151,7 @@ pub(crate) fn compress_qcow2_image(
         .write(true)
         .open(dest)
         .with_context(|| format!("cannot create compressed qcow2: {}", dest.display()))?;
-    let compressor = build_compressor(compression_type, compressor_opts)?;
+    let compressor = build_compressor(compressor_verb, compressor_opts)?;
 
     // Build a rayon thread pool sized by the compressor's worker setting.
     // workers() == 0 means "all available cores" (rayon's default when
@@ -419,7 +418,7 @@ pub(crate) fn compress_qcow2_image(
     write_header(
         &mut output,
         HeaderWriteSpec {
-            compression_type,
+            compressor_verb,
             cluster_size,
             virtual_size,
             l1_size,
@@ -802,8 +801,8 @@ impl DataAllocator {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct HeaderWriteSpec {
-    compression_type: CompressionType,
+struct HeaderWriteSpec<'a> {
+    compressor_verb: &'a str,
     cluster_size: u64,
     virtual_size: u64,
     l1_size: u64,
@@ -932,14 +931,11 @@ fn increment_refcount_range(
     Ok(())
 }
 
-fn write_header(file: &mut File, spec: HeaderWriteSpec) -> Result<()> {
+fn write_header(file: &mut File, spec: HeaderWriteSpec<'_>) -> Result<()> {
     let mut header =
         vec![0u8; usize::try_from(spec.cluster_size).context("cluster size too large")?];
-    let incompatible_features = if matches!(spec.compression_type, CompressionType::Zstd) {
-        QCOW2_INCOMPAT_COMPRESSION
-    } else {
-        0
-    };
+    let (incompatible_features, compression_type_byte) =
+        qcow2_compression_fields(spec.compressor_verb)?;
     write_be_u32(&mut header, HDR_MAGIC, QCOW_MAGIC);
     write_be_u32(&mut header, HDR_VERSION, 3);
     write_be_u32(
@@ -968,11 +964,16 @@ fn write_header(file: &mut File, spec: HeaderWriteSpec) -> Result<()> {
     write_be_u64(&mut header, HDR_INCOMPAT_FEATURES, incompatible_features);
     write_be_u32(&mut header, HDR_REFCOUNT_ORDER, DEFAULT_REFCOUNT_ORDER);
     write_be_u32(&mut header, HDR_HEADER_LENGTH, QCOW_HEADER_LENGTH_V3);
-    header[HDR_COMPRESSION_TYPE] = match spec.compression_type {
-        CompressionType::Zstd => QCOW2_COMPRESSION_TYPE_ZSTD,
-        CompressionType::Zlib => QCOW2_COMPRESSION_TYPE_ZLIB,
-    };
+    header[HDR_COMPRESSION_TYPE] = compression_type_byte;
     write_exact_at(file, 0, &header)
+}
+
+fn qcow2_compression_fields(compressor_verb: &str) -> Result<(u64, u8)> {
+    match compressor_verb {
+        "zstd" => Ok((QCOW2_INCOMPAT_COMPRESSION, QCOW2_COMPRESSION_TYPE_ZSTD)),
+        "zlib" => Ok((0, QCOW2_COMPRESSION_TYPE_ZLIB)),
+        other => bail!("unsupported qcow2 compression verb '{other}'"),
+    }
 }
 
 fn write_l1_table(
@@ -1445,14 +1446,8 @@ mod tests {
         // Use a multi-cluster fixture so adjacent-cluster packing is exercised.
         write_multi_cluster_test_image(&source, 4).expect("write source qcow2");
 
-        compress_qcow2_image(
-            &source,
-            &dest,
-            CompressionType::Zstd,
-            &BTreeMap::new(),
-            "-19 -T0",
-        )
-        .expect("compress");
+        compress_qcow2_image(&source, &dest, "zstd", &BTreeMap::new(), "-19 -T0")
+            .expect("compress");
 
         let mut file = File::open(&dest).expect("open dest");
         let header = read_header(&mut file).expect("read header");
@@ -1500,8 +1495,7 @@ mod tests {
         let dest = tmp.path().join("dest.qcow2");
         write_multi_cluster_test_image(&source, 4).expect("write source qcow2");
 
-        compress_qcow2_image(&source, &dest, CompressionType::Zlib, &BTreeMap::new(), "")
-            .expect("compress");
+        compress_qcow2_image(&source, &dest, "zlib", &BTreeMap::new(), "").expect("compress");
 
         let mut file = File::open(&dest).expect("open dest");
         let header = read_header(&mut file).expect("read header");
@@ -1551,7 +1545,7 @@ mod tests {
                 .parent()
                 .expect("fixture source should have a parent directory")
                 .join(format!("{fixture_name}_{suffix}.qcow2"));
-            compress_qcow2_image(source, &dest, CompressionType::Zstd, &BTreeMap::new(), opts)
+            compress_qcow2_image(source, &dest, "zstd", &BTreeMap::new(), opts)
                 .unwrap_or_else(|e| panic!("compress with {opts}: {e:#}"));
             let bytes =
                 std::fs::read(&dest).unwrap_or_else(|e| panic!("read dest with {opts}: {e:#}"));
@@ -1612,22 +1606,10 @@ mod tests {
         // Compress twice with different worker counts and assert bit-identical output.
         let dest_t1 = tmp.path().join("dest_t1.qcow2");
         let dest_t0 = tmp.path().join("dest_t0.qcow2");
-        compress_qcow2_image(
-            &source,
-            &dest_t1,
-            CompressionType::Zstd,
-            &BTreeMap::new(),
-            "-3 -T1",
-        )
-        .expect("compress -T1");
-        compress_qcow2_image(
-            &source,
-            &dest_t0,
-            CompressionType::Zstd,
-            &BTreeMap::new(),
-            "-3 -T0",
-        )
-        .expect("compress -T0");
+        compress_qcow2_image(&source, &dest_t1, "zstd", &BTreeMap::new(), "-3 -T1")
+            .expect("compress -T1");
+        compress_qcow2_image(&source, &dest_t0, "zstd", &BTreeMap::new(), "-3 -T0")
+            .expect("compress -T0");
 
         let bytes_t1 = std::fs::read(&dest_t1).expect("read -T1 output");
         let bytes_t0 = std::fs::read(&dest_t0).expect("read -T0 output");
@@ -2078,7 +2060,7 @@ mod tests {
         path: &Path,
         expected: &[u8],
         target_cluster_size: u64,
-        compression_type: CompressionType,
+        compression_type: &str,
     ) {
         let mut file = File::open(path).expect("open compressed image");
         let header = read_header(&mut file).expect("read header");
@@ -2119,7 +2101,7 @@ mod tests {
             read_exact_at(&mut file, compressed_offset, &mut compressed).expect("read compressed");
 
             let decoded = match compression_type {
-                CompressionType::Zstd => {
+                "zstd" => {
                     // Assert qemu-compatible single-frame structure.
                     // zstd::stream::read::Decoder transparently accepts multi-frame /
                     // worker-chunked output, so the decode below would pass even for
@@ -2190,7 +2172,7 @@ mod tests {
                     out.resize(cluster_size, 0);
                     out
                 }
-                CompressionType::Zlib => {
+                "zlib" => {
                     let mut decoder = flate2::read::DeflateDecoder::new(compressed.as_slice());
                     use std::io::Read;
                     let mut out = Vec::with_capacity(cluster_size);
@@ -2204,6 +2186,7 @@ mod tests {
                     out.resize(cluster_size, 0);
                     out
                 }
+                other => panic!("unsupported test compression verb '{other}'"),
             };
 
             let start = usize::try_from(cluster_idx * target_cluster_size).expect("start fits");
@@ -2217,7 +2200,7 @@ mod tests {
     }
 
     fn run_realistic_round_trip_test(
-        compression_type: CompressionType,
+        compression_type: &str,
         source_cluster_size: u64,
         target_cluster_size: Option<u64>,
         compressor_opts: &str,
@@ -2295,7 +2278,7 @@ mod tests {
         }
     }
 
-    fn run_copied_flag_test(compression_type: CompressionType, cluster_size: u64) {
+    fn run_copied_flag_test(compression_type: &str, cluster_size: u64) {
         let tmp = tempdir().expect("tempdir");
         let source = tmp.path().join("source.qcow2");
         let dest = tmp.path().join("compressed.qcow2");
@@ -2313,7 +2296,7 @@ mod tests {
         if cluster_size == 1_048_576 {
             compressor_args.insert("cluster_size".to_owned(), "1M".to_owned());
         }
-        let compressor_opts = if compression_type == CompressionType::Zstd {
+        let compressor_opts = if compression_type == "zstd" {
             "-19 -T0"
         } else {
             ""
@@ -2416,7 +2399,7 @@ mod tests {
     // single cluster.
     // -------------------------------------------------------------------------
 
-    fn run_round_trip_test(compression_type: CompressionType, cluster_size_bytes: u64) {
+    fn run_round_trip_test(compression_type: &str, cluster_size_bytes: u64) {
         let tmp = tempdir().expect("tempdir");
         let source = tmp.path().join("source.qcow2");
         let dest = tmp.path().join("compressed.qcow2");
@@ -2431,7 +2414,7 @@ mod tests {
             compressor_args.insert("cluster_size".to_owned(), "1M".to_owned());
         }
         let zstd_opts = "-19 -T0";
-        let extra_opts = if compression_type == CompressionType::Zstd {
+        let extra_opts = if compression_type == "zstd" {
             zstd_opts
         } else {
             ""
@@ -2458,22 +2441,22 @@ mod tests {
 
     #[test]
     fn native_compress_round_trip_zstd_4k() {
-        run_round_trip_test(CompressionType::Zstd, 4096);
+        run_round_trip_test("zstd", 4096);
     }
 
     #[test]
     fn native_compress_round_trip_zlib_4k() {
-        run_round_trip_test(CompressionType::Zlib, 4096);
+        run_round_trip_test("zlib", 4096);
     }
 
     #[test]
     fn native_compress_round_trip_zstd_1m() {
-        run_round_trip_test(CompressionType::Zstd, 1_048_576);
+        run_round_trip_test("zstd", 1_048_576);
     }
 
     #[test]
     fn native_compress_round_trip_zlib_1m() {
-        run_round_trip_test(CompressionType::Zlib, 1_048_576);
+        run_round_trip_test("zlib", 1_048_576);
     }
 
     // -------------------------------------------------------------------------
@@ -2486,7 +2469,7 @@ mod tests {
     // compressed qcow2 as its source and must produce a bootable image.
     // -------------------------------------------------------------------------
 
-    fn run_double_compress_test(compression_type: CompressionType, cluster_size_bytes: u64) {
+    fn run_double_compress_test(compression_type: &str, cluster_size_bytes: u64) {
         let tmp = tempdir().expect("tempdir");
         let source = tmp.path().join("a.qcow2");
         let intermediate = tmp.path().join("b.qcow2");
@@ -2500,7 +2483,7 @@ mod tests {
             compressor_args.insert("cluster_size".to_owned(), "1M".to_owned());
         }
         let zstd_opts = "-19 -T0";
-        let extra_opts = if compression_type == CompressionType::Zstd {
+        let extra_opts = if compression_type == "zstd" {
             zstd_opts
         } else {
             ""
@@ -2532,22 +2515,22 @@ mod tests {
 
     #[test]
     fn native_compress_double_compress_zstd_4k() {
-        run_double_compress_test(CompressionType::Zstd, 4096);
+        run_double_compress_test("zstd", 4096);
     }
 
     #[test]
     fn native_compress_double_compress_zlib_4k() {
-        run_double_compress_test(CompressionType::Zlib, 4096);
+        run_double_compress_test("zlib", 4096);
     }
 
     #[test]
     fn native_compress_double_compress_zstd_1m() {
-        run_double_compress_test(CompressionType::Zstd, 1_048_576);
+        run_double_compress_test("zstd", 1_048_576);
     }
 
     #[test]
     fn native_compress_double_compress_zlib_1m() {
-        run_double_compress_test(CompressionType::Zlib, 1_048_576);
+        run_double_compress_test("zlib", 1_048_576);
     }
 
     // -------------------------------------------------------------------------
@@ -2562,7 +2545,7 @@ mod tests {
     // bytes (e.g. from a qemu-produced image with a partial last cluster).
     // -------------------------------------------------------------------------
 
-    fn run_partial_last_cluster_test(compression_type: CompressionType) {
+    fn run_partial_last_cluster_test(compression_type: &str) {
         let tmp = tempdir().expect("tempdir");
         let cluster_size: u64 = 4096;
         // virtual_size is NOT a multiple of cluster_size: last cluster is partial.
@@ -2616,7 +2599,7 @@ mod tests {
         }
 
         let dest = tmp.path().join("compressed.qcow2");
-        let opts = if compression_type == CompressionType::Zstd {
+        let opts = if compression_type == "zstd" {
             "-19 -T0"
         } else {
             ""
@@ -2649,12 +2632,12 @@ mod tests {
 
     #[test]
     fn native_compress_partial_last_cluster_zlib() {
-        run_partial_last_cluster_test(CompressionType::Zlib);
+        run_partial_last_cluster_test("zlib");
     }
 
     #[test]
     fn native_compress_partial_last_cluster_zstd() {
-        run_partial_last_cluster_test(CompressionType::Zstd);
+        run_partial_last_cluster_test("zstd");
     }
 
     fn write_short_zlib_compressed_source_cluster(
@@ -2710,14 +2693,14 @@ mod tests {
         Ok(expected)
     }
 
-    fn run_short_zlib_source_recompress_test(target_compression: CompressionType) {
+    fn run_short_zlib_source_recompress_test(target_compression: &str) {
         let tmp = tempdir().expect("tempdir");
         let source = tmp.path().join("source-short-zlib.qcow2");
         let dest = tmp.path().join("dest.qcow2");
         let cluster_size = 4096u64;
         let expected = write_short_zlib_compressed_source_cluster(&source, cluster_size, 1024)
             .expect("write short-zlib source");
-        let opts = if target_compression == CompressionType::Zstd {
+        let opts = if target_compression == "zstd" {
             "-19 -T0"
         } else {
             ""
@@ -2739,52 +2722,52 @@ mod tests {
 
     #[test]
     fn native_compress_recompresses_short_zlib_source_cluster_to_zlib() {
-        run_short_zlib_source_recompress_test(CompressionType::Zlib);
+        run_short_zlib_source_recompress_test("zlib");
     }
 
     #[test]
     fn native_compress_recompresses_short_zlib_source_cluster_to_zstd() {
-        run_short_zlib_source_recompress_test(CompressionType::Zstd);
+        run_short_zlib_source_recompress_test("zstd");
     }
 
     #[test]
     fn native_compress_sets_copied_flags_zstd_4k() {
-        run_copied_flag_test(CompressionType::Zstd, 4096);
+        run_copied_flag_test("zstd", 4096);
     }
 
     #[test]
     fn native_compress_sets_copied_flags_zlib_4k() {
-        run_copied_flag_test(CompressionType::Zlib, 4096);
+        run_copied_flag_test("zlib", 4096);
     }
 
     #[test]
     fn native_compress_sets_copied_flags_zstd_1m() {
-        run_copied_flag_test(CompressionType::Zstd, 1_048_576);
+        run_copied_flag_test("zstd", 1_048_576);
     }
 
     #[test]
     fn native_compress_sets_copied_flags_zlib_1m() {
-        run_copied_flag_test(CompressionType::Zlib, 1_048_576);
+        run_copied_flag_test("zlib", 1_048_576);
     }
 
     #[test]
     fn native_compress_round_trip_realistic_zlib_default_cluster_size() {
-        run_realistic_round_trip_test(CompressionType::Zlib, 65_536, None, "");
+        run_realistic_round_trip_test("zlib", 65_536, None, "");
     }
 
     #[test]
     fn native_compress_round_trip_realistic_zstd_default_cluster_size() {
-        run_realistic_round_trip_test(CompressionType::Zstd, 65_536, None, "-19 -T0");
+        run_realistic_round_trip_test("zstd", 65_536, None, "-19 -T0");
     }
 
     #[test]
     fn native_compress_round_trip_realistic_zlib_small_target_cluster_size() {
-        run_realistic_round_trip_test(CompressionType::Zlib, 65_536, Some(4096), "");
+        run_realistic_round_trip_test("zlib", 65_536, Some(4096), "");
     }
 
     #[test]
     fn native_compress_round_trip_realistic_zstd_small_target_cluster_size() {
-        run_realistic_round_trip_test(CompressionType::Zstd, 65_536, Some(4096), "-19 -T0");
+        run_realistic_round_trip_test("zstd", 65_536, Some(4096), "-19 -T0");
     }
 
     // -------------------------------------------------------------------------
@@ -2810,14 +2793,8 @@ mod tests {
         write_custom_test_image_with_cluster_size(&source, &cluster_contents, cluster_size)
             .expect("write source");
 
-        compress_qcow2_image(
-            &source,
-            &dest,
-            CompressionType::Zstd,
-            &BTreeMap::new(),
-            "-19 -T0",
-        )
-        .expect("compress");
+        compress_qcow2_image(&source, &dest, "zstd", &BTreeMap::new(), "-19 -T0")
+            .expect("compress");
 
         // assert_compressed_entries_decode_with_declared_codec now verifies:
         //   (1) each zstd cluster has a pledged content size == cluster_size, and
@@ -2827,7 +2804,7 @@ mod tests {
             &dest,
             &expected,
             cluster_size,
-            CompressionType::Zstd,
+            "zstd",
         );
     }
 
@@ -2855,8 +2832,7 @@ mod tests {
 
         let mut args = BTreeMap::new();
         args.insert("cluster_size".to_owned(), "1M".to_owned());
-        compress_qcow2_image(&source, &dest, CompressionType::Zstd, &args, "-19 -T0")
-            .expect("compress");
+        compress_qcow2_image(&source, &dest, "zstd", &args, "-19 -T0").expect("compress");
 
         assert_qemu_img_check(&dest);
     }
@@ -2878,22 +2854,10 @@ mod tests {
         let mut args = BTreeMap::new();
         args.insert("cluster_size".to_owned(), "1M".to_owned());
 
-        compress_qcow2_image(
-            &source,
-            &intermediate,
-            CompressionType::Zstd,
-            &args,
-            "-19 -T0",
-        )
-        .expect("compress A → B");
-        compress_qcow2_image(
-            &intermediate,
-            &final_image,
-            CompressionType::Zstd,
-            &args,
-            "-19 -T0",
-        )
-        .expect("compress B → C");
+        compress_qcow2_image(&source, &intermediate, "zstd", &args, "-19 -T0")
+            .expect("compress A → B");
+        compress_qcow2_image(&intermediate, &final_image, "zstd", &args, "-19 -T0")
+            .expect("compress B → C");
 
         assert_qemu_img_check(&final_image);
     }
@@ -2913,7 +2877,7 @@ mod tests {
 
         let mut args = BTreeMap::new();
         args.insert("cluster_size".to_owned(), "1M".to_owned());
-        compress_qcow2_image(&source, &dest, CompressionType::Zlib, &args, "").expect("compress");
+        compress_qcow2_image(&source, &dest, "zlib", &args, "").expect("compress");
 
         assert_qemu_img_check(&dest);
     }
@@ -2935,16 +2899,9 @@ mod tests {
         let mut args = BTreeMap::new();
         args.insert("cluster_size".to_owned(), "1M".to_owned());
 
-        compress_qcow2_image(&source, &intermediate, CompressionType::Zlib, &args, "")
-            .expect("compress A → B");
-        compress_qcow2_image(
-            &intermediate,
-            &final_image,
-            CompressionType::Zlib,
-            &args,
-            "",
-        )
-        .expect("compress B → C");
+        compress_qcow2_image(&source, &intermediate, "zlib", &args, "").expect("compress A → B");
+        compress_qcow2_image(&intermediate, &final_image, "zlib", &args, "")
+            .expect("compress B → C");
 
         assert_qemu_img_check(&final_image);
     }
@@ -3166,14 +3123,8 @@ mod tests {
         let compressed = tmp.path().join("multi_l1_zlib.qcow2");
         let (written_clusters, virtual_size) = make_multi_l1_source_qcow2(&source, cluster_size, 3);
         assert_qemu_img_check(&source);
-        compress_qcow2_image(
-            &source,
-            &compressed,
-            CompressionType::Zlib,
-            &BTreeMap::new(),
-            "",
-        )
-        .expect("compress multi-L1 source (zlib)");
+        compress_qcow2_image(&source, &compressed, "zlib", &BTreeMap::new(), "")
+            .expect("compress multi-L1 source (zlib)");
         assert_qemu_img_check(&compressed);
         assert_qemu_img_convert_roundtrip(
             &compressed,
@@ -3196,14 +3147,8 @@ mod tests {
         let compressed = tmp.path().join("multi_l1_zstd.qcow2");
         let (written_clusters, virtual_size) = make_multi_l1_source_qcow2(&source, cluster_size, 3);
         assert_qemu_img_check(&source);
-        compress_qcow2_image(
-            &source,
-            &compressed,
-            CompressionType::Zstd,
-            &BTreeMap::new(),
-            "",
-        )
-        .expect("compress multi-L1 source (zstd)");
+        compress_qcow2_image(&source, &compressed, "zstd", &BTreeMap::new(), "")
+            .expect("compress multi-L1 source (zstd)");
         assert_qemu_img_check(&compressed);
         assert_qemu_img_convert_roundtrip(
             &compressed,
@@ -3348,7 +3293,7 @@ mod integration_tests {
         );
     }
 
-    fn run_integration_compress_test(compression_type: CompressionType, label: &str) {
+    fn run_integration_compress_test(compression_type: &str, label: &str) {
         let Some(source) = integration_source() else {
             eprintln!("integration source not found — skipping {label} integration test");
             return;
@@ -3366,8 +3311,9 @@ mod integration_tests {
         let compressed = tmp.path().join(format!("compressed_{label}.qcow2"));
 
         let opts = match compression_type {
-            CompressionType::Zstd => "-19 -T0",
-            CompressionType::Zlib => "",
+            "zstd" => "-19 -T0",
+            "zlib" => "",
+            other => panic!("unsupported test compression verb '{other}'"),
         };
         compress_qcow2_image(
             &source,
@@ -3393,11 +3339,11 @@ mod integration_tests {
 
     #[test]
     fn integration_compress_zlib_roundtrip() {
-        run_integration_compress_test(CompressionType::Zlib, "zlib");
+        run_integration_compress_test("zlib", "zlib");
     }
 
     #[test]
     fn integration_compress_zstd_roundtrip() {
-        run_integration_compress_test(CompressionType::Zstd, "zstd");
+        run_integration_compress_test("zstd", "zstd");
     }
 }
