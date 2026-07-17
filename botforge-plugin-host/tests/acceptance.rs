@@ -22,11 +22,11 @@
 //!
 //! The test resolves the Cargo target directory by honoring
 //! `CARGO_TARGET_DIR` (falling back to `<workspace>/target`) and then probing
-//! the known build-profile subdirectories (`debug`, `release`, and
-//! tarpaulin's profile dir).  It returns the first candidate that actually
-//! contains the requested fixture `.so`.  This keeps the tests working under
-//! both `cargo test` and `cargo tarpaulin`, whose artifacts land in different
-//! profile directories.
+//! the standard build-profile subdirectories (`debug` and `release`).  It
+//! returns the first candidate that actually contains the requested fixture
+//! `.so`.  `cargo tarpaulin` instruments binaries under `target/debug` (the
+//! same location as plain `cargo test`), so no special tarpaulin subdir is
+//! needed.
 
 use botforge_plugin_host::{
     LoadError, PingHandle, PluginRegistry, HOST_ABI_VERSION, PING_SENTINEL,
@@ -56,21 +56,14 @@ fn target_base() -> PathBuf {
 /// Different tooling uses different profile dirs:
 /// - `cargo test` (debug) → `debug`
 /// - `cargo test --release` → `release`
-/// - `cargo tarpaulin` → its own instrumented profile dir
+/// - `cargo tarpaulin` instruments binaries under `target/debug` (same as
+///   `cargo test`; the tarpaulin profile subdir does not exist).
 ///
-/// We probe all of them and pick the first that contains the artifact.
+/// We probe both standard profiles and pick the first that contains the
+/// artifact.
 fn profile_candidates() -> Vec<PathBuf> {
     let base = target_base();
-    [
-        if cfg!(debug_assertions) { "debug" } else { "release" },
-        "debug",
-        "release",
-        // tarpaulin builds instrumented artifacts here.
-        "tarpaulin",
-    ]
-    .iter()
-    .map(|p| base.join(p))
-    .collect()
+    ["debug", "release"].iter().map(|p| base.join(p)).collect()
 }
 
 /// Locate a fixture `.so` by filename across the candidate profile dirs.

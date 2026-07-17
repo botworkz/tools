@@ -106,6 +106,8 @@ jobs:
     - name: Fallback install cargo-tarpaulin
       if: steps.tarpaulin_install.outcome != 'success'
       run: cargo install cargo-tarpaulin --locked
+    - name: Build plugin fixture cdylibs
+      run: cargo build -p botforge-plugin-hello -p botforge-plugin-hello-badabi
     - name: Run unit test coverage
       run: cargo tarpaulin
     - name: Upload coverage report

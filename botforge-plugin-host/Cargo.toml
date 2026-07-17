@@ -17,8 +17,5 @@ path = "src/lib.rs"
 libloading = "0.8"
 thiserror = "2"
 
-[dev-dependencies]
-tempfile = "3"
-
 [lints]
 workspace = true
