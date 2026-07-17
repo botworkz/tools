@@ -48,12 +48,13 @@ jobs:
         sudo apt-get -qq install -y guestfish qemu-utils --no-install-recommends
 
     # ── Plugin host acceptance tests ─────────────────────────────────────────
-    # Build the hello-world fixture cdylib first, then run the plugin-host
-    # acceptance tests against the real compiled libhello.so.
-    - name: Build plugin fixture cdylibs (.so)
+    # Build all plugin cdylibs first, then run the plugin-host acceptance tests
+    # against the real compiled .so files.
+    - name: Build plugin cdylibs (.so)
       run: |
         cargo build -p botforge-plugin-hello
         cargo build -p botforge-plugin-hello-badabi
+        cargo build -p botforge-plugin-pigz
     - name: Run plugin-host acceptance tests
       run: cargo test -p botforge-plugin-host
 
@@ -64,6 +65,24 @@ jobs:
         path: .ci-prebuilt/botforge
     - name: Make botforge binary executable
       run: chmod +x .ci-prebuilt/botforge/botforge
+    - name: Stage libpigz.so for container build
+      run: |
+        set -euo pipefail
+        # Find the built libpigz.so (debug or release profile).
+        so_path=""
+        for dir in target/debug target/release; do
+          if [[ -f "${dir}/libpigz.so" ]]; then
+            so_path="${dir}/libpigz.so"
+            break
+          fi
+        done
+        if [[ -z "${so_path}" ]]; then
+          echo "ERROR: libpigz.so not found in target/debug or target/release" >&2
+          exit 1
+        fi
+        echo "Staging ${so_path} → .ci-plugins/libpigz.so"
+        mkdir -p .ci-plugins
+        cp "${so_path}" .ci-plugins/libpigz.so
     - name: Build botworkz/botforge:ci runtime image
       run: |
         set -euo pipefail
@@ -130,6 +149,23 @@ jobs:
           exit 1
         fi
         echo "Inline assets OK: debian-base present in marker; no standalone shasset.yaml"
+    # Inject the pigz plugin declaration when the pigz compressor is in use.
+    # The plugins: block points at /usr/share/botforge/plugins/libpigz.so —
+    # the canonical path where the container ships libpigz.so (see Dockerfile).
+    - name: Inject pigz plugin declaration into workspace marker
+      if: inputs.compressor == 'pigz'
+      run: |
+        set -euo pipefail
+        cat >> testrepo/botforge.yaml << 'EOF'
+        plugins:
+          - name: pigz
+            src: /usr/share/botforge/plugins/libpigz.so
+            provides:
+              - build/compressor
+        EOF
+        echo "Injected pigz plugin block into testrepo/botforge.yaml"
+        echo "----- testrepo/botforge.yaml -----"
+        cat testrepo/botforge.yaml
     - name: Create build config
       uses: envoyproxy/toolshed/actions/jq@6a20085af231aba4c72d6866f94098343a8c5616
       id: build-config
@@ -220,6 +256,48 @@ jobs:
       run: |
         qemu-img check -r all -f qcow2 testrepo/build/artifact/foo.qcow2
         sudo guestfish --ro -a testrepo/build/artifact/foo.qcow2 -i sh 'file /boot/vmlinuz*; ls -l /boot'
+
+    # Pigz-specific: assert the plugin-compressed artifact exists, is valid
+    # gzip, and round-trips correctly.  Fails loud if pigz compression was a
+    # silent no-op (i.e. the .gz artifact was not produced).
+    - name: Assert pigz plugin artifact is a valid gzip round-trip
+      if: inputs.compressor == 'pigz'
+      run: |
+        set -euo pipefail
+        gz_path="testrepo/build/artifact/foo.qcow2.gz"
+
+        # Guard: the .gz artifact MUST exist — any silent no-op is a hard failure.
+        if [[ ! -f "${gz_path}" ]]; then
+          echo "ERROR: ${gz_path} not found — pigz plugin compression did not run!" >&2
+          echo "Contents of testrepo/build/artifact/:" >&2
+          ls -la testrepo/build/artifact/ >&2
+          exit 1
+        fi
+
+        echo "Found pigz artifact: $(du -sh "${gz_path}" | cut -f1) ${gz_path}"
+
+        # Verify the file starts with gzip magic bytes (0x1F 0x8B).
+        magic=$(xxd -p -l 2 "${gz_path}")
+        if [[ "${magic}" != "1f8b" ]]; then
+          echo "ERROR: ${gz_path} does not start with gzip magic (got: ${magic})" >&2
+          exit 1
+        fi
+        echo "Gzip magic OK: ${magic}"
+
+        # Integrity check via gzip -t (tests full decompression without writing).
+        gzip -t "${gz_path}"
+        echo "gzip -t integrity check PASSED"
+
+        # Size guard: the compressed artifact must be non-trivially large
+        # (at minimum a few MB — a qcow2 image is never a handful of bytes).
+        gz_bytes=$(stat -c '%s' "${gz_path}")
+        if (( gz_bytes < 1048576 )); then
+          echo "ERROR: ${gz_path} is suspiciously small (${gz_bytes} bytes)" \
+               "— compressed output may be corrupt or empty" >&2
+          exit 1
+        fi
+        echo "Artifact size OK: ${gz_bytes} bytes"
+        echo "All pigz acceptance checks PASSED"
 
     - name: Create chained build config
       uses: envoyproxy/toolshed/actions/jq@6a20085af231aba4c72d6866f94098343a8c5616

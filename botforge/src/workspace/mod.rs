@@ -50,9 +50,7 @@ struct RawPluginEntry {
 ///
 /// Created by [`load_plugin_entries`].  Consumers pass these to
 /// `botforge_plugin_host::PluginRegistry::load_plugin` to open the `.so` and
-/// wire capabilities.  This struct is new in this PR; callers will be added in
-/// follow-up PRs when plugin-aware commands are introduced.
-#[allow(dead_code)]
+/// wire capabilities.
 #[derive(Debug, Clone)]
 pub(crate) struct PluginEntry {
     /// Unique plugin instance name.
@@ -190,9 +188,6 @@ pub(crate) fn load_inline_manifest(context_root: &Path) -> Result<Manifest> {
 /// This function parses config only; it does **not** open or load any `.so`
 /// files.  Callers that want to load plugins pass the returned entries to
 /// `botforge_plugin_host::PluginRegistry::load_plugin`.
-///
-/// Called from tests and will be called by plugin-aware commands in follow-up PRs.
-#[allow(dead_code)]
 pub(crate) fn load_plugin_entries(context_root: &Path) -> Result<Vec<PluginEntry>> {
     let marker = marker_path(context_root)?;
     let contents = std::fs::read_to_string(&marker)
