@@ -33,6 +33,8 @@ pub(crate) enum Commands {
     Iso(commands::iso::IsoArgs),
     /// Build a payload ISO from a spec-driven staging plan.
     Payload(commands::payload::PayloadArgs),
+    /// Publish build artifacts to one or more targets (fs, s3).
+    Publish(commands::publish::PublishArgs),
     /// Launch a VM with qemu (KVM-only).
     Run(commands::run::RunArgs),
     /// Boot and validate a packed VM from a test config.
