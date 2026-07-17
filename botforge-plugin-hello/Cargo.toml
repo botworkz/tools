@@ -1,0 +1,23 @@
+[package]
+name = "botforge-plugin-hello"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "Hello-world fixture plugin for botforge plugin system acceptance tests"
+
+# This crate builds a cdylib (.so) for use in acceptance tests.
+# It is NOT a workspace member intended for deployment; it is a test fixture.
+#
+# `unsafe_code = "forbid"` is intentionally absent from this crate.
+# The extern "C" ABI exports require unsafe blocks for the FFI boundary.
+# See botforge-plugin-host/Cargo.toml for the workspace unsafe policy.
+[lib]
+name = "hello"
+crate-type = ["cdylib"]
+
+[dependencies]
+# Reference the host's ABI version constant so the fixture can never drift.
+botforge-plugin-host = { path = "../botforge-plugin-host" }
+
+[lints]
+workspace = true
