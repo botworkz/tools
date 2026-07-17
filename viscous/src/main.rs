@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! `viscous` CLI — thin wrapper around the library.
 //!
 //! Three verbs match the lib API:

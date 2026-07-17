@@ -1,0 +1,17 @@
+[package]
+name = "botforge-plugin-host"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Host for botforge .so FFI plugins; the sole sanctioned location for unsafe code in this workspace"
+
+[lib]
+name = "botforge_plugin_host"
+path = "src/lib.rs"
+
+# `unsafe_code = "forbid"` is intentionally absent from this crate.
+# See the root Cargo.toml workspace-lint comment for the full policy
+# rationale: this is the designated blast-radius container for all
+# .so / FFI-loading code in the botforge plugin system.
+[lints]
+workspace = true
