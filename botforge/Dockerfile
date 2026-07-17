@@ -53,6 +53,7 @@ ARG BINARY_SOURCE=source
 # hadolint ignore=DL3008
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
+        awscli \
         ca-certificates \
         cloud-image-utils \
         curl \

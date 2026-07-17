@@ -138,15 +138,17 @@ fn build_glob_set(patterns: &[String]) -> Result<GlobSet> {
 /// Indexed workspace spec paths, keyed by `(name, type)`.
 ///
 /// Produced by [`discover`]; consumed by `botforge build <name>` /
-/// `botforge test <name>`.  Structure is intentionally a reusable helper so
-/// future work (B4 sync/drift-check) can materialise the same output without
-/// re-discovering.
+/// `botforge test <name>` / `botforge publish <name>`.  Structure is
+/// intentionally a reusable helper so future work (B4 sync/drift-check) can
+/// materialise the same output without re-discovering.
 #[derive(Debug, Default)]
 pub(crate) struct Registry {
     /// Maps spec name → absolute path for `type: botforge/build` docs.
     pub(crate) builds: BTreeMap<String, PathBuf>,
     /// Maps spec name → absolute path for `type: botforge/test` docs.
     pub(crate) tests: BTreeMap<String, PathBuf>,
+    /// Maps spec name → absolute path for `type: botforge/publish` docs.
+    pub(crate) publishes: BTreeMap<String, PathBuf>,
 }
 
 /// Methods used in tests to look up named entries in the discovered registry.
@@ -173,6 +175,17 @@ impl Registry {
             )
         })
     }
+
+    /// Resolve a publish spec by name (test helper).
+    pub(crate) fn publish(&self, name: &str, context_root: &Path) -> Result<&PathBuf> {
+        self.publishes.get(name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "no publish plan named '{}' found in {}",
+                name,
+                context_root.display()
+            )
+        })
+    }
 }
 
 // ─── doc-type peeker ─────────────────────────────────────────────────────────
@@ -181,10 +194,12 @@ impl Registry {
 enum DocKind {
     Build,
     Test,
+    Publish,
 }
 
 /// Read a YAML file enough to extract `type:` and `name:`.
-/// Returns `None` if the file is not a `botforge/build` or `botforge/test` doc.
+/// Returns `None` if the file is not a `botforge/build`, `botforge/test`, or
+/// `botforge/publish` doc.
 /// Returns an error if the file has the right type but a missing/invalid name.
 fn peek_doc(path: &Path) -> Result<Option<(DocKind, String)>> {
     let contents = match std::fs::read_to_string(path) {
@@ -220,7 +235,14 @@ fn peek_doc(path: &Path) -> Result<Option<(DocKind, String)>> {
     let kind = match type_val.as_str() {
         Some("botforge/build") => DocKind::Build,
         Some("botforge/test") => DocKind::Test,
+        Some("botforge/publish") => DocKind::Publish,
         _ => return Ok(None),
+    };
+
+    let type_label = match kind {
+        DocKind::Build => "type: botforge/build",
+        DocKind::Test => "type: botforge/test",
+        DocKind::Publish => "type: botforge/publish",
     };
 
     // `name:` is required for entrypoint docs.
@@ -228,20 +250,14 @@ fn peek_doc(path: &Path) -> Result<Option<(DocKind, String)>> {
         None => {
             bail!(
                 "'name' is required in a '{}' document ({})",
-                match kind {
-                    DocKind::Build => "type: botforge/build",
-                    DocKind::Test => "type: botforge/test",
-                },
+                type_label,
                 path.display()
             )
         }
         Some(v) => match v.as_str() {
             None => bail!(
                 "'name' must be a string in {} ({})",
-                match kind {
-                    DocKind::Build => "type: botforge/build",
-                    DocKind::Test => "type: botforge/test",
-                },
+                type_label,
                 path.display()
             ),
             Some(s) => s.to_string(),
@@ -252,20 +268,14 @@ fn peek_doc(path: &Path) -> Result<Option<(DocKind, String)>> {
     if name.trim().is_empty() {
         bail!(
             "'name' must not be blank in {} ({})",
-            match kind {
-                DocKind::Build => "type: botforge/build",
-                DocKind::Test => "type: botforge/test",
-            },
+            type_label,
             path.display()
         );
     }
     if !name.is_ascii() || name.chars().any(|c| c.is_ascii_control()) {
         bail!(
             "'name' must be printable ASCII in {} ({})",
-            match kind {
-                DocKind::Build => "type: botforge/build",
-                DocKind::Test => "type: botforge/test",
-            },
+            type_label,
             path.display()
         );
     }
@@ -500,6 +510,9 @@ pub(crate) fn discover(context_root: &Path) -> Result<Registry> {
             Some((DocKind::Test, name)) => {
                 insert_entry(&mut registry.tests, name, path, "botforge/test")?;
             }
+            Some((DocKind::Publish, name)) => {
+                insert_entry(&mut registry.publishes, name, path, "botforge/publish")?;
+            }
         }
     }
 
@@ -540,6 +553,11 @@ mod tests {
 
     fn write_fragment_doc(dir: &Path, filename: &str) {
         fs::write(dir.join(filename), "type: botforge/fragment\n").unwrap();
+    }
+
+    fn write_publish_doc(dir: &Path, filename: &str, name: &str) {
+        let content = format!("type: botforge/publish\nname: {name}\n");
+        fs::write(dir.join(filename), content).unwrap();
     }
 
     // ── load_workspace_config ─────────────────────────────────────────────────
@@ -902,6 +920,24 @@ mod tests {
         let reg = discover(root.path()).unwrap();
         assert!(reg.build("anything", root.path()).is_err());
         assert!(reg.test("anything", root.path()).is_err());
+        assert!(reg.publish("anything", root.path()).is_err());
+    }
+
+    #[test]
+    fn discover_finds_publish_docs() {
+        let root = TempDir::new().unwrap();
+        write_marker(root.path());
+        write_publish_doc(root.path(), "release.yaml", "my-release");
+
+        let reg = discover(root.path()).unwrap();
+        assert!(
+            reg.publish("my-release", root.path()).is_ok(),
+            "publish doc should be discoverable"
+        );
+        assert!(
+            reg.build("my-release", root.path()).is_err(),
+            "publish doc must not appear in builds"
+        );
     }
 
     // ── recursive discovery ───────────────────────────────────────────────────

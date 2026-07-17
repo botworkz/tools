@@ -1182,6 +1182,134 @@ fn env_merge(accumulated: &mut Vec<(String, String)>, new_entries: Vec<(String, 
     }
 }
 
+/// Execute an ordered, sequential, fail-fast prepare-phase for `botforge publish`.
+///
+/// Steps run **locally** in the container with `cwd` at `context` (the repo/context
+/// root) — the same execution context as `on: host` steps in build/test plans.
+/// Only `RunStep` steps are supported; `ArchiveStep` produces a hard error.
+///
+/// - Shell selection, `shell:` / default bash template, reused as-is.
+/// - `for:` expansion is performed at load time by `expand_raw_step`; by the time
+///   steps reach this function they are already fully expanded.
+/// - `if:` condition checking: a step with `if: false` is skipped (logged).
+/// - `expect:` assertion handling: supported; exit/stdout/stderr assertions apply.
+/// - `BOTFORGE_ENV` env accumulation: each step may append `KEY=VALUE` pairs; later
+///   steps see earlier steps' exported vars (same mechanics as host steps in build/test).
+/// - Fail-fast: a non-zero exit (or failed assertion) aborts the whole phase immediately.
+pub(crate) fn run_local_steps(context: &Path, steps: &[TestStep]) -> Result<()> {
+    if steps.is_empty() {
+        return Ok(());
+    }
+
+    let step_log_dir = context.join("build").join("logs");
+    std::fs::create_dir_all(&step_log_dir).with_context(|| {
+        format!(
+            "cannot create publish step log dir: {}",
+            step_log_dir.display()
+        )
+    })?;
+
+    // No overall wall-clock timeout for publish steps; each step has a generous
+    // per-step budget.  Using a far-future deadline avoids code paths that check
+    // `overall_deadline` from firing spuriously.  24 hours is well beyond any
+    // reasonable publish step and avoids Duration arithmetic overflow.
+    let overall_timeout = Duration::from_secs(86_400);
+    let overall_deadline = Instant::now() + overall_timeout;
+    let default_step_timeout = Duration::from_secs(300);
+
+    let mut accumulated_env: Vec<(String, String)> = Vec::new();
+
+    for (step_idx, step) in steps.iter().enumerate() {
+        let TestStep::Run(run) = step else {
+            let name = step.display_name();
+            anyhow::bail!(
+                "publish step {} ('{}'): archive steps are not supported in the \
+                 publish prepare phase; only run steps are allowed",
+                step_idx + 1,
+                name
+            );
+        };
+
+        if !run.condition_enabled() {
+            print_step_skipped(step_idx, step.display_name(), step.display_id());
+            continue;
+        }
+
+        print_step_title(step_idx, step.display_name(), step.display_id());
+
+        let log_path = step_log_path(&step_log_dir, step_idx, &run.name);
+        let step_timeout = resolve_step_timeout(run.timeout, default_step_timeout);
+        let budget = StepExecutionBudget {
+            step_timeout,
+            overall_deadline,
+            overall_timeout,
+        };
+
+        let template =
+            resolve_shell(run.shell.as_deref()).expect("shell already validated at config load");
+        let suffix = unique_suffix();
+        let env_file = std::env::temp_dir().join(format!("botforge-publish-env-{suffix}"));
+
+        let step_result: Result<()> = if let Some(expect) = &run.expect {
+            let (capture, actual_exit) = run_host_step_capturing(
+                &run.name,
+                &run.run,
+                context,
+                budget,
+                &template,
+                &accumulated_env,
+                HostStepFiles {
+                    env_file: &env_file,
+                    log_path: &log_path,
+                },
+            )
+            .with_context(|| format!("publish step '{}' command failed", run.name))?;
+
+            if let Ok(contents) = std::fs::read_to_string(&env_file) {
+                if let Ok(new_entries) = parse_env_file(&contents) {
+                    env_merge(&mut accumulated_env, new_entries);
+                }
+            }
+            let _ = std::fs::remove_file(&env_file);
+            check_expect_block(&run.name, expect, &capture, actual_exit)
+        } else {
+            let result = run_host_step(
+                &run.name,
+                &run.run,
+                context,
+                budget,
+                &template,
+                &accumulated_env,
+                HostStepFiles {
+                    env_file: &env_file,
+                    log_path: &log_path,
+                },
+            )
+            .with_context(|| format!("publish step '{}' command failed", run.name));
+
+            if result.is_ok() {
+                if let Ok(contents) = std::fs::read_to_string(&env_file) {
+                    if let Ok(new_entries) = parse_env_file(&contents) {
+                        env_merge(&mut accumulated_env, new_entries);
+                    }
+                }
+            }
+            let _ = std::fs::remove_file(&env_file);
+            result
+        };
+
+        print_step_status(
+            step_idx,
+            step.display_name(),
+            step.display_id(),
+            step_result.is_ok(),
+        );
+        step_result?;
+    }
+
+    Ok(())
+}
+
 pub(crate) fn collect_test_diagnostics(ssh: &SshOptions, units: &[String]) {
     let _ = ssh_with_retry(
         ssh,
