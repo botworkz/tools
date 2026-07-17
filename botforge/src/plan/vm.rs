@@ -20,10 +20,7 @@ use super::log::{
     spawn_capturing_forwarder, spawn_output_forwarder, step_log_path, StepLogWriter,
     StepOutputStream,
 };
-use crate::assert::{
-    run_assert_files, run_assert_groups, run_assert_packages, run_assert_services,
-    run_assert_users, AssertBlock,
-};
+use crate::assert::{registry::built_in_assert_registry, AssertBlock};
 use crate::config::{TestConfig, TestIsoBootstrap};
 use crate::step::{
     resolve_shell, ArchiveStep, ExpectBlock, RunStep, StdioExpect, StepTarget, TestStep,
@@ -126,20 +123,12 @@ fn run_assert_phase(
     assert_block: &AssertBlock,
     installer_username: Option<&str>,
 ) -> Result<()> {
-    if !assert_block.files.is_empty() {
-        run_assert_files(ssh, assert_block)?;
-    }
-    if !assert_block.users.is_empty() {
-        run_assert_users(ssh, assert_block, installer_username)?;
-    }
-    if !assert_block.groups.is_empty() {
-        run_assert_groups(ssh, assert_block, installer_username)?;
-    }
-    if !assert_block.packages.is_empty() {
-        run_assert_packages(ssh, assert_block)?;
-    }
-    if !assert_block.services.is_empty() {
-        run_assert_services(ssh, assert_block)?;
+    let registry = built_in_assert_registry();
+    for kind in registry.iter() {
+        if kind.is_empty(assert_block) {
+            continue;
+        }
+        kind.run(ssh, assert_block, installer_username)?;
     }
     Ok(())
 }
