@@ -6,10 +6,11 @@ steps:
   run: |
     printf 'artifact: foo.qcow2\n' > build/artifact/RELEASE_NOTES.txt
 
-fs:
-- src: "@artifact://foo.qcow2"
-  dest: build/publish/fs
+publish:
+  fs:
+  - src: "@artifact://foo.qcow2"
+    dest: build/publish/fs
 
-s3:
-- src: "@artifact://foo.qcow2"
-  dest: s3://botforge-ci/publish
+  s3:
+  - src: "@artifact://foo.qcow2"
+    dest: s3://botforge-ci/publish

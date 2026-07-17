@@ -18,8 +18,10 @@
 //! in the container.  This is where versioning paths, rewriting changelogs,
 //! computing checksums, and staging/renaming artifacts belong.
 //!
-//! Each target kind (`fs`, `s3`) is a **list of instances** — multiple
-//! destinations of the same kind are expressed as multiple list entries.
+//! Publish target directives live under the top-level `publish:` map.  Each
+//! target kind within that map (`fs`, `s3`) is a **list of instances** —
+//! multiple destinations of the same kind are expressed as multiple list
+//! entries.
 //! Publish targets are **unordered** and MAY run in parallel; plans MUST NOT
 //! assume any ordering within a kind's list or across kinds.  The current
 //! implementation runs them serially, but the iteration order is an
@@ -35,17 +37,18 @@
 //!   - name: stamp version
 //!     run: echo "$(cat VERSION)" > build/artifact/VERSION.txt
 //!
-//! fs:
-//!   - src: "@artifact://images/my-vm.qcow2"
-//!     dest: /mnt/nas/releases/
-//!   - src: "@artifact://images/my-vm.qcow2"
-//!     dest: /mnt/mirror/releases/
+//! publish:
+//!   fs:
+//!     - src: "@artifact://images/my-vm.qcow2"
+//!       dest: /mnt/nas/releases/
+//!     - src: "@artifact://images/my-vm.qcow2"
+//!       dest: /mnt/mirror/releases/
 //!
-//! s3:
-//!   - src: "@artifact://images/my-vm.qcow2"
-//!     dest: s3://bucket-a/releases/
-//!   - src: "@artifact://images/my-vm.qcow2"
-//!     dest: s3://bucket-b/releases/
+//!   s3:
+//!     - src: "@artifact://images/my-vm.qcow2"
+//!       dest: s3://bucket-a/releases/
+//!     - src: "@artifact://images/my-vm.qcow2"
+//!       dest: s3://bucket-b/releases/
 //! ```
 
 use anyhow::{bail, Context, Result};
@@ -639,9 +642,10 @@ mod tests {
         let yaml = r#"
 type: botforge/publish
 name: my-release
-fs:
-  - src: "@artifact://images/vm.qcow2"
-    dest: /mnt/nas/releases/
+publish:
+  fs:
+    - src: "@artifact://images/vm.qcow2"
+      dest: /mnt/nas/releases/
 "#;
         let (_dir, path) = write_temp_publish(yaml);
         let config = crate::config::load_publish_config(&path).unwrap();
@@ -656,11 +660,12 @@ fs:
         let yaml = r#"
 type: botforge/publish
 name: my-release
-fs:
-  - src: "@artifact://images/vm.qcow2"
-    dest: /mnt/nas/releases/
-  - src: "@artifact://images/vm.qcow2"
-    dest: /mnt/mirror/releases/
+publish:
+  fs:
+    - src: "@artifact://images/vm.qcow2"
+      dest: /mnt/nas/releases/
+    - src: "@artifact://images/vm.qcow2"
+      dest: /mnt/mirror/releases/
 "#;
         let (_dir, path) = write_temp_publish(yaml);
         let config = crate::config::load_publish_config(&path).unwrap();
@@ -675,9 +680,10 @@ fs:
         let yaml = r#"
 type: botforge/publish
 name: my-release
-s3:
-  - src: "@artifact://images/vm.qcow2"
-    dest: s3://bucket-a/releases/
+publish:
+  s3:
+    - src: "@artifact://images/vm.qcow2"
+      dest: s3://bucket-a/releases/
 "#;
         let (_dir, path) = write_temp_publish(yaml);
         let config = crate::config::load_publish_config(&path).unwrap();
@@ -692,11 +698,12 @@ s3:
         let yaml = r#"
 type: botforge/publish
 name: my-release
-s3:
-  - src: "@artifact://images/vm.qcow2"
-    dest: s3://bucket-a/releases/
-  - src: "@artifact://images/vm.qcow2"
-    dest: s3://bucket-b/releases/
+publish:
+  s3:
+    - src: "@artifact://images/vm.qcow2"
+      dest: s3://bucket-a/releases/
+    - src: "@artifact://images/vm.qcow2"
+      dest: s3://bucket-b/releases/
 "#;
         let (_dir, path) = write_temp_publish(yaml);
         let config = crate::config::load_publish_config(&path).unwrap();
@@ -710,16 +717,17 @@ s3:
         let yaml = r#"
 type: botforge/publish
 name: mixed-release
-fs:
-  - src: "@artifact://images/vm.qcow2"
-    dest: /mnt/nas/releases/
-  - src: "@artifact://images/vm.qcow2"
-    dest: /mnt/mirror/releases/
-s3:
-  - src: "@artifact://images/vm.qcow2"
-    dest: s3://bucket-a/releases/
-  - src: "@artifact://images/vm.qcow2"
-    dest: s3://bucket-b/releases/
+publish:
+  fs:
+    - src: "@artifact://images/vm.qcow2"
+      dest: /mnt/nas/releases/
+    - src: "@artifact://images/vm.qcow2"
+      dest: /mnt/mirror/releases/
+  s3:
+    - src: "@artifact://images/vm.qcow2"
+      dest: s3://bucket-a/releases/
+    - src: "@artifact://images/vm.qcow2"
+      dest: s3://bucket-b/releases/
 "#;
         let (_dir, path) = write_temp_publish(yaml);
         let config = crate::config::load_publish_config(&path).unwrap();
@@ -728,13 +736,14 @@ s3:
     }
 
     #[test]
-    fn publish_config_unknown_top_level_key_is_error() {
+    fn publish_config_unknown_publish_target_is_error() {
         let yaml = r#"
 type: botforge/publish
 name: my-release
-github:
-  - src: "@artifact://images/vm.qcow2"
-    dest: https://github.com/foo/bar/releases/
+publish:
+  github:
+    - src: "@artifact://images/vm.qcow2"
+      dest: https://github.com/foo/bar/releases/
 "#;
         let (_dir, path) = write_temp_publish(yaml);
         let err = crate::config::load_publish_config(&path).unwrap_err();
@@ -746,13 +755,14 @@ github:
     }
 
     #[test]
-    fn publish_config_typo_top_level_key_is_error() {
+    fn publish_config_typo_publish_target_key_is_error() {
         let yaml = r#"
 type: botforge/publish
 name: my-release
-s3x:
-  - src: "@artifact://images/vm.qcow2"
-    dest: s3://bucket-a/releases/
+publish:
+  s3x:
+    - src: "@artifact://images/vm.qcow2"
+      dest: s3://bucket-a/releases/
 "#;
         let (_dir, path) = write_temp_publish(yaml);
         let err = crate::config::load_publish_config(&path).unwrap_err();
@@ -760,6 +770,24 @@ s3x:
         assert!(
             msg.contains("unknown field") || msg.contains("invalid publish config"),
             "expected parse-time unknown-field error for typo'd key, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn publish_config_old_top_level_fs_is_error() {
+        let yaml = r#"
+type: botforge/publish
+name: migrated-release
+fs:
+  - src: "@artifact://images/vm.qcow2"
+    dest: /mnt/nas/releases/
+"#;
+        let (_dir, path) = write_temp_publish(yaml);
+        let err = crate::config::load_publish_config(&path).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("unknown field") || msg.contains("fs"),
+            "expected unknown top-level field error for old flat fs key, got: {msg}"
         );
     }
 
@@ -783,9 +811,10 @@ name: empty-release
         let yaml = r#"
 type: botforge/publish
 name: my-release
-fs:
-  - src: "plain/path/no-at"
-    dest: /mnt/nas/releases/
+publish:
+  fs:
+    - src: "plain/path/no-at"
+      dest: /mnt/nas/releases/
 "#;
         let (_dir, path) = write_temp_publish(yaml);
         let err = crate::config::load_publish_config(&path).unwrap_err();
@@ -801,9 +830,10 @@ fs:
         let yaml = r#"
 type: botforge/publish
 name: my-release
-s3:
-  - src: "plain/path/no-at"
-    dest: s3://bucket-a/releases/
+publish:
+  s3:
+    - src: "plain/path/no-at"
+      dest: s3://bucket-a/releases/
 "#;
         let (_dir, path) = write_temp_publish(yaml);
         let err = crate::config::load_publish_config(&path).unwrap_err();
@@ -819,9 +849,10 @@ s3:
         let yaml = r#"
 type: botforge/publish
 name: my-release
-s3:
-  - src: "@artifact://images/vm.qcow2"
-    dest: https://bucket-a/releases/
+publish:
+  s3:
+    - src: "@artifact://images/vm.qcow2"
+      dest: https://bucket-a/releases/
 "#;
         let (_dir, path) = write_temp_publish(yaml);
         let err = crate::config::load_publish_config(&path).unwrap_err();
@@ -838,11 +869,12 @@ s3:
         let yaml = r#"
 type: botforge/publish
 name: my-release
-s3:
-  - src: "@artifact://images/vm.qcow2"
-    dest: s3://bucket-a/releases/
-  - src: "@artifact://images/vm.qcow2"
-    dest: https://not-s3/releases/
+publish:
+  s3:
+    - src: "@artifact://images/vm.qcow2"
+      dest: s3://bucket-a/releases/
+    - src: "@artifact://images/vm.qcow2"
+      dest: https://not-s3/releases/
 "#;
         let (_dir, path) = write_temp_publish(yaml);
         let err = crate::config::load_publish_config(&path).unwrap_err();
@@ -859,11 +891,12 @@ s3:
         let yaml = r#"
 type: botforge/publish
 name: my-release
-fs:
-  - src: "@artifact://images/vm.qcow2"
-    dest: /mnt/nas/releases/
-  - src: "plain/path"
-    dest: /mnt/mirror/releases/
+publish:
+  fs:
+    - src: "@artifact://images/vm.qcow2"
+      dest: /mnt/nas/releases/
+    - src: "plain/path"
+      dest: /mnt/mirror/releases/
 "#;
         let (_dir, path) = write_temp_publish(yaml);
         let err = crate::config::load_publish_config(&path).unwrap_err();
