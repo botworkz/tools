@@ -274,47 +274,21 @@ jobs:
         qemu-img check -r all -f qcow2 testrepo/build/artifact/foo.qcow2
         sudo guestfish --ro -a testrepo/build/artifact/foo.qcow2 -i sh 'file /boot/vmlinuz*; ls -l /boot'
 
-    # Pigz-specific: assert the plugin-compressed artifact exists, is valid
-    # gzip, and round-trips correctly.  Fails loud if pigz compression was a
-    # silent no-op (i.e. the .gz artifact was not produced).
-    - name: Assert pigz plugin artifact is a valid gzip round-trip
+    # Regression guard: the build/compressor plugin must never create sidecar files.
+    # Selecting a plugin compressor (e.g. pigz) must NOT produce a .gz artifact alongside
+    # the original qcow2 — the plugin is a pure bytes→bytes capability, not a file writer.
+    - name: Assert no plugin-compressor sidecar was created
       if: inputs.compressor == 'pigz'
       run: |
         set -euo pipefail
         gz_path="testrepo/build/artifact/foo.qcow2.gz"
-
-        # Guard: the .gz artifact MUST exist — any silent no-op is a hard failure.
-        if [[ ! -f "${gz_path}" ]]; then
-          echo "ERROR: ${gz_path} not found — pigz plugin compression did not run!" >&2
+        if [[ -f "${gz_path}" ]]; then
+          echo "ERROR: ${gz_path} exists — plugin compressor must not create sidecar files!" >&2
           echo "Contents of testrepo/build/artifact/:" >&2
           ls -la testrepo/build/artifact/ >&2
           exit 1
         fi
-
-        echo "Found pigz artifact: $(du -sh "${gz_path}" | cut -f1) ${gz_path}"
-
-        # Verify the file starts with gzip magic bytes (0x1F 0x8B).
-        magic=$(xxd -p -l 2 "${gz_path}")
-        if [[ "${magic}" != "1f8b" ]]; then
-          echo "ERROR: ${gz_path} does not start with gzip magic (got: ${magic})" >&2
-          exit 1
-        fi
-        echo "Gzip magic OK: ${magic}"
-
-        # Integrity check via gzip -t (tests full decompression without writing).
-        gzip -t "${gz_path}"
-        echo "gzip -t integrity check PASSED"
-
-        # Size guard: the compressed artifact must be non-trivially large
-        # (at minimum a few MB — a qcow2 image is never a handful of bytes).
-        gz_bytes=$(stat -c '%s' "${gz_path}")
-        if (( gz_bytes < 1048576 )); then
-          echo "ERROR: ${gz_path} is suspiciously small (${gz_bytes} bytes)" \
-               "— compressed output may be corrupt or empty" >&2
-          exit 1
-        fi
-        echo "Artifact size OK: ${gz_bytes} bytes"
-        echo "All pigz acceptance checks PASSED"
+        echo "Sidecar guard OK: ${gz_path} was not created (correct behaviour)"
 
     - name: Create chained build config
       uses: envoyproxy/toolshed/actions/jq@6a20085af231aba4c72d6866f94098343a8c5616
