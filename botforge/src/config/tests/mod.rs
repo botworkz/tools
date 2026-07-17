@@ -3994,4 +3994,203 @@ fs:
         // @:// references (repo-root) should be accepted as valid @-references.
         assert!(load_publish_config(&path).is_ok());
     }
+
+    // ── steps: field tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn publish_steps_parse_and_preserve_order() {
+        let repo = TempDir::new().unwrap();
+        let path = write_publish_doc(
+            &repo,
+            "release.yaml",
+            r#"
+type: botforge/publish
+name: steps-test
+steps:
+  - name: first step
+    run: echo first
+  - name: second step
+    run: echo second
+  - name: third step
+    run: echo third
+fs:
+  - src: "@artifact://vm.qcow2"
+    dest: /tmp/dest/
+"#,
+        );
+        let cfg = load_publish_config(&path).unwrap();
+        assert_eq!(cfg.steps.len(), 3, "three steps should parse");
+        let names: Vec<&str> = cfg.steps.iter().map(|s| s.display_name()).collect();
+        assert_eq!(names, ["first step", "second step", "third step"]);
+    }
+
+    #[test]
+    fn publish_steps_without_targets_is_error() {
+        let repo = TempDir::new().unwrap();
+        let path = write_publish_doc(
+            &repo,
+            "release.yaml",
+            r#"
+type: botforge/publish
+name: steps-only
+steps:
+  - name: prepare
+    run: echo hello
+"#,
+        );
+        let err = load_publish_config(&path).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("no targets"),
+            "steps-only plan should still error 'no targets': {msg}"
+        );
+    }
+
+    #[test]
+    fn publish_no_steps_is_still_valid() {
+        let repo = TempDir::new().unwrap();
+        let path = write_publish_doc(
+            &repo,
+            "release.yaml",
+            r#"
+type: botforge/publish
+name: no-steps
+fs:
+  - src: "@artifact://vm.qcow2"
+    dest: /tmp/dest/
+"#,
+        );
+        let cfg = load_publish_config(&path).unwrap();
+        assert!(cfg.steps.is_empty(), "steps should default to empty");
+    }
+
+    #[test]
+    fn publish_steps_with_for_expansion() {
+        let repo = TempDir::new().unwrap();
+        let path = write_publish_doc(
+            &repo,
+            "release.yaml",
+            r#"
+type: botforge/publish
+name: for-test
+steps:
+  - name: "copy ${{ args.0 }}"
+    run: "echo ${{ args.0 }}"
+    for: [alpha, beta]
+fs:
+  - src: "@artifact://vm.qcow2"
+    dest: /tmp/dest/
+"#,
+        );
+        let cfg = load_publish_config(&path).unwrap();
+        assert_eq!(
+            cfg.steps.len(),
+            2,
+            "for: [alpha, beta] should expand to 2 steps"
+        );
+    }
+
+    #[test]
+    fn publish_step_with_shell_field_parses() {
+        let repo = TempDir::new().unwrap();
+        let path = write_publish_doc(
+            &repo,
+            "release.yaml",
+            r#"
+type: botforge/publish
+name: shell-test
+steps:
+  - name: sh step
+    shell: sh
+    run: echo hello
+fs:
+  - src: "@artifact://vm.qcow2"
+    dest: /tmp/dest/
+"#,
+        );
+        let cfg = load_publish_config(&path).unwrap();
+        assert_eq!(cfg.steps.len(), 1);
+        if let crate::step::TestStep::Run(run) = &cfg.steps[0] {
+            assert_eq!(run.shell.as_deref(), Some("sh"));
+        }
+    }
+
+    #[test]
+    fn publish_step_invalid_shell_errors() {
+        let repo = TempDir::new().unwrap();
+        let path = write_publish_doc(
+            &repo,
+            "release.yaml",
+            r#"
+type: botforge/publish
+name: bad-shell
+steps:
+  - name: fish step
+    shell: fish
+    run: echo hello
+fs:
+  - src: "@artifact://vm.qcow2"
+    dest: /tmp/dest/
+"#,
+        );
+        let err = load_publish_config(&path).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("shell") || msg.contains("fish"),
+            "error should mention invalid shell: {msg}"
+        );
+    }
+
+    #[test]
+    fn publish_archive_step_in_steps_is_error() {
+        let repo = TempDir::new().unwrap();
+        let path = write_publish_doc(
+            &repo,
+            "release.yaml",
+            r#"
+type: botforge/publish
+name: archive-step-test
+steps:
+  - name: bad archive
+    archive:
+      src: "@artifact://vm.qcow2"
+fs:
+  - src: "@artifact://vm.qcow2"
+    dest: /tmp/dest/
+"#,
+        );
+        let err = load_publish_config(&path).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("archive") || msg.contains("not supported"),
+            "archive step in publish should be rejected: {msg}"
+        );
+    }
+
+    #[test]
+    fn publish_unknown_top_level_key_still_errors_with_steps() {
+        let repo = TempDir::new().unwrap();
+        let path = write_publish_doc(
+            &repo,
+            "release.yaml",
+            r#"
+type: botforge/publish
+name: my-release
+steps:
+  - name: prepare
+    run: echo hello
+fs:
+  - src: "@artifact://vm.qcow2"
+    dest: /tmp/dest/
+github:
+  token: secret
+"#,
+        );
+        let err = load_publish_config(&path).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("github") || msg.contains("unknown field"),
+            "unknown top-level key should still error when steps is present: {msg}"
+        );
+    }
 }

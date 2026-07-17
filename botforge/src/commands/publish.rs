@@ -10,20 +10,28 @@
 //!
 //! ## Schema contract
 //!
+//! `steps:` is an **ordered, sequential, fail-fast prepare phase** that runs
+//! BEFORE any targets.  Steps use plain shell only — no `@://` in step bodies,
+//! no `${{ }}` expressions, no input machinery.  cwd is the repo/context root
+//! in the container.  This is where versioning paths, rewriting changelogs,
+//! computing checksums, and staging/renaming artifacts belong.
+//!
 //! Each target kind (`fs`, `s3`) is a **list of instances** — multiple
 //! destinations of the same kind are expressed as multiple list entries.
 //! Publish targets are **unordered** and MAY run in parallel; plans MUST NOT
 //! assume any ordering within a kind's list or across kinds.  The current
 //! implementation runs them serially, but the iteration order is an
 //! implementation detail that plans must not depend on.
-//! All ordered / pre-publish work (path mangling, versioning, checksums, etc.)
-//! is deferred to a future `steps:` prepare phase (not yet implemented).
 //!
 //! ## Plan shape
 //!
 //! ```yaml
 //! type: botforge/publish
 //! name: my-release
+//!
+//! steps:
+//!   - name: stamp version
+//!     run: echo "$(cat VERSION)" > build/artifact/VERSION.txt
 //!
 //! fs:
 //!   - src: "@artifact://images/my-vm.qcow2"
@@ -44,7 +52,9 @@ use shasset::manifest::Manifest;
 use std::path::{Path, PathBuf};
 
 use crate::config::{load_publish_config, FsTarget, PublishConfig, S3Target};
+use crate::plan::run_local_steps;
 use crate::resolver::{Reference, ResolveFileContext, ResolvedFile};
+use crate::step::TestStep;
 use crate::util::{ensure_command, resolve_under_root, run_command};
 use crate::workspace::{discover_context, load_inline_manifest, registry::load_committed_registry};
 
@@ -98,6 +108,23 @@ fn run_publish(
         manifest,
         cache_dir_override: None,
     };
+
+    // ── prepare phase (steps) ─────────────────────────────────────────────────
+    // Steps run sequentially and fail-fast BEFORE any target executes.
+    // In dry-run, steps are not executed (they may have side effects); instead,
+    // each step name is logged so the user can see what would run.
+    if !config.steps.is_empty() {
+        if dry_run {
+            for (i, step) in config.steps.iter().enumerate() {
+                if let TestStep::Run(run) = step {
+                    eprintln!("[dry-run] publish step {}: {}", i + 1, run.name);
+                }
+            }
+        } else {
+            run_local_steps(context, &config.steps)
+                .context("publish: prepare phase (steps) failed")?;
+        }
+    }
 
     // Publish targets are unordered; iteration order is an implementation
     // detail that plans must not depend on.  Future work may run these in
@@ -733,6 +760,286 @@ fs:
         assert!(
             msg.contains("@-reference") || msg.contains("fs[1]"),
             "validation should fire on second fs list element, got: {msg}"
+        );
+    }
+
+    // ── prepare-phase steps + run_publish tests ───────────────────────────────
+
+    /// Build a minimal `PublishConfig` with `steps:` populated, and `fs` pointing at
+    /// a source file in `context`.
+    fn make_publish_config_with_steps(
+        steps: Vec<crate::step::TestStep>,
+        fs: Vec<FsTarget>,
+    ) -> PublishConfig {
+        PublishConfig {
+            name: "test-publish".to_string(),
+            steps,
+            fs,
+            s3: vec![],
+        }
+    }
+
+    #[test]
+    fn run_publish_steps_execute_before_targets() {
+        // A step writes a sentinel file at the repo root; the fs target then
+        // publishes that file.  The published content must reflect the step's write.
+        let workspace = TempDir::new().unwrap();
+        let context = workspace.path();
+        fs::write(context.join("botforge.yaml"), "").unwrap();
+
+        // Source file that the step will WRITE (does not exist yet at plan load time).
+        let sentinel = context.join("sentinel.txt");
+
+        // Destination directory for the fs target.
+        let dest_dir = TempDir::new().unwrap();
+
+        let manifest = Manifest::default();
+        let _resolve_ctx = ResolveFileContext {
+            context,
+            manifest: &manifest,
+            cache_dir_override: None,
+        };
+
+        // Step: write "step-was-here" into sentinel.txt at the repo root.
+        let step = crate::step::TestStep::Run(crate::step::RunStep {
+            name: "write sentinel".to_string(),
+            run: format!("echo step-was-here > {}", sentinel.display()),
+            target: crate::step::StepTarget::Guest, // ignored for local steps
+            shell: None,
+            timeout: None,
+            sudo: None,
+            id: None,
+            expect: None,
+            condition: None,
+        });
+
+        let config = make_publish_config_with_steps(
+            vec![step],
+            vec![FsTarget {
+                src: "@://sentinel.txt".to_string(),
+                dest: dest_dir.path().display().to_string(),
+            }],
+        );
+
+        run_publish(context, &manifest, &config, false).unwrap();
+
+        // The fs target should have published the file that the step created.
+        let published = dest_dir.path().join("sentinel.txt");
+        assert!(published.exists(), "sentinel.txt should be published");
+        let content = fs::read_to_string(&published).unwrap();
+        assert!(
+            content.contains("step-was-here"),
+            "published file should contain the step's output: {content:?}"
+        );
+    }
+
+    #[test]
+    fn run_publish_failing_step_aborts_before_targets() {
+        let workspace = TempDir::new().unwrap();
+        let context = workspace.path();
+        fs::write(context.join("botforge.yaml"), "").unwrap();
+
+        // Source file for the target (exists, so the target would succeed if reached).
+        let src_dir = context.join("artifacts");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::write(src_dir.join("vm.qcow2"), b"data").unwrap();
+
+        let dest_dir = TempDir::new().unwrap();
+        let manifest = Manifest::default();
+
+        let failing_step = crate::step::TestStep::Run(crate::step::RunStep {
+            name: "fail-fast step".to_string(),
+            run: "exit 42".to_string(),
+            target: crate::step::StepTarget::Guest,
+            shell: Some("sh".to_string()),
+            timeout: None,
+            sudo: None,
+            id: None,
+            expect: None,
+            condition: None,
+        });
+
+        let config = make_publish_config_with_steps(
+            vec![failing_step],
+            vec![FsTarget {
+                src: "@://artifacts/vm.qcow2".to_string(),
+                dest: dest_dir.path().display().to_string(),
+            }],
+        );
+
+        let err = run_publish(context, &manifest, &config, false).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("prepare phase") || msg.contains("step") || msg.contains("failed"),
+            "failing step should abort publish with a clear error: {msg}"
+        );
+
+        // The fs target must NOT have run (the destination file must not exist).
+        let would_be_dest = dest_dir.path().join("vm.qcow2");
+        assert!(
+            !would_be_dest.exists(),
+            "target must not execute when a step fails"
+        );
+    }
+
+    #[test]
+    fn run_publish_dry_run_does_not_execute_steps() {
+        let workspace = TempDir::new().unwrap();
+        let context = workspace.path();
+        fs::write(context.join("botforge.yaml"), "").unwrap();
+
+        // The step tries to create this marker file; it must NOT be created in dry-run.
+        let marker = context.join("dry-run-marker.txt");
+
+        let src_dir = context.join("artifacts");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::write(src_dir.join("vm.qcow2"), b"data").unwrap();
+
+        let dest_dir = TempDir::new().unwrap();
+        let manifest = Manifest::default();
+
+        let step = crate::step::TestStep::Run(crate::step::RunStep {
+            name: "side-effect step".to_string(),
+            run: format!("touch {}", marker.display()),
+            target: crate::step::StepTarget::Guest,
+            shell: None,
+            timeout: None,
+            sudo: None,
+            id: None,
+            expect: None,
+            condition: None,
+        });
+
+        let config = make_publish_config_with_steps(
+            vec![step],
+            vec![FsTarget {
+                src: "@://artifacts/vm.qcow2".to_string(),
+                dest: dest_dir.path().display().to_string(),
+            }],
+        );
+
+        run_publish(context, &manifest, &config, true).unwrap();
+
+        assert!(
+            !marker.exists(),
+            "dry-run must not execute step side effects"
+        );
+    }
+
+    #[test]
+    fn run_local_steps_step_env_accumulates_across_steps() {
+        let workspace = TempDir::new().unwrap();
+        let context = workspace.path();
+
+        // Step 1 writes a key to BOTFORGE_ENV; step 2 reads it.
+        // If accumulation works, step 2 should see MY_KEY.
+        let output_file = context.join("output.txt");
+        let steps = vec![
+            crate::step::TestStep::Run(crate::step::RunStep {
+                name: "set env".to_string(),
+                run: "echo MY_KEY=hello >> \"$BOTFORGE_ENV\"".to_string(),
+                target: crate::step::StepTarget::Guest,
+                shell: None,
+                timeout: None,
+                sudo: None,
+                id: None,
+                expect: None,
+                condition: None,
+            }),
+            crate::step::TestStep::Run(crate::step::RunStep {
+                name: "read env".to_string(),
+                run: format!("echo \"$MY_KEY\" > {}", output_file.display()),
+                target: crate::step::StepTarget::Guest,
+                shell: None,
+                timeout: None,
+                sudo: None,
+                id: None,
+                expect: None,
+                condition: None,
+            }),
+        ];
+
+        crate::plan::run_local_steps(context, &steps).unwrap();
+
+        let content = fs::read_to_string(&output_file).unwrap();
+        assert!(
+            content.contains("hello"),
+            "step 2 should see MY_KEY exported by step 1, got: {content:?}"
+        );
+    }
+
+    #[test]
+    fn run_local_steps_cwd_is_context_root() {
+        let workspace = TempDir::new().unwrap();
+        let context = workspace.path();
+
+        // Write a file in the repo root; the step should be able to read it
+        // with a relative path (cwd = context root).
+        fs::write(context.join("VERSION"), "1.2.3").unwrap();
+        let output_file = context.join("version-check.txt");
+
+        let steps = vec![crate::step::TestStep::Run(crate::step::RunStep {
+            name: "read VERSION".to_string(),
+            run: format!("cat VERSION > {}", output_file.display()),
+            target: crate::step::StepTarget::Guest,
+            shell: None,
+            timeout: None,
+            sudo: None,
+            id: None,
+            expect: None,
+            condition: None,
+        })];
+
+        crate::plan::run_local_steps(context, &steps).unwrap();
+
+        let content = fs::read_to_string(&output_file).unwrap();
+        assert!(
+            content.contains("1.2.3"),
+            "step should read VERSION from cwd (context root): {content:?}"
+        );
+    }
+
+    #[test]
+    fn run_local_steps_nonzero_exit_fails_fast() {
+        let workspace = TempDir::new().unwrap();
+        let context = workspace.path();
+
+        let marker = context.join("after-fail.txt");
+
+        let steps = vec![
+            crate::step::TestStep::Run(crate::step::RunStep {
+                name: "failing step".to_string(),
+                run: "exit 1".to_string(),
+                target: crate::step::StepTarget::Guest,
+                shell: Some("sh".to_string()),
+                timeout: None,
+                sudo: None,
+                id: None,
+                expect: None,
+                condition: None,
+            }),
+            crate::step::TestStep::Run(crate::step::RunStep {
+                name: "should not run".to_string(),
+                run: format!("touch {}", marker.display()),
+                target: crate::step::StepTarget::Guest,
+                shell: None,
+                timeout: None,
+                sudo: None,
+                id: None,
+                expect: None,
+                condition: None,
+            }),
+        ];
+
+        let err = crate::plan::run_local_steps(context, &steps).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("step") || msg.contains("failed") || msg.contains("exit"),
+            "failing step should produce a clear error: {msg}"
+        );
+        assert!(
+            !marker.exists(),
+            "second step must not run after first step fails"
         );
     }
 }

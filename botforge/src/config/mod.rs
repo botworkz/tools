@@ -537,6 +537,10 @@ struct RawPublishDocument {
     doc_type: DocumentType,
     #[serde(default)]
     name: Option<String>,
+    /// Ordered prepare-phase steps executed before any target.
+    /// Raw YAML values; expanded via `expand_raw_step` at load time.
+    #[serde(default)]
+    steps: Vec<Value>,
     /// Zero or more filesystem targets.
     #[serde(default)]
     fs: Vec<RawFsTarget>,
@@ -567,18 +571,23 @@ pub(crate) struct S3Target {
 ///
 /// ## Schema contract
 ///
+/// - `steps:` is an **ordered, sequential, fail-fast prepare phase** that runs
+///   BEFORE any targets.  Steps use plain shell only — no `@://` in step bodies,
+///   no `${{ }}` expressions, no input machinery.  cwd is the repo/context root
+///   in the container.  All pre-publish mangling (path versioning, changelog
+///   rewriting, checksum generation, staging/renaming) belongs here.
 /// - Each target kind (`fs`, `s3`) is a **list of instances**.  Multiple
 ///   destinations of the same kind are expressed as multiple list entries.
 /// - Publish targets are **unordered** and MAY run in parallel; plans MUST NOT
 ///   assume any ordering within a kind's list or across kinds.  The current
 ///   implementation runs them serially, but the iteration order is an
 ///   implementation detail that plans must not depend on.
-/// - All ordered / pre-publish work (path mangling, versioning, checksums, etc.)
-///   is deferred to a future `steps:` prepare phase (not yet implemented).
 #[derive(Debug)]
 pub(crate) struct PublishConfig {
     #[allow(dead_code)]
     pub(crate) name: String,
+    /// Ordered prepare-phase steps; run sequentially before any target.
+    pub(crate) steps: Vec<TestStep>,
     /// Filesystem targets (may be empty).
     pub(crate) fs: Vec<FsTarget>,
     /// S3 targets (may be empty; credentials from environment).
@@ -598,6 +607,15 @@ pub(crate) fn load_publish_config(path: &Path) -> Result<PublishConfig> {
         );
     }
     let name = validate_entrypoint_name(raw.name, path, DocumentType::Publish)?;
+
+    // Expand `steps:` (handles `for:` expansion at load time).
+    let mut steps: Vec<TestStep> = Vec::new();
+    for (i, v) in raw.steps.into_iter().enumerate() {
+        let expanded = expand_raw_step(v)
+            .with_context(|| format!("invalid publish step [{}] in {}", i, path.display()))?;
+        steps.extend(expanded);
+    }
+    validate_publish_steps(&steps)?;
 
     let fs: Vec<FsTarget> = raw
         .fs
@@ -635,7 +653,12 @@ pub(crate) fn load_publish_config(path: &Path) -> Result<PublishConfig> {
         );
     }
 
-    Ok(PublishConfig { name, fs, s3 })
+    Ok(PublishConfig {
+        name,
+        steps,
+        fs,
+        s3,
+    })
 }
 
 /// Assert that a publish `src` value is an `@`-reference.
@@ -653,6 +676,34 @@ fn validate_publish_src(src: &str, path: &Path, target: &str) -> Result<()> {
             path.display()
         )
     })?;
+    Ok(())
+}
+
+/// Validate publish prepare-phase steps.
+///
+/// Publish steps always run locally (no VM/SSH); only run-steps are permitted.
+pub(crate) fn validate_publish_steps(steps: &[TestStep]) -> Result<()> {
+    for step in steps {
+        match step {
+            TestStep::Run(step) => {
+                resolve_shell(step.shell.as_deref()).with_context(|| {
+                    format!("publish step '{}': invalid `shell:` value", step.name)
+                })?;
+            }
+            TestStep::Archive(step) => {
+                let name = step
+                    .archive
+                    .name
+                    .as_deref()
+                    .unwrap_or(step.archive.src.as_str());
+                anyhow::bail!(
+                    "publish step '{}': `archive` steps are not supported in the \
+                     publish prepare phase; only `run` steps are allowed",
+                    name
+                );
+            }
+        }
+    }
     Ok(())
 }
 
