@@ -78,6 +78,11 @@ RUN mkdir -p /usr/share/botforge/plugins
 # before the docker buildx invocation so ABI and glibc versions match exactly.
 COPY .ci-plugins/libpigz.so /usr/share/botforge/plugins/libpigz.so
 
+# Stage the github publish/github plugin.  libgithub.so is built alongside
+# libpigz.so (same toolchain / glibc / ABI version) and staged to
+# .ci-plugins/ by the CI job before docker buildx.
+COPY .ci-plugins/libgithub.so /usr/share/botforge/plugins/libgithub.so
+
 WORKDIR /work
 
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]

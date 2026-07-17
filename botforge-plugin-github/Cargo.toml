@@ -1,0 +1,29 @@
+[package]
+name = "botforge-plugin-github"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "GitHub Releases publish/github plugin for the botforge plugin system"
+
+# This crate builds a cdylib (.so) for deployment in the botforge plugin system.
+#
+# `unsafe_code = "forbid"` is intentionally absent from this crate.
+# The extern "C" ABI exports require unsafe blocks for the FFI boundary.
+# See botforge-plugin-host/Cargo.toml for the workspace unsafe policy.
+[lib]
+name = "github"
+crate-type = ["cdylib"]
+
+[dependencies]
+# Reference the host's ABI version constant so the plugin can never drift.
+botforge-plugin-host = { path = "../botforge-plugin-host" }
+# HTTP client for GitHub Releases REST API calls.  Uses blocking mode to keep
+# the FFI boundary synchronous; rustls-tls for pure-Rust TLS with no system
+# library dependency so the .so is self-contained.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+# JSON serialization/deserialization for GitHub API payloads.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[lints]
+workspace = true

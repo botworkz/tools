@@ -136,6 +136,56 @@
 //! void plugin_build_compressor_free(uint8_t *ptr);
 //! ```
 //!
+//! # `publish/github` capability
+//!
+//! `publish/github` publishes build artifacts to a GitHub Releases endpoint.
+//! The host hands all inputs explicitly across the ABI boundary (trust
+//! boundary upheld): asset file paths, release metadata, the target repo, the
+//! **API base URL**, and the **auth token**.  The plugin never reads any ambient
+//! host environment.
+//!
+//! ## Plugin ABI contract for `publish/github`
+//!
+//! ### Memory-ownership contract
+//!
+//! On success (return value `0`):
+//! - The plugin allocates a NUL-terminated release URL string and writes its
+//!   address to `*out_url`.
+//! - The **host** is responsible for freeing the string by calling
+//!   `plugin_publish_github_free(*out_url)` exactly once after use.
+//! - `*out_url` is guaranteed non-null on success.
+//!
+//! On error (return value non-zero):
+//! - `*out_url` is **undefined** — the host must not read or free it.
+//!
+//! `title` may be `NULL`, which the plugin treats as equivalent to `tag`.
+//! `description` may be `NULL`, which the plugin treats as equivalent to `""`.
+//! `asset_paths` may be `NULL` when `asset_count == 0` (no assets).
+//!
+//! ```c
+//! // Publish a GitHub Release.
+//! // Returns 0 on success; non-zero on error.
+//! // On success: *out_url points to a plugin-allocated NUL-terminated release
+//! // URL string.  The caller MUST call plugin_publish_github_free(*out_url)
+//! // after use.  On failure: *out_url is undefined.
+//! int32_t plugin_publish_github(
+//!     const char        *repo,          // "owner/repo", non-null
+//!     const char        *tag,           // release tag, non-null
+//!     const char        *title,         // release title (NULL ≡ tag)
+//!     const char        *description,   // release body (NULL ≡ "")
+//!     const char *const *asset_paths,   // array of NUL-terminated file paths
+//!     uint32_t           asset_count,   // length of asset_paths (0 is valid)
+//!     const char        *api_base_url,  // e.g. "https://api.github.com", non-null
+//!     const char        *token,         // bearer auth token, non-null
+//!     char             **out_url        // set to release URL on success
+//! );
+//!
+//! // Free a URL string previously returned by plugin_publish_github.
+//! // Calling with NULL is safe (no-op).  Must be called exactly once per
+//! // successful publish invocation.
+//! void plugin_publish_github_free(char *url);
+//! ```
+//!
 //! # ABI version history
 //!
 //! | Version | Change |
@@ -143,6 +193,8 @@
 //! | 1 | Initial: `core/ping` capability only. |
 //! | 2 | Added `build/compressor` capability (`plugin_build_compress`, |
 //! |   | `plugin_build_decompress`, `plugin_build_compressor_free`). |
+//! | 3 | Added `publish/github` capability (`plugin_publish_github`, |
+//! |   | `plugin_publish_github_free`). |
 //!
 //! # Safety policy
 //!
@@ -169,8 +221,8 @@ use thiserror::Error;
 /// this constant (and rebuild all plugins) whenever the plugin ABI changes in
 /// a backwards-incompatible way.
 ///
-/// Version 2 adds the `build/compressor` capability slot.
-pub const HOST_ABI_VERSION: u32 = 2;
+/// Version 3 adds the `publish/github` capability slot.
+pub const HOST_ABI_VERSION: u32 = 3;
 
 /// Sentinel value returned by a correct `core/ping` implementation.
 ///
@@ -256,6 +308,15 @@ pub enum LoadError {
          which overflows usize"
     )]
     CompressorOutputOverflow { plugin: String, out_len: usize },
+
+    /// A `publish/github` publish operation returned a non-zero error code
+    /// from the plugin.
+    #[error("plugin '{plugin}' publish/github operation failed with error code {code}")]
+    PublisherError { plugin: String, code: i32 },
+
+    /// The plugin returned an invalid UTF-8 release URL.
+    #[error("plugin '{plugin}' publish/github returned a non-UTF-8 release URL")]
+    PublisherInvalidUrl { plugin: String },
 }
 
 // ── Capability handles ────────────────────────────────────────────────────────
@@ -428,6 +489,166 @@ impl CompressorHandle {
     }
 }
 
+/// Request data for a `publish/github` call, passed by the host to
+/// [`PublisherHandle::publish`].
+pub struct PublishRequest<'a> {
+    /// GitHub repository in `owner/repo` form.
+    pub repo: &'a str,
+    /// Release tag name (e.g. `v1.0.0`).
+    pub tag: &'a str,
+    /// Release title.  `None` → plugin uses the tag name.
+    pub title: Option<&'a str>,
+    /// Release description / body text.  `None` → plugin uses empty string.
+    pub description: Option<&'a str>,
+    /// Paths to local asset files to upload to the release.
+    pub asset_paths: &'a [&'a std::path::Path],
+    /// Base URL of the GitHub-compatible REST API
+    /// (e.g. `"https://api.github.com"` or `"http://mock:8080"`).
+    pub api_base_url: &'a str,
+    /// ****** token (`GITHUB_TOKEN` / `GH_TOKEN`).
+    pub token: &'a str,
+}
+
+/// Outcome of a successful `publish/github` call.
+pub struct PublishOutcome {
+    /// The web URL of the published release
+    /// (e.g. `"https://github.com/owner/repo/releases/tag/v1.0.0"`).
+    pub release_url: String,
+}
+
+/// A callable handle to a wired `publish/github` capability.
+///
+/// Exposes a safe [`publish`](PublisherHandle::publish) method that calls
+/// across the C ABI boundary, manages the plugin-allocated URL string, and
+/// returns an owned [`PublishOutcome`].
+///
+/// # Memory ownership
+///
+/// Internally, `publish` calls the plugin's `plugin_publish_github` FFI
+/// function.  On success the plugin allocates a NUL-terminated release URL
+/// string and writes it to the out-parameter.  `publish` copies the URL into
+/// a Rust `String`, then calls `plugin_publish_github_free` to release the
+/// plugin-owned string.  The caller receives a purely Rust-owned
+/// `PublishOutcome` with no lifetime coupling to the plugin.
+///
+/// # Safety
+///
+/// All function pointers are valid for as long as the originating
+/// [`LoadedPlugin`] (and hence its [`Library`]) stays alive.  Callers must
+/// not use a `PublisherHandle` after the plugin has been dropped.
+pub struct PublisherHandle {
+    /// Plugin name (for error messages).
+    plugin_name: String,
+    /// `plugin_publish_github` function pointer.
+    ///
+    /// SAFETY: see [`LoadedPlugin::load`].
+    #[allow(clippy::type_complexity)]
+    publish_fn: unsafe extern "C" fn(
+        *const std::os::raw::c_char,        // repo
+        *const std::os::raw::c_char,        // tag
+        *const std::os::raw::c_char,        // title (may be null)
+        *const std::os::raw::c_char,        // description (may be null)
+        *const *const std::os::raw::c_char, // asset_paths
+        u32,                                // asset_count
+        *const std::os::raw::c_char,        // api_base_url
+        *const std::os::raw::c_char,        // token
+        *mut *mut std::os::raw::c_char,     // out_url
+    ) -> i32,
+    /// `plugin_publish_github_free` function pointer.
+    ///
+    /// SAFETY: see [`LoadedPlugin::load`].
+    free_fn: unsafe extern "C" fn(*mut std::os::raw::c_char),
+}
+
+impl PublisherHandle {
+    /// Publish a GitHub Release using the plugin.
+    ///
+    /// Converts `request` to C-compatible types, calls the plugin's
+    /// `plugin_publish_github` entrypoint, copies the returned release URL
+    /// into a [`PublishOutcome`], and frees the plugin-allocated URL string.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoadError::PublisherError`] if the plugin reports a non-zero
+    /// error code, or [`LoadError::PublisherInvalidUrl`] if the returned URL
+    /// is not valid UTF-8.
+    pub fn publish(&self, request: &PublishRequest<'_>) -> Result<PublishOutcome, LoadError> {
+        use std::ffi::CString;
+
+        // Build NUL-terminated C strings for all input parameters.
+        let repo_c = CString::new(request.repo).unwrap_or_default();
+        let tag_c = CString::new(request.tag).unwrap_or_default();
+        let title_c: Option<CString> = request.title.map(|t| CString::new(t).unwrap_or_default());
+        let description_c: Option<CString> = request
+            .description
+            .map(|d| CString::new(d).unwrap_or_default());
+        let api_base_url_c = CString::new(request.api_base_url).unwrap_or_default();
+        let token_c = CString::new(request.token).unwrap_or_default();
+
+        // Build array of C string pointers for asset paths.
+        // Keep `CString` values alive in a Vec so the pointers remain valid.
+        let asset_cstrings: Vec<CString> = request
+            .asset_paths
+            .iter()
+            .map(|p| CString::new(p.to_string_lossy().as_ref()).unwrap_or_default())
+            .collect();
+        let asset_ptrs: Vec<*const std::os::raw::c_char> =
+            asset_cstrings.iter().map(|cs| cs.as_ptr()).collect();
+
+        let mut out_url: *mut std::os::raw::c_char = std::ptr::null_mut();
+
+        // SAFETY: We call the plugin's publish function pointer, which was
+        // obtained from a live `Library` via `dlsym`.  All input C strings are
+        // NUL-terminated and valid for the duration of this call (kept alive
+        // by the local CString variables above).  `out_url` is a valid stack
+        // address.  On success the plugin writes a non-null, plugin-allocated
+        // NUL-terminated string to `*out_url`; we copy it and free it below.
+        // On failure the out-parameter is undefined and we do not read it.
+        let rc = unsafe {
+            (self.publish_fn)(
+                repo_c.as_ptr(),
+                tag_c.as_ptr(),
+                title_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
+                description_c
+                    .as_ref()
+                    .map_or(std::ptr::null(), |c| c.as_ptr()),
+                if asset_ptrs.is_empty() {
+                    std::ptr::null()
+                } else {
+                    asset_ptrs.as_ptr()
+                },
+                asset_ptrs.len() as u32,
+                api_base_url_c.as_ptr(),
+                token_c.as_ptr(),
+                &mut out_url,
+            )
+        };
+
+        if rc != 0 {
+            return Err(LoadError::PublisherError {
+                plugin: self.plugin_name.clone(),
+                code: rc,
+            });
+        }
+
+        // SAFETY: rc == 0, so the plugin guarantees `out_url` is a valid,
+        // non-null, NUL-terminated C string.  We copy it into a Rust String
+        // before freeing.
+        let release_url = unsafe { CStr::from_ptr(out_url) }
+            .to_str()
+            .map(str::to_owned)
+            .map_err(|_| LoadError::PublisherInvalidUrl {
+                plugin: self.plugin_name.clone(),
+            })?;
+
+        // SAFETY: `out_url` was allocated by the plugin via `plugin_publish_github`.
+        // We call `plugin_publish_github_free` exactly once here.
+        unsafe { (self.free_fn)(out_url) };
+
+        Ok(PublishOutcome { release_url })
+    }
+}
+
 // ── Loaded plugin ─────────────────────────────────────────────────────────────
 
 /// A plugin that has been successfully opened and version-checked.
@@ -449,6 +670,8 @@ pub struct LoadedPlugin {
     pub ping: Option<PingHandle>,
     /// `build/compressor` handle, present if the plugin wired that capability.
     pub compressor: Option<CompressorHandle>,
+    /// `publish/github` handle, present if the plugin wired that capability.
+    pub publisher: Option<PublisherHandle>,
     /// The open library handle.  Must stay alive as long as any capability
     /// handles derived from it are in use.
     _lib: Library,
@@ -462,6 +685,7 @@ impl std::fmt::Debug for LoadedPlugin {
             .field("provides", &self.provides)
             .field("ping", &self.ping.is_some())
             .field("compressor", &self.compressor.is_some())
+            .field("publisher", &self.publisher.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -621,6 +845,7 @@ impl LoadedPlugin {
         // ── Resolve capability handles ────────────────────────────────────
         let mut ping: Option<PingHandle> = None;
         let mut compressor: Option<CompressorHandle> = None;
+        let mut publisher: Option<PublisherHandle> = None;
 
         for (slot, _cap_name) in &provides {
             match slot.as_str() {
@@ -700,6 +925,55 @@ impl LoadedPlugin {
                         free_fn,
                     });
                 }
+                "publish/github" => {
+                    // Resolve both publisher symbols.
+                    //
+                    // SAFETY: Each symbol is looked up with the exact signature
+                    // documented in the module-level `publish/github` ABI
+                    // contract.  `Symbol::into_raw` detaches the lifetime from
+                    // `lib`; the raw pointers remain valid as long as `_lib`
+                    // (stored on the returned `LoadedPlugin`) is alive.
+
+                    #[allow(clippy::type_complexity)]
+                    type PublishFn = unsafe extern "C" fn(
+                        *const std::os::raw::c_char,
+                        *const std::os::raw::c_char,
+                        *const std::os::raw::c_char,
+                        *const std::os::raw::c_char,
+                        *const *const std::os::raw::c_char,
+                        u32,
+                        *const std::os::raw::c_char,
+                        *const std::os::raw::c_char,
+                        *mut *mut std::os::raw::c_char,
+                    ) -> i32;
+
+                    let publish_sym: Symbol<PublishFn> = unsafe {
+                        lib.get(b"plugin_publish_github\0").map_err(|_| {
+                            LoadError::MissingSymbol {
+                                plugin: plugin_name.to_owned(),
+                                symbol: "plugin_publish_github",
+                            }
+                        })?
+                    };
+                    let publish_fn = *unsafe { publish_sym.into_raw() };
+
+                    type PublishFreeFn = unsafe extern "C" fn(*mut std::os::raw::c_char);
+                    let free_sym: Symbol<PublishFreeFn> = unsafe {
+                        lib.get(b"plugin_publish_github_free\0").map_err(|_| {
+                            LoadError::MissingSymbol {
+                                plugin: plugin_name.to_owned(),
+                                symbol: "plugin_publish_github_free",
+                            }
+                        })?
+                    };
+                    let free_fn = *unsafe { free_sym.into_raw() };
+
+                    publisher = Some(PublisherHandle {
+                        plugin_name: plugin_name.to_owned(),
+                        publish_fn,
+                        free_fn,
+                    });
+                }
                 other => {
                     return Err(LoadError::UnknownCapabilitySlot {
                         plugin: plugin_name.to_owned(),
@@ -715,6 +989,7 @@ impl LoadedPlugin {
             provides,
             ping,
             compressor,
+            publisher,
             _lib: lib,
         })
     }
@@ -823,6 +1098,20 @@ impl PluginRegistry {
             .iter()
             .find(|p| &p.name == provider)
             .and_then(|p| p.compressor.as_ref())
+    }
+
+    /// Look up the `publish/github` handle for a named capability registration.
+    ///
+    /// Returns `None` if no plugin is loaded that registered
+    /// `publish/github` under `name`.
+    pub fn get_publisher(&self, name: &str) -> Option<&PublisherHandle> {
+        let provider = self
+            .entries
+            .get(&("publish/github".to_owned(), name.to_owned()))?;
+        self.plugins
+            .iter()
+            .find(|p| &p.name == provider)
+            .and_then(|p| p.publisher.as_ref())
     }
 
     /// Returns `true` if `(slot, name)` is already registered (by a built-in or
@@ -956,5 +1245,37 @@ mod tests {
         reg.seed_builtin("build/compressor", "pigz");
         let names = reg.compressor_names();
         assert!(names.contains(&"pigz"), "pigz should appear: {names:?}");
+    }
+
+    #[test]
+    fn publisher_error_variants_are_structured() {
+        let err = LoadError::PublisherError {
+            plugin: "github".to_owned(),
+            code: -1,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("github"), "should name plugin: {msg}");
+        assert!(msg.contains("-1"), "should show error code: {msg}");
+
+        let err2 = LoadError::PublisherInvalidUrl {
+            plugin: "github".to_owned(),
+        };
+        let msg2 = err2.to_string();
+        assert!(msg2.contains("github"), "should name plugin: {msg2}");
+    }
+
+    #[test]
+    fn get_publisher_returns_none_when_not_loaded() {
+        let reg = PluginRegistry::new();
+        assert!(reg.get_publisher("github").is_none());
+    }
+
+    #[test]
+    fn publish_github_slot_is_not_compressor_slot() {
+        let mut reg = PluginRegistry::new();
+        reg.seed_builtin("publish/github", "github");
+        // build/compressor is a different slot — not a collision
+        assert!(!reg.is_registered("build/compressor", "github"));
+        assert!(reg.is_registered("publish/github", "github"));
     }
 }

@@ -526,13 +526,37 @@ struct RawS3Target {
     dest: String,
 }
 
+/// GitHub Releases target block in a `type: botforge/publish` document.
+///
+/// Requires the `publish/github` plugin capability to be declared in the
+/// workspace marker under `plugins:`.  The host resolves the auth token
+/// from `GITHUB_TOKEN` (fallback `GH_TOKEN`) and the API base URL from
+/// `GITHUB_API_URL` (default `https://api.github.com`).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawGithubTarget {
+    /// Source: an `@`-notation reference to the artifact to upload as a
+    /// release asset (e.g. `@artifact://images/vm.qcow2`).
+    src: String,
+    /// GitHub repository in `owner/repo` form (e.g. `botworkz/tools`).
+    repo: String,
+    /// Release tag name (e.g. `v1.0.0`).
+    tag: String,
+    /// Release title.  Optional; defaults to the tag name when absent.
+    #[serde(default)]
+    title: Option<String>,
+    /// Release description / body text.  Optional; defaults to `""`.
+    #[serde(default)]
+    description: Option<String>,
+}
+
 /// Raw deserialization target for the nested `publish:` target map in a
 /// `type: botforge/publish` document.
 ///
 /// `deny_unknown_fields` ensures that unrecognised target kinds under
-/// `publish:` (e.g. `github:`, typo'd `s3x:`) produce a clear parse-time
-/// error today.  This inner map is the future registry seam where plugin
-/// target kinds will be admitted later.
+/// `publish:` (e.g. typo'd `s3x:`, `githubx:`) produce a clear parse-time
+/// error.  This inner map is the registry seam where plugin target kinds
+/// (`github`) are admitted alongside built-in ones (`fs`, `s3`).
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 struct RawPublishTargets {
@@ -542,6 +566,9 @@ struct RawPublishTargets {
     /// Zero or more S3 targets.
     #[serde(default)]
     s3: Vec<RawS3Target>,
+    /// Zero or more GitHub Releases targets.
+    #[serde(default)]
+    github: Vec<RawGithubTarget>,
 }
 
 /// Raw deserialization target for a top-level `botforge publish` document.
@@ -583,6 +610,26 @@ pub(crate) struct S3Target {
     pub(crate) dest: String,
 }
 
+/// GitHub Releases publish target.
+///
+/// Requires the `publish/github` plugin capability.  The host reads
+/// `GITHUB_TOKEN` (fallback `GH_TOKEN`) for auth and `GITHUB_API_URL`
+/// (default `https://api.github.com`) for the API base URL; both are
+/// passed explicitly across the plugin ABI boundary.
+#[derive(Debug)]
+pub(crate) struct GithubTarget {
+    /// Resolved `@`-reference string (as written in the YAML).
+    pub(crate) src: String,
+    /// GitHub repository in `owner/repo` form.
+    pub(crate) repo: String,
+    /// Release tag name.
+    pub(crate) tag: String,
+    /// Optional release title; defaults to `tag` when absent.
+    pub(crate) title: Option<String>,
+    /// Optional release body text; defaults to `""` when absent.
+    pub(crate) description: Option<String>,
+}
+
 /// Validated publish plan loaded from a `type: botforge/publish` document.
 ///
 /// ## Schema contract
@@ -593,7 +640,7 @@ pub(crate) struct S3Target {
 ///   in the container.  All pre-publish mangling (path versioning, changelog
 ///   rewriting, checksum generation, staging/renaming) belongs here.
 /// - Publish target directives live under the top-level `publish:` map.  Each
-///   target kind within that map (`fs`, `s3`) is a **list of instances**.
+///   target kind within that map (`fs`, `s3`, `github`) is a **list of instances**.
 ///   Multiple destinations of the same kind are expressed as multiple list
 ///   entries.
 /// - Publish targets are **unordered** and MAY run in parallel; plans MUST NOT
@@ -610,6 +657,8 @@ pub(crate) struct PublishConfig {
     pub(crate) fs: Vec<FsTarget>,
     /// S3 targets (may be empty; credentials from environment).
     pub(crate) s3: Vec<S3Target>,
+    /// GitHub Releases targets (may be empty; requires `publish/github` plugin).
+    pub(crate) github: Vec<GithubTarget>,
 }
 
 /// Load and validate a `type: botforge/publish` document from `path`.
@@ -664,10 +713,39 @@ pub(crate) fn load_publish_config(path: &Path) -> Result<PublishConfig> {
         })
         .collect::<Result<_>>()?;
 
-    if fs.is_empty() && s3.is_empty() {
+    let github: Vec<GithubTarget> = raw
+        .publish
+        .github
+        .into_iter()
+        .enumerate()
+        .map(|(i, t)| {
+            validate_publish_src(&t.src, path, &format!("github[{i}]"))?;
+            if t.repo.is_empty() {
+                anyhow::bail!(
+                    "publish github[{i}].repo must not be empty in {}",
+                    path.display()
+                );
+            }
+            if t.tag.is_empty() {
+                anyhow::bail!(
+                    "publish github[{i}].tag must not be empty in {}",
+                    path.display()
+                );
+            }
+            Ok(GithubTarget {
+                src: t.src,
+                repo: t.repo,
+                tag: t.tag,
+                title: t.title,
+                description: t.description,
+            })
+        })
+        .collect::<Result<_>>()?;
+
+    if fs.is_empty() && s3.is_empty() && github.is_empty() {
         anyhow::bail!(
             "publish plan '{}' ({}) has no targets; \
-             add at least one 'fs' or 's3' entry under 'publish:'",
+             add at least one 'fs', 's3', or 'github' entry under 'publish:'",
             name,
             path.display()
         );
@@ -678,6 +756,7 @@ pub(crate) fn load_publish_config(path: &Path) -> Result<PublishConfig> {
         steps,
         fs,
         s3,
+        github,
     })
 }
 
