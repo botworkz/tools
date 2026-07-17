@@ -10,6 +10,7 @@
 
 use anyhow::Result;
 use serde::Deserialize;
+use serde_yaml::Value;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::time::Duration;
@@ -19,6 +20,8 @@ use crate::util::shell_single_quote;
 
 use crate::config::{validate_mode_string, validate_owner_group_string};
 use crate::plan::log::print_phase_status;
+
+pub(crate) mod registry;
 
 // ---------------------------------------------------------------------------
 // assert: block types  (schema / parse section)
@@ -167,25 +170,38 @@ pub(crate) struct AssertBlock {
     pub(crate) services: BTreeMap<String, AssertService>,
 }
 
+pub(crate) fn parse_assert_block(raw_block: &Value) -> Result<AssertBlock> {
+    let Some(mapping) = raw_block.as_mapping() else {
+        anyhow::bail!("'assert' must be a mapping");
+    };
+
+    let registry = registry::built_in_assert_registry();
+    let mut block = AssertBlock::default();
+
+    for (raw_key, raw_value) in mapping {
+        let Some(verb) = raw_key.as_str() else {
+            anyhow::bail!("assert verb keys must be strings");
+        };
+        let Some(kind) = registry.get(verb) else {
+            anyhow::bail!(
+                "unknown assert verb '{verb}' (known verbs: {})",
+                registry.known_verbs().join(", ")
+            );
+        };
+        kind.parse_into(raw_value, &mut block)?;
+    }
+
+    Ok(block)
+}
+
 // ---------------------------------------------------------------------------
 // Config-load-time validation
 // ---------------------------------------------------------------------------
 
 pub(crate) fn validate_assert_block(block: &AssertBlock) -> Result<()> {
-    for (guest_path, expectation) in &block.files {
-        validate_assert_file_entry(guest_path, expectation)?;
-    }
-    for (name_or_pattern, expectation) in &block.users {
-        validate_assert_user_entry(name_or_pattern, expectation)?;
-    }
-    for (name_or_pattern, expectation) in &block.groups {
-        validate_assert_group_entry(name_or_pattern, expectation)?;
-    }
-    for (name_or_pattern, expectation) in &block.packages {
-        validate_assert_package_entry(name_or_pattern, expectation)?;
-    }
-    for (name, expectation) in &block.services {
-        validate_assert_service_entry(name, expectation)?;
+    let registry = registry::built_in_assert_registry();
+    for kind in registry.iter() {
+        kind.validate(block)?;
     }
     Ok(())
 }
@@ -1640,6 +1656,27 @@ mod tests {
         assert_eq!(names, vec!["botforge-abc123", "bot"]);
     }
 
+    #[test]
+    fn test_assert_registry_resolves_builtin_verbs() {
+        let registry = super::registry::built_in_assert_registry();
+        for verb in ["files", "users", "groups", "packages", "services"] {
+            assert!(
+                registry.get(verb).is_some(),
+                "expected assert registry to resolve built-in verb '{verb}'"
+            );
+        }
+    }
+
+    #[test]
+    fn test_assert_registry_preserves_dispatch_order() {
+        let registry = super::registry::built_in_assert_registry();
+        let verbs: Vec<&str> = registry.iter().map(|kind| kind.verb()).collect();
+        assert_eq!(
+            verbs,
+            vec!["files", "users", "groups", "packages", "services"]
+        );
+    }
+
     mod assert_block {
         use super::super::AssertFileType;
         use crate::config::load_test_config;
@@ -2128,6 +2165,38 @@ assert:
             assert!(
                 msg.contains("version") || msg.contains("unknown field"),
                 "error should mention unknown field: {msg}"
+            );
+        }
+
+        #[test]
+        fn test_load_test_config_assert_unknown_verb_is_error() {
+            let repo = TempDir::new().unwrap();
+            fs::write(
+                repo.path().join("test.yaml"),
+                r#"
+type: botforge/test
+name: test
+steps: []
+assert:
+  foo:
+    bar:
+      exists: true
+"#,
+            )
+            .unwrap();
+            let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("unknown assert verb 'foo'"),
+                "error should mention unknown assert verb: {msg}"
+            );
+            assert!(
+                msg.contains("files")
+                    && msg.contains("users")
+                    && msg.contains("groups")
+                    && msg.contains("packages")
+                    && msg.contains("services"),
+                "error should list known assert verbs: {msg}"
             );
         }
     }
