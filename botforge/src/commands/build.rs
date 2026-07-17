@@ -201,15 +201,6 @@ pub(crate) fn cmd_build(args: BuildArgs) -> Result<()> {
         ensure_command("qemu-nbd")?;
     }
 
-    // Determine whether the configured compressor is a plugin verb (i.e. not a
-    // built-in). Plugin verbs route to whole-artifact stream compression rather
-    // than qcow2-cluster-level compression.
-    let plugin_compressor_verb: Option<(String, String)> = build_config
-        .compress
-        .as_ref()
-        .filter(|c| c.enabled && plugin_compressor_refs.contains(&c.compressor.as_str()))
-        .map(|c| (c.compressor.clone(), c.compressor_opts.clone()));
-
     // Resolve the source qcow2: --source wins; otherwise resolve image: via the shared resolver.
     let source = if let Some(src) = args.source {
         resolve_under_root(&context, src)
@@ -532,57 +523,15 @@ pub(crate) fn cmd_build(args: BuildArgs) -> Result<()> {
     // Disk lifecycle step 8 (was 6): commit partial → output (plain rename or
     // compress-and-rename depending on the spec's `compress:` config).
     //
-    // When a plugin compressor verb is configured (e.g. "pigz"), the qcow2
-    // commit uses NO internal cluster compression (plugin compressors are
-    // whole-artifact stream compressors, not qcow2-cluster codecs). The
-    // artifact is then stream-compressed in the next step.
+    // Plugin compressor verbs (e.g. "pigz") are not qcow2-cluster codecs; they
+    // are pure bytes→bytes capabilities.  Selecting a plugin verb skips qcow2
+    // internal cluster compression — the artifact is committed as-is.
     // ---------------------------------------------------------------------------
     let qcow2_compress = build_config
         .compress
         .as_ref()
-        .filter(|c| c.enabled && plugin_compressor_verb.is_none());
+        .filter(|c| c.enabled && !plugin_compressor_refs.contains(&c.compressor.as_str()));
     commit_output(&partial, &output, qcow2_compress)?;
-
-    // ── Plugin stream compression (artifact-level) ────────────────────────────
-    // When a plugin compressor verb is active, compress the committed output
-    // artifact as a whole file (stream compression). The result is written to
-    // `<output>.gz` alongside the original qcow2.
-    if let Some((verb, opts)) = &plugin_compressor_verb {
-        let handle = plugin_registry.get_compressor(verb).with_context(|| {
-            format!("plugin compressor '{verb}' was resolved but is not in the registry")
-        })?;
-        let output_gz = output.with_extension("qcow2.gz");
-        crate::plan::print_phase(
-            "compress",
-            &format!(
-                "Stream-compressing artifact with {verb} → {}",
-                output_gz.display()
-            ),
-        );
-        let input_data = std::fs::read(&output).with_context(|| {
-            format!(
-                "failed to read artifact for stream compression: {}",
-                output.display()
-            )
-        })?;
-        let compressed = handle
-            .compress(&input_data, opts)
-            .with_context(|| format!("plugin '{verb}' failed to compress artifact"))?;
-        std::fs::write(&output_gz, &compressed).with_context(|| {
-            format!(
-                "failed to write compressed artifact: {}",
-                output_gz.display()
-            )
-        })?;
-        crate::plan::print_phase(
-            "output",
-            &format!(
-                "Compressed artifact written to {} ({})",
-                output_gz.display(),
-                format_bytes_human(compressed.len() as u64)
-            ),
-        );
-    }
 
     let output_stats = read_qcow2_image_stats(&output)?;
     if botforge_debug_enabled() {
