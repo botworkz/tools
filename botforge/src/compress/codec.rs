@@ -1,10 +1,11 @@
+use super::registry::{
+    build_registered_compressor, decompress_registered_cluster, lookup_compressor,
+};
 use anyhow::{bail, Context, Result};
 use flate2::read::DeflateDecoder;
 use flate2::write::DeflateEncoder;
 use flate2::Compression;
 use std::io::{Read, Write};
-
-use super::config::CompressionType;
 
 pub(crate) trait Compressor: Sync {
     fn id(&self) -> &str;
@@ -17,46 +18,20 @@ pub(crate) trait Compressor: Sync {
 }
 
 pub(crate) fn build_compressor(
-    compression_type: CompressionType,
+    compressor_verb: &str,
     raw_opts: &str,
 ) -> Result<Box<dyn Compressor + Sync + Send>> {
-    match compression_type {
-        CompressionType::Zstd => Ok(Box::new(ZstdCompressor::from_opts(raw_opts)?)),
-        CompressionType::Zlib => Ok(Box::new(ZlibCompressor::from_opts(raw_opts)?)),
-    }
+    let registration = lookup_compressor(compressor_verb)?;
+    build_registered_compressor(registration, raw_opts)
 }
 
 pub(crate) fn decompress_cluster(
-    compression_type: CompressionType,
+    compressor_verb: &str,
     compressed: &[u8],
     cluster_size: usize,
 ) -> Result<Vec<u8>> {
-    match compression_type {
-        CompressionType::Zstd => {
-            // Trim the input to exactly the first zstd frame, discarding any
-            // trailing sector-padding bytes.  The streaming decoder would
-            // otherwise try to parse padding zeros as a second frame and fail
-            // with "Unknown frame descriptor".
-            let frame_end = zstd::zstd_safe::find_frame_compressed_size(compressed)
-                .unwrap_or(compressed.len())
-                .min(compressed.len());
-            let mut decoder = zstd::stream::read::Decoder::with_buffer(&compressed[..frame_end])
-                .context("failed to initialize zstd decoder")?;
-            let mut out = Vec::with_capacity(cluster_size);
-            decoder
-                .read_to_end(&mut out)
-                .context("failed to decode zstd qcow2 cluster")?;
-            pad_decompressed(out, cluster_size, "zstd")
-        }
-        CompressionType::Zlib => {
-            let mut decoder = DeflateDecoder::new(compressed);
-            let mut out = Vec::with_capacity(cluster_size);
-            decoder
-                .read_to_end(&mut out)
-                .context("failed to decode zlib qcow2 cluster")?;
-            pad_decompressed(out, cluster_size, "zlib")
-        }
-    }
+    let registration = lookup_compressor(compressor_verb)?;
+    decompress_registered_cluster(registration, compressed, cluster_size)
 }
 
 /// Validates that `decoded` is no larger than `cluster_size`, then zero-pads
@@ -71,6 +46,32 @@ fn pad_decompressed(mut decoded: Vec<u8>, cluster_size: usize, codec: &str) -> R
     }
     decoded.resize(cluster_size, 0);
     Ok(decoded)
+}
+
+pub(super) fn decompress_zstd_cluster(compressed: &[u8], cluster_size: usize) -> Result<Vec<u8>> {
+    // Trim the input to exactly the first zstd frame, discarding any
+    // trailing sector-padding bytes.  The streaming decoder would
+    // otherwise try to parse padding zeros as a second frame and fail
+    // with "Unknown frame descriptor".
+    let frame_end = zstd::zstd_safe::find_frame_compressed_size(compressed)
+        .unwrap_or(compressed.len())
+        .min(compressed.len());
+    let mut decoder = zstd::stream::read::Decoder::with_buffer(&compressed[..frame_end])
+        .context("failed to initialize zstd decoder")?;
+    let mut out = Vec::with_capacity(cluster_size);
+    decoder
+        .read_to_end(&mut out)
+        .context("failed to decode zstd qcow2 cluster")?;
+    pad_decompressed(out, cluster_size, "zstd")
+}
+
+pub(super) fn decompress_zlib_cluster(compressed: &[u8], cluster_size: usize) -> Result<Vec<u8>> {
+    let mut decoder = DeflateDecoder::new(compressed);
+    let mut out = Vec::with_capacity(cluster_size);
+    decoder
+        .read_to_end(&mut out)
+        .context("failed to decode zlib qcow2 cluster")?;
+    pad_decompressed(out, cluster_size, "zlib")
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -238,13 +239,13 @@ mod tests {
 
     #[test]
     fn compressor_factory_dispatches_zstd() {
-        let compressor = build_compressor(CompressionType::Zstd, "-19 -T0").expect("factory");
+        let compressor = build_compressor("zstd", "-19 -T0").expect("factory");
         assert_eq!(compressor.id(), "zstd");
     }
 
     #[test]
     fn compressor_factory_dispatches_zlib() {
-        let compressor = build_compressor(CompressionType::Zlib, "").expect("factory");
+        let compressor = build_compressor("zlib", "").expect("factory");
         assert_eq!(compressor.id(), "zlib");
     }
 
@@ -305,7 +306,7 @@ mod tests {
         encoder.write_all(&short_data).expect("encode");
         let compressed = encoder.finish().expect("finish");
 
-        let result = decompress_cluster(CompressionType::Zlib, &compressed, cluster_size)
+        let result = decompress_cluster("zlib", &compressed, cluster_size)
             .expect("decompress must succeed even when inflated length < cluster_size");
 
         assert_eq!(
@@ -332,7 +333,7 @@ mod tests {
         compressor.include_contentsize(true).expect("contentsize");
         let compressed = compressor.compress(&short_data).expect("compress");
 
-        let result = decompress_cluster(CompressionType::Zstd, &compressed, cluster_size)
+        let result = decompress_cluster("zstd", &compressed, cluster_size)
             .expect("decompress must succeed even when inflated length < cluster_size");
 
         assert_eq!(
@@ -359,7 +360,7 @@ mod tests {
         encoder.write_all(&data).expect("encode");
         let compressed = encoder.finish().expect("finish");
 
-        let result = decompress_cluster(CompressionType::Zlib, &compressed, cluster_size)
+        let result = decompress_cluster("zlib", &compressed, cluster_size)
             .expect("decompress full-size cluster");
         assert_eq!(result, data);
     }
@@ -372,7 +373,7 @@ mod tests {
         compressor.include_contentsize(true).expect("contentsize");
         let compressed = compressor.compress(&data).expect("compress");
 
-        let result = decompress_cluster(CompressionType::Zstd, &compressed, cluster_size)
+        let result = decompress_cluster("zstd", &compressed, cluster_size)
             .expect("decompress full-size cluster");
         assert_eq!(result, data);
     }

@@ -17,12 +17,8 @@ pub(crate) enum ReclaimMode {
     Discard,
 }
 
-#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum CompressionType {
-    #[default]
-    Zstd,
-    Zlib,
+fn default_compressor_verb() -> String {
+    "zstd".to_owned()
 }
 
 /// Output-compression options for `botforge build`.
@@ -69,8 +65,8 @@ pub(crate) struct CompressConfig {
     ///
     /// Defaults to `zstd`, which requires qemu >= 5.1 only on consumers that
     /// open the produced qcow2.
-    #[serde(default)]
-    pub(crate) compressor: CompressionType,
+    #[serde(default = "default_compressor_verb")]
+    pub(crate) compressor: String,
     /// Optional qcow2-structural key=value options interpreted by botforge's
     /// native qcow2 writer. Keys are sorted (BTreeMap) so the stored config is
     /// deterministic.
@@ -89,9 +85,21 @@ pub(crate) struct CompressConfig {
     pub(crate) reclaim: ReclaimMode,
 }
 
+impl Default for CompressConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            compressor: default_compressor_verb(),
+            compressor_args: Default::default(),
+            compressor_opts: String::new(),
+            reclaim: ReclaimMode::None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{CompressionType, ReclaimMode};
+    use super::ReclaimMode;
     use crate::config::load_build_config;
     use tempfile::TempDir;
 
@@ -130,8 +138,7 @@ mod tests {
         let compress = config.compress.expect("compress should be Some");
         assert!(compress.enabled, "enabled must be true");
         assert_eq!(
-            compress.compressor,
-            CompressionType::Zstd,
+            compress.compressor, "zstd",
             "compressor must default to zstd"
         );
         assert!(
@@ -160,7 +167,7 @@ mod tests {
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
         let compress = config.compress.expect("compress should be Some");
         assert!(compress.enabled);
-        assert_eq!(compress.compressor, CompressionType::Zstd);
+        assert_eq!(compress.compressor, "zstd");
         assert_eq!(
             compress
                 .compressor_args
@@ -182,7 +189,7 @@ mod tests {
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
         let compress = config.compress.expect("compress should be Some");
         assert!(compress.enabled);
-        assert_eq!(compress.compressor, CompressionType::Zstd);
+        assert_eq!(compress.compressor, "zstd");
     }
 
     #[test]
@@ -196,7 +203,7 @@ mod tests {
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
         let compress = config.compress.expect("compress should be Some");
         assert!(compress.enabled);
-        assert_eq!(compress.compressor, CompressionType::Zlib);
+        assert_eq!(compress.compressor, "zlib");
     }
 
     #[test]
@@ -243,7 +250,7 @@ mod tests {
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
         let compress = config.compress.expect("compress should be Some");
         assert!(!compress.enabled, "enabled must be false");
-        assert_eq!(compress.compressor, CompressionType::Zstd);
+        assert_eq!(compress.compressor, "zstd");
         assert_eq!(compress.reclaim, ReclaimMode::None);
     }
 
@@ -394,8 +401,8 @@ mod tests {
         let err = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("bogus") || msg.contains("unknown variant"),
-            "error should mention compressor enum variant parse failure: {msg}"
+            msg.contains("bogus") && msg.contains("unknown compressor"),
+            "error should mention unknown compressor verb validation: {msg}"
         );
     }
 
