@@ -3,7 +3,7 @@ name = "shasset"
 version = "0.1.0"
 edition = "2021"
 description = "Generic verified-asset downloader and registry manager"
-license = "MIT"
+license = "GPL-3.0-or-later"
 
 [lib]
 name = "shasset"

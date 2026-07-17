@@ -3,7 +3,7 @@ name = "viscous"
 version = "0.1.0"
 edition = "2021"
 description = "Opinionated, agent-friendly directory template generator"
-license = "MIT"
+license = "GPL-3.0-or-later"
 
 [lib]
 name = "viscous"
