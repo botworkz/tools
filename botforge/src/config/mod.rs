@@ -520,7 +520,7 @@ struct RawS3Target {
 /// Raw deserialization target for a top-level `botforge publish` document.
 ///
 /// `deny_unknown_fields` ensures that unrecognised target blocks (e.g.
-/// `github:`) produce a clear parse-time error.
+/// `github:`, typo'd `s3x:`) produce a clear parse-time error.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawPublishDocument {
@@ -528,12 +528,12 @@ struct RawPublishDocument {
     doc_type: DocumentType,
     #[serde(default)]
     name: Option<String>,
-    /// Optional filesystem target.
+    /// Zero or more filesystem targets.
     #[serde(default)]
-    fs: Option<RawFsTarget>,
-    /// Optional S3 target.
+    fs: Vec<RawFsTarget>,
+    /// Zero or more S3 targets.
     #[serde(default)]
-    s3: Option<RawS3Target>,
+    s3: Vec<RawS3Target>,
 }
 
 /// Filesystem publish target.
@@ -541,7 +541,7 @@ struct RawPublishDocument {
 pub(crate) struct FsTarget {
     /// Resolved `@`-reference string (as written in the YAML).
     pub(crate) src: String,
-    /// Local destination directory.
+    /// Local destination directory (a plain filesystem path; not `@`-resolved).
     pub(crate) dest: String,
 }
 
@@ -555,14 +555,25 @@ pub(crate) struct S3Target {
 }
 
 /// Validated publish plan loaded from a `type: botforge/publish` document.
+///
+/// ## Schema contract
+///
+/// - Each target kind (`fs`, `s3`) is a **list of instances**.  Multiple
+///   destinations of the same kind are expressed as multiple list entries.
+/// - Publish targets are **unordered** and MAY run in parallel; plans MUST NOT
+///   assume any ordering within a kind's list or across kinds.  The current
+///   implementation runs them serially, but the iteration order is an
+///   implementation detail that plans must not depend on.
+/// - All ordered / pre-publish work (path mangling, versioning, checksums, etc.)
+///   is deferred to a future `steps:` prepare phase (not yet implemented).
 #[derive(Debug)]
 pub(crate) struct PublishConfig {
     #[allow(dead_code)]
     pub(crate) name: String,
-    /// Optional filesystem target.
-    pub(crate) fs: Option<FsTarget>,
-    /// Optional S3 target (credentials from environment).
-    pub(crate) s3: Option<S3Target>,
+    /// Filesystem targets (may be empty).
+    pub(crate) fs: Vec<FsTarget>,
+    /// S3 targets (may be empty; credentials from environment).
+    pub(crate) s3: Vec<S3Target>,
 }
 
 /// Load and validate a `type: botforge/publish` document from `path`.
@@ -579,28 +590,41 @@ pub(crate) fn load_publish_config(path: &Path) -> Result<PublishConfig> {
     }
     let name = validate_entrypoint_name(raw.name, path, DocumentType::Publish)?;
 
-    let fs = raw
+    let fs: Vec<FsTarget> = raw
         .fs
-        .map(|t| {
-            validate_publish_src(&t.src, path, "fs")?;
-            Ok::<_, anyhow::Error>(FsTarget {
+        .into_iter()
+        .enumerate()
+        .map(|(i, t)| {
+            validate_publish_src(&t.src, path, &format!("fs[{i}]"))?;
+            Ok(FsTarget {
                 src: t.src,
                 dest: t.dest,
             })
         })
-        .transpose()?;
+        .collect::<Result<_>>()?;
 
-    let s3 = raw
+    let s3: Vec<S3Target> = raw
         .s3
-        .map(|t| {
-            validate_publish_src(&t.src, path, "s3")?;
+        .into_iter()
+        .enumerate()
+        .map(|(i, t)| {
+            validate_publish_src(&t.src, path, &format!("s3[{i}]"))?;
             validate_s3_dest(&t.dest, path)?;
-            Ok::<_, anyhow::Error>(S3Target {
+            Ok(S3Target {
                 src: t.src,
                 dest: t.dest,
             })
         })
-        .transpose()?;
+        .collect::<Result<_>>()?;
+
+    if fs.is_empty() && s3.is_empty() {
+        anyhow::bail!(
+            "publish plan '{}' ({}) has no targets; \
+             add at least one 'fs' or 's3' entry",
+            name,
+            path.display()
+        );
+    }
 
     Ok(PublishConfig { name, fs, s3 })
 }

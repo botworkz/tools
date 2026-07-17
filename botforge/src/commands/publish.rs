@@ -8,9 +8,16 @@
 //!   and optionally `AWS_ENDPOINT_URL` for S3-compatible services such as
 //!   Contabo Object Storage).
 //!
-//! Targets execute in fixed order: `fs` first, then `s3`.  If a target fails
-//! the run stops and the error is reported; subsequent targets are not
-//! attempted.
+//! ## Schema contract
+//!
+//! Each target kind (`fs`, `s3`) is a **list of instances** — multiple
+//! destinations of the same kind are expressed as multiple list entries.
+//! Publish targets are **unordered** and MAY run in parallel; plans MUST NOT
+//! assume any ordering within a kind's list or across kinds.  The current
+//! implementation runs them serially, but the iteration order is an
+//! implementation detail that plans must not depend on.
+//! All ordered / pre-publish work (path mangling, versioning, checksums, etc.)
+//! is deferred to a future `steps:` prepare phase (not yet implemented).
 //!
 //! ## Plan shape
 //!
@@ -19,12 +26,16 @@
 //! name: my-release
 //!
 //! fs:
-//!   src: "@artifact://images/my-vm.qcow2"
-//!   dest: /mnt/nas/releases/
+//!   - src: "@artifact://images/my-vm.qcow2"
+//!     dest: /mnt/nas/releases/
+//!   - src: "@artifact://images/my-vm.qcow2"
+//!     dest: /mnt/mirror/releases/
 //!
 //! s3:
-//!   src: "@artifact://images/my-vm.qcow2"
-//!   dest: s3://my-bucket/releases/
+//!   - src: "@artifact://images/my-vm.qcow2"
+//!     dest: s3://bucket-a/releases/
+//!   - src: "@artifact://images/my-vm.qcow2"
+//!     dest: s3://bucket-b/releases/
 //! ```
 
 use anyhow::{bail, Context, Result};
@@ -88,14 +99,20 @@ fn run_publish(
         cache_dir_override: None,
     };
 
-    // ── fs target ─────────────────────────────────────────────────────────────
-    if let Some(fs) = &config.fs {
-        run_fs_target(fs, &resolve_ctx, dry_run).context("publish: fs target failed")?;
+    // Publish targets are unordered; iteration order is an implementation
+    // detail that plans must not depend on.  Future work may run these in
+    // parallel.
+
+    // ── fs targets ────────────────────────────────────────────────────────────
+    for (i, fs) in config.fs.iter().enumerate() {
+        run_fs_target(fs, &resolve_ctx, dry_run)
+            .with_context(|| format!("publish: fs[{i}] target failed"))?;
     }
 
-    // ── s3 target ─────────────────────────────────────────────────────────────
-    if let Some(s3) = &config.s3 {
-        run_s3_target(s3, &resolve_ctx, dry_run).context("publish: s3 target failed")?;
+    // ── s3 targets ────────────────────────────────────────────────────────────
+    for (i, s3) in config.s3.iter().enumerate() {
+        run_s3_target(s3, &resolve_ctx, dry_run)
+            .with_context(|| format!("publish: s3[{i}] target failed"))?;
     }
 
     Ok(())
@@ -468,5 +485,254 @@ mod tests {
 
         // dry_run=true: should succeed without calling the `aws` CLI.
         run_s3_target(&target, &resolve_ctx, true).unwrap();
+    }
+
+    // ── publish config: list-valued schema ────────────────────────────────────
+
+    fn write_temp_publish(content: &str) -> (TempDir, std::path::PathBuf) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("publish.yaml");
+        fs::write(&path, content).unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn publish_config_single_fs_instance_parses() {
+        let yaml = r#"
+type: botforge/publish
+name: my-release
+fs:
+  - src: "@artifact://images/vm.qcow2"
+    dest: /mnt/nas/releases/
+"#;
+        let (_dir, path) = write_temp_publish(yaml);
+        let config = crate::config::load_publish_config(&path).unwrap();
+        assert_eq!(config.fs.len(), 1);
+        assert_eq!(config.fs[0].src, "@artifact://images/vm.qcow2");
+        assert_eq!(config.fs[0].dest, "/mnt/nas/releases/");
+        assert!(config.s3.is_empty());
+    }
+
+    #[test]
+    fn publish_config_multiple_fs_instances_parse() {
+        let yaml = r#"
+type: botforge/publish
+name: my-release
+fs:
+  - src: "@artifact://images/vm.qcow2"
+    dest: /mnt/nas/releases/
+  - src: "@artifact://images/vm.qcow2"
+    dest: /mnt/mirror/releases/
+"#;
+        let (_dir, path) = write_temp_publish(yaml);
+        let config = crate::config::load_publish_config(&path).unwrap();
+        assert_eq!(config.fs.len(), 2);
+        assert_eq!(config.fs[0].dest, "/mnt/nas/releases/");
+        assert_eq!(config.fs[1].dest, "/mnt/mirror/releases/");
+        assert!(config.s3.is_empty());
+    }
+
+    #[test]
+    fn publish_config_single_s3_instance_parses() {
+        let yaml = r#"
+type: botforge/publish
+name: my-release
+s3:
+  - src: "@artifact://images/vm.qcow2"
+    dest: s3://bucket-a/releases/
+"#;
+        let (_dir, path) = write_temp_publish(yaml);
+        let config = crate::config::load_publish_config(&path).unwrap();
+        assert_eq!(config.s3.len(), 1);
+        assert_eq!(config.s3[0].src, "@artifact://images/vm.qcow2");
+        assert_eq!(config.s3[0].dest, "s3://bucket-a/releases/");
+        assert!(config.fs.is_empty());
+    }
+
+    #[test]
+    fn publish_config_multiple_s3_instances_parse() {
+        let yaml = r#"
+type: botforge/publish
+name: my-release
+s3:
+  - src: "@artifact://images/vm.qcow2"
+    dest: s3://bucket-a/releases/
+  - src: "@artifact://images/vm.qcow2"
+    dest: s3://bucket-b/releases/
+"#;
+        let (_dir, path) = write_temp_publish(yaml);
+        let config = crate::config::load_publish_config(&path).unwrap();
+        assert_eq!(config.s3.len(), 2);
+        assert_eq!(config.s3[0].dest, "s3://bucket-a/releases/");
+        assert_eq!(config.s3[1].dest, "s3://bucket-b/releases/");
+    }
+
+    #[test]
+    fn publish_config_mixed_fs_and_s3_parses() {
+        let yaml = r#"
+type: botforge/publish
+name: mixed-release
+fs:
+  - src: "@artifact://images/vm.qcow2"
+    dest: /mnt/nas/releases/
+  - src: "@artifact://images/vm.qcow2"
+    dest: /mnt/mirror/releases/
+s3:
+  - src: "@artifact://images/vm.qcow2"
+    dest: s3://bucket-a/releases/
+  - src: "@artifact://images/vm.qcow2"
+    dest: s3://bucket-b/releases/
+"#;
+        let (_dir, path) = write_temp_publish(yaml);
+        let config = crate::config::load_publish_config(&path).unwrap();
+        assert_eq!(config.fs.len(), 2);
+        assert_eq!(config.s3.len(), 2);
+    }
+
+    #[test]
+    fn publish_config_unknown_top_level_key_is_error() {
+        let yaml = r#"
+type: botforge/publish
+name: my-release
+github:
+  - src: "@artifact://images/vm.qcow2"
+    dest: https://github.com/foo/bar/releases/
+"#;
+        let (_dir, path) = write_temp_publish(yaml);
+        let err = crate::config::load_publish_config(&path).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("unknown field") || msg.contains("invalid publish config"),
+            "expected parse-time unknown-field error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn publish_config_typo_top_level_key_is_error() {
+        let yaml = r#"
+type: botforge/publish
+name: my-release
+s3x:
+  - src: "@artifact://images/vm.qcow2"
+    dest: s3://bucket-a/releases/
+"#;
+        let (_dir, path) = write_temp_publish(yaml);
+        let err = crate::config::load_publish_config(&path).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("unknown field") || msg.contains("invalid publish config"),
+            "expected parse-time unknown-field error for typo'd key, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn publish_config_no_targets_is_error() {
+        let yaml = r#"
+type: botforge/publish
+name: empty-release
+"#;
+        let (_dir, path) = write_temp_publish(yaml);
+        let err = crate::config::load_publish_config(&path).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("no targets"),
+            "expected 'no targets' error for empty publish plan, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn publish_config_fs_src_must_be_at_reference() {
+        let yaml = r#"
+type: botforge/publish
+name: my-release
+fs:
+  - src: "plain/path/no-at"
+    dest: /mnt/nas/releases/
+"#;
+        let (_dir, path) = write_temp_publish(yaml);
+        let err = crate::config::load_publish_config(&path).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("@-reference") || msg.contains("fs[0].src"),
+            "expected @-reference validation error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn publish_config_s3_src_must_be_at_reference() {
+        let yaml = r#"
+type: botforge/publish
+name: my-release
+s3:
+  - src: "plain/path/no-at"
+    dest: s3://bucket-a/releases/
+"#;
+        let (_dir, path) = write_temp_publish(yaml);
+        let err = crate::config::load_publish_config(&path).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("@-reference") || msg.contains("s3[0].src"),
+            "expected @-reference validation error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn publish_config_s3_dest_must_have_s3_prefix() {
+        let yaml = r#"
+type: botforge/publish
+name: my-release
+s3:
+  - src: "@artifact://images/vm.qcow2"
+    dest: https://bucket-a/releases/
+"#;
+        let (_dir, path) = write_temp_publish(yaml);
+        let err = crate::config::load_publish_config(&path).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("s3://") || msg.contains("S3 URL"),
+            "expected s3:// prefix validation error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn publish_config_s3_dest_validation_applies_to_every_list_element() {
+        // First element valid, second invalid — validation must fire on the second.
+        let yaml = r#"
+type: botforge/publish
+name: my-release
+s3:
+  - src: "@artifact://images/vm.qcow2"
+    dest: s3://bucket-a/releases/
+  - src: "@artifact://images/vm.qcow2"
+    dest: https://not-s3/releases/
+"#;
+        let (_dir, path) = write_temp_publish(yaml);
+        let err = crate::config::load_publish_config(&path).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("s3://") || msg.contains("S3 URL"),
+            "validation should fire on second list element, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn publish_config_fs_src_validation_applies_to_every_list_element() {
+        // Second element has a bad src — validation must fire on it.
+        let yaml = r#"
+type: botforge/publish
+name: my-release
+fs:
+  - src: "@artifact://images/vm.qcow2"
+    dest: /mnt/nas/releases/
+  - src: "plain/path"
+    dest: /mnt/mirror/releases/
+"#;
+        let (_dir, path) = write_temp_publish(yaml);
+        let err = crate::config::load_publish_config(&path).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("@-reference") || msg.contains("fs[1]"),
+            "validation should fire on second fs list element, got: {msg}"
+        );
     }
 }

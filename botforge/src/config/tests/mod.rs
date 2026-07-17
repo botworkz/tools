@@ -3663,16 +3663,15 @@ mod publish_config_tests {
 type: botforge/publish
 name: my-release
 fs:
-  src: "@artifact://images/vm.qcow2"
-  dest: /tmp/releases/
+  - src: "@artifact://images/vm.qcow2"
+    dest: /tmp/releases/
 "#,
         );
         let cfg = load_publish_config(&path).unwrap();
-        assert!(cfg.fs.is_some(), "fs target should be present");
-        assert!(cfg.s3.is_none(), "s3 target should be absent");
-        let fs = cfg.fs.unwrap();
-        assert_eq!(fs.src, "@artifact://images/vm.qcow2");
-        assert_eq!(fs.dest, "/tmp/releases/");
+        assert_eq!(cfg.fs.len(), 1, "fs should have one target");
+        assert!(cfg.s3.is_empty(), "s3 target should be absent");
+        assert_eq!(cfg.fs[0].src, "@artifact://images/vm.qcow2");
+        assert_eq!(cfg.fs[0].dest, "/tmp/releases/");
     }
 
     #[test]
@@ -3685,15 +3684,14 @@ fs:
 type: botforge/publish
 name: my-release
 s3:
-  src: "@artifact://images/vm.qcow2"
-  dest: s3://my-bucket/releases/
+  - src: "@artifact://images/vm.qcow2"
+    dest: s3://my-bucket/releases/
 "#,
         );
         let cfg = load_publish_config(&path).unwrap();
-        assert!(cfg.s3.is_some(), "s3 target should be present");
-        let s3 = cfg.s3.unwrap();
-        assert_eq!(s3.src, "@artifact://images/vm.qcow2");
-        assert_eq!(s3.dest, "s3://my-bucket/releases/");
+        assert_eq!(cfg.s3.len(), 1, "s3 should have one target");
+        assert_eq!(cfg.s3[0].src, "@artifact://images/vm.qcow2");
+        assert_eq!(cfg.s3[0].dest, "s3://my-bucket/releases/");
     }
 
     #[test]
@@ -3706,16 +3704,88 @@ s3:
 type: botforge/publish
 name: dual-target
 fs:
-  src: "@artifact://vm.qcow2"
-  dest: /tmp/dest/
+  - src: "@artifact://vm.qcow2"
+    dest: /tmp/dest/
 s3:
-  src: "@artifact://vm.qcow2"
-  dest: s3://bucket/path/
+  - src: "@artifact://vm.qcow2"
+    dest: s3://bucket/path/
 "#,
         );
         let cfg = load_publish_config(&path).unwrap();
-        assert!(cfg.fs.is_some());
-        assert!(cfg.s3.is_some());
+        assert_eq!(cfg.fs.len(), 1);
+        assert_eq!(cfg.s3.len(), 1);
+    }
+
+    #[test]
+    fn publish_multiple_fs_instances_parse() {
+        let repo = TempDir::new().unwrap();
+        let path = write_publish_doc(
+            &repo,
+            "release.yaml",
+            r#"
+type: botforge/publish
+name: multi-fs
+fs:
+  - src: "@artifact://vm.qcow2"
+    dest: /mnt/nas/releases/
+  - src: "@artifact://vm.qcow2"
+    dest: /mnt/mirror/releases/
+"#,
+        );
+        let cfg = load_publish_config(&path).unwrap();
+        assert_eq!(cfg.fs.len(), 2);
+        assert_eq!(cfg.fs[0].dest, "/mnt/nas/releases/");
+        assert_eq!(cfg.fs[1].dest, "/mnt/mirror/releases/");
+        assert!(cfg.s3.is_empty());
+    }
+
+    #[test]
+    fn publish_multiple_s3_instances_parse() {
+        let repo = TempDir::new().unwrap();
+        let path = write_publish_doc(
+            &repo,
+            "release.yaml",
+            r#"
+type: botforge/publish
+name: multi-s3
+s3:
+  - src: "@artifact://vm.qcow2"
+    dest: s3://bucket-a/releases/
+  - src: "@artifact://vm.qcow2"
+    dest: s3://bucket-b/releases/
+"#,
+        );
+        let cfg = load_publish_config(&path).unwrap();
+        assert_eq!(cfg.s3.len(), 2);
+        assert_eq!(cfg.s3[0].dest, "s3://bucket-a/releases/");
+        assert_eq!(cfg.s3[1].dest, "s3://bucket-b/releases/");
+        assert!(cfg.fs.is_empty());
+    }
+
+    #[test]
+    fn publish_mixed_multi_fs_multi_s3_parses() {
+        let repo = TempDir::new().unwrap();
+        let path = write_publish_doc(
+            &repo,
+            "release.yaml",
+            r#"
+type: botforge/publish
+name: mixed-release
+fs:
+  - src: "@artifact://vm.qcow2"
+    dest: /mnt/nas/releases/
+  - src: "@artifact://vm.qcow2"
+    dest: /mnt/mirror/releases/
+s3:
+  - src: "@artifact://vm.qcow2"
+    dest: s3://bucket-a/releases/
+  - src: "@artifact://vm.qcow2"
+    dest: s3://bucket-b/releases/
+"#,
+        );
+        let cfg = load_publish_config(&path).unwrap();
+        assert_eq!(cfg.fs.len(), 2);
+        assert_eq!(cfg.s3.len(), 2);
     }
 
     #[test]
@@ -3737,6 +3807,28 @@ github:
         assert!(
             msg.contains("github") || msg.contains("unknown field"),
             "error should mention unknown field 'github': {msg}"
+        );
+    }
+
+    #[test]
+    fn publish_typo_target_key_fails_clearly() {
+        let repo = TempDir::new().unwrap();
+        let path = write_publish_doc(
+            &repo,
+            "release.yaml",
+            r#"
+type: botforge/publish
+name: my-release
+s3x:
+  - src: "@artifact://vm.qcow2"
+    dest: s3://bucket/path/
+"#,
+        );
+        let err = load_publish_config(&path).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("s3x") || msg.contains("unknown field"),
+            "error should mention unknown/typo'd key: {msg}"
         );
     }
 
@@ -3763,8 +3855,8 @@ github:
 type: botforge/publish
 name: bad-src
 fs:
-  src: "some/plain/path"
-  dest: /tmp/dest/
+  - src: "some/plain/path"
+    dest: /tmp/dest/
 "#,
         );
         let err = load_publish_config(&path).unwrap_err();
@@ -3785,8 +3877,8 @@ fs:
 type: botforge/publish
 name: bad-dest
 s3:
-  src: "@artifact://vm.qcow2"
-  dest: https://bucket.example.com/path/
+  - src: "@artifact://vm.qcow2"
+    dest: https://bucket.example.com/path/
 "#,
         );
         let err = load_publish_config(&path).unwrap_err();
@@ -3794,6 +3886,56 @@ s3:
         assert!(
             msg.contains("s3://") || msg.contains("S3 URL"),
             "error should mention s3:// requirement: {msg}"
+        );
+    }
+
+    #[test]
+    fn publish_s3_dest_validation_applies_to_every_list_element() {
+        let repo = TempDir::new().unwrap();
+        // First entry valid, second entry has wrong dest prefix.
+        let path = write_publish_doc(
+            &repo,
+            "release.yaml",
+            r#"
+type: botforge/publish
+name: bad-second-dest
+s3:
+  - src: "@artifact://vm.qcow2"
+    dest: s3://bucket-a/path/
+  - src: "@artifact://vm.qcow2"
+    dest: https://not-s3.example.com/path/
+"#,
+        );
+        let err = load_publish_config(&path).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("s3://") || msg.contains("S3 URL"),
+            "validation should fire on second list element: {msg}"
+        );
+    }
+
+    #[test]
+    fn publish_fs_src_validation_applies_to_every_list_element() {
+        let repo = TempDir::new().unwrap();
+        // Second entry has a bad src.
+        let path = write_publish_doc(
+            &repo,
+            "release.yaml",
+            r#"
+type: botforge/publish
+name: bad-second-src
+fs:
+  - src: "@artifact://vm.qcow2"
+    dest: /mnt/nas/
+  - src: "plain/path"
+    dest: /mnt/mirror/
+"#,
+        );
+        let err = load_publish_config(&path).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("@-reference") || msg.contains("fs[1]"),
+            "validation should fire on second fs list element: {msg}"
         );
     }
 
@@ -3806,8 +3948,8 @@ s3:
             r#"
 type: botforge/publish
 fs:
-  src: "@artifact://vm.qcow2"
-  dest: /tmp/
+  - src: "@artifact://vm.qcow2"
+    dest: /tmp/
 "#,
         );
         let err = load_publish_config(&path).unwrap_err();
@@ -3819,16 +3961,20 @@ fs:
     }
 
     #[test]
-    fn publish_empty_plan_with_name_parses() {
+    fn publish_empty_plan_with_name_is_error() {
+        // An empty publish plan (no fs, no s3) is a clear error.
         let repo = TempDir::new().unwrap();
         let path = write_publish_doc(
             &repo,
             "release.yaml",
             "type: botforge/publish\nname: empty-release\n",
         );
-        let cfg = load_publish_config(&path).unwrap();
-        assert!(cfg.fs.is_none());
-        assert!(cfg.s3.is_none());
+        let err = load_publish_config(&path).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("no targets"),
+            "expected 'no targets' error for empty publish plan, got: {msg}"
+        );
     }
 
     #[test]
@@ -3841,8 +3987,8 @@ fs:
 type: botforge/publish
 name: repo-src
 fs:
-  src: "@://path/to/file.txt"
-  dest: /tmp/dest/
+  - src: "@://path/to/file.txt"
+    dest: /tmp/dest/
 "#,
         );
         // @:// references (repo-root) should be accepted as valid @-references.
