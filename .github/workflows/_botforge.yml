@@ -150,22 +150,39 @@ jobs:
         fi
         echo "Inline assets OK: debian-base present in marker; no standalone shasset.yaml"
     # Inject the pigz plugin declaration when the pigz compressor is in use.
-    # The plugins: block points at /usr/share/botforge/plugins/libpigz.so —
-    # the canonical path where the container ships libpigz.so (see Dockerfile).
+    # Done as a STRUCTURED jq merge into the marker (not a heredoc append) so
+    # the output stays a single well-formed document — the inline-assets step
+    # emits compact single-line JSON, so a raw text append produced invalid
+    # YAML ("}}}plugins:" with no separator).
     - name: Inject pigz plugin declaration into workspace marker
+      if: inputs.compressor == 'pigz'
+      uses: envoyproxy/toolshed/actions/jq@6a20085af231aba4c72d6866f94098343a8c5616
+      with:
+        input-format: yaml-path
+        output-path: testrepo/botforge.yaml
+        input: testrepo/botforge.yaml
+        filter: |
+          . + {
+            plugins: [
+              {
+                name: "pigz",
+                src: "/usr/share/botforge/plugins/libpigz.so",
+                provides: ["build/compressor"]
+              }
+            ]
+          }
+    # Assert the pigz plugin block actually landed as valid config.
+    - name: Assert pigz plugin declaration landed in the marker
       if: inputs.compressor == 'pigz'
       run: |
         set -euo pipefail
-        cat >> testrepo/botforge.yaml << 'EOF'
-        plugins:
-          - name: pigz
-            src: /usr/share/botforge/plugins/libpigz.so
-            provides:
-              - build/compressor
-        EOF
-        echo "Injected pigz plugin block into testrepo/botforge.yaml"
-        echo "----- testrepo/botforge.yaml -----"
-        cat testrepo/botforge.yaml
+        if ! grep -q 'libpigz.so' testrepo/botforge.yaml; then
+          echo "ERROR: pigz plugin injection failed — 'libpigz.so' not present in testrepo/botforge.yaml" >&2
+          echo "----- testrepo/botforge.yaml -----" >&2
+          cat testrepo/botforge.yaml >&2
+          exit 1
+        fi
+        echo "pigz plugin declaration OK: libpigz.so present in marker"
     - name: Create build config
       uses: envoyproxy/toolshed/actions/jq@6a20085af231aba4c72d6866f94098343a8c5616
       id: build-config
