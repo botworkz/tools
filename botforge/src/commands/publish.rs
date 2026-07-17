@@ -241,16 +241,22 @@ fn run_fs_target(
     resolve_ctx: &ResolveFileContext<'_>,
     dry_run: bool,
 ) -> Result<()> {
-    let reference = Reference::parse(&target.src)
-        .with_context(|| format!("invalid fs.src reference '{}'", target.src))?;
+    let context = resolve_ctx.context;
+    let src = interpolate_target_field(&target.src, context)
+        .with_context(|| format!("fs: failed to interpolate src '{}'", target.src))?;
+    let dest_str = interpolate_target_field(&target.dest, context)
+        .with_context(|| format!("fs: failed to interpolate dest '{}'", target.dest))?;
+
+    let reference =
+        Reference::parse(&src).with_context(|| format!("invalid fs.src reference '{src}'"))?;
     let files = reference
         .resolve_to_files(resolve_ctx)
-        .with_context(|| format!("fs: cannot resolve source '{}'", target.src))?;
+        .with_context(|| format!("fs: cannot resolve source '{src}'"))?;
     if files.is_empty() {
-        bail!("fs: source '{}' resolved to no files", target.src);
+        bail!("fs: source '{src}' resolved to no files");
     }
 
-    let dest = PathBuf::from(&target.dest);
+    let dest = PathBuf::from(&dest_str);
 
     for file in &files {
         copy_to_fs(file, &dest, dry_run)?;
@@ -318,16 +324,22 @@ fn run_s3_target(
     resolve_ctx: &ResolveFileContext<'_>,
     dry_run: bool,
 ) -> Result<()> {
-    let reference = Reference::parse(&target.src)
-        .with_context(|| format!("invalid s3.src reference '{}'", target.src))?;
+    let context = resolve_ctx.context;
+    let src = interpolate_target_field(&target.src, context)
+        .with_context(|| format!("s3: failed to interpolate src '{}'", target.src))?;
+    let dest_str = interpolate_target_field(&target.dest, context)
+        .with_context(|| format!("s3: failed to interpolate dest '{}'", target.dest))?;
+
+    let reference =
+        Reference::parse(&src).with_context(|| format!("invalid s3.src reference '{src}'"))?;
     let files = reference
         .resolve_to_files(resolve_ctx)
-        .with_context(|| format!("s3: cannot resolve source '{}'", target.src))?;
+        .with_context(|| format!("s3: cannot resolve source '{src}'"))?;
     if files.is_empty() {
-        bail!("s3: source '{}' resolved to no files", target.src);
+        bail!("s3: source '{src}' resolved to no files");
     }
 
-    let dest_prefix = target.dest.trim_end_matches('/');
+    let dest_prefix = dest_str.trim_end_matches('/');
 
     for file in &files {
         upload_to_s3(file, dest_prefix, dry_run)?;
@@ -456,6 +468,96 @@ async fn upload_to_s3_async(
     Ok(())
 }
 
+// ─── target-field interpolation ──────────────────────────────────────────────
+
+/// Read the `VERSION` file at `context_root/VERSION`, returning the trimmed
+/// content.
+///
+/// Returns `None` if the file does not exist — the caller decides whether to
+/// treat that as an error based on whether `${VERSION}` is actually used.
+/// Errors (non-`NotFound` I/O errors, or an empty file) are returned
+/// immediately.
+fn read_context_version(context_root: &Path) -> Result<Option<String>> {
+    let version_path = context_root.join("VERSION");
+    match std::fs::read_to_string(&version_path) {
+        Ok(raw) => {
+            let version = raw.trim().to_string();
+            if version.is_empty() {
+                anyhow::bail!(
+                    "VERSION file at '{}' is empty or contains only whitespace",
+                    version_path.display()
+                );
+            }
+            Ok(Some(version))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(anyhow::anyhow!(e)).with_context(|| {
+            format!(
+                "failed to read VERSION file at '{}'",
+                version_path.display()
+            )
+        }),
+    }
+}
+
+/// Interpolate `${VERSION}` and other `${VAR}` references in a non-secret
+/// publish target field string.
+///
+/// - `${VERSION}` is resolved from the `VERSION` file at `context_root`
+///   (never from the environment).  This is the single source of truth for
+///   the version in a publish plan, consistent with how the prepare-phase
+///   `steps:` cwd points at the context root.
+/// - All other `${VAR}` patterns are resolved from the environment via
+///   [`interpolate_env`].
+///
+/// Returns an error if:
+/// - `${VERSION}` is used but no `VERSION` file exists at `context_root`.
+/// - Any other `${VAR}` references an unset environment variable.
+///
+/// **This function MUST NOT be called on `secrets:` values.**  Secret
+/// templates are resolved separately via `interpolate_env` at plugin
+/// invocation time.
+///
+/// TODO: Consider whether general `${VAR}` env-interpolation on non-secret
+/// fields should be restricted to an explicit opt-in list once more use-cases
+/// are understood.
+fn interpolate_target_field(s: &str, context_root: &Path) -> Result<String> {
+    // Fast-path: no placeholders to interpolate.
+    if !s.contains("${") {
+        return Ok(s.to_string());
+    }
+
+    // Lazily resolve ${VERSION} from the VERSION file — only if referenced.
+    let version_value: Option<String> = if s.contains("${VERSION}") {
+        match read_context_version(context_root)? {
+            Some(v) => Some(v),
+            None => {
+                anyhow::bail!(
+                    "publish: field '{}' references ${{VERSION}} but no VERSION file was \
+                     found at '{}'.\n\
+                     Create a VERSION file at the workspace root containing the release \
+                     version string (e.g. '1.2.3').",
+                    s,
+                    context_root.join("VERSION").display()
+                )
+            }
+        }
+    } else {
+        None
+    };
+
+    // Replace ${VERSION} first so interpolate_env never sees it.
+    let intermediate = match &version_value {
+        Some(v) => s.replace("${VERSION}", v),
+        None => s.to_string(),
+    };
+
+    // Delegate any remaining ${VAR} substitution to interpolate_env (env vars).
+    interpolate_env(&intermediate).with_context(|| {
+        format!("failed to interpolate environment variables in publish field: {s:?}")
+    })
+}
+
 // ─── github target ────────────────────────────────────────────────────────────
 
 /// Allowlist of environment variable names passed through to plugin
@@ -532,13 +634,40 @@ fn run_github_target(
     api_base_url: &str,
     dry_run: bool,
 ) -> Result<()> {
-    let reference = Reference::parse(&target.src)
-        .with_context(|| format!("invalid github.src reference '{}'", target.src))?;
+    let context = resolve_ctx.context;
+
+    // Interpolate non-secret target fields: ${VERSION} from the VERSION file at
+    // context root, other ${VAR} from the environment.
+    // Secrets are intentionally excluded — they are resolved separately via
+    // interpolate_env at plugin invocation time so they are never logged.
+    let tag = interpolate_target_field(&target.tag, context)
+        .with_context(|| format!("github: failed to interpolate tag '{}'", target.tag))?;
+    let title = target
+        .title
+        .as_deref()
+        .map(|t| {
+            interpolate_target_field(t, context)
+                .with_context(|| format!("github: failed to interpolate title '{t}'"))
+        })
+        .transpose()?;
+    let description = target
+        .description
+        .as_deref()
+        .map(|d| {
+            interpolate_target_field(d, context)
+                .with_context(|| format!("github: failed to interpolate description '{d}'"))
+        })
+        .transpose()?;
+    let src = interpolate_target_field(&target.src, context)
+        .with_context(|| format!("github: failed to interpolate src '{}'", target.src))?;
+
+    let reference =
+        Reference::parse(&src).with_context(|| format!("invalid github.src reference '{src}'"))?;
     let files = reference
         .resolve_to_files(resolve_ctx)
-        .with_context(|| format!("github: cannot resolve source '{}'", target.src))?;
+        .with_context(|| format!("github: cannot resolve source '{src}'"))?;
     if files.is_empty() {
-        bail!("github: source '{}' resolved to no files", target.src);
+        bail!("github: source '{src}' resolved to no files");
     }
 
     if dry_run {
@@ -550,7 +679,7 @@ fn run_github_target(
                 file.local_path.display(),
                 api_base_url,
                 target.repo,
-                target.tag,
+                tag,
             );
         }
         return Ok(());
@@ -588,9 +717,9 @@ fn run_github_target(
 
     let request = botforge_plugin_host::PublishRequest {
         repo: &target.repo,
-        tag: &target.tag,
-        title: target.title.as_deref(),
-        description: target.description.as_deref(),
+        tag: &tag,
+        title: title.as_deref(),
+        description: description.as_deref(),
         asset_paths: &asset_paths,
         api_base_url,
         secrets: &secrets_refs,
@@ -599,11 +728,11 @@ fn run_github_target(
     // Invoke the plugin with a trimmed environment (hygiene / deterrent; see
     // PLUGIN_ENV_ALLOWLIST for the rationale and the trust-model caveat).
     let outcome = with_trimmed_env(|| publisher.publish(&request))
-        .with_context(|| format!("github: publish to {}/{} failed", target.repo, target.tag))?;
+        .with_context(|| format!("github: publish to {}/{} failed", target.repo, tag))?;
 
     eprintln!(
         "publish: github: released {} → {}",
-        target.tag, outcome.release_url
+        tag, outcome.release_url
     );
 
     Ok(())
@@ -1732,5 +1861,215 @@ publish:
                 );
             });
         }
+    }
+
+    // ── interpolate_target_field ──────────────────────────────────────────────
+
+    #[test]
+    fn interpolate_target_field_no_placeholders_unchanged() {
+        let dir = TempDir::new().unwrap();
+        let result = interpolate_target_field("v1.0.0", dir.path()).unwrap();
+        assert_eq!(result, "v1.0.0");
+    }
+
+    #[test]
+    fn interpolate_target_field_version_from_file() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("VERSION"), "1.2.3").unwrap();
+        let result = interpolate_target_field("v${VERSION}", dir.path()).unwrap();
+        assert_eq!(result, "v1.2.3");
+    }
+
+    #[test]
+    fn interpolate_target_field_version_trimmed_from_file() {
+        // VERSION file with trailing newline (the common case) must be trimmed.
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("VERSION"), "2.0.0\n").unwrap();
+        let result = interpolate_target_field("Release v${VERSION}", dir.path()).unwrap();
+        assert_eq!(result, "Release v2.0.0");
+    }
+
+    #[test]
+    fn interpolate_target_field_version_multiple_occurrences() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("VERSION"), "3.1.4").unwrap();
+        let result =
+            interpolate_target_field("v${VERSION}/build-${VERSION}.tar.gz", dir.path()).unwrap();
+        assert_eq!(result, "v3.1.4/build-3.1.4.tar.gz");
+    }
+
+    #[test]
+    fn interpolate_target_field_missing_version_file_is_error() {
+        let dir = TempDir::new().unwrap();
+        // No VERSION file in dir.
+        let err = interpolate_target_field("v${VERSION}", dir.path()).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("VERSION") && (msg.contains("no VERSION file") || msg.contains("found")),
+            "error should mention missing VERSION file: {msg}"
+        );
+    }
+
+    #[test]
+    fn interpolate_target_field_empty_version_file_is_error() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("VERSION"), "   \n").unwrap();
+        let err = interpolate_target_field("v${VERSION}", dir.path()).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("VERSION") && (msg.contains("empty") || msg.contains("whitespace")),
+            "error should mention empty VERSION file: {msg}"
+        );
+    }
+
+    #[test]
+    fn interpolate_target_field_no_version_placeholder_no_file_needed() {
+        // ${VERSION} is not referenced, so no VERSION file is needed.
+        let dir = TempDir::new().unwrap();
+        // No VERSION file exists — must not error.
+        let result = interpolate_target_field("static-tag", dir.path()).unwrap();
+        assert_eq!(result, "static-tag");
+    }
+
+    // ── github target VERSION interpolation ──────────────────────────────────
+
+    #[test]
+    fn github_target_dry_run_version_in_tag_resolves_from_file() {
+        let workspace = TempDir::new().unwrap();
+        let context = workspace.path();
+        fs::write(context.join("botforge.yaml"), "").unwrap();
+        fs::write(context.join("VERSION"), "0.7.2").unwrap();
+
+        let src_dir = context.join("artifacts");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::write(src_dir.join("vm.qcow2"), b"fake-qcow2-data").unwrap();
+
+        let manifest = shasset::manifest::Manifest::default();
+        let resolve_ctx = ResolveFileContext {
+            context,
+            manifest: &manifest,
+            cache_dir_override: None,
+        };
+
+        let registry = botforge_plugin_host::PluginRegistry::new();
+
+        let target = GithubTarget {
+            src: "@://artifacts/vm.qcow2".to_string(),
+            repo: "my-org/my-repo".to_string(),
+            tag: "v${VERSION}".to_string(),
+            title: Some("Release v${VERSION}".to_string()),
+            description: None,
+            secrets: std::collections::HashMap::new(),
+        };
+
+        // Dry-run must succeed and resolve tag + title from the VERSION file.
+        run_github_target(
+            &target,
+            &resolve_ctx,
+            &registry,
+            "https://api.github.com",
+            /* dry_run = */ true,
+        )
+        .expect("dry-run with ${VERSION} tag should succeed when VERSION file exists");
+    }
+
+    #[test]
+    fn github_target_dry_run_missing_version_file_is_error() {
+        let workspace = TempDir::new().unwrap();
+        let context = workspace.path();
+        fs::write(context.join("botforge.yaml"), "").unwrap();
+        // No VERSION file.
+
+        let src_dir = context.join("artifacts");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::write(src_dir.join("vm.qcow2"), b"fake-qcow2-data").unwrap();
+
+        let manifest = shasset::manifest::Manifest::default();
+        let resolve_ctx = ResolveFileContext {
+            context,
+            manifest: &manifest,
+            cache_dir_override: None,
+        };
+
+        let registry = botforge_plugin_host::PluginRegistry::new();
+
+        let target = GithubTarget {
+            src: "@://artifacts/vm.qcow2".to_string(),
+            repo: "my-org/my-repo".to_string(),
+            tag: "v${VERSION}".to_string(),
+            title: None,
+            description: None,
+            secrets: std::collections::HashMap::new(),
+        };
+
+        let err = run_github_target(
+            &target,
+            &resolve_ctx,
+            &registry,
+            "https://api.github.com",
+            /* dry_run = */ true,
+        )
+        .unwrap_err();
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("VERSION") && (msg.contains("no VERSION file") || msg.contains("found")),
+            "should give clear error about missing VERSION file: {msg}"
+        );
+    }
+
+    #[test]
+    fn github_target_secrets_unaffected_by_version_interpolation() {
+        // Secrets with ${VAR} templates must remain as template strings in
+        // the GithubTarget struct — they are never passed through
+        // interpolate_target_field and must not be altered.
+        let workspace = TempDir::new().unwrap();
+        let context = workspace.path();
+        fs::write(context.join("botforge.yaml"), "").unwrap();
+        fs::write(context.join("VERSION"), "9.9.9").unwrap();
+
+        let src_dir = context.join("artifacts");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::write(src_dir.join("vm.qcow2"), b"fake-data").unwrap();
+
+        let manifest = shasset::manifest::Manifest::default();
+        let resolve_ctx = ResolveFileContext {
+            context,
+            manifest: &manifest,
+            cache_dir_override: None,
+        };
+
+        let registry = botforge_plugin_host::PluginRegistry::new();
+
+        let secrets: std::collections::HashMap<String, String> =
+            [("token".to_string(), "${GITHUB_TOKEN}".to_string())]
+                .into_iter()
+                .collect();
+
+        let target = GithubTarget {
+            src: "@://artifacts/vm.qcow2".to_string(),
+            repo: "my-org/my-repo".to_string(),
+            tag: "v${VERSION}".to_string(),
+            title: None,
+            description: None,
+            secrets,
+        };
+
+        // In dry-run mode the secret is never resolved — it must still be the
+        // template string after the call returns.
+        run_github_target(
+            &target,
+            &resolve_ctx,
+            &registry,
+            "https://api.github.com",
+            /* dry_run = */ true,
+        )
+        .expect("dry-run with VERSION in tag and unresolved secret should succeed");
+
+        assert_eq!(
+            target.secrets.get("token").map(String::as_str),
+            Some("${GITHUB_TOKEN}"),
+            "secret template must remain verbatim — never altered by VERSION interpolation"
+        );
     }
 }
