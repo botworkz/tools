@@ -1,5 +1,5 @@
 [workspace]
-members = ["shasset", "botforge", "viscous", "botforge-plugin-host", "botforge-plugin-hello", "botforge-plugin-hello-badabi", "botforge-plugin-pigz"]
+members = ["shasset", "botforge", "viscous", "botforge-plugin-host", "botforge-plugin-hello", "botforge-plugin-hello-badabi", "botforge-plugin-pigz", "botforge-plugin-github"]
 exclude = ["viscous/tests/fixtures"]
 resolver = "2"
 
