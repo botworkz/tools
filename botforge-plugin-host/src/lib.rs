@@ -63,14 +63,16 @@
 //!
 //! # `core/ping` handshake seam
 //!
-//! `core/ping` is a lightweight host-level diagnostic/handshake capability.  Its
-//! sole purpose is to prove the full path end to end:
+//! `core/ping` is a lightweight host-level diagnostic/handshake capability, not
+//! a general-purpose plugin feature. Its sole purpose is to prove the full path
+//! end to end:
 //!
 //! > load → `abi_version()` hard-match → read `provides` → reconcile/wire →
 //! > call across boundary → get the correct sentinel back
 //!
-//! It takes no host-environment access (trust boundary upheld).  This capability
-//! persists as the loader's permanent self-test seam.
+//! The "must return 42" contract exists only for this self-test seam. It takes
+//! no host-environment access (trust boundary upheld), and persists as the
+//! loader's permanent handshake check.
 //!
 //! ## Plugin ABI contract for `core/ping`
 //!

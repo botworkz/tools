@@ -33,9 +33,15 @@ static NAME_HELLO: &[u8] = b"hello\0";
 /// Returns the ABI version this plugin was built against.
 ///
 /// The host hard-matches this value against [`HOST_ABI_VERSION`].
+/// The optional `wrong-abi` feature exists only for acceptance-test fixtures
+/// that need a deliberately incompatible ABI number.
 #[no_mangle]
 pub extern "C" fn abi_version() -> u32 {
-    HOST_ABI_VERSION
+    if cfg!(feature = "wrong-abi") {
+        HOST_ABI_VERSION + 100
+    } else {
+        HOST_ABI_VERSION
+    }
 }
 
 /// Returns the number of `(slot, name)` pairs this plugin provides.

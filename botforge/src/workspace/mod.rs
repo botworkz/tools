@@ -178,7 +178,8 @@ pub(crate) fn load_inline_manifest(context_root: &Path) -> Result<Manifest> {
 ///
 /// - Duplicate `name` values across the `plugins:` list are an error.
 /// - `src` is resolved via the two-root scheme:
-///   - Absolute paths are used as-is.
+///   - Absolute paths are used exactly as provided in config (no normalization
+///     or `..` cleanup by this function).
 ///   - Relative paths are resolved against `context_root`.
 /// - `name` must be non-empty.
 /// - `provides:` entries are passed through as-is (slot format validation
@@ -216,7 +217,12 @@ pub(crate) fn load_plugin_entries(context_root: &Path) -> Result<Vec<PluginEntry
                 marker.display()
             );
         }
-        let src = resolve_under_root(context_root, PathBuf::from(&raw.src));
+        let src = PathBuf::from(&raw.src);
+        let src = if src.is_absolute() {
+            src
+        } else {
+            resolve_under_root(context_root, src)
+        };
         entries.push(PluginEntry {
             name: raw.name,
             src,
@@ -421,6 +427,20 @@ mod tests {
             std::path::Path::new("/usr/share/botforge/plugins/libhello.so")
         );
         assert!(entries[0].provides.is_none());
+    }
+
+    #[test]
+    fn load_plugin_entries_keeps_absolute_src_exactly_as_written() {
+        let root = TempDir::new().unwrap();
+        let raw_src = "/usr/share/botforge/plugins/../plugins/libhello.so";
+        write_named_marker(
+            root.path(),
+            "botforge.yaml",
+            &format!("plugins:\n  - name: hello\n    src: {raw_src}\n"),
+        );
+        let entries = load_plugin_entries(root.path()).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].src, std::path::Path::new(raw_src));
     }
 
     #[test]

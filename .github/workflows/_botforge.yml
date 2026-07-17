@@ -50,8 +50,10 @@ jobs:
     # ── Plugin host acceptance tests ─────────────────────────────────────────
     # Build the hello-world fixture cdylib first, then run the plugin-host
     # acceptance tests against the real compiled libhello.so.
-    - name: Build botforge-plugin-hello fixture (.so)
-      run: cargo build -p botforge-plugin-hello
+    - name: Build plugin fixture cdylibs (.so)
+      run: |
+        cargo build -p botforge-plugin-hello
+        cargo build -p botforge-plugin-hello-badabi
     - name: Run plugin-host acceptance tests
       run: cargo test -p botforge-plugin-host
 

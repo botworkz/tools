@@ -1121,14 +1121,14 @@ const char *plugin_provides_name(uint32_t index);  // static string
 Plus one entrypoint per declared capability, e.g. for `core/ping`:
 
 ```c
-uint32_t plugin_core_ping(void);  // must return 42
+uint32_t plugin_core_ping(void);  // host handshake self-test only; must return 42
 ```
 
 ### Capability slots
 
 | Slot | Description |
 |------|-------------|
-| `core/ping` | Host-level handshake/diagnostic.  Returns `42`. |
+| `core/ping` | Host-level handshake/self-test seam (not a general-purpose capability). Must return `42` only to prove load→call round-trip. |
 
 More slots will be added in follow-up PRs (e.g. `build/compressor`).
 

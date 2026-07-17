@@ -19,5 +19,9 @@ crate-type = ["cdylib"]
 # Reference the host's ABI version constant so the fixture can never drift.
 botforge-plugin-host = { path = "../botforge-plugin-host" }
 
+[features]
+default = []
+wrong-abi = []
+
 [lints]
 workspace = true

@@ -336,6 +336,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "botforge-plugin-hello-badabi"
+version = "0.1.0"
+dependencies = [
+ "botforge-plugin-host",
+]
+
+[[package]]
 name = "botforge-plugin-host"
 version = "0.1.0"
 dependencies = [

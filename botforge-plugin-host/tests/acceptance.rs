@@ -9,6 +9,7 @@
 //!
 //! ```sh
 //! cargo build -p botforge-plugin-hello
+//! cargo build -p botforge-plugin-hello-badabi
 //! ```
 //!
 //! Then run the tests:
@@ -23,7 +24,9 @@
 //! the standard Cargo target directory layout.  The build profile (debug /
 //! release) is detected via `cfg(debug_assertions)`.
 
-use botforge_plugin_host::{LoadError, PingHandle, PluginRegistry, PING_SENTINEL};
+use botforge_plugin_host::{
+    LoadError, PingHandle, PluginRegistry, HOST_ABI_VERSION, PING_SENTINEL,
+};
 use std::path::{Path, PathBuf};
 
 // ── Fixture path helpers ──────────────────────────────────────────────────────
@@ -52,16 +55,17 @@ fn hello_so_path() -> PathBuf {
     target_dir().join("libhello.so")
 }
 
-/// Skip the test if the fixture .so has not been built yet.
-macro_rules! require_hello_so {
-    () => {{
-        let path = hello_so_path();
+/// Returns the path to `libhello_badabi.so` in the Cargo target directory.
+fn hello_badabi_so_path() -> PathBuf {
+    target_dir().join("libhello_badabi.so")
+}
+
+/// Require a fixture `.so` to exist before continuing.
+macro_rules! require_fixture_so {
+    ($path:expr, $hint:expr) => {{
+        let path = $path;
         if !path.exists() {
-            eprintln!(
-                "SKIP: {} not found — run `cargo build -p botforge-plugin-hello` first",
-                path.display()
-            );
-            return;
+            panic!("{} not found — run `{}` first", path.display(), $hint);
         }
         path
     }};
@@ -72,7 +76,7 @@ macro_rules! require_hello_so {
 /// Full path: load → abi_version → provides → reconcile → wire → call.
 #[test]
 fn acceptance_full_path_repo_relative() {
-    let so = require_hello_so!();
+    let so = require_fixture_so!(hello_so_path(), "cargo build -p botforge-plugin-hello");
     let mut reg = PluginRegistry::new();
     reg.load_plugin("hello", &so, None)
         .expect("hello plugin should load cleanly");
@@ -101,7 +105,7 @@ fn acceptance_full_path_repo_relative() {
 /// Explicit provides: filter — wiring only the listed slot.
 #[test]
 fn acceptance_provides_filter_wires_only_listed_slot() {
-    let so = require_hello_so!();
+    let so = require_fixture_so!(hello_so_path(), "cargo build -p botforge-plugin-hello");
     let mut reg = PluginRegistry::new();
     // Allow-list includes core/ping → it should be wired.
     reg.load_plugin("hello", &so, Some(&["core/ping".to_owned()]))
@@ -113,7 +117,7 @@ fn acceptance_provides_filter_wires_only_listed_slot() {
 /// Explicit provides: filter that excludes all slots — plugin registers nothing.
 #[test]
 fn acceptance_provides_filter_excludes_all() {
-    let so = require_hello_so!();
+    let so = require_fixture_so!(hello_so_path(), "cargo build -p botforge-plugin-hello");
     let mut reg = PluginRegistry::new();
     // Allow-list with a slot the plugin does NOT provide → filtered to empty.
     reg.load_plugin("hello", &so, Some(&["build/compressor".to_owned()]))
@@ -125,27 +129,48 @@ fn acceptance_provides_filter_excludes_all() {
 
 // ── Negative: ABI version mismatch ────────────────────────────────────────────
 
-/// A file that exports the wrong `abi_version()` must be rejected with a
-/// structured mismatch error.  We simulate this by creating a tiny inline
-/// shared library via a temporary file ... but that requires compiling C code
-/// at test time.  Instead we test the error type/message directly via
-/// unit-level construction (the real load path is covered by the positive tests
-/// above; mismatch is triggered there if HOST_ABI_VERSION ever changes).
+/// A real `.so` exporting the wrong `abi_version()` must be rejected by the
+/// loader with a structured mismatch error and no wiring side effects.
 #[test]
-fn abi_mismatch_error_is_structured() {
+fn abi_mismatch_real_so_is_rejected() {
+    let so = require_fixture_so!(
+        hello_badabi_so_path(),
+        "cargo build -p botforge-plugin-hello-badabi"
+    );
+    let mut reg = PluginRegistry::new();
+    let err = reg
+        .load_plugin("hello-badabi", &so, None)
+        .expect_err("wrong-ABI fixture must be rejected");
+    match err {
+        LoadError::AbiVersionMismatch {
+            plugin_version,
+            host_version,
+            ..
+        } => {
+            assert_eq!(host_version, HOST_ABI_VERSION);
+            assert_eq!(plugin_version, HOST_ABI_VERSION + 100);
+        }
+        other => panic!("expected AbiVersionMismatch, got: {other}"),
+    }
+    assert!(reg.plugins.is_empty(), "bad-ABI plugin must not be wired");
+    assert!(!reg.is_registered("core/ping", "hello"));
+}
+
+/// Structured mismatch errors should still render actionable host/plugin versions.
+#[test]
+fn abi_mismatch_error_display_is_structured() {
     let err = LoadError::AbiVersionMismatch {
         plugin: "bad-plugin".to_owned(),
         plugin_version: 99,
-        host_version: botforge_plugin_host::HOST_ABI_VERSION,
+        host_version: HOST_ABI_VERSION,
     };
     let msg = err.to_string();
     assert!(msg.contains("bad-plugin"), "must name the plugin: {msg}");
     assert!(msg.contains("99"), "must show plugin version: {msg}");
     assert!(
-        msg.contains(&botforge_plugin_host::HOST_ABI_VERSION.to_string()),
+        msg.contains(&HOST_ABI_VERSION.to_string()),
         "must show host version: {msg}"
     );
-    // Confirm it's a LoadError::AbiVersionMismatch variant.
     assert!(matches!(err, LoadError::AbiVersionMismatch { .. }));
 }
 
@@ -155,7 +180,7 @@ fn abi_mismatch_error_is_structured() {
 /// load, naming both providers.
 #[test]
 fn collision_same_plugin_loaded_twice() {
-    let so = require_hello_so!();
+    let so = require_fixture_so!(hello_so_path(), "cargo build -p botforge-plugin-hello");
     let mut reg = PluginRegistry::new();
     reg.load_plugin("hello", &so, None)
         .expect("first load should succeed");
@@ -192,7 +217,7 @@ fn collision_same_plugin_loaded_twice() {
 /// A built-in with the same (slot, name) blocks the plugin.
 #[test]
 fn collision_builtin_blocks_plugin() {
-    let so = require_hello_so!();
+    let so = require_fixture_so!(hello_so_path(), "cargo build -p botforge-plugin-hello");
     let mut reg = PluginRegistry::new();
     reg.seed_builtin("core/ping", "hello");
     let err = reg
