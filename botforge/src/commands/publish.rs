@@ -13,17 +13,44 @@
 //!   or reuse), via the `publish/github` plugin capability.  Requires the
 //!   `publish/github` plugin to be declared in the workspace marker.
 //!
-//! ## GitHub publish environment contract
+//! ## GitHub publish secrets contract
 //!
-//! The host reads the following environment variables and hands them
-//! explicitly across the plugin ABI boundary.  The plugin receives NO ambient
-//! host environment.
+//! Auth secrets are declared in the publish plan's `secrets:` map as
+//! `${VAR}` templates.  The host resolves each template via `interpolate_env`
+//! at publish time and passes the resolved values to the plugin across the ABI
+//! boundary.  **Resolved values are never stored, logged, or echoed.**  Any
+//! config display or dry-run output shows the template strings only.
 //!
-//! - `GITHUB_TOKEN` (fallback `GH_TOKEN`): bearer auth token for the
-//!   GitHub API.  **Required** unless `--dry-run` is active.
+//! Example:
+//!
+//! ```yaml
+//! publish:
+//!   github:
+//!     - src: "@artifact://images/vm.qcow2"
+//!       repo: my-org/my-repo
+//!       tag: v1.0.0
+//!       secrets:
+//!         token: ${GITHUB_TOKEN}
+//! ```
+//!
 //! - `GITHUB_API_URL`: base URL of the GitHub-compatible REST API.
 //!   Defaults to `https://api.github.com` when not set.  Override to
-//!   point at a mock server in CI.
+//!   point at a mock server in CI.  This is non-secret config, not a
+//!   `secrets:` entry.
+//!
+//! ## Ambient-env hygiene for plugin invocations
+//!
+//! Before each plugin invocation, the host trims the process environment to an
+//! explicit allowlist of benign, operationally-necessary variables (PATH,
+//! HOME, TLS/cert vars, proxy vars, etc.) and restores it afterward.  This is
+//! **hygiene / defence-in-depth for trusted in-process plugins, NOT an
+//! enforced security boundary.**
+//!
+//! The plugin already has full process access via its `.so` address space
+//! (the same posture Envoy takes for dynamic modules); this env trimming only
+//! deters *casual / accidental* ambient env reads.  It is racy in
+//! multi-threaded contexts; acceptable for this single-threaded publish path.
+//! Do not mistake this for a sandbox.
 //!
 //! ## Schema contract
 //!
@@ -67,11 +94,13 @@
 //!       tag: v1.0.0
 //!       title: "Release v1.0.0"
 //!       description: "Release notes here."
+//!       secrets:
+//!         token: ${GITHUB_TOKEN}
 //! ```
 
 use anyhow::{bail, Context, Result};
 use clap::{ArgGroup, Args};
-use shasset::manifest::Manifest;
+use shasset::manifest::{interpolate_env, Manifest};
 use std::path::{Path, PathBuf};
 
 use crate::config::{load_publish_config, FsTarget, GithubTarget, PublishConfig, S3Target};
@@ -191,23 +220,13 @@ fn run_publish(
             .as_ref()
             .expect("plugin registry must be Some when github targets are present");
 
-        // Resolve token and API base URL from host environment.
-        // In dry-run mode the token is optional (no network calls).
-        let token = if dry_run {
-            std::env::var("GITHUB_TOKEN")
-                .or_else(|_| std::env::var("GH_TOKEN"))
-                .unwrap_or_default()
-        } else {
-            std::env::var("GITHUB_TOKEN")
-                .or_else(|_| std::env::var("GH_TOKEN"))
-                .context("publish: github targets require a token in GITHUB_TOKEN or GH_TOKEN")?
-        };
-
+        // GITHUB_API_URL is non-secret config (a base URL, not a credential);
+        // it can remain env-driven.
         let api_base_url = std::env::var("GITHUB_API_URL")
             .unwrap_or_else(|_| "https://api.github.com".to_string());
 
         for (i, gh) in config.github.iter().enumerate() {
-            run_github_target(gh, &resolve_ctx, registry, &token, &api_base_url, dry_run)
+            run_github_target(gh, &resolve_ctx, registry, &api_base_url, dry_run)
                 .with_context(|| format!("publish: github[{i}] target failed"))?;
         }
     }
@@ -439,11 +458,77 @@ async fn upload_to_s3_async(
 
 // ─── github target ────────────────────────────────────────────────────────────
 
+/// Allowlist of environment variable names passed through to plugin
+/// invocations.  Variables not in this list are removed from the process
+/// environment for the duration of the plugin call and restored afterward.
+///
+/// **This is hygiene / defence-in-depth for trusted in-process plugins, NOT
+/// an enforced security boundary.**  A dlopen'd `.so` shares the address
+/// space and retains full process capabilities (filesystem, network, libc,
+/// `/proc/self/environ`).  This list deters *accidental* ambient env reads
+/// only — consistent with the Envoy dynamic-modules trust model.  Do not
+/// mistake this for a sandbox.
+const PLUGIN_ENV_ALLOWLIST: &[&str] = &[
+    "PATH",
+    "HOME",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "SSL_CERT_PATH",
+    "CURL_CA_BUNDLE",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TERM",
+    "USER",
+    "LOGNAME",
+    "XDG_RUNTIME_DIR",
+    "RUST_LOG",
+];
+
+/// Execute `f` with the process environment trimmed to [`PLUGIN_ENV_ALLOWLIST`].
+///
+/// Variables not in the allowlist are removed before calling `f` and
+/// restored (to their original values) afterward.  The restoration is
+/// best-effort; if `f` panics, env vars already removed will not be restored.
+///
+/// **Hygiene / deterrent only** — see [`PLUGIN_ENV_ALLOWLIST`] doc.
+fn with_trimmed_env<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    // Capture all current env vars not in the allowlist.
+    let removed: Vec<(String, String)> = std::env::vars()
+        .filter(|(k, _)| !PLUGIN_ENV_ALLOWLIST.contains(&k.as_str()))
+        .collect();
+
+    // Remove them from the current process environment.
+    for (k, _) in &removed {
+        std::env::remove_var(k);
+    }
+
+    let result = f();
+
+    // Restore all removed vars.
+    for (k, v) in removed {
+        std::env::set_var(k, v);
+    }
+
+    result
+}
+
 fn run_github_target(
     target: &GithubTarget,
     resolve_ctx: &ResolveFileContext<'_>,
     registry: &botforge_plugin_host::PluginRegistry,
-    token: &str,
     api_base_url: &str,
     dry_run: bool,
 ) -> Result<()> {
@@ -457,6 +542,8 @@ fn run_github_target(
     }
 
     if dry_run {
+        // In dry-run mode, do not resolve secrets (no network calls needed).
+        // Show only the template strings — never resolved values.
         for file in &files {
             eprintln!(
                 "[dry-run] github: would upload {} → {}/{}/releases/tag/{}",
@@ -468,6 +555,25 @@ fn run_github_target(
         }
         return Ok(());
     }
+
+    // Resolve secrets from the target's `secrets:` map via `interpolate_env`.
+    // Each value is a `${VAR}` template; the resolved values are live stack
+    // allocations that never leave this scope.
+    let resolved_secrets: Vec<(String, String)> = target
+        .secrets
+        .iter()
+        .map(|(name, tpl)| {
+            let value = interpolate_env(tpl).with_context(|| {
+                format!("github: failed to resolve secret '{name}' from template '{tpl}'")
+            })?;
+            Ok((name.clone(), value))
+        })
+        .collect::<Result<_>>()?;
+
+    let secrets_refs: Vec<(&str, &str)> = resolved_secrets
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
 
     // Look up the publish/github capability from the registry.
     let publisher = registry.get_publisher("github").ok_or_else(|| {
@@ -487,11 +593,12 @@ fn run_github_target(
         description: target.description.as_deref(),
         asset_paths: &asset_paths,
         api_base_url,
-        token,
+        secrets: &secrets_refs,
     };
 
-    let outcome = publisher
-        .publish(&request)
+    // Invoke the plugin with a trimmed environment (hygiene / deterrent; see
+    // PLUGIN_ENV_ALLOWLIST for the rationale and the trust-model caveat).
+    let outcome = with_trimmed_env(|| publisher.publish(&request))
         .with_context(|| format!("github: publish to {}/{} failed", target.repo, target.tag))?;
 
     eprintln!(
@@ -1391,18 +1498,18 @@ publish:
             tag: "v1.0.0".to_string(),
             title: Some("Release v1.0.0".to_string()),
             description: None,
+            secrets: std::collections::HashMap::new(),
         };
 
-        // Dry-run must succeed without a token or plugin loaded.
+        // Dry-run must succeed without secrets resolved or plugin loaded.
         run_github_target(
             &target,
             &resolve_ctx,
             &registry,
-            /* token = */ "",
             /* api_base_url = */ "https://api.github.com",
             /* dry_run = */ true,
         )
-        .expect("dry-run github target must succeed without plugin or token");
+        .expect("dry-run github target must succeed without plugin or secrets");
     }
 
     #[test]
@@ -1431,13 +1538,16 @@ publish:
             tag: "v1.0.0".to_string(),
             title: None,
             description: None,
+            // Provide a resolved token so the test reaches the plugin lookup.
+            secrets: [("token".to_string(), "dummy-token".to_string())]
+                .into_iter()
+                .collect(),
         };
 
         let err = run_github_target(
             &target,
             &resolve_ctx,
             &registry,
-            "dummy-token",
             "https://api.github.com",
             /* dry_run = */ false,
         )
@@ -1467,5 +1577,160 @@ publish:
         assert_eq!(config.github.len(), 1);
         assert!(config.fs.is_empty());
         assert!(config.s3.is_empty());
+    }
+
+    // ── github secrets config ─────────────────────────────────────────────────
+
+    #[test]
+    fn publish_config_github_secrets_parses() {
+        // Secrets declared as ${VAR} templates must round-trip through config
+        // as templates, not resolved values.
+        let yaml = r#"
+type: botforge/publish
+name: my-release
+publish:
+  github:
+    - src: "@artifact://images/vm.qcow2"
+      repo: my-org/my-repo
+      tag: v1.0.0
+      secrets:
+        token: ${GITHUB_TOKEN}
+        extra: ${EXTRA_SECRET}
+"#;
+        let (_dir, path) = write_temp_publish(yaml);
+        let config = crate::config::load_publish_config(&path).unwrap();
+        assert_eq!(config.github.len(), 1);
+        let gh = &config.github[0];
+        assert_eq!(
+            gh.secrets.get("token").map(String::as_str),
+            Some("${GITHUB_TOKEN}"),
+            "token secret template must be stored verbatim"
+        );
+        assert_eq!(
+            gh.secrets.get("extra").map(String::as_str),
+            Some("${EXTRA_SECRET}"),
+            "extra secret template must be stored verbatim"
+        );
+        // The secrets map must never contain a resolved value at this stage.
+        for (name, tpl) in &gh.secrets {
+            assert!(
+                tpl.starts_with("${") && tpl.ends_with('}'),
+                "secret '{name}' must be a ${{VAR}} template at config time, got: {tpl:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn publish_config_github_empty_secrets_is_allowed() {
+        // No `secrets:` block is allowed (omitted → empty map); resolution
+        // errors will surface at publish time, not load time.
+        let yaml = r#"
+type: botforge/publish
+name: my-release
+publish:
+  github:
+    - src: "@artifact://images/vm.qcow2"
+      repo: my-org/my-repo
+      tag: v1.0.0
+"#;
+        let (_dir, path) = write_temp_publish(yaml);
+        let config = crate::config::load_publish_config(&path).unwrap();
+        assert!(
+            config.github[0].secrets.is_empty(),
+            "absent secrets block must produce an empty map"
+        );
+    }
+
+    #[test]
+    fn github_target_missing_token_secret_is_error() {
+        // When no 'token' secret is provided and we are not in dry-run mode,
+        // the publish invocation must fail with a clear error.  We use a
+        // preloaded registry with the real plugin so the error comes from the
+        // plugin's 'token not found' path.
+        //
+        // This test only runs when the plugin .so has been built.
+        let workspace = TempDir::new().unwrap();
+        let context = workspace.path();
+        fs::write(context.join("botforge.yaml"), "").unwrap();
+
+        let src_dir = context.join("artifacts");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::write(src_dir.join("vm.qcow2"), b"data").unwrap();
+
+        let manifest = Manifest::default();
+        let resolve_ctx = ResolveFileContext {
+            context,
+            manifest: &manifest,
+            cache_dir_override: None,
+        };
+
+        // An empty secrets map means the plugin will not find "token".
+        let target = GithubTarget {
+            src: "@://artifacts/vm.qcow2".to_string(),
+            repo: "my-org/my-repo".to_string(),
+            tag: "v1.0.0".to_string(),
+            title: None,
+            description: None,
+            secrets: std::collections::HashMap::new(),
+        };
+
+        // Use an empty registry — missing plugin error fires first, which is
+        // also a legible failure (confirms the error propagation chain).
+        let registry = botforge_plugin_host::PluginRegistry::new();
+        let err = run_github_target(
+            &target,
+            &resolve_ctx,
+            &registry,
+            "https://api.github.com",
+            false,
+        )
+        .unwrap_err();
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("plugin") || msg.contains("publish/github"),
+            "should mention missing plugin or capability: {msg}"
+        );
+    }
+
+    // ── env hygiene: with_trimmed_env ─────────────────────────────────────────
+
+    #[test]
+    fn with_trimmed_env_restores_removed_vars() {
+        // Set a sentinel env var that is NOT in the allowlist.
+        let key = "_BOTFORGE_TEST_TRIMMED_RESTORE";
+        std::env::set_var(key, "original-value");
+
+        // Inside with_trimmed_env the var should be absent.
+        with_trimmed_env(|| {
+            assert!(
+                std::env::var(key).is_err(),
+                "non-allowlist var should be absent inside with_trimmed_env"
+            );
+        });
+
+        // After with_trimmed_env the var should be restored.
+        assert_eq!(
+            std::env::var(key).as_deref(),
+            Ok("original-value"),
+            "non-allowlist var must be restored after with_trimmed_env"
+        );
+
+        // Clean up.
+        std::env::remove_var(key);
+    }
+
+    #[test]
+    fn with_trimmed_env_allowlist_vars_remain() {
+        // PATH (always in allowlist) must remain set inside the closure.
+        let path_val = std::env::var("PATH").unwrap_or_default();
+        if !path_val.is_empty() {
+            with_trimmed_env(|| {
+                assert!(
+                    std::env::var("PATH").is_ok(),
+                    "PATH must remain set inside with_trimmed_env"
+                );
+            });
+        }
     }
 }

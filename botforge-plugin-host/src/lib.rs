@@ -140,11 +140,11 @@
 //!
 //! `publish/github` publishes build artifacts to a GitHub Releases endpoint.
 //! The host hands all inputs explicitly across the ABI boundary (trust
-//! boundary upheld): asset file paths, release metadata, the target repo, the
-//! **API base URL**, and the **auth token**.  The plugin never reads any ambient
-//! host environment.
+//! boundary upheld): asset file paths, release metadata, the target repo,
+//! the **API base URL**, and a **named-secrets map** (resolved by the host).
+//! The plugin never reads any ambient host environment.
 //!
-//! ## Plugin ABI contract for `publish/github`
+//! ## Plugin ABI contract for `publish/github` (ABI v4)
 //!
 //! ### Memory-ownership contract
 //!
@@ -154,20 +154,28 @@
 //! - The **host** is responsible for freeing the string by calling
 //!   `plugin_publish_github_free(*out_url)` exactly once after use.
 //! - `*out_url` is guaranteed non-null on success.
+//! - `*out_error` is **undefined** on success — the host must not read or free
+//!   it.
 //!
 //! On error (return value non-zero):
-//! - `*out_url` is **undefined** — the host must not read or free it.
+//! - The plugin allocates a NUL-terminated error-message string and writes its
+//!   address to `*out_error`.
+//! - The **host** is responsible for freeing the string by calling
+//!   `plugin_publish_github_free(*out_error)` exactly once after use.
+//! - `*out_url` is **undefined** on error — the host must not read or free it.
 //!
 //! `title` may be `NULL`, which the plugin treats as equivalent to `tag`.
 //! `description` may be `NULL`, which the plugin treats as equivalent to `""`.
 //! `asset_paths` may be `NULL` when `asset_count == 0` (no assets).
+//! `secret_keys`/`secret_values` may be `NULL` when `secret_count == 0`.
 //!
 //! ```c
 //! // Publish a GitHub Release.
 //! // Returns 0 on success; non-zero on error.
 //! // On success: *out_url points to a plugin-allocated NUL-terminated release
 //! // URL string.  The caller MUST call plugin_publish_github_free(*out_url)
-//! // after use.  On failure: *out_url is undefined.
+//! // after use.  On failure: *out_error is set to a plugin-allocated error
+//! // message; the caller MUST call plugin_publish_github_free(*out_error).
 //! int32_t plugin_publish_github(
 //!     const char        *repo,          // "owner/repo", non-null
 //!     const char        *tag,           // release tag, non-null
@@ -176,14 +184,17 @@
 //!     const char *const *asset_paths,   // array of NUL-terminated file paths
 //!     uint32_t           asset_count,   // length of asset_paths (0 is valid)
 //!     const char        *api_base_url,  // e.g. "https://api.github.com", non-null
-//!     const char        *token,         // bearer auth token, non-null
-//!     char             **out_url        // set to release URL on success
+//!     const char *const *secret_keys,   // array of secret name strings
+//!     const char *const *secret_values, // array of secret value strings (parallel)
+//!     uint32_t           secret_count,  // length of both secret arrays
+//!     char             **out_url,       // set to release URL on success
+//!     char             **out_error      // set to error message on failure
 //! );
 //!
-//! // Free a URL string previously returned by plugin_publish_github.
-//! // Calling with NULL is safe (no-op).  Must be called exactly once per
-//! // successful publish invocation.
-//! void plugin_publish_github_free(char *url);
+//! // Free a string previously returned (via *out_url or *out_error) by
+//! // plugin_publish_github.  Calling with NULL is safe (no-op).  Must be
+//! // called exactly once per non-null pointer returned by the plugin.
+//! void plugin_publish_github_free(char *ptr);
 //! ```
 //!
 //! # ABI version history
@@ -195,6 +206,8 @@
 //! |   | `plugin_build_decompress`, `plugin_build_compressor_free`). |
 //! | 3 | Added `publish/github` capability (`plugin_publish_github`, |
 //! |   | `plugin_publish_github_free`). |
+//! | 4 | Extended `publish/github`: named-secrets array replaces `token`; |
+//! |   | `out_error` out-parameter surfaces legible failure messages. |
 //!
 //! # Safety policy
 //!
@@ -222,7 +235,10 @@ use thiserror::Error;
 /// a backwards-incompatible way.
 ///
 /// Version 3 adds the `publish/github` capability slot.
-pub const HOST_ABI_VERSION: u32 = 3;
+/// Version 4 extends `publish/github`: named-secrets array replaces the single
+/// `token` parameter; an `out_error` out-parameter surfaces legible error
+/// messages on failure.
+pub const HOST_ABI_VERSION: u32 = 4;
 
 /// Sentinel value returned by a correct `core/ping` implementation.
 ///
@@ -310,9 +326,14 @@ pub enum LoadError {
     CompressorOutputOverflow { plugin: String, out_len: usize },
 
     /// A `publish/github` publish operation returned a non-zero error code
-    /// from the plugin.
-    #[error("plugin '{plugin}' publish/github operation failed with error code {code}")]
-    PublisherError { plugin: String, code: i32 },
+    /// from the plugin.  `message` is the human-readable error string that the
+    /// plugin wrote to `out_error` (empty when the plugin returned no message).
+    #[error("plugin '{plugin}' publish/github operation failed (code {code}): {message}")]
+    PublisherError {
+        plugin: String,
+        code: i32,
+        message: String,
+    },
 
     /// The plugin returned an invalid UTF-8 release URL.
     #[error("plugin '{plugin}' publish/github returned a non-UTF-8 release URL")]
@@ -505,11 +526,20 @@ pub struct PublishRequest<'a> {
     /// Base URL of the GitHub-compatible REST API
     /// (e.g. `"https://api.github.com"` or `"http://mock:8080"`).
     pub api_base_url: &'a str,
-    /// ****** token (`GITHUB_TOKEN` / `GH_TOKEN`).
-    pub token: &'a str,
+    /// Named resolved secrets to pass across the ABI boundary.
+    ///
+    /// Each entry is `(name, resolved_value)`.  The host resolves any
+    /// `${VAR}` templates at publish time and hands the live values here;
+    /// they are never stored beyond the duration of this call.
+    ///
+    /// The `publish/github` plugin reads the entry named `"token"` as its
+    /// bearer-auth credential.  Additional entries support future multi-secret
+    /// plugins without ABI changes.
+    pub secrets: &'a [(&'a str, &'a str)],
 }
 
 /// Outcome of a successful `publish/github` call.
+#[derive(Debug)]
 pub struct PublishOutcome {
     /// The web URL of the published release
     /// (e.g. `"https://github.com/owner/repo/releases/tag/v1.0.0"`).
@@ -526,10 +556,11 @@ pub struct PublishOutcome {
 ///
 /// Internally, `publish` calls the plugin's `plugin_publish_github` FFI
 /// function.  On success the plugin allocates a NUL-terminated release URL
-/// string and writes it to the out-parameter.  `publish` copies the URL into
-/// a Rust `String`, then calls `plugin_publish_github_free` to release the
-/// plugin-owned string.  The caller receives a purely Rust-owned
-/// `PublishOutcome` with no lifetime coupling to the plugin.
+/// string and writes it to `*out_url`; on failure it allocates a NUL-terminated
+/// error message and writes it to `*out_error`.  `publish` copies the
+/// relevant string into a Rust value, then calls `plugin_publish_github_free`
+/// to release the plugin-owned allocation.  The caller receives a purely
+/// Rust-owned value with no lifetime coupling to the plugin.
 ///
 /// # Safety
 ///
@@ -539,7 +570,7 @@ pub struct PublishOutcome {
 pub struct PublisherHandle {
     /// Plugin name (for error messages).
     plugin_name: String,
-    /// `plugin_publish_github` function pointer.
+    /// `plugin_publish_github` function pointer (ABI v4).
     ///
     /// SAFETY: see [`LoadedPlugin::load`].
     #[allow(clippy::type_complexity)]
@@ -551,10 +582,15 @@ pub struct PublisherHandle {
         *const *const std::os::raw::c_char, // asset_paths
         u32,                                // asset_count
         *const std::os::raw::c_char,        // api_base_url
-        *const std::os::raw::c_char,        // token
-        *mut *mut std::os::raw::c_char,     // out_url
+        *const *const std::os::raw::c_char, // secret_keys
+        *const *const std::os::raw::c_char, // secret_values
+        u32,                                // secret_count
+        *mut *mut std::os::raw::c_char,     // out_url  (success)
+        *mut *mut std::os::raw::c_char,     // out_error (failure)
     ) -> i32,
     /// `plugin_publish_github_free` function pointer.
+    ///
+    /// Frees both URL strings (success path) and error strings (failure path).
     ///
     /// SAFETY: see [`LoadedPlugin::load`].
     free_fn: unsafe extern "C" fn(*mut std::os::raw::c_char),
@@ -565,13 +601,15 @@ impl PublisherHandle {
     ///
     /// Converts `request` to C-compatible types, calls the plugin's
     /// `plugin_publish_github` entrypoint, copies the returned release URL
-    /// into a [`PublishOutcome`], and frees the plugin-allocated URL string.
+    /// into a [`PublishOutcome`] (or the error message into a
+    /// [`LoadError::PublisherError`]), and frees the plugin-allocated string.
     ///
     /// # Errors
     ///
     /// Returns [`LoadError::PublisherError`] if the plugin reports a non-zero
-    /// error code, or [`LoadError::PublisherInvalidUrl`] if the returned URL
-    /// is not valid UTF-8.
+    /// error code (with the plugin-supplied error message), or
+    /// [`LoadError::PublisherInvalidUrl`] if the returned URL is not valid
+    /// UTF-8.
     pub fn publish(&self, request: &PublishRequest<'_>) -> Result<PublishOutcome, LoadError> {
         use std::ffi::CString;
 
@@ -583,7 +621,6 @@ impl PublisherHandle {
             .description
             .map(|d| CString::new(d).unwrap_or_default());
         let api_base_url_c = CString::new(request.api_base_url).unwrap_or_default();
-        let token_c = CString::new(request.token).unwrap_or_default();
 
         // Build array of C string pointers for asset paths.
         // Keep `CString` values alive in a Vec so the pointers remain valid.
@@ -595,15 +632,35 @@ impl PublisherHandle {
         let asset_ptrs: Vec<*const std::os::raw::c_char> =
             asset_cstrings.iter().map(|cs| cs.as_ptr()).collect();
 
+        // Build parallel arrays for named secrets.
+        // Keep `CString` values alive until after the FFI call.
+        let secret_key_cstrings: Vec<CString> = request
+            .secrets
+            .iter()
+            .map(|(k, _)| CString::new(*k).unwrap_or_default())
+            .collect();
+        let secret_val_cstrings: Vec<CString> = request
+            .secrets
+            .iter()
+            .map(|(_, v)| CString::new(*v).unwrap_or_default())
+            .collect();
+        let secret_key_ptrs: Vec<*const std::os::raw::c_char> =
+            secret_key_cstrings.iter().map(|cs| cs.as_ptr()).collect();
+        let secret_val_ptrs: Vec<*const std::os::raw::c_char> =
+            secret_val_cstrings.iter().map(|cs| cs.as_ptr()).collect();
+
         let mut out_url: *mut std::os::raw::c_char = std::ptr::null_mut();
+        let mut out_error: *mut std::os::raw::c_char = std::ptr::null_mut();
 
         // SAFETY: We call the plugin's publish function pointer, which was
         // obtained from a live `Library` via `dlsym`.  All input C strings are
         // NUL-terminated and valid for the duration of this call (kept alive
-        // by the local CString variables above).  `out_url` is a valid stack
-        // address.  On success the plugin writes a non-null, plugin-allocated
-        // NUL-terminated string to `*out_url`; we copy it and free it below.
-        // On failure the out-parameter is undefined and we do not read it.
+        // by the local CString variables above).  `out_url` and `out_error`
+        // are valid stack addresses.
+        // On success (rc == 0): the plugin writes a non-null, plugin-allocated
+        // NUL-terminated string to `*out_url`; `*out_error` is undefined.
+        // On failure (rc != 0): the plugin writes a NUL-terminated error
+        // message to `*out_error`; `*out_url` is undefined.
         let rc = unsafe {
             (self.publish_fn)(
                 repo_c.as_ptr(),
@@ -619,15 +676,44 @@ impl PublisherHandle {
                 },
                 asset_ptrs.len() as u32,
                 api_base_url_c.as_ptr(),
-                token_c.as_ptr(),
+                if secret_key_ptrs.is_empty() {
+                    std::ptr::null()
+                } else {
+                    secret_key_ptrs.as_ptr()
+                },
+                if secret_val_ptrs.is_empty() {
+                    std::ptr::null()
+                } else {
+                    secret_val_ptrs.as_ptr()
+                },
+                secret_key_ptrs.len() as u32,
                 &mut out_url,
+                &mut out_error,
             )
         };
 
         if rc != 0 {
+            // Read the error message the plugin wrote to *out_error, then free
+            // the plugin-allocated string.  If the plugin wrote NULL (should
+            // not happen but defensive), use an empty message.
+            let message = if out_error.is_null() {
+                String::new()
+            } else {
+                // SAFETY: rc != 0 so the plugin guarantees `out_error` is a
+                // valid, non-null, NUL-terminated C string.
+                let s = unsafe { CStr::from_ptr(out_error) }
+                    .to_str()
+                    .unwrap_or("")
+                    .to_owned();
+                // SAFETY: `out_error` was allocated by the plugin and must be
+                // freed via `plugin_publish_github_free` exactly once.
+                unsafe { (self.free_fn)(out_error) };
+                s
+            };
             return Err(LoadError::PublisherError {
                 plugin: self.plugin_name.clone(),
                 code: rc,
+                message,
             });
         }
 
@@ -929,22 +1015,25 @@ impl LoadedPlugin {
                     // Resolve both publisher symbols.
                     //
                     // SAFETY: Each symbol is looked up with the exact signature
-                    // documented in the module-level `publish/github` ABI
+                    // documented in the module-level `publish/github` ABI v4
                     // contract.  `Symbol::into_raw` detaches the lifetime from
                     // `lib`; the raw pointers remain valid as long as `_lib`
                     // (stored on the returned `LoadedPlugin`) is alive.
 
                     #[allow(clippy::type_complexity)]
                     type PublishFn = unsafe extern "C" fn(
-                        *const std::os::raw::c_char,
-                        *const std::os::raw::c_char,
-                        *const std::os::raw::c_char,
-                        *const std::os::raw::c_char,
-                        *const *const std::os::raw::c_char,
-                        u32,
-                        *const std::os::raw::c_char,
-                        *const std::os::raw::c_char,
-                        *mut *mut std::os::raw::c_char,
+                        *const std::os::raw::c_char,        // repo
+                        *const std::os::raw::c_char,        // tag
+                        *const std::os::raw::c_char,        // title
+                        *const std::os::raw::c_char,        // description
+                        *const *const std::os::raw::c_char, // asset_paths
+                        u32,                                // asset_count
+                        *const std::os::raw::c_char,        // api_base_url
+                        *const *const std::os::raw::c_char, // secret_keys
+                        *const *const std::os::raw::c_char, // secret_values
+                        u32,                                // secret_count
+                        *mut *mut std::os::raw::c_char,     // out_url
+                        *mut *mut std::os::raw::c_char,     // out_error
                     ) -> i32;
 
                     let publish_sym: Symbol<PublishFn> = unsafe {
@@ -1252,10 +1341,12 @@ mod tests {
         let err = LoadError::PublisherError {
             plugin: "github".to_owned(),
             code: -1,
+            message: "GitHub API 401: Bad credentials".to_owned(),
         };
         let msg = err.to_string();
         assert!(msg.contains("github"), "should name plugin: {msg}");
         assert!(msg.contains("-1"), "should show error code: {msg}");
+        assert!(msg.contains("401"), "should include error message: {msg}");
 
         let err2 = LoadError::PublisherInvalidUrl {
             plugin: "github".to_owned(),

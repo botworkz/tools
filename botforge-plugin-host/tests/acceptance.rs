@@ -623,7 +623,7 @@ fn github_acceptance_full_path_against_mock() {
         description: Some("Test release from botforge acceptance test."),
         asset_paths: &[asset_path.as_path()],
         api_base_url: &mock.base_url,
-        token: "dummy-test-token",
+        secrets: &[("token", "dummy-test-token")],
     };
 
     let outcome = publisher
@@ -744,4 +744,162 @@ fn github_and_pigz_coexist_no_collision() {
 fn get_publisher_returns_none_without_plugin() {
     let reg = PluginRegistry::new();
     assert!(reg.get_publisher("github").is_none());
+}
+
+// ── Error-path: mock HTTP errors surface as legible messages ─────────────────
+
+/// A mock server that always returns a fixed status code with a JSON body.
+struct FixedStatusMockServer {
+    pub base_url: String,
+    _server: std::sync::Arc<tiny_http::Server>,
+}
+
+impl FixedStatusMockServer {
+    fn start(status: u16, body: &'static str) -> Self {
+        let server = tiny_http::Server::http("127.0.0.1:0").expect("bind mock server");
+        let addr = server.server_addr().to_ip().expect("server addr");
+        let base_url = format!("http://127.0.0.1:{}", addr.port());
+        let server = std::sync::Arc::new(server);
+        let server_clone = std::sync::Arc::clone(&server);
+
+        std::thread::spawn(move || {
+            while let Ok(req) = server_clone.recv() {
+                let response = tiny_http::Response::from_string(body)
+                    .with_status_code(status)
+                    .with_header(
+                        "Content-Type: application/json"
+                            .parse::<tiny_http::Header>()
+                            .unwrap(),
+                    );
+                let _ = req.respond(response);
+            }
+        });
+
+        FixedStatusMockServer {
+            base_url,
+            _server: server,
+        }
+    }
+}
+
+/// Helper: load the github plugin, publish against a mock, return the error.
+fn github_publish_expect_err(mock_base_url: &str) -> botforge_plugin_host::LoadError {
+    let so = require_fixture_so!(github_so_path(), "cargo build -p botforge-plugin-github");
+    let mut reg = PluginRegistry::new();
+    reg.load_plugin("github", &so, None)
+        .expect("github plugin should load cleanly");
+
+    let tmpdir = tempfile::tempdir().expect("temp dir");
+    let asset_path = tmpdir.path().join("asset.bin");
+    std::fs::write(&asset_path, b"test-data").expect("write temp asset");
+
+    let publisher = reg.get_publisher("github").expect("publisher handle");
+    let request = botforge_plugin_host::PublishRequest {
+        repo: "owner/repo",
+        tag: "v1.0.0",
+        title: None,
+        description: None,
+        asset_paths: &[asset_path.as_path()],
+        api_base_url: mock_base_url,
+        secrets: &[("token", "dummy-token")],
+    };
+
+    publisher
+        .publish(&request)
+        .expect_err("publish against error mock must fail")
+}
+
+/// A 401 response must surface as `PublisherError` with a legible message.
+#[test]
+fn github_error_401_surfaces_legible_message() {
+    let mock = FixedStatusMockServer::start(
+        401,
+        r#"{"message":"Bad credentials","documentation_url":"https://docs.github.com"}"#,
+    );
+
+    let err = github_publish_expect_err(&mock.base_url);
+    match &err {
+        LoadError::PublisherError { code, message, .. } => {
+            assert_eq!(*code, -1, "error code must be -1");
+            assert!(
+                message.contains("401")
+                    || message.contains("Unauthorized")
+                    || message.contains("credentials"),
+                "error message must mention 401 or auth failure: {message:?}"
+            );
+        }
+        other => panic!("expected PublisherError, got: {other}"),
+    }
+}
+
+/// A 500 response must surface as `PublisherError` with a legible message.
+#[test]
+fn github_error_500_surfaces_legible_message() {
+    let mock = FixedStatusMockServer::start(500, r#"{"message":"Internal Server Error"}"#);
+
+    let err = github_publish_expect_err(&mock.base_url);
+    match &err {
+        LoadError::PublisherError { code, message, .. } => {
+            assert_eq!(*code, -1, "error code must be -1");
+            assert!(
+                message.contains("500") || message.contains("Server"),
+                "error message must mention 500: {message:?}"
+            );
+        }
+        other => panic!("expected PublisherError, got: {other}"),
+    }
+}
+
+/// Missing 'token' in secrets must surface a clear error message.
+#[test]
+fn github_missing_token_in_secrets_surfaces_legible_message() {
+    let so = require_fixture_so!(github_so_path(), "cargo build -p botforge-plugin-github");
+    let mut reg = PluginRegistry::new();
+    reg.load_plugin("github", &so, None)
+        .expect("github plugin should load cleanly");
+
+    let tmpdir = tempfile::tempdir().expect("temp dir");
+    let asset_path = tmpdir.path().join("asset.bin");
+    std::fs::write(&asset_path, b"test-data").expect("write temp asset");
+
+    let publisher = reg.get_publisher("github").expect("publisher handle");
+    let request = botforge_plugin_host::PublishRequest {
+        repo: "owner/repo",
+        tag: "v1.0.0",
+        title: None,
+        description: None,
+        asset_paths: &[asset_path.as_path()],
+        api_base_url: "http://127.0.0.1:1",
+        // Deliberately omit 'token'.
+        secrets: &[("other_key", "other_value")],
+    };
+
+    let err = publisher
+        .publish(&request)
+        .expect_err("missing token must fail");
+
+    match &err {
+        LoadError::PublisherError { code, message, .. } => {
+            assert_eq!(*code, -1, "error code must be -1");
+            assert!(
+                message.contains("token") || message.contains("secret"),
+                "error must mention missing token: {message:?}"
+            );
+        }
+        other => panic!("expected PublisherError, got: {other}"),
+    }
+}
+
+/// `PublisherError` display string must include the message.
+#[test]
+fn publisher_error_display_includes_message() {
+    let err = LoadError::PublisherError {
+        plugin: "github".to_owned(),
+        code: -1,
+        message: "GitHub API 401: Bad credentials".to_owned(),
+    };
+    let s = err.to_string();
+    assert!(s.contains("github"), "must name plugin: {s}");
+    assert!(s.contains("401"), "must contain message content: {s}");
+    assert!(s.contains("-1"), "must contain code: {s}");
 }

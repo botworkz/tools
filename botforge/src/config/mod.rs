@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use serde::{de, Deserialize};
 use serde_yaml::Value;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::qemu::PortSpec;
@@ -529,9 +529,8 @@ struct RawS3Target {
 /// GitHub Releases target block in a `type: botforge/publish` document.
 ///
 /// Requires the `publish/github` plugin capability to be declared in the
-/// workspace marker under `plugins:`.  The host resolves the auth token
-/// from `GITHUB_TOKEN` (fallback `GH_TOKEN`) and the API base URL from
-/// `GITHUB_API_URL` (default `https://api.github.com`).
+/// workspace marker under `plugins:`.  Auth and configuration are passed via
+/// the `secrets:` and `api_base_url:` fields (or `GITHUB_API_URL` env var).
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawGithubTarget {
@@ -548,6 +547,21 @@ struct RawGithubTarget {
     /// Release description / body text.  Optional; defaults to `""`.
     #[serde(default)]
     description: Option<String>,
+    /// Named secret templates resolved by the host at publish time.
+    ///
+    /// Each value is a `${VAR}` template (e.g. `${GITHUB_TOKEN}`).  The host
+    /// calls `interpolate_env` on each template at publish time and passes the
+    /// resolved values across the plugin ABI.  Resolved values are never
+    /// stored.  Any config display or dry-run output MUST show only the
+    /// template strings, never the resolved values.
+    ///
+    /// The `publish/github` plugin requires a `"token"` entry:
+    /// ```yaml
+    /// secrets:
+    ///   token: ${GITHUB_TOKEN}
+    /// ```
+    #[serde(default)]
+    secrets: HashMap<String, String>,
 }
 
 /// Raw deserialization target for the nested `publish:` target map in a
@@ -612,10 +626,17 @@ pub(crate) struct S3Target {
 
 /// GitHub Releases publish target.
 ///
-/// Requires the `publish/github` plugin capability.  The host reads
-/// `GITHUB_TOKEN` (fallback `GH_TOKEN`) for auth and `GITHUB_API_URL`
-/// (default `https://api.github.com`) for the API base URL; both are
-/// passed explicitly across the plugin ABI boundary.
+/// Requires the `publish/github` plugin capability.  The host resolves the
+/// `secrets:` map templates via `interpolate_env` at publish time and passes
+/// the resolved values across the plugin ABI.  The API base URL comes from
+/// the `GITHUB_API_URL` environment variable (default
+/// `https://api.github.com`).
+///
+/// ## Template-only invariant
+///
+/// `secrets` stores `${VAR}` templates as written in the YAML — **never**
+/// resolved values.  Any config display, dry-run output, or serialisation
+/// MUST emit the template strings, not the values.
 #[derive(Debug)]
 pub(crate) struct GithubTarget {
     /// Resolved `@`-reference string (as written in the YAML).
@@ -628,6 +649,10 @@ pub(crate) struct GithubTarget {
     pub(crate) title: Option<String>,
     /// Optional release body text; defaults to `""` when absent.
     pub(crate) description: Option<String>,
+    /// Named secret templates (e.g. `{"token": "${GITHUB_TOKEN}"}`).
+    /// Resolved by the host at publish time via `interpolate_env`; never stored
+    /// as live values.
+    pub(crate) secrets: HashMap<String, String>,
 }
 
 /// Validated publish plan loaded from a `type: botforge/publish` document.
@@ -738,6 +763,7 @@ pub(crate) fn load_publish_config(path: &Path) -> Result<PublishConfig> {
                 tag: t.tag,
                 title: t.title,
                 description: t.description,
+                secrets: t.secrets,
             })
         })
         .collect::<Result<_>>()?;
