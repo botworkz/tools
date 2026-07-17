@@ -48,6 +48,9 @@ enum DocumentType {
     /// `disk_size:`, `memsize:`, `smp:`).
     #[serde(rename = "botforge/fragment")]
     Fragment,
+    /// An entrypoint document consumed directly by `botforge publish`.
+    #[serde(rename = "botforge/publish")]
+    Publish,
 }
 
 impl DocumentType {
@@ -56,6 +59,7 @@ impl DocumentType {
             DocumentType::Test => "botforge/test",
             DocumentType::Build => "botforge/build",
             DocumentType::Fragment => "botforge/fragment",
+            DocumentType::Publish => "botforge/publish",
         }
     }
 
@@ -72,6 +76,11 @@ impl DocumentType {
     /// Returns `true` if this kind can be consumed via a `uses:` reference.
     fn is_consumable_fragment(self) -> bool {
         matches!(self, DocumentType::Fragment)
+    }
+
+    /// Returns `true` if this kind is the expected entrypoint for `botforge publish`.
+    fn is_publish_entrypoint(self) -> bool {
+        matches!(self, DocumentType::Publish)
     }
 }
 
@@ -481,6 +490,149 @@ pub(crate) fn load_build_config(repo_root: &Path, path: &Path) -> Result<BuildCo
         files: &config.files,
     })?;
     Ok(config)
+}
+
+// ─── publish config ───────────────────────────────────────────────────────────
+
+/// Filesystem target block in a `type: botforge/publish` document.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawFsTarget {
+    /// Source: an `@`-notation reference, e.g. `@artifact://images/vm.qcow2`.
+    src: String,
+    /// Destination directory on the local filesystem.  Created if absent.
+    dest: String,
+}
+
+/// S3 target block in a `type: botforge/publish` document.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawS3Target {
+    /// Source: an `@`-notation reference, e.g. `@artifact://images/vm.qcow2`.
+    src: String,
+    /// S3 destination URL, e.g. `s3://my-bucket/releases/`.
+    /// Credentials are read from the environment
+    /// (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION`,
+    /// and optionally `AWS_ENDPOINT_URL` for S3-compatible services).
+    dest: String,
+}
+
+/// Raw deserialization target for a top-level `botforge publish` document.
+///
+/// `deny_unknown_fields` ensures that unrecognised target blocks (e.g.
+/// `github:`) produce a clear parse-time error.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPublishDocument {
+    #[serde(rename = "type")]
+    doc_type: DocumentType,
+    #[serde(default)]
+    name: Option<String>,
+    /// Optional filesystem target.
+    #[serde(default)]
+    fs: Option<RawFsTarget>,
+    /// Optional S3 target.
+    #[serde(default)]
+    s3: Option<RawS3Target>,
+}
+
+/// Filesystem publish target.
+#[derive(Debug)]
+pub(crate) struct FsTarget {
+    /// Resolved `@`-reference string (as written in the YAML).
+    pub(crate) src: String,
+    /// Local destination directory.
+    pub(crate) dest: String,
+}
+
+/// S3 publish target.
+#[derive(Debug)]
+pub(crate) struct S3Target {
+    /// Resolved `@`-reference string (as written in the YAML).
+    pub(crate) src: String,
+    /// S3 destination URL (`s3://bucket/prefix`).
+    pub(crate) dest: String,
+}
+
+/// Validated publish plan loaded from a `type: botforge/publish` document.
+#[derive(Debug)]
+pub(crate) struct PublishConfig {
+    #[allow(dead_code)]
+    pub(crate) name: String,
+    /// Optional filesystem target.
+    pub(crate) fs: Option<FsTarget>,
+    /// Optional S3 target (credentials from environment).
+    pub(crate) s3: Option<S3Target>,
+}
+
+/// Load and validate a `type: botforge/publish` document from `path`.
+pub(crate) fn load_publish_config(path: &Path) -> Result<PublishConfig> {
+    let yaml = std::fs::read_to_string(path)
+        .with_context(|| format!("cannot read publish config: {}", path.display()))?;
+    let raw: RawPublishDocument = serde_yaml::from_str(&yaml)
+        .with_context(|| format!("invalid publish config: {}", path.display()))?;
+    if !raw.doc_type.is_publish_entrypoint() {
+        anyhow::bail!(
+            "botforge publish requires a 'type: botforge/publish' document, got 'type: {}'",
+            raw.doc_type.as_str()
+        );
+    }
+    let name = validate_entrypoint_name(raw.name, path, DocumentType::Publish)?;
+
+    let fs = raw
+        .fs
+        .map(|t| {
+            validate_publish_src(&t.src, path, "fs")?;
+            Ok::<_, anyhow::Error>(FsTarget {
+                src: t.src,
+                dest: t.dest,
+            })
+        })
+        .transpose()?;
+
+    let s3 = raw
+        .s3
+        .map(|t| {
+            validate_publish_src(&t.src, path, "s3")?;
+            validate_s3_dest(&t.dest, path)?;
+            Ok::<_, anyhow::Error>(S3Target {
+                src: t.src,
+                dest: t.dest,
+            })
+        })
+        .transpose()?;
+
+    Ok(PublishConfig { name, fs, s3 })
+}
+
+/// Assert that a publish `src` value is an `@`-reference.
+fn validate_publish_src(src: &str, path: &Path, target: &str) -> Result<()> {
+    if !src.starts_with('@') {
+        anyhow::bail!(
+            "publish {target}.src must be an @-reference (e.g. @artifact://...), \
+             got '{src}' in {}",
+            path.display()
+        );
+    }
+    crate::resolver::Reference::parse(src).with_context(|| {
+        format!(
+            "invalid {target}.src reference '{src}' in {}",
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
+/// Assert that a publish `s3.dest` value starts with `s3://`.
+fn validate_s3_dest(dest: &str, path: &Path) -> Result<()> {
+    if !dest.starts_with("s3://") {
+        anyhow::bail!(
+            "publish s3.dest must be an S3 URL starting with 's3://', \
+             got '{dest}' in {}",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 fn validate_entrypoint_name(

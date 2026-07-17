@@ -32,6 +32,7 @@ use super::marker_path;
 struct RawPlan {
     pub(crate) build: Option<String>,
     pub(crate) test: Option<String>,
+    pub(crate) publish: Option<String>,
 }
 
 /// The `botforge.yaml` root document — only the registry block is consumed here.
@@ -52,6 +53,8 @@ pub(crate) struct CommittedRegistry {
     pub(crate) builds: BTreeMap<String, PathBuf>,
     /// Maps plan name → absolute path for `type: botforge/test` entries.
     pub(crate) tests: BTreeMap<String, PathBuf>,
+    /// Maps plan name → absolute path for `type: botforge/publish` entries.
+    pub(crate) publishes: BTreeMap<String, PathBuf>,
 }
 
 impl CommittedRegistry {
@@ -76,6 +79,19 @@ impl CommittedRegistry {
         self.tests.get(name).ok_or_else(|| {
             anyhow::anyhow!(
                 "no test named '{}' in registry (run 'botforge config sync')",
+                name
+            )
+        })
+    }
+
+    /// Resolve a publish spec by name.
+    ///
+    /// Returns the absolute path of the spec file, or an error naming the registry
+    /// and hinting at `botforge config sync`.
+    pub(crate) fn publish(&self, name: &str) -> Result<&PathBuf> {
+        self.publishes.get(name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "no publish plan named '{}' in registry (run 'botforge config sync')",
                 name
             )
         })
@@ -141,7 +157,17 @@ pub(crate) fn load_committed_registry(context_root: &Path) -> Result<CommittedRe
                 )
             })?;
             let abs = context_root.join(&spec);
-            reg.tests.insert(name, abs);
+            reg.tests.insert(name.clone(), abs);
+        }
+        if let Some(spec) = plan.publish {
+            validate_spec_path(&spec).with_context(|| {
+                format!(
+                    "invalid publish spec path for plan '{name}' in {}",
+                    marker_path.display()
+                )
+            })?;
+            let abs = context_root.join(&spec);
+            reg.publishes.insert(name, abs);
         }
     }
 
@@ -153,12 +179,13 @@ pub(crate) fn load_committed_registry(context_root: &Path) -> Result<CommittedRe
 /// Rewrite the `plans:` registry block in `<context_root>/botforge.yaml`,
 /// preserving all other keys (e.g. `config:`, `assets:`) unchanged.
 ///
-/// `builds` and `tests` map plan names → **absolute** paths.  Paths are stored
-/// as relative-to-context-root in the YAML.
+/// `builds`, `tests`, and `publishes` map plan names → **absolute** paths.
+/// Paths are stored as relative-to-context-root in the YAML.
 pub(crate) fn save_registry(
     context_root: &Path,
     builds: &BTreeMap<String, PathBuf>,
     tests: &BTreeMap<String, PathBuf>,
+    publishes: &BTreeMap<String, PathBuf>,
 ) -> Result<()> {
     let marker_path = marker_path(context_root)?;
 
@@ -178,7 +205,7 @@ pub(crate) fn save_registry(
         .ok_or_else(|| anyhow::anyhow!("{} is not a YAML mapping", marker_path.display()))?;
 
     // Build the new `plans:` block.
-    let plans_block = build_plans_yaml(context_root, builds, tests)?;
+    let plans_block = build_plans_yaml(context_root, builds, tests, publishes)?;
 
     // Insert or overwrite the `plans:` key.
     map.insert(serde_yaml::Value::String("plans".to_string()), plans_block);
@@ -192,14 +219,19 @@ pub(crate) fn save_registry(
     Ok(())
 }
 
-/// Build a `plans:` YAML value from two plan-name → absolute-path maps.
+/// Build a `plans:` YAML value from plan-name → absolute-path maps.
 fn build_plans_yaml(
     context_root: &Path,
     builds: &BTreeMap<String, PathBuf>,
     tests: &BTreeMap<String, PathBuf>,
+    publishes: &BTreeMap<String, PathBuf>,
 ) -> Result<serde_yaml::Value> {
     // Collect the union of all plan names in sorted order.
-    let names: BTreeSet<&String> = builds.keys().chain(tests.keys()).collect();
+    let names: BTreeSet<&String> = builds
+        .keys()
+        .chain(tests.keys())
+        .chain(publishes.keys())
+        .collect();
 
     let mut plans = serde_yaml::Mapping::new();
 
@@ -217,6 +249,13 @@ fn build_plans_yaml(
             let rel_str = abs_to_rel_str(context_root, abs_path)?;
             plan.insert(
                 serde_yaml::Value::String("test".to_string()),
+                serde_yaml::Value::String(rel_str),
+            );
+        }
+        if let Some(abs_path) = publishes.get(name) {
+            let rel_str = abs_to_rel_str(context_root, abs_path)?;
+            plan.insert(
+                serde_yaml::Value::String("publish".to_string()),
                 serde_yaml::Value::String(rel_str),
             );
         }
@@ -402,7 +441,7 @@ mod tests {
         let mut tests = BTreeMap::new();
         tests.insert("bar".to_string(), root.path().join("specs/bar-test.yaml"));
 
-        save_registry(root.path(), &builds, &tests).unwrap();
+        save_registry(root.path(), &builds, &tests, &BTreeMap::new()).unwrap();
 
         let reg = load_committed_registry(root.path()).unwrap();
         assert_eq!(reg.builds["foo"], root.path().join("specs/foo.yaml"));
@@ -410,11 +449,34 @@ mod tests {
     }
 
     #[test]
+    fn save_registry_round_trips_with_publish() {
+        let root = TempDir::new().unwrap();
+        write_marker(root.path(), "");
+
+        let mut publishes = BTreeMap::new();
+        publishes.insert("my-release".to_string(), root.path().join("publish.yaml"));
+
+        save_registry(root.path(), &BTreeMap::new(), &BTreeMap::new(), &publishes).unwrap();
+
+        let reg = load_committed_registry(root.path()).unwrap();
+        assert_eq!(
+            reg.publishes["my-release"],
+            root.path().join("publish.yaml")
+        );
+    }
+
+    #[test]
     fn save_registry_preserves_config_block() {
         let root = TempDir::new().unwrap();
         write_named_marker(root.path(), "BOTFORGE", "config:\n  repo-only: true\n");
 
-        save_registry(root.path(), &BTreeMap::new(), &BTreeMap::new()).unwrap();
+        save_registry(
+            root.path(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
 
         let contents = fs::read_to_string(root.path().join("BOTFORGE")).unwrap();
         assert!(
@@ -431,7 +493,7 @@ mod tests {
         let mut builds = BTreeMap::new();
         builds.insert("new".to_string(), root.path().join("new.yaml"));
 
-        save_registry(root.path(), &builds, &BTreeMap::new()).unwrap();
+        save_registry(root.path(), &builds, &BTreeMap::new(), &BTreeMap::new()).unwrap();
 
         let reg = load_committed_registry(root.path()).unwrap();
         assert!(reg.builds.contains_key("new"));

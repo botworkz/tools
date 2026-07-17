@@ -3639,3 +3639,213 @@ steps:
         );
     }
 }
+
+// ─── publish config tests ──────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod publish_config_tests {
+    use super::*;
+    use crate::config::load_publish_config;
+
+    fn write_publish_doc(repo: &TempDir, filename: &str, content: &str) -> PathBuf {
+        let path = repo.path().join(filename);
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    #[test]
+    fn publish_minimal_fs_target_parses() {
+        let repo = TempDir::new().unwrap();
+        let path = write_publish_doc(
+            &repo,
+            "release.yaml",
+            r#"
+type: botforge/publish
+name: my-release
+fs:
+  src: "@artifact://images/vm.qcow2"
+  dest: /tmp/releases/
+"#,
+        );
+        let cfg = load_publish_config(&path).unwrap();
+        assert!(cfg.fs.is_some(), "fs target should be present");
+        assert!(cfg.s3.is_none(), "s3 target should be absent");
+        let fs = cfg.fs.unwrap();
+        assert_eq!(fs.src, "@artifact://images/vm.qcow2");
+        assert_eq!(fs.dest, "/tmp/releases/");
+    }
+
+    #[test]
+    fn publish_minimal_s3_target_parses() {
+        let repo = TempDir::new().unwrap();
+        let path = write_publish_doc(
+            &repo,
+            "release.yaml",
+            r#"
+type: botforge/publish
+name: my-release
+s3:
+  src: "@artifact://images/vm.qcow2"
+  dest: s3://my-bucket/releases/
+"#,
+        );
+        let cfg = load_publish_config(&path).unwrap();
+        assert!(cfg.s3.is_some(), "s3 target should be present");
+        let s3 = cfg.s3.unwrap();
+        assert_eq!(s3.src, "@artifact://images/vm.qcow2");
+        assert_eq!(s3.dest, "s3://my-bucket/releases/");
+    }
+
+    #[test]
+    fn publish_both_targets_parses() {
+        let repo = TempDir::new().unwrap();
+        let path = write_publish_doc(
+            &repo,
+            "release.yaml",
+            r#"
+type: botforge/publish
+name: dual-target
+fs:
+  src: "@artifact://vm.qcow2"
+  dest: /tmp/dest/
+s3:
+  src: "@artifact://vm.qcow2"
+  dest: s3://bucket/path/
+"#,
+        );
+        let cfg = load_publish_config(&path).unwrap();
+        assert!(cfg.fs.is_some());
+        assert!(cfg.s3.is_some());
+    }
+
+    #[test]
+    fn publish_unknown_target_fails_clearly() {
+        let repo = TempDir::new().unwrap();
+        let path = write_publish_doc(
+            &repo,
+            "release.yaml",
+            r#"
+type: botforge/publish
+name: my-release
+github:
+  version: "@artifact://VERSION"
+  message: "@artifact://changelog"
+"#,
+        );
+        let err = load_publish_config(&path).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("github") || msg.contains("unknown field"),
+            "error should mention unknown field 'github': {msg}"
+        );
+    }
+
+    #[test]
+    fn publish_wrong_type_fails_clearly() {
+        let repo = TempDir::new().unwrap();
+        // Use a document that has no unknown fields but the wrong type.
+        let path = write_publish_doc(&repo, "test.yaml", "type: botforge/test\nname: foo\n");
+        let err = load_publish_config(&path).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("botforge/publish") || msg.contains("botforge/test"),
+            "error should mention the wrong type: {msg}"
+        );
+    }
+
+    #[test]
+    fn publish_src_must_be_at_reference() {
+        let repo = TempDir::new().unwrap();
+        let path = write_publish_doc(
+            &repo,
+            "release.yaml",
+            r#"
+type: botforge/publish
+name: bad-src
+fs:
+  src: "some/plain/path"
+  dest: /tmp/dest/
+"#,
+        );
+        let err = load_publish_config(&path).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("@-reference") || msg.contains("must be an @"),
+            "error should require @-reference: {msg}"
+        );
+    }
+
+    #[test]
+    fn publish_s3_dest_must_start_with_s3_scheme() {
+        let repo = TempDir::new().unwrap();
+        let path = write_publish_doc(
+            &repo,
+            "release.yaml",
+            r#"
+type: botforge/publish
+name: bad-dest
+s3:
+  src: "@artifact://vm.qcow2"
+  dest: https://bucket.example.com/path/
+"#,
+        );
+        let err = load_publish_config(&path).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("s3://") || msg.contains("S3 URL"),
+            "error should mention s3:// requirement: {msg}"
+        );
+    }
+
+    #[test]
+    fn publish_missing_name_fails() {
+        let repo = TempDir::new().unwrap();
+        let path = write_publish_doc(
+            &repo,
+            "release.yaml",
+            r#"
+type: botforge/publish
+fs:
+  src: "@artifact://vm.qcow2"
+  dest: /tmp/
+"#,
+        );
+        let err = load_publish_config(&path).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("name"),
+            "error should mention missing 'name': {msg}"
+        );
+    }
+
+    #[test]
+    fn publish_empty_plan_with_name_parses() {
+        let repo = TempDir::new().unwrap();
+        let path = write_publish_doc(
+            &repo,
+            "release.yaml",
+            "type: botforge/publish\nname: empty-release\n",
+        );
+        let cfg = load_publish_config(&path).unwrap();
+        assert!(cfg.fs.is_none());
+        assert!(cfg.s3.is_none());
+    }
+
+    #[test]
+    fn publish_repo_at_reference_is_valid_src() {
+        let repo = TempDir::new().unwrap();
+        let path = write_publish_doc(
+            &repo,
+            "release.yaml",
+            r#"
+type: botforge/publish
+name: repo-src
+fs:
+  src: "@://path/to/file.txt"
+  dest: /tmp/dest/
+"#,
+        );
+        // @:// references (repo-root) should be accepted as valid @-references.
+        assert!(load_publish_config(&path).is_ok());
+    }
+}
