@@ -87,6 +87,8 @@ fn do_inward(context: &Path, write: bool) -> Result<()> {
         &discovered.builds,
         &committed.tests,
         &discovered.tests,
+        &committed.publishes,
+        &discovered.publishes,
         context,
     );
 
@@ -99,8 +101,13 @@ fn do_inward(context: &Path, write: bool) -> Result<()> {
     print_diff(&diff);
 
     if write {
-        save_registry(context, &discovered.builds, &discovered.tests)
-            .context("failed to update registry in botforge.yaml")?;
+        save_registry(
+            context,
+            &discovered.builds,
+            &discovered.tests,
+            &discovered.publishes,
+        )
+        .context("failed to update registry in botforge.yaml")?;
         println!("registry updated in botforge.yaml");
     } else {
         println!("\nrun 'botforge config sync --write' to apply these changes");
@@ -120,6 +127,8 @@ fn do_check(context: &Path) -> Result<()> {
         &discovered.builds,
         &committed.tests,
         &discovered.tests,
+        &committed.publishes,
+        &discovered.publishes,
         context,
     );
 
@@ -142,10 +151,15 @@ fn do_out(context: &Path, delete: bool) -> Result<()> {
 
     // Validate: no two entries may share the same spec path.
     let mut all_spec_paths: BTreeMap<PathBuf, String> = BTreeMap::new();
-    for (name, path) in committed.builds.iter().chain(committed.tests.iter()) {
+    for (name, path) in committed
+        .builds
+        .iter()
+        .chain(committed.tests.iter())
+        .chain(committed.publishes.iter())
+    {
         if let Some(prev_name) = all_spec_paths.insert(path.clone(), name.clone()) {
             bail!(
-                "registry error: build/test entries '{}' and '{}' both point at '{}' \
+                "registry error: build/test/publish entries '{}' and '{}' both point at '{}' \
                  — each spec file must have exactly one registry entry",
                 prev_name,
                 name,
@@ -155,7 +169,12 @@ fn do_out(context: &Path, delete: bool) -> Result<()> {
     }
 
     // Validate: every spec path in the committed registry must exist on disk.
-    for (name, path) in committed.builds.iter().chain(committed.tests.iter()) {
+    for (name, path) in committed
+        .builds
+        .iter()
+        .chain(committed.tests.iter())
+        .chain(committed.publishes.iter())
+    {
         if !path.is_file() {
             bail!(
                 "spec file for entry '{}' does not exist: '{}'\n\
@@ -168,7 +187,12 @@ fn do_out(context: &Path, delete: bool) -> Result<()> {
 
     // Perform name rewrites.
     let mut rewrites = 0usize;
-    for (name, path) in committed.builds.iter().chain(committed.tests.iter()) {
+    for (name, path) in committed
+        .builds
+        .iter()
+        .chain(committed.tests.iter())
+        .chain(committed.publishes.iter())
+    {
         if rewrite_spec_name(path, name)? {
             rewrites += 1;
         }
@@ -235,11 +259,17 @@ fn collect_unreferenced(
         .builds
         .values()
         .chain(committed.tests.values())
+        .chain(committed.publishes.values())
         .collect();
 
     let mut unreferenced = Vec::new();
 
-    for path in discovered.builds.values().chain(discovered.tests.values()) {
+    for path in discovered
+        .builds
+        .values()
+        .chain(discovered.tests.values())
+        .chain(discovered.publishes.values())
+    {
         if !registered_paths.contains(path) {
             unreferenced.push(path.clone());
         }
@@ -409,10 +439,13 @@ fn compute_diff(
     disc_builds: &BTreeMap<String, PathBuf>,
     comm_tests: &BTreeMap<String, PathBuf>,
     disc_tests: &BTreeMap<String, PathBuf>,
+    comm_publishes: &BTreeMap<String, PathBuf>,
+    disc_publishes: &BTreeMap<String, PathBuf>,
     context: &Path,
 ) -> Vec<DiffItem> {
     let mut items = diff_map("build", comm_builds, disc_builds, context);
     items.extend(diff_map("test", comm_tests, disc_tests, context));
+    items.extend(diff_map("publish", comm_publishes, disc_publishes, context));
     items
 }
 
@@ -433,6 +466,8 @@ fn compute_drift(
     disc_builds: &BTreeMap<String, PathBuf>,
     comm_tests: &BTreeMap<String, PathBuf>,
     disc_tests: &BTreeMap<String, PathBuf>,
+    comm_publishes: &BTreeMap<String, PathBuf>,
+    disc_publishes: &BTreeMap<String, PathBuf>,
     context: &Path,
 ) -> Vec<String> {
     let mut items = Vec::new();
@@ -507,6 +542,44 @@ fn compute_drift(
                 .unwrap_or(comm_path.as_path());
             items.push(format!(
                 "test '{}' is in the registry at '{}' but not discoverable on disk",
+                name,
+                rel.display()
+            ));
+        }
+    }
+
+    // --- publishes ---
+    for (name, disc_path) in disc_publishes {
+        let rel = disc_path
+            .strip_prefix(context)
+            .unwrap_or(disc_path.as_path());
+        match comm_publishes.get(name) {
+            None => items.push(format!(
+                "publish '{}' is discoverable at '{}' but not in the registry",
+                name,
+                rel.display()
+            )),
+            Some(comm_path) if comm_path != disc_path => {
+                let comm_rel = comm_path
+                    .strip_prefix(context)
+                    .unwrap_or(comm_path.as_path());
+                items.push(format!(
+                    "publish '{}' is registered at '{}' but discovered at '{}'",
+                    name,
+                    comm_rel.display(),
+                    rel.display()
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    for (name, comm_path) in comm_publishes {
+        if !disc_publishes.contains_key(name) {
+            let rel = comm_path
+                .strip_prefix(context)
+                .unwrap_or(comm_path.as_path());
+            items.push(format!(
+                "publish '{}' is in the registry at '{}' but not discoverable on disk",
                 name,
                 rel.display()
             ));
@@ -880,6 +953,8 @@ mod tests {
             &disc,
             &BTreeMap::new(),
             &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             context.path(),
         );
         assert_eq!(drift.len(), 1);
@@ -896,6 +971,8 @@ mod tests {
         let drift = compute_drift(
             &comm,
             &disc,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
             context.path(),
@@ -916,6 +993,8 @@ mod tests {
             &disc,
             &BTreeMap::new(),
             &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             context.path(),
         );
         assert_eq!(drift.len(), 1);
@@ -932,6 +1011,8 @@ mod tests {
         let drift = compute_drift(
             &comm,
             &disc,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
             context.path(),

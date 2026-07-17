@@ -33,6 +33,7 @@ fn run() -> Result<()> {
         Commands::Deps(args) => commands::deps::cmd_deps(args),
         Commands::Iso(args) => commands::iso::cmd_iso(args),
         Commands::Payload(args) => commands::payload::cmd_payload(args),
+        Commands::Publish(args) => commands::publish::cmd_publish(args),
         Commands::Run(args) => commands::run::cmd_run(args),
         Commands::Test(args) => commands::test::cmd_test(args),
     }
