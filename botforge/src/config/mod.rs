@@ -526,10 +526,29 @@ struct RawS3Target {
     dest: String,
 }
 
+/// Raw deserialization target for the nested `publish:` target map in a
+/// `type: botforge/publish` document.
+///
+/// `deny_unknown_fields` ensures that unrecognised target kinds under
+/// `publish:` (e.g. `github:`, typo'd `s3x:`) produce a clear parse-time
+/// error today.  This inner map is the future registry seam where plugin
+/// target kinds will be admitted later.
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawPublishTargets {
+    /// Zero or more filesystem targets.
+    #[serde(default)]
+    fs: Vec<RawFsTarget>,
+    /// Zero or more S3 targets.
+    #[serde(default)]
+    s3: Vec<RawS3Target>,
+}
+
 /// Raw deserialization target for a top-level `botforge publish` document.
 ///
-/// `deny_unknown_fields` ensures that unrecognised target blocks (e.g.
-/// `github:`, typo'd `s3x:`) produce a clear parse-time error.
+/// `deny_unknown_fields` keeps top-level typo protection strict, so stray
+/// fields (including the old flat `fs:` / `s3:` shape) fail clearly at load
+/// time.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawPublishDocument {
@@ -541,12 +560,9 @@ struct RawPublishDocument {
     /// Raw YAML values; expanded via `expand_raw_step` at load time.
     #[serde(default)]
     steps: Vec<Value>,
-    /// Zero or more filesystem targets.
+    /// Grouped publish target directives (`fs`, `s3`, ...future kinds).
     #[serde(default)]
-    fs: Vec<RawFsTarget>,
-    /// Zero or more S3 targets.
-    #[serde(default)]
-    s3: Vec<RawS3Target>,
+    publish: RawPublishTargets,
 }
 
 /// Filesystem publish target.
@@ -576,8 +592,10 @@ pub(crate) struct S3Target {
 ///   no `${{ }}` expressions, no input machinery.  cwd is the repo/context root
 ///   in the container.  All pre-publish mangling (path versioning, changelog
 ///   rewriting, checksum generation, staging/renaming) belongs here.
-/// - Each target kind (`fs`, `s3`) is a **list of instances**.  Multiple
-///   destinations of the same kind are expressed as multiple list entries.
+/// - Publish target directives live under the top-level `publish:` map.  Each
+///   target kind within that map (`fs`, `s3`) is a **list of instances**.
+///   Multiple destinations of the same kind are expressed as multiple list
+///   entries.
 /// - Publish targets are **unordered** and MAY run in parallel; plans MUST NOT
 ///   assume any ordering within a kind's list or across kinds.  The current
 ///   implementation runs them serially, but the iteration order is an
@@ -618,6 +636,7 @@ pub(crate) fn load_publish_config(path: &Path) -> Result<PublishConfig> {
     validate_publish_steps(&steps)?;
 
     let fs: Vec<FsTarget> = raw
+        .publish
         .fs
         .into_iter()
         .enumerate()
@@ -631,6 +650,7 @@ pub(crate) fn load_publish_config(path: &Path) -> Result<PublishConfig> {
         .collect::<Result<_>>()?;
 
     let s3: Vec<S3Target> = raw
+        .publish
         .s3
         .into_iter()
         .enumerate()
@@ -647,7 +667,7 @@ pub(crate) fn load_publish_config(path: &Path) -> Result<PublishConfig> {
     if fs.is_empty() && s3.is_empty() {
         anyhow::bail!(
             "publish plan '{}' ({}) has no targets; \
-             add at least one 'fs' or 's3' entry",
+             add at least one 'fs' or 's3' entry under 'publish:'",
             name,
             path.display()
         );

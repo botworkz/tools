@@ -3662,9 +3662,10 @@ mod publish_config_tests {
             r#"
 type: botforge/publish
 name: my-release
-fs:
-  - src: "@artifact://images/vm.qcow2"
-    dest: /tmp/releases/
+publish:
+  fs:
+    - src: "@artifact://images/vm.qcow2"
+      dest: /tmp/releases/
 "#,
         );
         let cfg = load_publish_config(&path).unwrap();
@@ -3683,9 +3684,10 @@ fs:
             r#"
 type: botforge/publish
 name: my-release
-s3:
-  - src: "@artifact://images/vm.qcow2"
-    dest: s3://my-bucket/releases/
+publish:
+  s3:
+    - src: "@artifact://images/vm.qcow2"
+      dest: s3://my-bucket/releases/
 "#,
         );
         let cfg = load_publish_config(&path).unwrap();
@@ -3703,12 +3705,13 @@ s3:
             r#"
 type: botforge/publish
 name: dual-target
-fs:
-  - src: "@artifact://vm.qcow2"
-    dest: /tmp/dest/
-s3:
-  - src: "@artifact://vm.qcow2"
-    dest: s3://bucket/path/
+publish:
+  fs:
+    - src: "@artifact://vm.qcow2"
+      dest: /tmp/dest/
+  s3:
+    - src: "@artifact://vm.qcow2"
+      dest: s3://bucket/path/
 "#,
         );
         let cfg = load_publish_config(&path).unwrap();
@@ -3725,11 +3728,12 @@ s3:
             r#"
 type: botforge/publish
 name: multi-fs
-fs:
-  - src: "@artifact://vm.qcow2"
-    dest: /mnt/nas/releases/
-  - src: "@artifact://vm.qcow2"
-    dest: /mnt/mirror/releases/
+publish:
+  fs:
+    - src: "@artifact://vm.qcow2"
+      dest: /mnt/nas/releases/
+    - src: "@artifact://vm.qcow2"
+      dest: /mnt/mirror/releases/
 "#,
         );
         let cfg = load_publish_config(&path).unwrap();
@@ -3748,11 +3752,12 @@ fs:
             r#"
 type: botforge/publish
 name: multi-s3
-s3:
-  - src: "@artifact://vm.qcow2"
-    dest: s3://bucket-a/releases/
-  - src: "@artifact://vm.qcow2"
-    dest: s3://bucket-b/releases/
+publish:
+  s3:
+    - src: "@artifact://vm.qcow2"
+      dest: s3://bucket-a/releases/
+    - src: "@artifact://vm.qcow2"
+      dest: s3://bucket-b/releases/
 "#,
         );
         let cfg = load_publish_config(&path).unwrap();
@@ -3771,16 +3776,17 @@ s3:
             r#"
 type: botforge/publish
 name: mixed-release
-fs:
-  - src: "@artifact://vm.qcow2"
-    dest: /mnt/nas/releases/
-  - src: "@artifact://vm.qcow2"
-    dest: /mnt/mirror/releases/
-s3:
-  - src: "@artifact://vm.qcow2"
-    dest: s3://bucket-a/releases/
-  - src: "@artifact://vm.qcow2"
-    dest: s3://bucket-b/releases/
+publish:
+  fs:
+    - src: "@artifact://vm.qcow2"
+      dest: /mnt/nas/releases/
+    - src: "@artifact://vm.qcow2"
+      dest: /mnt/mirror/releases/
+  s3:
+    - src: "@artifact://vm.qcow2"
+      dest: s3://bucket-a/releases/
+    - src: "@artifact://vm.qcow2"
+      dest: s3://bucket-b/releases/
 "#,
         );
         let cfg = load_publish_config(&path).unwrap();
@@ -3789,7 +3795,7 @@ s3:
     }
 
     #[test]
-    fn publish_unknown_target_fails_clearly() {
+    fn publish_unknown_publish_target_fails_clearly() {
         let repo = TempDir::new().unwrap();
         let path = write_publish_doc(
             &repo,
@@ -3797,9 +3803,10 @@ s3:
             r#"
 type: botforge/publish
 name: my-release
-github:
-  version: "@artifact://VERSION"
-  message: "@artifact://changelog"
+publish:
+  github:
+    version: "@artifact://VERSION"
+    message: "@artifact://changelog"
 "#,
         );
         let err = load_publish_config(&path).unwrap_err();
@@ -3811,7 +3818,7 @@ github:
     }
 
     #[test]
-    fn publish_typo_target_key_fails_clearly() {
+    fn publish_typo_publish_target_key_fails_clearly() {
         let repo = TempDir::new().unwrap();
         let path = write_publish_doc(
             &repo,
@@ -3819,9 +3826,10 @@ github:
             r#"
 type: botforge/publish
 name: my-release
-s3x:
-  - src: "@artifact://vm.qcow2"
-    dest: s3://bucket/path/
+publish:
+  s3x:
+    - src: "@artifact://vm.qcow2"
+      dest: s3://bucket/path/
 "#,
         );
         let err = load_publish_config(&path).unwrap_err();
@@ -3854,9 +3862,10 @@ s3x:
             r#"
 type: botforge/publish
 name: bad-src
-fs:
-  - src: "some/plain/path"
-    dest: /tmp/dest/
+publish:
+  fs:
+    - src: "some/plain/path"
+      dest: /tmp/dest/
 "#,
         );
         let err = load_publish_config(&path).unwrap_err();
@@ -3876,9 +3885,10 @@ fs:
             r#"
 type: botforge/publish
 name: bad-dest
-s3:
-  - src: "@artifact://vm.qcow2"
-    dest: https://bucket.example.com/path/
+publish:
+  s3:
+    - src: "@artifact://vm.qcow2"
+      dest: https://bucket.example.com/path/
 "#,
         );
         let err = load_publish_config(&path).unwrap_err();
@@ -3899,11 +3909,12 @@ s3:
             r#"
 type: botforge/publish
 name: bad-second-dest
-s3:
-  - src: "@artifact://vm.qcow2"
-    dest: s3://bucket-a/path/
-  - src: "@artifact://vm.qcow2"
-    dest: https://not-s3.example.com/path/
+publish:
+  s3:
+    - src: "@artifact://vm.qcow2"
+      dest: s3://bucket-a/path/
+    - src: "@artifact://vm.qcow2"
+      dest: https://not-s3.example.com/path/
 "#,
         );
         let err = load_publish_config(&path).unwrap_err();
@@ -3924,11 +3935,12 @@ s3:
             r#"
 type: botforge/publish
 name: bad-second-src
-fs:
-  - src: "@artifact://vm.qcow2"
-    dest: /mnt/nas/
-  - src: "plain/path"
-    dest: /mnt/mirror/
+publish:
+  fs:
+    - src: "@artifact://vm.qcow2"
+      dest: /mnt/nas/
+    - src: "plain/path"
+      dest: /mnt/mirror/
 "#,
         );
         let err = load_publish_config(&path).unwrap_err();
@@ -3947,9 +3959,10 @@ fs:
             "release.yaml",
             r#"
 type: botforge/publish
-fs:
-  - src: "@artifact://vm.qcow2"
-    dest: /tmp/
+publish:
+  fs:
+    - src: "@artifact://vm.qcow2"
+      dest: /tmp/
 "#,
         );
         let err = load_publish_config(&path).unwrap_err();
@@ -3986,9 +3999,10 @@ fs:
             r#"
 type: botforge/publish
 name: repo-src
-fs:
-  - src: "@://path/to/file.txt"
-    dest: /tmp/dest/
+publish:
+  fs:
+    - src: "@://path/to/file.txt"
+      dest: /tmp/dest/
 "#,
         );
         // @:// references (repo-root) should be accepted as valid @-references.
@@ -4013,9 +4027,10 @@ steps:
     run: echo second
   - name: third step
     run: echo third
-fs:
-  - src: "@artifact://vm.qcow2"
-    dest: /tmp/dest/
+publish:
+  fs:
+    - src: "@artifact://vm.qcow2"
+      dest: /tmp/dest/
 "#,
         );
         let cfg = load_publish_config(&path).unwrap();
@@ -4055,9 +4070,10 @@ steps:
             r#"
 type: botforge/publish
 name: no-steps
-fs:
-  - src: "@artifact://vm.qcow2"
-    dest: /tmp/dest/
+publish:
+  fs:
+    - src: "@artifact://vm.qcow2"
+      dest: /tmp/dest/
 "#,
         );
         let cfg = load_publish_config(&path).unwrap();
@@ -4077,9 +4093,10 @@ steps:
   - name: "copy ${{ args.0 }}"
     run: "echo ${{ args.0 }}"
     for: [alpha, beta]
-fs:
-  - src: "@artifact://vm.qcow2"
-    dest: /tmp/dest/
+publish:
+  fs:
+    - src: "@artifact://vm.qcow2"
+      dest: /tmp/dest/
 "#,
         );
         let cfg = load_publish_config(&path).unwrap();
@@ -4103,9 +4120,10 @@ steps:
   - name: sh step
     shell: sh
     run: echo hello
-fs:
-  - src: "@artifact://vm.qcow2"
-    dest: /tmp/dest/
+publish:
+  fs:
+    - src: "@artifact://vm.qcow2"
+      dest: /tmp/dest/
 "#,
         );
         let cfg = load_publish_config(&path).unwrap();
@@ -4128,9 +4146,10 @@ steps:
   - name: fish step
     shell: fish
     run: echo hello
-fs:
-  - src: "@artifact://vm.qcow2"
-    dest: /tmp/dest/
+publish:
+  fs:
+    - src: "@artifact://vm.qcow2"
+      dest: /tmp/dest/
 "#,
         );
         let err = load_publish_config(&path).unwrap_err();
@@ -4154,9 +4173,10 @@ steps:
   - name: bad archive
     archive:
       src: "@artifact://vm.qcow2"
-fs:
-  - src: "@artifact://vm.qcow2"
-    dest: /tmp/dest/
+publish:
+  fs:
+    - src: "@artifact://vm.qcow2"
+      dest: /tmp/dest/
 "#,
         );
         let err = load_publish_config(&path).unwrap_err();
@@ -4168,7 +4188,7 @@ fs:
     }
 
     #[test]
-    fn publish_unknown_top_level_key_still_errors_with_steps() {
+    fn publish_old_top_level_fs_still_errors_with_steps() {
         let repo = TempDir::new().unwrap();
         let path = write_publish_doc(
             &repo,
@@ -4182,15 +4202,13 @@ steps:
 fs:
   - src: "@artifact://vm.qcow2"
     dest: /tmp/dest/
-github:
-  token: secret
 "#,
         );
         let err = load_publish_config(&path).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("github") || msg.contains("unknown field"),
-            "unknown top-level key should still error when steps is present: {msg}"
+            msg.contains("fs") || msg.contains("unknown field"),
+            "old top-level fs key should still error when steps is present: {msg}"
         );
     }
 }
