@@ -20,9 +20,13 @@
 //!
 //! # How the `.so` is located
 //!
-//! The test computes the path to `libhello.so` via `CARGO_MANIFEST_DIR` and
-//! the standard Cargo target directory layout.  The build profile (debug /
-//! release) is detected via `cfg(debug_assertions)`.
+//! The test resolves the Cargo target directory by honoring
+//! `CARGO_TARGET_DIR` (falling back to `<workspace>/target`) and then probing
+//! the known build-profile subdirectories (`debug`, `release`, and
+//! tarpaulin's profile dir).  It returns the first candidate that actually
+//! contains the requested fixture `.so`.  This keeps the tests working under
+//! both `cargo test` and `cargo tarpaulin`, whose artifacts land in different
+//! profile directories.
 
 use botforge_plugin_host::{
     LoadError, PingHandle, PluginRegistry, HOST_ABI_VERSION, PING_SENTINEL,
@@ -39,35 +43,71 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// Returns the Cargo target subdirectory for the current build profile.
-fn target_dir() -> PathBuf {
-    workspace_root()
-        .join("target")
-        .join(if cfg!(debug_assertions) {
-            "debug"
-        } else {
-            "release"
-        })
+/// Returns the base Cargo target directory, honoring `CARGO_TARGET_DIR`.
+fn target_base() -> PathBuf {
+    match std::env::var_os("CARGO_TARGET_DIR") {
+        Some(dir) => PathBuf::from(dir),
+        None => workspace_root().join("target"),
+    }
 }
 
-/// Returns the path to `libhello.so` in the Cargo target directory.
-fn hello_so_path() -> PathBuf {
-    target_dir().join("libhello.so")
+/// Candidate build-profile subdirectories where a fixture `.so` might live.
+///
+/// Different tooling uses different profile dirs:
+/// - `cargo test` (debug) → `debug`
+/// - `cargo test --release` → `release`
+/// - `cargo tarpaulin` → its own instrumented profile dir
+///
+/// We probe all of them and pick the first that contains the artifact.
+fn profile_candidates() -> Vec<PathBuf> {
+    let base = target_base();
+    [
+        if cfg!(debug_assertions) { "debug" } else { "release" },
+        "debug",
+        "release",
+        // tarpaulin builds instrumented artifacts here.
+        "tarpaulin",
+    ]
+    .iter()
+    .map(|p| base.join(p))
+    .collect()
 }
 
-/// Returns the path to `libhello_badabi.so` in the Cargo target directory.
-fn hello_badabi_so_path() -> PathBuf {
-    target_dir().join("libhello_badabi.so")
+/// Locate a fixture `.so` by filename across the candidate profile dirs.
+///
+/// Returns the first existing path, or `None` if the fixture was not built
+/// in any known location.
+fn find_fixture_so(filename: &str) -> Option<PathBuf> {
+    profile_candidates()
+        .into_iter()
+        .map(|dir| dir.join(filename))
+        .find(|p| p.exists())
+}
+
+/// Returns the path to `libhello.so` if it has been built, else `None`.
+fn hello_so_path() -> Option<PathBuf> {
+    find_fixture_so("libhello.so")
+}
+
+/// Returns the path to `libhello_badabi.so` if it has been built, else `None`.
+fn hello_badabi_so_path() -> Option<PathBuf> {
+    find_fixture_so("libhello_badabi.so")
 }
 
 /// Require a fixture `.so` to exist before continuing.
+///
+/// Hard-fails (panics) with an actionable message if the fixture has not been
+/// built in any known profile directory.  This is intentional: these are
+/// acceptance tests and a missing fixture must not silently pass.
 macro_rules! require_fixture_so {
-    ($path:expr, $hint:expr) => {{
-        let path = $path;
-        if !path.exists() {
-            panic!("{} not found — run `{}` first", path.display(), $hint);
+    ($lookup:expr, $hint:expr) => {{
+        match $lookup {
+            Some(path) => path,
+            None => panic!(
+                "fixture .so not found in any known target profile dir — run `{}` first",
+                $hint
+            ),
         }
-        path
     }};
 }
 
@@ -261,22 +301,24 @@ fn missing_so_gives_file_not_found() {
     assert!(reg.plugins.is_empty());
 }
 
-// ── No autoload: .so present but not in config ────────────────────────────────
+// ── No autoload: .so present but not in config ────────────────────────��───────
 
 /// A `.so` on disk that is NOT explicitly loaded via load_plugin must never
 /// appear in the registry.  This is enforced by the architecture (the registry
 /// only gets entries from explicit `load_plugin` calls) — this test documents
 /// the invariant.
+///
+/// This test does NOT require the fixture to exist: it asserts the registry is
+/// empty regardless, so it must not use the hard-fail `require_fixture_so!`.
 #[test]
 fn no_autoload_so_on_disk_not_in_registry_unless_explicitly_loaded() {
-    let so = hello_so_path();
     // Even if the .so exists, an empty registry has no entry for it.
     let reg = PluginRegistry::new();
     assert!(!reg.is_registered("core/ping", "hello"));
     assert!(reg.plugins.is_empty());
-    // The file exists on disk (if the fixture was built), but the registry is empty.
-    if so.exists() {
-        // Still not in registry — only explicit load_plugin adds entries.
+    // If the fixture happens to be built, it is STILL not in the registry —
+    // only explicit load_plugin adds entries.
+    if hello_so_path().is_some() {
         assert!(!reg.is_registered("core/ping", "hello"));
     }
 }
