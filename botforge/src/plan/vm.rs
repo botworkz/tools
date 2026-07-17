@@ -1196,9 +1196,13 @@ fn env_merge(accumulated: &mut Vec<(String, String)>, new_entries: Vec<(String, 
 /// - `BOTFORGE_ENV` env accumulation: each step may append `KEY=VALUE` pairs; later
 ///   steps see earlier steps' exported vars (same mechanics as host steps in build/test).
 /// - Fail-fast: a non-zero exit (or failed assertion) aborts the whole phase immediately.
-pub(crate) fn run_local_steps(context: &Path, steps: &[TestStep]) -> Result<()> {
+///
+/// Returns the accumulated step env (all `KEY=VALUE` pairs written to `$BOTFORGE_ENV`
+/// across all steps).  When there are no steps the map is empty.  Callers may use
+/// this env to interpolate target fields after the prepare phase.
+pub(crate) fn run_local_steps(context: &Path, steps: &[TestStep]) -> Result<Vec<(String, String)>> {
     if steps.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let step_log_dir = context.join("build").join("logs");
@@ -1307,7 +1311,7 @@ pub(crate) fn run_local_steps(context: &Path, steps: &[TestStep]) -> Result<()> 
         step_result?;
     }
 
-    Ok(())
+    Ok(accumulated_env)
 }
 
 pub(crate) fn collect_test_diagnostics(ssh: &SshOptions, units: &[String]) {
