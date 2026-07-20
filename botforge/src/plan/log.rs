@@ -103,7 +103,7 @@ fn step_title_line(step_idx: usize, name: &str, id: Option<&str>, color: bool) -
         None => format!("{step_idx}"),
     };
     if color {
-        format!("🤖 ({counter}) \x1b[1m{name}\x1b[0m")
+        format!("🤖 \x1b[2m({counter})\x1b[0m \x1b[1m{name}\x1b[0m")
     } else {
         format!("🤖 ({counter}) {name}")
     }
@@ -122,9 +122,9 @@ fn step_status_marker(
     };
     if color {
         if success {
-            format!(" \x1b[32m✓\x1b[0m ({counter}) \x1b[2m{name}\x1b[0m")
+            format!(" \x1b[32m✓\x1b[0m \x1b[2m({counter})\x1b[0m \x1b[2m{name}\x1b[0m")
         } else {
-            format!(" \x1b[31m✗\x1b[0m ({counter}) {name}")
+            format!(" \x1b[31m✗\x1b[0m \x1b[2m({counter})\x1b[0m {name}")
         }
     } else {
         let tick = if success { '✓' } else { '✗' };
@@ -141,7 +141,7 @@ pub(super) fn print_step_title(step_idx: usize, step_name: &str, step_id: Option
 
 fn phase_title_line(label: &str, description: &str, color: bool) -> String {
     if color {
-        format!("🤖 ({label}) \x1b[1m{description}\x1b[0m")
+        format!("🤖 \x1b[2m({label})\x1b[0m \x1b[1m{description}\x1b[0m")
     } else {
         format!("🤖 ({label}) {description}")
     }
@@ -162,9 +162,9 @@ pub(crate) fn print_phase(label: &str, description: &str) {
 fn phase_status_marker(label: &str, description: &str, success: bool, color: bool) -> String {
     if color {
         if success {
-            format!(" \x1b[32m✓\x1b[0m ({label}) \x1b[2m{description}\x1b[0m")
+            format!(" \x1b[32m✓\x1b[0m \x1b[2m({label})\x1b[0m \x1b[2m{description}\x1b[0m")
         } else {
-            format!(" \x1b[31m✗\x1b[0m ({label}) {description}")
+            format!(" \x1b[31m✗\x1b[0m \x1b[2m({label})\x1b[0m {description}")
         }
     } else {
         let tick = if success { '✓' } else { '✗' };
@@ -207,7 +207,7 @@ fn step_skipped_marker(step_idx: usize, name: &str, id: Option<&str>, color: boo
         None => format!("{step_idx}"),
     };
     if color {
-        format!(" ⊘ ({counter}) \x1b[2m{name}\x1b[0m")
+        format!(" ⊘ \x1b[2m({counter})\x1b[0m \x1b[2m{name}\x1b[0m")
     } else {
         format!(" ⊘ ({counter}) {name}")
     }
@@ -348,7 +348,8 @@ pub(super) fn join_output_forwarders(handles: Vec<JoinHandle<Result<()>>>) -> Re
 #[cfg(test)]
 mod tests {
     use super::{
-        phase_status_marker, phase_title_line, step_log_path, step_status_marker, step_title_line,
+        phase_status_marker, phase_title_line, step_log_path, step_skipped_marker,
+        step_status_marker, step_title_line,
     };
     use crate::util::write_all_resilient;
     use std::path::PathBuf;
@@ -389,7 +390,11 @@ mod tests {
             "success color should contain tick: {success_color:?}"
         );
         assert!(
-            success_color.contains("\x1b[2m"),
+            success_color.contains("\x1b[2m(4)\x1b[0m"),
+            "success color should dim marker: {success_color:?}"
+        );
+        assert!(
+            success_color.contains("\x1b[2mmcp-smoke\x1b[0m"),
             "success color should dim name: {success_color:?}"
         );
         assert!(
@@ -410,7 +415,11 @@ mod tests {
             "failure color should contain cross: {failure_color:?}"
         );
         assert!(
-            !failure_color.contains("\x1b[2m"),
+            failure_color.contains("\x1b[2m(4)\x1b[0m"),
+            "failure color should dim marker: {failure_color:?}"
+        );
+        assert!(
+            !failure_color.contains("\x1b[2mmcp-smoke\x1b[0m"),
             "failure color should NOT dim name: {failure_color:?}"
         );
     }
@@ -427,8 +436,8 @@ mod tests {
         );
         let success_color = step_status_marker(4, "mcp-smoke", true, Some("build"), true);
         assert!(
-            success_color.contains("(4/build)"),
-            "success color with id should contain counter: {success_color:?}"
+            success_color.contains("\x1b[2m(4/build)\x1b[0m"),
+            "success color with id should dim counter: {success_color:?}"
         );
         assert!(
             success_color.contains("\x1b[32m"),
@@ -444,8 +453,8 @@ mod tests {
         );
         let failure_color = step_status_marker(4, "mcp-smoke", false, Some("build"), true);
         assert!(
-            failure_color.contains("(4/build)"),
-            "failure color with id should contain counter: {failure_color:?}"
+            failure_color.contains("\x1b[2m(4/build)\x1b[0m"),
+            "failure color with id should dim counter: {failure_color:?}"
         );
         assert!(
             failure_color.contains("\x1b[31m"),
@@ -465,7 +474,7 @@ mod tests {
         );
         let colored = step_title_line(4, "mcp-smoke", None, true);
         assert!(
-            colored.contains("🤖 (4) "),
+            colored.contains("🤖 \x1b[2m(4)\x1b[0m "),
             "colored title should contain robot prefix: {colored:?}"
         );
         assert!(
@@ -490,8 +499,8 @@ mod tests {
         );
         let colored = step_title_line(4, "mcp-smoke", Some("build"), true);
         assert!(
-            colored.contains("(4/build)"),
-            "colored title with id should contain counter: {colored:?}"
+            colored.contains("\x1b[2m(4/build)\x1b[0m"),
+            "colored title with id should dim counter: {colored:?}"
         );
         assert!(
             colored.contains("\x1b[1m"),
@@ -504,6 +513,32 @@ mod tests {
         assert!(
             colored.contains("\x1b[0m"),
             "colored title with id should contain reset: {colored:?}"
+        );
+    }
+
+    #[test]
+    fn test_step_skipped_marker_formats() {
+        assert_eq!(
+            step_skipped_marker(4, "mcp-smoke", None, false),
+            " ⊘ (4) mcp-smoke"
+        );
+        let colored = step_skipped_marker(4, "mcp-smoke", None, true);
+        assert!(
+            colored.contains("\x1b[2m(4)\x1b[0m"),
+            "colored skipped marker should dim counter: {colored:?}"
+        );
+        assert!(
+            colored.contains("\x1b[2mmcp-smoke\x1b[0m"),
+            "colored skipped marker should dim name: {colored:?}"
+        );
+        assert_eq!(
+            step_skipped_marker(4, "mcp-smoke", Some("build"), false),
+            " ⊘ (4/build) mcp-smoke"
+        );
+        let colored_with_id = step_skipped_marker(4, "mcp-smoke", Some("build"), true);
+        assert!(
+            colored_with_id.contains("\x1b[2m(4/build)\x1b[0m"),
+            "colored skipped marker with id should dim counter: {colored_with_id:?}"
         );
     }
 
@@ -579,7 +614,7 @@ mod tests {
             true,
         );
         assert!(
-            colored.contains("🤖 (compress) "),
+            colored.contains("🤖 \x1b[2m(compress)\x1b[0m "),
             "colored phase title should contain robot prefix: {colored:?}"
         );
         assert!(
@@ -630,8 +665,11 @@ mod tests {
         assert!(s.starts_with(' '), "should start with space: {s:?}");
         assert!(s.contains("\x1b[32m"), "should contain green: {s:?}");
         assert!(s.contains('✓'), "should contain tick: {s:?}");
-        assert!(s.contains("(vm)"), "should contain label: {s:?}");
-        assert!(s.contains("\x1b[2m"), "should dim description: {s:?}");
+        assert!(s.contains("\x1b[2m(vm)\x1b[0m"), "should dim label: {s:?}");
+        assert!(
+            s.contains("\x1b[2mStopping vm\x1b[0m"),
+            "should dim description: {s:?}"
+        );
         assert!(s.contains("\x1b[0m"), "should reset: {s:?}");
     }
 
@@ -641,7 +679,10 @@ mod tests {
         assert!(s.starts_with(' '), "should start with space: {s:?}");
         assert!(s.contains("\x1b[31m"), "should contain red: {s:?}");
         assert!(s.contains('✗'), "should contain cross: {s:?}");
-        assert!(s.contains("(vm)"), "should contain label: {s:?}");
-        assert!(!s.contains("\x1b[2m"), "failure should NOT dim name: {s:?}");
+        assert!(s.contains("\x1b[2m(vm)\x1b[0m"), "should dim label: {s:?}");
+        assert!(
+            !s.contains("\x1b[2mStopping vm\x1b[0m"),
+            "failure should NOT dim name: {s:?}"
+        );
     }
 }
