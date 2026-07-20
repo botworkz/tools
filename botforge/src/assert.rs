@@ -65,6 +65,20 @@ pub(crate) struct AssertFile {
     /// When `false`, the path must not exist on the guest.  Defaults to `true`.
     #[serde(default = "default_assert_exists")]
     pub(crate) exists: bool,
+    /// Selects the permission-check baseline for this entry.
+    ///
+    /// When omitted or `true` (default), a secure credset baseline is applied:
+    /// `owner: root`, `group: root`, and a filetype-aware default mode
+    /// (`0644` for regular files, `0755` for directories, skipped for symlinks).
+    /// Any explicit `owner`/`group`/`mode` fields overlay the baseline per field.
+    ///
+    /// When `false`, only the permission fields the user explicitly wrote are
+    /// checked; anything omitted is skipped entirely.
+    ///
+    /// Must be omitted when `exists: false` (a non-existent file has no perms).
+    /// Only meaningful when `exists: true`.
+    #[serde(rename = "default-permissions", default)]
+    pub(crate) default_permissions: Option<bool>,
     /// Expected file type (`file`, `directory`, or `symlink`).
     /// Only meaningful when `exists: true`.
     #[serde(default)]
@@ -242,10 +256,11 @@ fn validate_assert_file_entry(guest_path: &str, expectation: &AssertFile) -> Res
             || expectation.owner.is_some()
             || expectation.group.is_some()
             || expectation.mode.is_some()
+            || expectation.default_permissions.is_some()
         {
             anyhow::bail!(
                 "assert.files: path '{guest_path}': attribute fields \
-                 (filetype/owner/group/mode) must not be set when `exists: false`"
+                 (filetype/owner/group/mode/default-permissions) must not be set when `exists: false`"
             );
         }
         return Ok(());
@@ -485,6 +500,7 @@ fn check_one_path(path: &str, expectation: &AssertFile, raw_line: &str) -> Vec<S
     // Normalize mode to 4-digit octal (e.g. "755" → "0755").
     let actual_mode_normalized = normalize_mode(actual_mode);
 
+    // Filetype check is always opt-in (explicit field only).
     if let Some(expected_ft) = expectation.filetype {
         if actual_ft != expected_ft.as_str() {
             failures.push(format!(
@@ -493,21 +509,61 @@ fn check_one_path(path: &str, expectation: &AssertFile, raw_line: &str) -> Vec<S
             ));
         }
     }
-    if let Some(ref expected_owner) = expectation.owner {
+
+    // Resolve the effective permission check set.
+    //
+    // `default_permissions` (None or Some(true)) → apply secure baseline:
+    //   owner: root, group: root, mode: filetype-aware default (0644/0755/skip).
+    //   Explicit owner/group/mode fields overlay the baseline per field.
+    //
+    // `default_permissions = Some(false)` → only fields the user wrote are checked.
+    let use_defaults = expectation.default_permissions.unwrap_or(true);
+
+    let effective_owner: Option<&str> = if expectation.owner.is_some() {
+        expectation.owner.as_deref()
+    } else if use_defaults {
+        Some("root")
+    } else {
+        None
+    };
+
+    let effective_group: Option<&str> = if expectation.group.is_some() {
+        expectation.group.as_deref()
+    } else if use_defaults {
+        Some("root")
+    } else {
+        None
+    };
+
+    // Filetype-aware default mode: 0644 for regular files, 0755 for
+    // directories, None (skip) for symlinks.
+    let effective_mode: Option<&str> = if expectation.mode.is_some() {
+        expectation.mode.as_deref()
+    } else if use_defaults {
+        match actual_ft {
+            "directory" => Some("0755"),
+            "symlink" => None, // symlink permissions are meaningless
+            _ => Some("0644"), // regular files and any other type
+        }
+    } else {
+        None
+    };
+
+    if let Some(expected_owner) = effective_owner {
         if actual_owner != expected_owner {
             failures.push(format!(
                 "owner: expected {expected_owner}, got {actual_owner}"
             ));
         }
     }
-    if let Some(ref expected_group) = expectation.group {
+    if let Some(expected_group) = effective_group {
         if actual_group != expected_group {
             failures.push(format!(
                 "group: expected {expected_group}, got {actual_group}"
             ));
         }
     }
-    if let Some(ref expected_mode) = expectation.mode {
+    if let Some(expected_mode) = effective_mode {
         let expected_normalized = normalize_mode(expected_mode);
         if actual_mode_normalized != expected_normalized {
             failures.push(format!(
@@ -1389,6 +1445,24 @@ mod tests {
     ) -> AssertFile {
         AssertFile {
             exists,
+            default_permissions: None, // None → effective default true (baseline applies)
+            filetype,
+            owner: owner.map(str::to_string),
+            group: group.map(str::to_string),
+            mode: mode.map(str::to_string),
+        }
+    }
+
+    /// Helper for entries where `default-permissions: false` (explicit-only checks).
+    fn file_expectation_no_defaults(
+        filetype: Option<AssertFileType>,
+        owner: Option<&str>,
+        group: Option<&str>,
+        mode: Option<&str>,
+    ) -> AssertFile {
+        AssertFile {
+            exists: true,
+            default_permissions: Some(false),
             filetype,
             owner: owner.map(str::to_string),
             group: group.map(str::to_string),
@@ -1478,8 +1552,9 @@ mod tests {
 
     #[test]
     fn test_check_one_path_no_attributes_present_passes() {
-        // When no attributes are specified (just exists: true), any present file passes.
-        let exp = file_expectation(true, None, None, None, None);
+        // With default-permissions: false and no explicit perm fields, only
+        // existence is checked — any present file passes.
+        let exp = file_expectation_no_defaults(None, None, None, None);
         let line = "present:file:someuser:somegroup:644";
         let failures = check_one_path("/some/file", &exp, line);
         assert!(failures.is_empty(), "should pass: {:?}", failures);
@@ -1530,8 +1605,186 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // check_one_service tests
+    // default-permissions tests
     // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_default_permissions_true_file_checks_root_root_0644() {
+        // {} (empty entry, default-permissions = true) → root:root 0644 for a regular file.
+        let exp = file_expectation(true, None, None, None, None);
+        let line = "present:file:root:root:644";
+        let failures = check_one_path("/etc/botwork/cfg.yaml", &exp, line);
+        assert!(
+            failures.is_empty(),
+            "root:root:0644 should pass: {:?}",
+            failures
+        );
+    }
+
+    #[test]
+    fn test_default_permissions_true_file_wrong_owner_fails() {
+        // Default baseline fires even with no explicit owner field.
+        let exp = file_expectation(true, None, None, None, None);
+        let line = "present:file:www-data:root:644";
+        let failures = check_one_path("/etc/botwork/cfg.yaml", &exp, line);
+        assert!(
+            !failures.is_empty(),
+            "non-root owner should fail with defaults"
+        );
+        assert!(
+            failures.iter().any(|m| m.contains("owner")),
+            "owner failure expected: {:?}",
+            failures
+        );
+    }
+
+    #[test]
+    fn test_default_permissions_true_file_wrong_mode_fails() {
+        // Default baseline fires even with no explicit mode field.
+        let exp = file_expectation(true, None, None, None, None);
+        let line = "present:file:root:root:666";
+        let failures = check_one_path("/etc/botwork/cfg.yaml", &exp, line);
+        assert!(!failures.is_empty(), "wrong mode should fail with defaults");
+        assert!(
+            failures.iter().any(|m| m.contains("mode")),
+            "mode failure expected: {:?}",
+            failures
+        );
+    }
+
+    #[test]
+    fn test_default_permissions_true_directory_checks_root_root_0755() {
+        // directory default → root:root 0755
+        let exp = file_expectation(true, Some(AssertFileType::Directory), None, None, None);
+        let line = "present:directory:root:root:755";
+        let failures = check_one_path("/etc/botwork", &exp, line);
+        assert!(
+            failures.is_empty(),
+            "root:root:0755 dir should pass: {:?}",
+            failures
+        );
+    }
+
+    #[test]
+    fn test_default_permissions_true_directory_wrong_mode_fails() {
+        // Directory baseline mode is 0755; 0644 should fail.
+        let exp = file_expectation(true, Some(AssertFileType::Directory), None, None, None);
+        let line = "present:directory:root:root:644";
+        let failures = check_one_path("/etc/botwork", &exp, line);
+        assert!(
+            !failures.is_empty(),
+            "0644 on dir should fail: {:?}",
+            failures
+        );
+        assert!(
+            failures.iter().any(|m| m.contains("mode")),
+            "mode failure expected: {:?}",
+            failures
+        );
+    }
+
+    #[test]
+    fn test_default_permissions_true_symlink_skips_mode() {
+        // Symlink: owner/group checked via baseline, mode is skipped.
+        let exp = file_expectation(true, Some(AssertFileType::Symlink), None, None, None);
+        let line = "present:symlink:root:root:777";
+        let failures = check_one_path("/usr/local/bin/tool", &exp, line);
+        assert!(
+            failures.is_empty(),
+            "symlink with any mode should pass: {:?}",
+            failures
+        );
+    }
+
+    #[test]
+    fn test_default_permissions_true_symlink_wrong_owner_still_fails() {
+        // Even for symlinks, owner/group baseline still applies.
+        let exp = file_expectation(true, Some(AssertFileType::Symlink), None, None, None);
+        let line = "present:symlink:nobody:root:777";
+        let failures = check_one_path("/usr/local/bin/tool", &exp, line);
+        assert!(
+            !failures.is_empty(),
+            "wrong owner on symlink should fail: {:?}",
+            failures
+        );
+    }
+
+    #[test]
+    fn test_default_permissions_true_explicit_mode_overlays_baseline() {
+        // Explicit mode: "0440" overrides the file baseline "0644".
+        let exp = file_expectation(true, None, None, None, Some("0440"));
+        let line = "present:file:root:root:440";
+        let failures = check_one_path("/etc/sudoers.d/90-botwork", &exp, line);
+        assert!(
+            failures.is_empty(),
+            "root:root:0440 should pass: {:?}",
+            failures
+        );
+    }
+
+    #[test]
+    fn test_default_permissions_true_explicit_owner_overlays_baseline() {
+        // Explicit owner: "www-data" overrides baseline "root"; group still root.
+        let exp = file_expectation(true, None, Some("www-data"), None, None);
+        let line = "present:file:www-data:root:644";
+        let failures = check_one_path("/var/www/index.html", &exp, line);
+        assert!(
+            failures.is_empty(),
+            "www-data:root:0644 should pass: {:?}",
+            failures
+        );
+    }
+
+    #[test]
+    fn test_default_permissions_false_no_perm_fields_passes_any_perms() {
+        // default-permissions: false + no explicit perm fields → existence only.
+        let exp = file_expectation_no_defaults(None, None, None, None);
+        let line = "present:file:someuser:somegroup:666";
+        let failures = check_one_path("/scratch/x", &exp, line);
+        assert!(
+            failures.is_empty(),
+            "existence-only should pass: {:?}",
+            failures
+        );
+    }
+
+    #[test]
+    fn test_default_permissions_false_with_mode_only_checks_mode() {
+        // default-permissions: false, mode: "0600" → only mode checked.
+        let exp = file_expectation_no_defaults(None, None, None, Some("0600"));
+        let line = "present:file:anyuser:anygroup:600";
+        let failures = check_one_path("/run/secret", &exp, line);
+        assert!(
+            failures.is_empty(),
+            "mode-only check should pass: {:?}",
+            failures
+        );
+    }
+
+    #[test]
+    fn test_default_permissions_false_with_mode_only_wrong_mode_fails() {
+        let exp = file_expectation_no_defaults(None, None, None, Some("0600"));
+        let line = "present:file:anyuser:anygroup:644";
+        let failures = check_one_path("/run/secret", &exp, line);
+        assert!(
+            !failures.is_empty(),
+            "wrong mode should fail: {:?}",
+            failures
+        );
+        assert!(
+            failures.iter().any(|m| m.contains("mode")),
+            "mode failure expected: {:?}",
+            failures
+        );
+        // Owner and group must NOT be checked.
+        assert!(
+            !failures
+                .iter()
+                .any(|m| m.contains("owner") || m.contains("group")),
+            "owner/group must not be checked with default-permissions:false: {:?}",
+            failures
+        );
+    }
 
     fn service_expectation(exists: bool, enabled: bool, active: bool) -> AssertService {
         AssertService {
@@ -2042,6 +2295,93 @@ assert:
                 msg.contains("exists: false") || msg.contains("attribute"),
                 "error should mention exists:false and attributes: {msg}"
             );
+        }
+
+        #[test]
+        fn test_load_test_config_assert_files_rejects_exists_false_with_default_permissions() {
+            let repo = TempDir::new().unwrap();
+            fs::write(
+                repo.path().join("test.yaml"),
+                r#"
+type: botforge/test
+name: test
+steps: []
+assert:
+  files:
+    /some/path:
+      exists: false
+      default-permissions: false
+"#,
+            )
+            .unwrap();
+            let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("exists: false")
+                    || msg.contains("attribute")
+                    || msg.contains("default-permissions"),
+                "error should mention exists:false and default-permissions: {msg}"
+            );
+        }
+
+        #[test]
+        fn test_load_test_config_assert_files_default_permissions_false_parses() {
+            let repo = TempDir::new().unwrap();
+            fs::write(
+                repo.path().join("test.yaml"),
+                r#"
+type: botforge/test
+name: test
+steps: []
+assert:
+  files:
+    /scratch/x:
+      default-permissions: false
+    /run/secret:
+      default-permissions: false
+      mode: "0600"
+"#,
+            )
+            .unwrap();
+            let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+            let assert_block = config.assert.unwrap();
+            let scratch = assert_block.files.get("/scratch/x").unwrap();
+            assert!(scratch.exists);
+            assert_eq!(scratch.default_permissions, Some(false));
+            assert!(scratch.mode.is_none());
+            let secret = assert_block.files.get("/run/secret").unwrap();
+            assert!(secret.exists);
+            assert_eq!(secret.default_permissions, Some(false));
+            assert_eq!(secret.mode.as_deref(), Some("0600"));
+        }
+
+        #[test]
+        fn test_load_test_config_assert_files_default_entry_has_default_permissions_none() {
+            // An empty entry {} should have default_permissions = None (effective: true).
+            let repo = TempDir::new().unwrap();
+            fs::write(
+                repo.path().join("test.yaml"),
+                r#"
+type: botforge/test
+name: test
+steps: []
+assert:
+  files:
+    /etc/botwork/bootstrap.yaml: {}
+"#,
+            )
+            .unwrap();
+            let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+            let assert_block = config.assert.unwrap();
+            let entry = assert_block
+                .files
+                .get("/etc/botwork/bootstrap.yaml")
+                .unwrap();
+            assert!(entry.exists);
+            assert_eq!(entry.default_permissions, None); // None → effective true
+            assert!(entry.owner.is_none());
+            assert!(entry.group.is_none());
+            assert!(entry.mode.is_none());
         }
 
         #[test]

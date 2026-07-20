@@ -1170,6 +1170,71 @@ assert:
 Multiple checks for a single container go under **one** key — do not repeat
 the container name.
 
+#### `assert.files:` schema
+
+In-tree (no plugin required) file-existence and permission assertions.  Each
+key is an absolute guest path; the value controls which checks to apply.  A
+bare entry (`path:` with no value, or `{}`) applies the **secure default
+baseline**: `root:root` ownership and a filetype-aware default mode.
+
+```yaml
+assert:
+  files:
+    # secure by default — asserts root:root 0644 (bare entry or {})
+    /etc/botwork/bootstrap.yaml: {}
+
+    # secure baseline, one field deviates — asserts root:root 0440
+    /etc/sudoers.d/90-botwork:
+      mode: "0440"
+
+    # baseline off — only existence is checked
+    /scratch/x:
+      default-permissions: false
+
+    # baseline off, assert exactly one thing — only mode 0600 checked
+    /run/secret:
+      default-permissions: false
+      mode: "0600"
+
+    # directory with filetype declared → root:root 0755
+    /etc/botwork:
+      filetype: directory
+
+    # must be absent
+    /tmp/leftover:
+      exists: false
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `exists` | bool | `true` | Path must exist on the guest.  When `false`, all other fields must be omitted. |
+| `default-permissions` | bool | `true` | Selects the permission-check baseline.  When `true`, a secure credset is applied as described below; explicit `owner`/`group`/`mode` overlay the baseline per field.  When `false`, only the fields the user wrote are checked.  Must be omitted when `exists: false`. |
+| `filetype` | string | absent (not checked) | Expected file type: `file`, `directory`, or `symlink`.  Only meaningful when `exists: true`. |
+| `owner` | string | baseline `root` | Expected owning user name or numeric uid (e.g. `root`, `1000`).  Overlays the baseline when `default-permissions: true`. |
+| `group` | string | baseline `root` | Expected owning group name or numeric gid.  Overlays the baseline when `default-permissions: true`. |
+| `mode` | string | baseline (filetype-aware) | Expected permission mode, 3–4 octal digits (e.g. `"0755"`).  Overlays the baseline when `default-permissions: true`. |
+
+**Baseline / filetype-aware default modes** (when `default-permissions: true`):
+
+| Actual file type | Default owner | Default group | Default mode |
+|-----------------|---------------|---------------|-------------|
+| regular file | `root` | `root` | `0644` |
+| directory | `root` | `root` | `0755` |
+| symlink | `root` | `root` | *(skipped — symlink permissions are meaningless)* |
+
+Explicit `owner`, `group`, and `mode` fields **overlay** the baseline per
+field — writing `mode: "0440"` keeps `owner: root, group: root` from the
+baseline.  Set `default-permissions: false` to suppress the baseline entirely
+and check only what you wrote.
+
+Secrets (`0600`) remain explicit via `mode: "0600"` (optionally combined with
+`default-permissions: false` to check only the mode and nothing else).
+
+Existence (and `filetype:` when set) is always checked regardless of
+`default-permissions`.
+
+`default-permissions:` must be omitted when `exists: false`.
+
 #### `assert.services:` schema
 
 In-tree (no plugin required) systemd-unit assertions.  Each key is a unit name;
