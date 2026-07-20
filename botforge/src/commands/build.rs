@@ -19,12 +19,13 @@ use crate::resolver::{AssetKind, ResolveFileContext, ResolveSpec, ARTIFACT_DIR};
 use crate::ssh::{scp_with_retry, ssh_with_retry, SshOptions, TemporarySshKeypair};
 use crate::util::{
     botforge_debug_enabled, create_temp_dir, default_cache_dir, ensure_command, format_bytes_human,
-    resolve_under_root, run_command_capture, unique_suffix,
+    resolve_under_root, unique_suffix,
 };
 
 use crate::compress::{
     compress_qcow2_image, known_compressor_verbs_with_extras, read_qcow2_image_stats,
-    read_virtual_sector0, sparsify_zero_clusters, validate_compressor_verb_with_extras,
+    read_virtual_sector0, resize_qcow2_image, sparsify_zero_clusters,
+    validate_compressor_verb_with_extras,
 };
 use crate::compress::{CompressConfig, ReclaimMode};
 use crate::config::{load_build_config, validate_build_steps};
@@ -123,7 +124,6 @@ pub(crate) struct BuildArgs {
 pub(crate) fn cmd_build(args: BuildArgs) -> Result<()> {
     require_kvm()?;
     ensure_command("qemu-system-x86_64")?;
-    ensure_command("qemu-img")?;
     detect_iso_tool()?;
 
     let context = discover_context(args.context.as_deref())?;
@@ -1370,12 +1370,7 @@ fn copy_qcow2(source: &Path, partial: &Path) -> Result<()> {
 }
 
 fn resize_qcow2(disk: &Path, size: &str) -> Result<()> {
-    let args = vec![
-        "resize".to_string(),
-        disk.display().to_string(),
-        size.to_string(),
-    ];
-    run_command_capture("qemu-img", &args, &[], "qemu-img resize failed")
+    resize_qcow2_image(disk, size)
 }
 
 #[cfg(test)]

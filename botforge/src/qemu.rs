@@ -5,7 +5,7 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
-use crate::util::run_command_capture;
+use crate::compress::create_qcow2_overlay;
 
 /// A forwarded port specification: a bind address and a port number.
 ///
@@ -68,21 +68,7 @@ pub(crate) fn create_overlay_image(base_image: &Path, overlay_image: &Path) -> R
         std::fs::create_dir_all(parent)
             .with_context(|| format!("cannot create overlay dir: {}", parent.display()))?;
     }
-    let args = qemu_img_create_args(base_image, overlay_image);
-    run_command_capture("qemu-img", &args, &[], "qemu-img create overlay failed")
-}
-
-pub(crate) fn qemu_img_create_args(base_image: &Path, overlay_image: &Path) -> Vec<String> {
-    vec![
-        "create".into(),
-        "-f".into(),
-        "qcow2".into(),
-        "-F".into(),
-        "qcow2".into(),
-        "-b".into(),
-        base_image.display().to_string(),
-        overlay_image.display().to_string(),
-    ]
+    create_qcow2_overlay(base_image, overlay_image)
 }
 
 pub(crate) fn qemu_run_args(
@@ -186,7 +172,7 @@ pub(crate) fn spawn_qemu_with_log(args: &[String], log_path: &Path) -> Result<Ch
 
 #[cfg(test)]
 mod tests {
-    use super::{qemu_img_create_args, qemu_run_args, PortSpec};
+    use super::{qemu_run_args, PortSpec};
     use std::path::{Path, PathBuf};
 
     fn loopback(port: u16) -> PortSpec {
@@ -201,23 +187,6 @@ mod tests {
             addr: "0.0.0.0".into(),
             port,
         }
-    }
-
-    #[test]
-    fn qemu_img_create_args_match_expected_argv() {
-        assert_eq!(
-            qemu_img_create_args(Path::new("/base.qcow2"), Path::new("/overlay.qcow2")),
-            vec![
-                "create",
-                "-f",
-                "qcow2",
-                "-F",
-                "qcow2",
-                "-b",
-                "/base.qcow2",
-                "/overlay.qcow2"
-            ]
-        );
     }
 
     #[test]
