@@ -11,9 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use crate::iso::{
-    detect_iso_tool, generate_installer_username, prepare_seed_image, render_user_data,
-};
+use crate::iso::{generate_installer_username, prepare_seed_image, render_user_data};
 use crate::qemu::{qemu_build_args, require_kvm, spawn_qemu_with_log};
 use crate::resolver::{AssetKind, ResolveFileContext, ResolveSpec, ARTIFACT_DIR};
 use crate::ssh::{scp_with_retry, ssh_with_retry, SshOptions, TemporarySshKeypair};
@@ -124,7 +122,6 @@ pub(crate) struct BuildArgs {
 pub(crate) fn cmd_build(args: BuildArgs) -> Result<()> {
     require_kvm()?;
     ensure_command("qemu-system-x86_64")?;
-    detect_iso_tool()?;
 
     let context = discover_context(args.context.as_deref())?;
     let manifest = load_inline_manifest(&context)?;

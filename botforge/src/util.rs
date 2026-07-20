@@ -84,6 +84,7 @@ pub(crate) fn context_relative_display(context: &Path, path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
+#[allow(dead_code)]
 pub(crate) fn run_command_capture(
     program: &str,
     args: &[String],

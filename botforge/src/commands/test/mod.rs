@@ -4,9 +4,7 @@ use shasset::manifest::Manifest;
 use std::path::{Path, PathBuf};
 
 use crate::commands::build::CpusArg;
-use crate::iso::{
-    detect_iso_tool, generate_installer_username, prepare_seed_image, render_user_data,
-};
+use crate::iso::{generate_installer_username, prepare_seed_image, render_user_data};
 use crate::qemu::{create_overlay_image, qemu_run_args, require_kvm, spawn_qemu_with_log};
 use crate::resolver::{AssetKind, Reference, ResolveFileContext, ResolveSpec};
 use crate::ssh::{SshOptions, TemporarySshKeypair};
@@ -68,7 +66,6 @@ pub(crate) fn cmd_test(args: TestArgs) -> Result<()> {
     require_kvm()?;
     ensure_command("qemu-system-x86_64")?;
     ensure_command("qemu-img")?;
-    detect_iso_tool()?;
 
     let context = discover_context(args.context.as_deref())?;
     let manifest = load_inline_manifest(&context)?;

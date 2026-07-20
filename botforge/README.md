@@ -1,6 +1,6 @@
 # botforge
 
-`botforge` is the build-time companion CLI for botworkz VM artifact workflows. It wraps the external toolchain (QEMU/KVM, xorriso, OpenSSH) so the same commands work identically inside the published container image and in local development.
+`botforge` is the build-time companion CLI for botworkz VM artifact workflows. It wraps the external toolchain (QEMU/KVM) so the same commands work identically inside the published container image and in local development.
 
 ## Container image
 
@@ -11,9 +11,8 @@ docker pull ghcr.io/botworkz/tools/botforge:latest
 ```
 
 botforge is distributed as a **batteries-included** image: the QEMU toolchain
-(`qemu-system-x86_64`, `qemu-img`), ISO utilities (`xorriso`, `genisoimage`), and the OpenSSH
-client are baked in so subcommands and image-build flows work reproducibly
-without installing exact tool versions on your host.
+(`qemu-system-x86_64`, `qemu-img`) is baked in so subcommands and image-build
+flows work reproducibly without installing exact tool versions on your host.
 
 ### Runtime requirements
 
@@ -391,10 +390,8 @@ In addition to the per-step numbered titles, `botforge build` emits several
 
 - `🤖 (setup) Preparing build environment (seed image)` — printed before the
   cloud-init cidata seed ISO is built (this ISO injects the ephemeral installer
-  user and SSH key).  The raw `xorriso`/`genisoimage` banner is captured and
-  suppressed on success; it is only surfaced in the error if the ISO build
-  fails.  Set `BOTFORGE_DEBUG=1` to pass the raw tool output through to the
-  console.
+  user and SSH key).  The ISO is built natively in Rust (via hadris-iso) with
+  no external tool dependency.
 - `🤖 (compress) Compressing image (reclaim, sparsify, compression)` — printed
   before the reclaim (`fstrim`/`discard`), zero-cluster sparsify, and/or qcow2
   compression work.  Only emitted when at least one of those steps actually
