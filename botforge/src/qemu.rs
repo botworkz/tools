@@ -5,7 +5,7 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
-use crate::util::run_command;
+use crate::util::run_command_capture;
 
 /// A forwarded port specification: a bind address and a port number.
 ///
@@ -69,7 +69,7 @@ pub(crate) fn create_overlay_image(base_image: &Path, overlay_image: &Path) -> R
             .with_context(|| format!("cannot create overlay dir: {}", parent.display()))?;
     }
     let args = qemu_img_create_args(base_image, overlay_image);
-    run_command("qemu-img", &args, &[], "qemu-img create overlay failed")
+    run_command_capture("qemu-img", &args, &[], "qemu-img create overlay failed")
 }
 
 pub(crate) fn qemu_img_create_args(base_image: &Path, overlay_image: &Path) -> Vec<String> {
@@ -170,6 +170,7 @@ pub(crate) fn qemu_build_args(
 }
 
 pub(crate) fn spawn_qemu_with_log(args: &[String], log_path: &Path) -> Result<Child> {
+    crate::plan::print_phase("vm", "Starting vm");
     let log = File::create(log_path)
         .with_context(|| format!("cannot create VM log file: {}", log_path.display()))?;
     let log_err = log

@@ -181,6 +181,18 @@ pub(crate) fn write_seed_files(seed_dir: &Path, user_data: &str) -> Result<()> {
     Ok(())
 }
 
+/// Prepare the cloud-init seed ISO: write seed files, build the ISO, then remove the
+/// temporary seed directory.  Brackets the work with `(setup)` phase markers on stderr.
+pub(crate) fn prepare_seed_image(seed_dir: &Path, seed_iso: &Path, user_data: &str) -> Result<()> {
+    crate::plan::print_phase("setup", "Preparing environment (seed image)");
+    write_seed_files(seed_dir, user_data)?;
+    build_iso(seed_dir, seed_iso, "cidata")?;
+    std::fs::remove_dir_all(seed_dir)
+        .with_context(|| format!("cannot remove temp seed dir: {}", seed_dir.display()))?;
+    crate::plan::print_phase_status("setup", "Preparing environment (seed image)", true);
+    Ok(())
+}
+
 pub(crate) fn detect_iso_tool() -> Result<&'static str> {
     if command_exists("xorriso") {
         return Ok("xorriso");

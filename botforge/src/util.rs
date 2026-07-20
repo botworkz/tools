@@ -74,6 +74,7 @@ pub(crate) fn botforge_debug_enabled() -> bool {
 /// processes) the threads have already reached EOF by the time the child has exited.
 /// Return `path` rendered relative to `context` when possible, or just the
 /// final file-name component otherwise.  An absolute path is **never** returned.
+#[allow(dead_code)]
 pub(crate) fn context_relative_display(context: &Path, path: &Path) -> String {
     if let Ok(rel) = path.strip_prefix(context) {
         return rel.display().to_string();
