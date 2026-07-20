@@ -68,6 +68,41 @@ fn parse_entries<T: DeserializeOwned>(
         .with_context(|| format!("invalid assert.{verb} block: expected a mapping"))
 }
 
+fn has_service_field(entry: &serde_yaml::Mapping, field: &str) -> bool {
+    entry.keys().any(|k| k.as_str() == Some(field))
+}
+
+fn validate_service_exists_attributes(raw_value: &Value) -> Result<()> {
+    let Some(entries) = raw_value.as_mapping() else {
+        return Ok(());
+    };
+
+    for (raw_name, raw_entry) in entries {
+        let Some(name) = raw_name.as_str() else {
+            continue;
+        };
+        let Some(entry) = raw_entry.as_mapping() else {
+            continue;
+        };
+
+        let exists_is_false = entry
+            .iter()
+            .find(|(k, _)| k.as_str() == Some("exists"))
+            .and_then(|(_, v)| v.as_bool())
+            == Some(false);
+
+        if exists_is_false
+            && (has_service_field(entry, "enabled") || has_service_field(entry, "active"))
+        {
+            anyhow::bail!(
+                "assert.services: entry '{name}': enabled/active must not be set when `exists: false`"
+            );
+        }
+    }
+
+    Ok(())
+}
+
 #[derive(Debug)]
 struct FilesAssertKind;
 
@@ -213,6 +248,7 @@ impl AssertKind for ServicesAssertKind {
     }
 
     fn parse_into(&self, raw_value: &Value, block: &mut AssertBlock) -> Result<()> {
+        validate_service_exists_attributes(raw_value)?;
         block.services = parse_entries::<AssertService>(raw_value, self.verb())?;
         Ok(())
     }
@@ -235,5 +271,38 @@ impl AssertKind for ServicesAssertKind {
 
     fn is_empty(&self, block: &AssertBlock) -> bool {
         block.services.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_service_exists_attributes;
+    use serde_yaml::Value;
+
+    #[test]
+    fn test_validate_service_exists_attributes_accepts_exists_false_without_attrs() {
+        let raw: Value = serde_yaml::from_str(
+            r#"
+retired:
+  exists: false
+"#,
+        )
+        .unwrap();
+        validate_service_exists_attributes(&raw).unwrap();
+    }
+
+    #[test]
+    fn test_validate_service_exists_attributes_rejects_enabled_with_exists_false() {
+        let raw: Value = serde_yaml::from_str(
+            r#"
+retired:
+  exists: false
+  enabled: true
+"#,
+        )
+        .unwrap();
+        let err = validate_service_exists_attributes(&raw).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("exists: false"), "{msg}");
     }
 }
