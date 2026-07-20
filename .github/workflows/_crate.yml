@@ -301,6 +301,21 @@ jobs:
                  cat /tmp/deps-bad-smoke.log >&2; exit 1; }
         fi
 
+    - name: Collect OCI image as tarball
+      run: |
+        set -euo pipefail
+        # Export the smoke-tested image in OCI archive format so the publish job
+        # can push the exact same bytes to GHCR without rebuilding.
+        skopeo copy \
+          docker-daemon:botwork/$CRATE:ci \
+          oci-archive:oci-amd64-$CRATE.tar
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: oci-amd64-${{ inputs.crate }}
+        path: oci-amd64-${{ inputs.crate }}.tar
+        if-no-files-found: error
+
     - uses: actions/upload-artifact@v4
       with:
         name: ${{ inputs.crate }}-binary

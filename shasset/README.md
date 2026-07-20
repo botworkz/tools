@@ -8,7 +8,7 @@
 - A verified downloader: fetch one or all named assets, verify each against its checksum, and fail loudly on any mismatch or error.
 
 **What shasset is explicitly NOT (out of scope):**
-- No management of image **digest pins** — Dependabot + EarthBuild manage `FROM ...@sha256` pins, and `shasset/bin/update-deps` resolves them at pin-update time. `shasset` itself can *fetch* an `oci://` image by digest, but it does not maintain the pin file.
+- No management of image **digest pins** — Dependabot and `shasset/bin/update-deps` resolve them at pin-update time. `shasset` itself can *fetch* an `oci://` image by digest, but it does not maintain the pin file.
 - No "sibling build" / `*_REF` logic — that belongs in consumer repos.
 - No awareness of qcow2, skopeo, tar export, or project-specific tooling.
 - It is a generic tool anyone could vendor.
@@ -28,10 +28,10 @@ docker run --rm -v "$PWD:/work" -w /work -e GH_TOKEN \
   ghcr.io/botworkz/tools/shasset fetch --out build/deps
 ```
 
-Build the image locally with [EarthBuild](https://github.com/EarthBuild/earthbuild) (from the repo root):
+Build the image locally with `docker buildx build` (from the repo root):
 
 ```sh
-earthly +shasset-image
+docker buildx build --platform linux/amd64 -f shasset/Dockerfile -t botwork/shasset:local --load .
 ```
 
 This produces the stable local tag `botwork/shasset:local`.
