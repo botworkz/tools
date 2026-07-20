@@ -170,6 +170,7 @@ pub(crate) fn qemu_build_args(
 }
 
 pub(crate) fn spawn_qemu_with_log(args: &[String], log_path: &Path) -> Result<Child> {
+    crate::plan::print_phase("vm", "Starting vm");
     let log = File::create(log_path)
         .with_context(|| format!("cannot create VM log file: {}", log_path.display()))?;
     let log_err = log

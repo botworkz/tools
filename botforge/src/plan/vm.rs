@@ -1349,6 +1349,7 @@ pub(crate) fn print_log_tail(path: &Path, line_count: usize) {
 }
 
 pub(crate) fn cleanup_test(vm_child: &mut Option<Child>, overlay_image: &Path) {
+    crate::plan::print_phase("vm", "Stopping vm");
     if let Some(child) = vm_child.as_mut() {
         let _ = child.kill();
         let _ = child.wait();
@@ -1395,6 +1396,7 @@ pub(crate) fn shutdown_build_vm(
     overall_deadline: Instant,
     overall_timeout: Duration,
 ) -> Result<()> {
+    crate::plan::print_phase("vm", "Stopping vm");
     if Instant::now() >= overall_deadline {
         if let Some(child) = vm_child.as_mut() {
             let _ = child.kill();
@@ -1402,6 +1404,7 @@ pub(crate) fn shutdown_build_vm(
         }
         *vm_child = None;
         preserve_failed_build_disk(partial, failed_partial)?;
+        crate::plan::print_phase_status("vm", "Stopping vm", false);
         return Err(overall_timeout_error(overall_timeout));
     }
 
@@ -1453,11 +1456,14 @@ pub(crate) fn shutdown_build_vm(
 
     if timed_out_overall {
         preserve_failed_build_disk(partial, failed_partial)?;
+        crate::plan::print_phase_status("vm", "Stopping vm", false);
         Err(overall_timeout_error(overall_timeout))
     } else if clean_exit {
+        crate::plan::print_phase_status("vm", "Stopping vm", true);
         Ok(())
     } else {
         preserve_failed_build_disk(partial, failed_partial)?;
+        crate::plan::print_phase_status("vm", "Stopping vm", false);
         anyhow::bail!(
             "build VM did not shut down cleanly; \
              partial disk left at {} for post-mortem",
