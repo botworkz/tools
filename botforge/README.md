@@ -1132,25 +1132,81 @@ uint32_t plugin_core_ping(void);  // host handshake self-test only; must return 
 
 #### `assert/docker` example
 
+The `docker:` block groups all container-infrastructure checks into a single
+SSH round trip.  A bare entry (`name:` with no value) is equivalent to `{}` —
+all defaults (`exists: true`).
+
 ```yaml
 assert:
   docker:
     images:
-      nginx:latest: { exists: true }
-      old-image:    { exists: false }
+      "botwork/api:local":        # bare — equivalent to {exists: true}
+      "botwork/api:old-version":  { exists: false }
+      "nginx:*":                  { exists: true }   # glob pattern
     networks:
-      mynet: { exists: true }
+      botwork-internal:           # bare — equivalent to {exists: true}
+      botwork-plugin:             {}
     containers:
-      web:
+      botwork-api:
         exists: true
         running: true
-        networks: [mynet, "!badnet"]
-        ports: ["80/tcp", "!9000/tcp"]
+        networks:
+          - "botwork-internal"
+          - "!botwork-plugin"   # must NOT be on botwork-plugin
+        ports:
+          - "9400/tcp"          # port 9400/tcp must be published to host
+          - "!9401/tcp"         # port 9401/tcp must NOT be published
         logs:
           contains: ["Started"]
           not_contains: ["ERROR"]
           timeout: 30
+      botwork-envoy:
+        running: true
+        networks:
+          - "botwork-internal"
+          - "botwork-plugin"    # on both networks
 ```
+
+Multiple checks for a single container go under **one** key — do not repeat
+the container name.
+
+#### `assert.services:` schema
+
+In-tree (no plugin required) systemd-unit assertions.  Each key is a unit name;
+the value controls which checks to apply.  A bare entry (`name:` with no value)
+defaults to `exists: true`, `enabled: true`, `active: true`.
+
+```yaml
+assert:
+  services:
+    ssh:                     # bare — exists + enabled + active all default true
+    nginx:
+      enabled: false         # must be present but NOT enabled
+    retired-unit.service:
+      exists: false          # must be absent (enabled/active/environment must be omitted)
+    botwork-launcher.service:
+      exists: true
+      enabled: true
+      active: true
+      environment:
+        contains:
+          - "BOTWORK_LAUNCHER_DEFAULT_NETWORK=botwork-plugin"
+        not_contains:
+          - "DEBUG=1"
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `exists` | bool | `true` | Unit must exist (`systemctl cat` succeeds). When `false`, all other fields must be omitted. |
+| `enabled` | bool | `true` | `systemctl is-enabled` must report `enabled`. |
+| `active` | bool | `true` | `systemctl is-active` must report `active`. |
+| `environment` | map | absent | Substring checks against `systemctl show -p Environment`. |
+| `environment.contains` | string list | `[]` | Every substring must appear in the unit's `Environment=` line. |
+| `environment.not_contains` | string list | `[]` | None of these substrings may appear in the unit's `Environment=` line. |
+
+`environment:` is only meaningful when `exists: true`; it is rejected at config
+load time when `exists: false`.  Matching is substring, not regex — consistent
+with `expect.stdout.contains`/`not_contains` on run steps.
 
 ### Trust boundary
 

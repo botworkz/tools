@@ -27,23 +27,26 @@
 //!           timeout: 30
 //! ```
 //!
+//! Bare/null map entries (`name:` with no value) behave identically to `{}`
+//! (all defaults: `exists: true`).
+//!
 //! # Probe output order
 //!
 //! The probe emits sections in this fixed order:
-//! 1. **Images** — one `present`/`absent` line per exact image (sorted),
-//!    followed by full `docker image ls` output + `__END_DOCKER_IMAGES__`
-//!    sentinel (only when pattern images are present).
-//! 2. **Networks** — one `present`/`absent` line per exact network (sorted),
-//!    followed by full `docker network ls` output + `__END_DOCKER_NETWORKS__`
-//!    sentinel (only when pattern networks are present).
-//! 3. **Container log wait loops** — for each container with `logs.contains`
-//!    (sorted by container name): a polling loop, then `__LOG_READY_RESULT__<name>:<0|1>`,
-//!    then the last 1000 log lines, then `__END_LOG_<name>__`.
-//! 4. **Containers** — for each exact container (sorted): one state line
-//!    `present:<running>:<networks>` or `absent`, then `docker port` output
-//!    \+ `__END_PORTS_<name>__` (only when ports checks exist), followed by
-//!    full `docker ps -a` output + `__END_DOCKER_CONTAINERS__` sentinel
-//!    (only when pattern containers are present).
+//! 1. **Images** (if images map is non-empty) — full `docker image ls` dump,
+//!    terminated by `__END_DOCKER_IMAGES__`.
+//! 2. **Networks** (if networks map is non-empty) — full `docker network ls`
+//!    dump, terminated by `__END_DOCKER_NETWORKS__`.
+//! 3. **Container log wait loops** — for each non-glob container with
+//!    `logs.contains` (sorted by container name): polling loop, then
+//!    `__LOG_READY_RESULT__<name>:<0|1>`, then the last 1000 log lines, then
+//!    `__END_LOG_<name>__`.
+//! 4. **Containers** (if containers map is non-empty) — `docker ps -a` dump
+//!    as tab-separated `Name\tState\tPorts`, terminated by
+//!    `__END_DOCKER_CONTAINERS__`.
+//! 5. **Network membership** (if any non-glob containers declare `networks:`)
+//!    — a single batched `docker inspect` over those containers with format
+//!    `{{.Name}} <net1> <net2> ...`, terminated by `__END_DOCKER_INSPECT__`.
 //!
 //! # Safety
 //!
@@ -74,35 +77,50 @@ fn default_timeout() -> u32 {
 }
 
 /// Top-level docker assert configuration.
+///
+/// Map values may be `null` (bare YAML entry with no body), which is treated
+/// identically to `{}` (all-defaults struct).
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct DockerConfig {
     #[serde(default)]
-    images: BTreeMap<String, ImageExpect>,
+    images: BTreeMap<String, Option<ImageExpect>>,
     #[serde(default)]
-    networks: BTreeMap<String, NetworkExpect>,
+    networks: BTreeMap<String, Option<NetworkExpect>>,
     #[serde(default)]
-    containers: BTreeMap<String, ContainerExpect>,
+    containers: BTreeMap<String, Option<ContainerExpect>>,
 }
 
 /// Expectation for a docker image.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ImageExpect {
     #[serde(default = "default_true")]
     exists: bool,
 }
 
+impl Default for ImageExpect {
+    fn default() -> Self {
+        Self { exists: true }
+    }
+}
+
 /// Expectation for a docker network.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct NetworkExpect {
     #[serde(default = "default_true")]
     exists: bool,
 }
 
+impl Default for NetworkExpect {
+    fn default() -> Self {
+        Self { exists: true }
+    }
+}
+
 /// Expectation for a docker container.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ContainerExpect {
     #[serde(default = "default_true")]
@@ -120,6 +138,18 @@ struct ContainerExpect {
     ports: Vec<String>,
 }
 
+impl Default for ContainerExpect {
+    fn default() -> Self {
+        Self {
+            exists: true,
+            running: None,
+            logs: None,
+            networks: Vec::new(),
+            ports: Vec::new(),
+        }
+    }
+}
+
 impl ContainerExpect {
     /// Effective `running` check: `true` when `exists: true` and `running` is absent.
     fn effective_running(&self) -> Option<bool> {
@@ -131,7 +161,7 @@ impl ContainerExpect {
 }
 
 /// Log-contents expectation for a container.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct LogsExpect {
     #[serde(default)]
@@ -167,54 +197,62 @@ fn sq(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// Parse published host ports from the `docker ps --format '{{.Ports}}'` field.
+///
+/// Each entry looks like `0.0.0.0:80->80/tcp` or `:::80->80/tcp` (published)
+/// or `80/tcp` (exposed but not published).  A port is considered published
+/// when a `HOSTIP:HOSTPORT->CONTAINERPORT/proto` mapping is present.  Returns
+/// the deduplicated set of `CONTAINERPORT/proto` values that are published.
+fn parse_published_ports(ports_str: &str) -> Vec<String> {
+    if ports_str.is_empty() {
+        return Vec::new();
+    }
+    let mut published = std::collections::BTreeSet::new();
+    for entry in ports_str.split(", ") {
+        let entry = entry.trim();
+        if let Some(pos) = entry.find("->") {
+            let container_port = &entry[pos + 2..];
+            if !container_port.is_empty() {
+                published.insert(container_port.to_owned());
+            }
+        }
+    }
+    published.into_iter().collect()
+}
+
 // ── Probe script generation ───────────────────────────────────────────────────
 
 fn build_probe_script(config: &DockerConfig) -> String {
     let mut out = String::new();
     out.push_str("set -e\n\n");
 
-    // ── IMAGES ───────────────────────────────────────────────────────────────
-    let (exact_images, pattern_images): (Vec<_>, Vec<_>) =
-        config.images.iter().partition(|(k, _)| !is_glob_pattern(k));
-
-    for (name, _) in &exact_images {
-        out.push_str(&format!(
-            "docker image inspect {n} >/dev/null 2>&1 && printf 'present\\n' || printf 'absent\\n'\n",
-            n = sq(name)
-        ));
-    }
-    if !pattern_images.is_empty() {
+    // ── IMAGES — one bulk listing for all keys (exact + glob) ────────────────
+    if !config.images.is_empty() {
         out.push_str(
             "docker image ls --format '{{.Repository}}:{{.Tag}}' 2>/dev/null\n\
              printf '__END_DOCKER_IMAGES__\\n'\n",
         );
     }
 
-    // ── NETWORKS ─────────────────────────────────────────────────────────────
-    let (exact_networks, pattern_networks): (Vec<_>, Vec<_>) = config
-        .networks
-        .iter()
-        .partition(|(k, _)| !is_glob_pattern(k));
-
-    for (name, _) in &exact_networks {
-        out.push_str(&format!(
-            "docker network inspect {n} >/dev/null 2>&1 && printf 'present\\n' || printf 'absent\\n'\n",
-            n = sq(name)
-        ));
-    }
-    if !pattern_networks.is_empty() {
+    // ── NETWORKS — one bulk listing for all keys ──────────────────────────────
+    if !config.networks.is_empty() {
         out.push_str(
             "docker network ls --format '{{.Name}}' 2>/dev/null\n\
              printf '__END_DOCKER_NETWORKS__\\n'\n",
         );
     }
 
-    // ── CONTAINER LOG READINESS ───────────────────────────────────────────────
-    // Sort containers by key (BTreeMap guarantees this).
-    for (cname, cexpect) in &config.containers {
+    // ── CONTAINER LOG READINESS WAIT LOOPS ───────────────────────────────────
+    // Emitted only for non-glob containers that declare logs.contains.
+    // BTreeMap iteration order is sorted by key — deterministic.
+    for (cname, opt_expect) in &config.containers {
         if is_glob_pattern(cname) {
             continue;
         }
+        let cexpect = match opt_expect {
+            Some(e) => e,
+            None => continue, // default ContainerExpect has no logs
+        };
         let Some(logs) = cexpect.logs.as_ref() else {
             continue;
         };
@@ -249,41 +287,39 @@ fn build_probe_script(config: &DockerConfig) -> String {
         ));
     }
 
-    // ── CONTAINERS ───────────────────────────────────────────────────────────
-    let (exact_containers, pattern_containers): (Vec<_>, Vec<_>) = config
-        .containers
-        .iter()
-        .partition(|(k, _)| !is_glob_pattern(k));
-
-    for (cname, cexpect) in &exact_containers {
-        let cname_sq = sq(cname);
-        out.push_str(&format!(
-            "if docker inspect {c} --format '{{{{.State.Running}}}}' >/dev/null 2>&1; then\n\
-             \x20 _running=$(docker inspect {c} --format '{{{{.State.Running}}}}' 2>/dev/null)\n\
-             \x20 _networks=$(docker inspect {c} --format '{{{{range $k,$v := .NetworkSettings.Networks}}}}{{{{$k}}}} {{{{end}}}}' 2>/dev/null)\n\
-             \x20 printf 'present:%s:%s\\n' \"$_running\" \"$_networks\"\n\
-             else\n\
-             \x20 printf 'absent\\n'\n\
-             fi\n",
-            c = cname_sq
-        ));
-
-        // Emit port listing if we have ports to check.
-        if !cexpect.ports.is_empty() {
-            out.push_str(&format!(
-                "docker port {c} 2>/dev/null || true\n\
-                 printf '__END_PORTS_{cname}__\\n'\n",
-                c = cname_sq,
-                cname = cname
-            ));
-        }
-    }
-
-    if !pattern_containers.is_empty() {
+    // ── CONTAINERS — one bulk ps -a listing (TSV: Name\tState\tPorts) ─────────
+    if !config.containers.is_empty() {
         out.push_str(
-            "docker ps -a --format '{{.Names}}' 2>/dev/null\n\
+            "docker ps -a --format '{{.Names}}\\t{{.State}}\\t{{.Ports}}' 2>/dev/null\n\
              printf '__END_DOCKER_CONTAINERS__\\n'\n",
         );
+    }
+
+    // ── BATCHED INSPECT for containers with networks: checks ──────────────────
+    // Collect non-glob containers that have at least one network check.
+    let containers_needing_inspect: Vec<&String> = config
+        .containers
+        .iter()
+        .filter(|(k, v)| {
+            !is_glob_pattern(k)
+                && v.as_ref().is_some_and(|e| !e.networks.is_empty())
+        })
+        .map(|(k, _)| k)
+        .collect();
+
+    if !containers_needing_inspect.is_empty() {
+        let names: String = containers_needing_inspect
+            .iter()
+            .map(|n| sq(n))
+            .collect::<Vec<_>>()
+            .join(" ");
+        // Format: "/container-name net1 net2 ..." (one line per container)
+        out.push_str(&format!(
+            "docker inspect {names} \
+             --format '{{{{.Name}}}} {{{{range $k,$v := .NetworkSettings.Networks}}}}{{{{$k}}}} {{{{end}}}}' \
+             2>/dev/null || true\n\
+             printf '__END_DOCKER_INSPECT__\\n'\n",
+        ));
     }
 
     out
@@ -296,65 +332,51 @@ fn evaluate_probe(config: &DockerConfig, probe_stdout: &str) -> Results {
     let mut lines = probe_stdout.lines().peekable();
 
     // ── IMAGES ───────────────────────────────────────────────────────────────
-    let (exact_images, pattern_images): (Vec<_>, Vec<_>) =
-        config.images.iter().partition(|(k, _)| !is_glob_pattern(k));
-
-    for (name, expect) in &exact_images {
-        let line = lines.next().unwrap_or("absent").trim();
-        let present = line == "present";
-        let ok = present == expect.exists;
-        let message = if !ok {
-            if expect.exists {
-                Some(format!("image {name} is absent (expected present)"))
-            } else {
-                Some(format!("image {name} is present (expected absent)"))
-            }
-        } else {
-            None
-        };
-        checks.push(CheckResult {
-            label: format!(
-                "docker image {name} {}",
-                if expect.exists { "present" } else { "absent" }
-            ),
-            ok,
-            message,
-        });
-    }
-
-    if !pattern_images.is_empty() {
-        // Consume all image ls lines until sentinel.
+    if !config.images.is_empty() {
+        // Consume image ls dump until sentinel.
         let mut all_images: Vec<String> = Vec::new();
         loop {
             match lines.next() {
-                None => break,
-                Some("__END_DOCKER_IMAGES__") => break,
-                Some(l) => all_images.push(l.to_owned()),
+                None | Some("__END_DOCKER_IMAGES__") => break,
+                Some(l) if !l.is_empty() => all_images.push(l.to_owned()),
+                _ => {}
             }
         }
-        for (pattern, expect) in &pattern_images {
-            let matches: Vec<&str> = all_images
-                .iter()
-                .filter(|img| glob_match(pattern, img))
-                .map(String::as_str)
-                .collect();
-            let found = !matches.is_empty();
+
+        for (name, opt_expect) in &config.images {
+            let expect = opt_expect.as_ref().cloned().unwrap_or_default();
+            let found = if is_glob_pattern(name) {
+                all_images.iter().any(|img| glob_match(name, img))
+            } else {
+                all_images.iter().any(|img| img == name)
+            };
             let ok = found == expect.exists;
             let message = if !ok {
                 if expect.exists {
-                    Some(format!("no images matching pattern {pattern:?} found"))
-                } else {
+                    if is_glob_pattern(name) {
+                        Some(format!("no images matching pattern {name:?} found"))
+                    } else {
+                        Some(format!("image {name} is absent (expected present)"))
+                    }
+                } else if is_glob_pattern(name) {
+                    let matches: Vec<&str> = all_images
+                        .iter()
+                        .filter(|img| glob_match(name, img))
+                        .map(String::as_str)
+                        .collect();
                     Some(format!(
-                        "images matching pattern {pattern:?} found: {}",
+                        "images matching pattern {name:?} found: {}",
                         matches.join(", ")
                     ))
+                } else {
+                    Some(format!("image {name} is present (expected absent)"))
                 }
             } else {
                 None
             };
             checks.push(CheckResult {
                 label: format!(
-                    "docker image {pattern} {}",
+                    "docker image {name} {}",
                     if expect.exists { "present" } else { "absent" }
                 ),
                 ok,
@@ -364,66 +386,50 @@ fn evaluate_probe(config: &DockerConfig, probe_stdout: &str) -> Results {
     }
 
     // ── NETWORKS ─────────────────────────────────────────────────────────────
-    let (exact_networks, pattern_networks): (Vec<_>, Vec<_>) = config
-        .networks
-        .iter()
-        .partition(|(k, _)| !is_glob_pattern(k));
-
-    for (name, expect) in &exact_networks {
-        let line = lines.next().unwrap_or("absent").trim();
-        let present = line == "present";
-        let ok = present == expect.exists;
-        let message = if !ok {
-            if expect.exists {
-                Some(format!("network {name} is absent (expected present)"))
-            } else {
-                Some(format!("network {name} is present (expected absent)"))
-            }
-        } else {
-            None
-        };
-        checks.push(CheckResult {
-            label: format!(
-                "docker network {name} {}",
-                if expect.exists { "present" } else { "absent" }
-            ),
-            ok,
-            message,
-        });
-    }
-
-    if !pattern_networks.is_empty() {
+    if !config.networks.is_empty() {
         let mut all_networks: Vec<String> = Vec::new();
         loop {
             match lines.next() {
-                None => break,
-                Some("__END_DOCKER_NETWORKS__") => break,
-                Some(l) => all_networks.push(l.to_owned()),
+                None | Some("__END_DOCKER_NETWORKS__") => break,
+                Some(l) if !l.is_empty() => all_networks.push(l.to_owned()),
+                _ => {}
             }
         }
-        for (pattern, expect) in &pattern_networks {
-            let matches: Vec<&str> = all_networks
-                .iter()
-                .filter(|net| glob_match(pattern, net))
-                .map(String::as_str)
-                .collect();
-            let found = !matches.is_empty();
+
+        for (name, opt_expect) in &config.networks {
+            let expect = opt_expect.as_ref().cloned().unwrap_or_default();
+            let found = if is_glob_pattern(name) {
+                all_networks.iter().any(|net| glob_match(name, net))
+            } else {
+                all_networks.iter().any(|net| net == name)
+            };
             let ok = found == expect.exists;
             let message = if !ok {
                 if expect.exists {
-                    Some(format!("no networks matching pattern {pattern:?} found"))
-                } else {
+                    if is_glob_pattern(name) {
+                        Some(format!("no networks matching pattern {name:?} found"))
+                    } else {
+                        Some(format!("network {name} is absent (expected present)"))
+                    }
+                } else if is_glob_pattern(name) {
+                    let matches: Vec<&str> = all_networks
+                        .iter()
+                        .filter(|net| glob_match(name, net))
+                        .map(String::as_str)
+                        .collect();
                     Some(format!(
-                        "networks matching pattern {pattern:?} found: {}",
+                        "networks matching pattern {name:?} found: {}",
                         matches.join(", ")
                     ))
+                } else {
+                    Some(format!("network {name} is present (expected absent)"))
                 }
             } else {
                 None
             };
             checks.push(CheckResult {
                 label: format!(
-                    "docker network {pattern} {}",
+                    "docker network {name} {}",
                     if expect.exists { "present" } else { "absent" }
                 ),
                 ok,
@@ -432,14 +438,18 @@ fn evaluate_probe(config: &DockerConfig, probe_stdout: &str) -> Results {
         }
     }
 
-    // ── CONTAINER LOG READINESS ───────────────────────────────────────────────
+    // ── CONTAINER LOG READINESS RESULTS ──────────────────────────────────────
     // Per-container log results: map from container name to (ready_bool, log_lines).
     let mut log_results: BTreeMap<String, (bool, Vec<String>)> = BTreeMap::new();
 
-    for (cname, cexpect) in &config.containers {
+    for (cname, opt_expect) in &config.containers {
         if is_glob_pattern(cname) {
             continue;
         }
+        let cexpect = match opt_expect {
+            Some(e) => e,
+            None => continue,
+        };
         let Some(logs) = cexpect.logs.as_ref() else {
             continue;
         };
@@ -450,7 +460,6 @@ fn evaluate_probe(config: &DockerConfig, probe_stdout: &str) -> Results {
         let ready_sentinel = format!("__LOG_READY_RESULT__{}:", cname);
         let end_sentinel = format!("__END_LOG_{}__", cname);
 
-        // Consume until ready sentinel.
         let mut ready = false;
         let mut log_lines: Vec<String> = Vec::new();
 
@@ -460,7 +469,6 @@ fn evaluate_probe(config: &DockerConfig, probe_stdout: &str) -> Results {
                 Some(l) if l.starts_with(&ready_sentinel) => {
                     let val = l.trim_start_matches(&ready_sentinel);
                     ready = val == "1";
-                    // Now collect log lines until end sentinel.
                     loop {
                         match lines.next() {
                             None => break,
@@ -478,256 +486,264 @@ fn evaluate_probe(config: &DockerConfig, probe_stdout: &str) -> Results {
     }
 
     // ── CONTAINERS ───────────────────────────────────────────────────────────
-    let (exact_containers, pattern_containers): (Vec<_>, Vec<_>) = config
-        .containers
-        .iter()
-        .partition(|(k, _)| !is_glob_pattern(k));
+    if !config.containers.is_empty() {
+        // Parse the docker ps -a TSV dump.
+        // Format: Name\tState\tPorts  (tab-separated, docker interprets \t as tab)
+        struct PsRow {
+            state: String,
+            published_ports: Vec<String>,
+        }
+        let mut ps_map: BTreeMap<String, PsRow> = BTreeMap::new();
 
-    for (cname, cexpect) in &exact_containers {
-        let state_line = lines.next().unwrap_or("absent").trim().to_owned();
-        let present = state_line != "absent";
-
-        // Presence check.
-        let exists_ok = present == cexpect.exists;
-        let exists_message = if !exists_ok {
-            if cexpect.exists {
-                Some(format!("container {cname} is absent (expected present)"))
-            } else {
-                Some(format!("container {cname} is present (expected absent)"))
-            }
-        } else {
-            None
-        };
-        checks.push(CheckResult {
-            label: format!(
-                "docker container {cname} {}",
-                if cexpect.exists { "present" } else { "absent" }
-            ),
-            ok: exists_ok,
-            message: exists_message,
-        });
-
-        // Parse ports listing if needed.
-        let port_lines: Vec<String> = if !cexpect.ports.is_empty() {
-            let end_sentinel = format!("__END_PORTS_{}__", cname);
-            let mut pl: Vec<String> = Vec::new();
-            loop {
-                match lines.next() {
-                    None => break,
-                    Some(l) if l == end_sentinel => break,
-                    Some(l) => pl.push(l.to_owned()),
+        loop {
+            match lines.next() {
+                None | Some("__END_DOCKER_CONTAINERS__") => break,
+                Some(l) => {
+                    let mut parts = l.splitn(3, '\t');
+                    let name = parts.next().unwrap_or("").trim().to_owned();
+                    let state = parts.next().unwrap_or("").trim().to_owned();
+                    let ports_str = parts.next().unwrap_or("").trim();
+                    let published_ports = parse_published_ports(ports_str);
+                    if !name.is_empty() {
+                        ps_map.insert(name, PsRow { state, published_ports });
+                    }
                 }
             }
-            pl
-        } else {
-            Vec::new()
-        };
-
-        // Further checks only matter when the container is present.
-        if !present {
-            continue;
         }
 
-        // Parse state line: "present:<running>:<networks>"
-        let parts: Vec<&str> = state_line.splitn(3, ':').collect();
-        let running_str = parts.get(1).unwrap_or(&"false");
-        let networks_str = parts.get(2).unwrap_or(&"");
-        let is_running = *running_str == "true";
-        let attached_networks: Vec<&str> = networks_str
-            .split_whitespace()
-            .filter(|s| !s.is_empty())
+        // Parse batched docker inspect dump for network membership.
+        // Only present when containers_needing_inspect is non-empty.
+        let containers_needing_inspect: Vec<&String> = config
+            .containers
+            .iter()
+            .filter(|(k, v)| {
+                !is_glob_pattern(k)
+                    && v.as_ref().is_some_and(|e| !e.networks.is_empty())
+            })
+            .map(|(k, _)| k)
             .collect();
 
-        // Running check.
-        if let Some(expected_running) = cexpect.effective_running() {
-            let running_ok = is_running == expected_running;
-            let running_message = if !running_ok {
-                if expected_running {
-                    Some(format!(
-                        "container {cname} is not running (expected running)"
-                    ))
-                } else {
-                    Some(format!(
-                        "container {cname} is running (expected not running)"
-                    ))
+        let mut inspect_networks: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        if !containers_needing_inspect.is_empty() {
+            loop {
+                match lines.next() {
+                    None | Some("__END_DOCKER_INSPECT__") => break,
+                    Some("") => {}
+                    Some(l) => {
+                        let mut parts = l.split_whitespace();
+                        if let Some(raw_name) = parts.next() {
+                            // docker inspect .Name starts with "/"
+                            let name = raw_name.strip_prefix('/').unwrap_or(raw_name).to_owned();
+                            let nets: Vec<String> = parts.map(str::to_owned).collect();
+                            inspect_networks.insert(name, nets);
+                        }
+                    }
                 }
-            } else {
-                None
-            };
+            }
+        }
+
+        // Evaluate per-container checks.
+        for (cname, opt_expect) in &config.containers {
+            let cexpect = opt_expect.as_ref().cloned().unwrap_or_default();
+
+            if is_glob_pattern(cname) {
+                // Pattern containers: existence check only (from PS map).
+                let matches: Vec<&str> = ps_map
+                    .keys()
+                    .filter(|n| glob_match(cname, n))
+                    .map(String::as_str)
+                    .collect();
+                let found = !matches.is_empty();
+                let ok = found == cexpect.exists;
+                let message = if !ok {
+                    if cexpect.exists {
+                        Some(format!("no containers matching pattern {cname:?} found"))
+                    } else {
+                        Some(format!(
+                            "containers matching pattern {cname:?} found: {}",
+                            matches.join(", ")
+                        ))
+                    }
+                } else {
+                    None
+                };
+                checks.push(CheckResult {
+                    label: format!(
+                        "docker container {cname} {}",
+                        if cexpect.exists { "present" } else { "absent" }
+                    ),
+                    ok,
+                    message,
+                });
+                continue;
+            }
+
+            // Exact container check.
+            let row = ps_map.get(cname);
+            let present = row.is_some();
+
+            // Existence check.
+            let exists_ok = present == cexpect.exists;
             checks.push(CheckResult {
                 label: format!(
                     "docker container {cname} {}",
-                    if expected_running {
-                        "running"
-                    } else {
-                        "stopped"
-                    }
-                ),
-                ok: running_ok,
-                message: running_message,
-            });
-        }
-
-        // Network membership checks.
-        for net_spec in &cexpect.networks {
-            let (net_name, must_attach) = if let Some(stripped) = net_spec.strip_prefix('!') {
-                (stripped, false)
-            } else {
-                (net_spec.as_str(), true)
-            };
-
-            let attached = attached_networks.contains(&net_name);
-            let ok = attached == must_attach;
-            let message = if !ok {
-                if must_attach {
-                    Some(format!(
-                        "container {cname} is not attached to network {net_name}"
-                    ))
-                } else {
-                    Some(format!(
-                        "container {cname} is unexpectedly attached to network {net_name}"
-                    ))
-                }
-            } else {
-                None
-            };
-            checks.push(CheckResult {
-                label: format!(
-                    "docker container {cname} network {net_name} {}",
-                    if must_attach {
-                        "attached"
-                    } else {
-                        "not attached"
-                    }
-                ),
-                ok,
-                message,
-            });
-        }
-
-        // Port checks: parse "docker port" output.
-        // Each line is like "80/tcp -> 0.0.0.0:8080" or "80/tcp -> :::8080".
-        let published_ports: Vec<String> = port_lines
-            .iter()
-            .filter_map(|l| l.split_whitespace().next().map(str::to_owned))
-            .collect();
-
-        for port_spec in &cexpect.ports {
-            let (port, must_publish) = if let Some(stripped) = port_spec.strip_prefix('!') {
-                (stripped, false)
-            } else {
-                (port_spec.as_str(), true)
-            };
-
-            let published = published_ports.iter().any(|p| p == port);
-            let ok = published == must_publish;
-            let message = if !ok {
-                if must_publish {
-                    Some(format!("container {cname} does not publish port {port}"))
-                } else {
-                    Some(format!(
-                        "container {cname} unexpectedly publishes port {port}"
-                    ))
-                }
-            } else {
-                None
-            };
-            checks.push(CheckResult {
-                label: format!(
-                    "docker container {cname} port {port} {}",
-                    if must_publish {
-                        "published"
-                    } else {
-                        "not published"
-                    }
-                ),
-                ok,
-                message,
-            });
-        }
-
-        // Log checks from the pre-collected log results.
-        if let Some(logs) = cexpect.logs.as_ref() {
-            let (ready, log_lines) = log_results
-                .get(cname.as_str())
-                .map(|(r, l)| (*r, l.clone()))
-                .unwrap_or((false, Vec::new()));
-
-            // Evaluate not_contains immediately (no polling needed).
-            for substr in &logs.not_contains {
-                let found = log_lines.iter().any(|l| l.contains(substr.as_str()));
-                let ok = !found;
-                let message = if !ok {
-                    Some(format!(
-                        "container {cname} logs contain unexpected string {substr:?}"
-                    ))
-                } else {
-                    None
-                };
-                checks.push(CheckResult {
-                    label: format!("docker container {cname} logs not_contains {substr:?}"),
-                    ok,
-                    message,
-                });
-            }
-
-            // For contains: the ready flag tells us whether the wait loop found all substrings.
-            if !logs.contains.is_empty() {
-                let ok = ready;
-                let message = if !ok {
-                    Some(format!(
-                        "container {cname} logs did not contain all expected strings within {} seconds",
-                        logs.timeout
-                    ))
-                } else {
-                    None
-                };
-                checks.push(CheckResult {
-                    label: format!("docker container {cname} logs contains"),
-                    ok,
-                    message,
-                });
-            }
-        }
-    }
-
-    if !pattern_containers.is_empty() {
-        let mut all_containers: Vec<String> = Vec::new();
-        loop {
-            match lines.next() {
-                None => break,
-                Some("__END_DOCKER_CONTAINERS__") => break,
-                Some(l) => all_containers.push(l.to_owned()),
-            }
-        }
-        for (pattern, cexpect) in &pattern_containers {
-            let matches: Vec<&str> = all_containers
-                .iter()
-                .filter(|c| glob_match(pattern, c))
-                .map(String::as_str)
-                .collect();
-            let found = !matches.is_empty();
-            let ok = found == cexpect.exists;
-            let message = if !ok {
-                if cexpect.exists {
-                    Some(format!("no containers matching pattern {pattern:?} found"))
-                } else {
-                    Some(format!(
-                        "containers matching pattern {pattern:?} found: {}",
-                        matches.join(", ")
-                    ))
-                }
-            } else {
-                None
-            };
-            checks.push(CheckResult {
-                label: format!(
-                    "docker container {pattern} {}",
                     if cexpect.exists { "present" } else { "absent" }
                 ),
-                ok,
-                message,
+                ok: exists_ok,
+                message: if !exists_ok {
+                    if cexpect.exists {
+                        Some(format!("container {cname} is absent (expected present)"))
+                    } else {
+                        Some(format!("container {cname} is present (expected absent)"))
+                    }
+                } else {
+                    None
+                },
             });
+
+            // Further checks only when container is present.
+            if !present {
+                continue;
+            }
+            let row = row.unwrap();
+            let is_running = row.state == "running";
+
+            // Running check.
+            if let Some(expected_running) = cexpect.effective_running() {
+                let running_ok = is_running == expected_running;
+                checks.push(CheckResult {
+                    label: format!(
+                        "docker container {cname} {}",
+                        if expected_running { "running" } else { "stopped" }
+                    ),
+                    ok: running_ok,
+                    message: if !running_ok {
+                        if expected_running {
+                            Some(format!(
+                                "container {cname} is not running (expected running)"
+                            ))
+                        } else {
+                            Some(format!(
+                                "container {cname} is running (expected not running)"
+                            ))
+                        }
+                    } else {
+                        None
+                    },
+                });
+            }
+
+            // Network membership checks (from batched inspect).
+            for net_spec in &cexpect.networks {
+                let (net_name, must_attach) = if let Some(stripped) = net_spec.strip_prefix('!') {
+                    (stripped, false)
+                } else {
+                    (net_spec.as_str(), true)
+                };
+                let attached = inspect_networks
+                    .get(cname)
+                    .is_some_and(|nets| nets.iter().any(|n| n == net_name));
+                let ok = attached == must_attach;
+                let message = if !ok {
+                    if must_attach {
+                        Some(format!(
+                            "container {cname} is not attached to network {net_name}"
+                        ))
+                    } else {
+                        Some(format!(
+                            "container {cname} is unexpectedly attached to network {net_name}"
+                        ))
+                    }
+                } else {
+                    None
+                };
+                checks.push(CheckResult {
+                    label: format!(
+                        "docker container {cname} network {net_name} {}",
+                        if must_attach { "attached" } else { "not attached" }
+                    ),
+                    ok,
+                    message,
+                });
+            }
+
+            // Port checks (from PS dump published_ports).
+            for port_spec in &cexpect.ports {
+                let (port, must_publish) = if let Some(stripped) = port_spec.strip_prefix('!') {
+                    (stripped, false)
+                } else {
+                    (port_spec.as_str(), true)
+                };
+                let published = row.published_ports.iter().any(|p| p == port);
+                let ok = published == must_publish;
+                let message = if !ok {
+                    if must_publish {
+                        Some(format!("container {cname} does not publish port {port}"))
+                    } else {
+                        Some(format!(
+                            "container {cname} unexpectedly publishes port {port}"
+                        ))
+                    }
+                } else {
+                    None
+                };
+                checks.push(CheckResult {
+                    label: format!(
+                        "docker container {cname} port {port} {}",
+                        if must_publish {
+                            "published"
+                        } else {
+                            "not published"
+                        }
+                    ),
+                    ok,
+                    message,
+                });
+            }
+
+            // Log checks from the pre-collected log results.
+            if let Some(logs) = cexpect.logs.as_ref() {
+                let (ready, log_lines) = log_results
+                    .get(cname.as_str())
+                    .map(|(r, l)| (*r, l.clone()))
+                    .unwrap_or((false, Vec::new()));
+
+                // not_contains: evaluated immediately from captured logs.
+                for substr in &logs.not_contains {
+                    let found = log_lines.iter().any(|l| l.contains(substr.as_str()));
+                    let ok = !found;
+                    let message = if !ok {
+                        Some(format!(
+                            "container {cname} logs contain unexpected string {substr:?}"
+                        ))
+                    } else {
+                        None
+                    };
+                    checks.push(CheckResult {
+                        label: format!("docker container {cname} logs not_contains {substr:?}"),
+                        ok,
+                        message,
+                    });
+                }
+
+                // contains: the ready flag tells us whether the wait loop found all substrings.
+                if !logs.contains.is_empty() {
+                    let ok = ready;
+                    let message = if !ok {
+                        Some(format!(
+                            "container {cname} logs did not contain all expected strings within {} seconds",
+                            logs.timeout
+                        ))
+                    } else {
+                        None
+                    };
+                    checks.push(CheckResult {
+                        label: format!("docker container {cname} logs contains"),
+                        ok,
+                        message,
+                    });
+                }
+            }
         }
     }
 
@@ -745,7 +761,6 @@ fn glob_match_impl(pat: &[u8], val: &[u8]) -> bool {
     match (pat.first(), val.first()) {
         (None, None) => true,
         (Some(b'*'), _) => {
-            // `*` matches zero or more characters.
             if glob_match_impl(&pat[1..], val) {
                 return true;
             }
@@ -756,7 +771,6 @@ fn glob_match_impl(pat: &[u8], val: &[u8]) -> bool {
         }
         (Some(b'?'), Some(_)) => glob_match_impl(&pat[1..], &val[1..]),
         (Some(b'['), Some(&vc)) => {
-            // Find the closing `]`.
             let end = match pat[1..].iter().position(|&b| b == b']') {
                 Some(i) => i + 1,
                 None => return false,
@@ -855,14 +869,19 @@ pub extern "C" fn plugin_provides_name(index: u32) -> *const c_char {
 
 /// Build the guest probe shell script from a JSON-encoded `DockerConfig`.
 ///
+/// On success, writes the script to `*out_ptr` and returns 0.
+/// On failure, writes a human-readable error string to `*out_error` and
+/// returns a non-zero error code.
+///
 /// # Safety
 ///
 /// `config_json` must be a valid NUL-terminated C string.
-/// `out_ptr` must be a valid non-null pointer to a `*mut c_char`.
+/// `out_ptr` and `out_error` must be valid non-null pointers to `*mut c_char`.
 #[no_mangle]
 pub unsafe extern "C" fn plugin_assert_build_probe(
     config_json: *const c_char,
     out_ptr: *mut *mut c_char,
+    out_error: *mut *mut c_char,
 ) -> i32 {
     // SAFETY: caller guarantees config_json is a valid NUL-terminated C string.
     let json_str = match unsafe { cstr_to_str(config_json) } {
@@ -872,7 +891,13 @@ pub unsafe extern "C" fn plugin_assert_build_probe(
 
     let config: DockerConfig = match serde_json::from_str(json_str) {
         Ok(c) => c,
-        Err(_) => return 2,
+        Err(e) => {
+            if !out_error.is_null() {
+                // SAFETY: out_error is a valid non-null pointer per ABI contract.
+                unsafe { write_cstring_out(e.to_string(), out_error) };
+            }
+            return 2;
+        }
     };
 
     let script = build_probe_script(&config);
@@ -884,15 +909,20 @@ pub unsafe extern "C" fn plugin_assert_build_probe(
 
 /// Evaluate captured probe stdout against a JSON-encoded `DockerConfig`.
 ///
+/// On success, writes the results JSON to `*out_ptr` and returns 0.
+/// On failure, writes a human-readable error string to `*out_error` and
+/// returns a non-zero error code.
+///
 /// # Safety
 ///
 /// `config_json` and `probe_stdout` must be valid NUL-terminated C strings.
-/// `out_ptr` must be a valid non-null pointer to a `*mut c_char`.
+/// `out_ptr` and `out_error` must be valid non-null pointers to `*mut c_char`.
 #[no_mangle]
 pub unsafe extern "C" fn plugin_assert_evaluate(
     config_json: *const c_char,
     probe_stdout: *const c_char,
     out_ptr: *mut *mut c_char,
+    out_error: *mut *mut c_char,
 ) -> i32 {
     // SAFETY: caller guarantees both are valid NUL-terminated C strings.
     let json_str = match unsafe { cstr_to_str(config_json) } {
@@ -906,7 +936,13 @@ pub unsafe extern "C" fn plugin_assert_evaluate(
 
     let config: DockerConfig = match serde_json::from_str(json_str) {
         Ok(c) => c,
-        Err(_) => return 2,
+        Err(e) => {
+            if !out_error.is_null() {
+                // SAFETY: out_error is a valid non-null pointer per ABI contract.
+                unsafe { write_cstring_out(e.to_string(), out_error) };
+            }
+            return 2;
+        }
     };
 
     let results = evaluate_probe(&config, stdout_str);
@@ -971,6 +1007,37 @@ mod tests {
         assert!(!is_glob_pattern("nginx:latest"));
     }
 
+    // ── parse_published_ports tests ───────────────────────────────────────────
+
+    #[test]
+    fn parse_published_ports_empty() {
+        assert!(parse_published_ports("").is_empty());
+    }
+
+    #[test]
+    fn parse_published_ports_exposed_only() {
+        // Exposed but not published (no -> mapping)
+        assert!(parse_published_ports("80/tcp").is_empty());
+    }
+
+    #[test]
+    fn parse_published_ports_ipv4_and_ipv6() {
+        let ports = parse_published_ports("0.0.0.0:9400->9400/tcp, :::9400->9400/tcp");
+        assert_eq!(ports, vec!["9400/tcp"]);
+    }
+
+    #[test]
+    fn parse_published_ports_multiple_ports() {
+        let ports = parse_published_ports(
+            "0.0.0.0:80->80/tcp, :::80->80/tcp, 0.0.0.0:443->443/tcp, :::443->443/tcp",
+        );
+        assert!(ports.contains(&"80/tcp".to_owned()));
+        assert!(ports.contains(&"443/tcp".to_owned()));
+        assert_eq!(ports.len(), 2);
+    }
+
+    // ── probe_script tests ────────────────────────────────────────────────────
+
     #[test]
     fn probe_script_empty_config() {
         let config = DockerConfig {
@@ -980,50 +1047,208 @@ mod tests {
         };
         let script = build_probe_script(&config);
         assert!(script.starts_with("set -e\n"));
+        // No images → no image ls
+        assert!(!script.contains("docker image ls"));
+        // No containers → no ps
+        assert!(!script.contains("docker ps"));
     }
 
     #[test]
-    fn probe_script_exact_image() {
+    fn probe_script_images_emit_bulk_listing() {
         let mut images = BTreeMap::new();
-        images.insert("nginx:latest".to_owned(), ImageExpect { exists: true });
+        images.insert("nginx:latest".to_owned(), Some(ImageExpect { exists: true }));
+        images.insert("nginx:*".to_owned(), Some(ImageExpect { exists: true }));
         let config = DockerConfig {
             images,
             networks: BTreeMap::new(),
             containers: BTreeMap::new(),
+        };
+        let script = build_probe_script(&config);
+        assert!(script.contains("docker image ls"), "script: {script}");
+        assert!(script.contains("__END_DOCKER_IMAGES__"), "script: {script}");
+        // No per-image inspect
+        assert!(!script.contains("docker image inspect"), "script: {script}");
+    }
+
+    #[test]
+    fn probe_script_networks_emit_bulk_listing() {
+        let mut networks = BTreeMap::new();
+        networks.insert("mynet".to_owned(), Some(NetworkExpect { exists: true }));
+        let config = DockerConfig {
+            images: BTreeMap::new(),
+            networks,
+            containers: BTreeMap::new(),
+        };
+        let script = build_probe_script(&config);
+        assert!(script.contains("docker network ls"), "script: {script}");
+        assert!(script.contains("__END_DOCKER_NETWORKS__"), "script: {script}");
+        assert!(!script.contains("docker network inspect"), "script: {script}");
+    }
+
+    #[test]
+    fn probe_script_containers_emit_ps_dump() {
+        let mut containers = BTreeMap::new();
+        containers.insert(
+            "web".to_owned(),
+            Some(ContainerExpect {
+                exists: true,
+                running: None,
+                logs: None,
+                networks: vec![],
+                ports: vec![],
+            }),
+        );
+        let config = DockerConfig {
+            images: BTreeMap::new(),
+            networks: BTreeMap::new(),
+            containers,
+        };
+        let script = build_probe_script(&config);
+        assert!(script.contains("docker ps -a"), "script: {script}");
+        assert!(script.contains("__END_DOCKER_CONTAINERS__"), "script: {script}");
+        // No per-container inspect on the existence/running path
+        assert!(!script.contains("docker inspect 'web'"), "script: {script}");
+    }
+
+    #[test]
+    fn probe_script_container_with_networks_emits_batched_inspect() {
+        let mut containers = BTreeMap::new();
+        containers.insert(
+            "web".to_owned(),
+            Some(ContainerExpect {
+                exists: true,
+                running: None,
+                logs: None,
+                networks: vec!["mynet".to_owned()],
+                ports: vec![],
+            }),
+        );
+        let config = DockerConfig {
+            images: BTreeMap::new(),
+            networks: BTreeMap::new(),
+            containers,
         };
         let script = build_probe_script(&config);
         assert!(
-            script.contains("docker image inspect 'nginx:latest'"),
-            "script: {script}"
+            script.contains("docker inspect 'web'"),
+            "batched inspect: {script}"
         );
-        assert!(script.contains("present"));
-        assert!(!script.contains("__END_DOCKER_IMAGES__"));
+        assert!(
+            script.contains("__END_DOCKER_INSPECT__"),
+            "inspect sentinel: {script}"
+        );
+        // Only one docker inspect call (batched)
+        assert_eq!(
+            script.matches("docker inspect").count(),
+            1,
+            "only one inspect call: {script}"
+        );
     }
 
     #[test]
-    fn probe_script_pattern_image_emits_sentinel() {
-        let mut images = BTreeMap::new();
-        images.insert("nginx:*".to_owned(), ImageExpect { exists: true });
+    fn probe_script_container_without_networks_no_inspect() {
+        let mut containers = BTreeMap::new();
+        containers.insert(
+            "web".to_owned(),
+            Some(ContainerExpect {
+                exists: true,
+                running: None,
+                logs: None,
+                networks: vec![],
+                ports: vec![],
+            }),
+        );
         let config = DockerConfig {
+            images: BTreeMap::new(),
+            networks: BTreeMap::new(),
+            containers,
+        };
+        let script = build_probe_script(&config);
+        assert!(!script.contains("__END_DOCKER_INSPECT__"), "script: {script}");
+    }
+
+    #[test]
+    fn probe_script_no_per_container_port_call() {
+        // Ports are now read from docker ps --format; no docker port subprocess.
+        let mut containers = BTreeMap::new();
+        containers.insert(
+            "web".to_owned(),
+            Some(ContainerExpect {
+                exists: true,
+                running: None,
+                logs: None,
+                networks: vec![],
+                ports: vec!["80/tcp".to_owned()],
+            }),
+        );
+        let config = DockerConfig {
+            images: BTreeMap::new(),
+            networks: BTreeMap::new(),
+            containers,
+        };
+        let script = build_probe_script(&config);
+        assert!(!script.contains("docker port"), "script: {script}");
+    }
+
+    #[test]
+    fn probe_script_batched_inspect_multiple_containers() {
+        let mut containers = BTreeMap::new();
+        for name in &["alpha", "beta", "gamma"] {
+            containers.insert(
+                name.to_string(),
+                Some(ContainerExpect {
+                    exists: true,
+                    running: None,
+                    logs: None,
+                    networks: vec!["mynet".to_owned()],
+                    ports: vec![],
+                }),
+            );
+        }
+        let config = DockerConfig {
+            images: BTreeMap::new(),
+            networks: BTreeMap::new(),
+            containers,
+        };
+        let script = build_probe_script(&config);
+        // Only ONE docker inspect call total
+        assert_eq!(
+            script.matches("docker inspect").count(),
+            1,
+            "only one batched inspect: {script}"
+        );
+        assert!(script.contains("'alpha'"), "alpha in inspect: {script}");
+        assert!(script.contains("'beta'"), "beta in inspect: {script}");
+        assert!(script.contains("'gamma'"), "gamma in inspect: {script}");
+    }
+
+    // ── evaluate_probe tests ──────────────────────────────────────────────────
+
+    fn make_image_config(name: &str, exists: bool) -> DockerConfig {
+        let mut images = BTreeMap::new();
+        images.insert(name.to_owned(), Some(ImageExpect { exists }));
+        DockerConfig {
             images,
             networks: BTreeMap::new(),
             containers: BTreeMap::new(),
-        };
-        let script = build_probe_script(&config);
-        assert!(script.contains("__END_DOCKER_IMAGES__"), "script: {script}");
-        assert!(script.contains("docker image ls"));
+        }
+    }
+
+    fn make_network_config(name: &str, exists: bool) -> DockerConfig {
+        let mut networks = BTreeMap::new();
+        networks.insert(name.to_owned(), Some(NetworkExpect { exists }));
+        DockerConfig {
+            images: BTreeMap::new(),
+            networks,
+            containers: BTreeMap::new(),
+        }
     }
 
     #[test]
     fn evaluate_exact_image_present() {
-        let mut images = BTreeMap::new();
-        images.insert("nginx:latest".to_owned(), ImageExpect { exists: true });
-        let config = DockerConfig {
-            images,
-            networks: BTreeMap::new(),
-            containers: BTreeMap::new(),
-        };
-        let results = evaluate_probe(&config, "present\n");
+        let config = make_image_config("nginx:latest", true);
+        // Image dump contains nginx:latest; sentinel follows.
+        let results = evaluate_probe(&config, "nginx:latest\n__END_DOCKER_IMAGES__\n");
         assert_eq!(results.checks.len(), 1);
         assert!(results.checks[0].ok);
         assert_eq!(results.checks[0].label, "docker image nginx:latest present");
@@ -1031,14 +1256,47 @@ mod tests {
 
     #[test]
     fn evaluate_exact_image_absent_when_expected_absent() {
+        let config = make_image_config("old:latest", false);
+        let results = evaluate_probe(&config, "__END_DOCKER_IMAGES__\n");
+        assert_eq!(results.checks.len(), 1);
+        assert!(results.checks[0].ok);
+    }
+
+    #[test]
+    fn evaluate_exact_image_present_when_expected_absent_fails() {
+        let config = make_image_config("old:latest", false);
+        let results = evaluate_probe(&config, "old:latest\n__END_DOCKER_IMAGES__\n");
+        assert_eq!(results.checks.len(), 1);
+        assert!(!results.checks[0].ok);
+    }
+
+    #[test]
+    fn evaluate_pattern_image_matches() {
         let mut images = BTreeMap::new();
-        images.insert("old:latest".to_owned(), ImageExpect { exists: false });
+        images.insert("nginx:*".to_owned(), Some(ImageExpect { exists: true }));
         let config = DockerConfig {
             images,
             networks: BTreeMap::new(),
             containers: BTreeMap::new(),
         };
-        let results = evaluate_probe(&config, "absent\n");
+        let results =
+            evaluate_probe(&config, "nginx:latest\nnginx:1.25\n__END_DOCKER_IMAGES__\n");
+        assert_eq!(results.checks.len(), 1);
+        assert!(results.checks[0].ok);
+    }
+
+    #[test]
+    fn evaluate_exact_network_present() {
+        let config = make_network_config("mynet", true);
+        let results = evaluate_probe(&config, "mynet\n__END_DOCKER_NETWORKS__\n");
+        assert_eq!(results.checks.len(), 1);
+        assert!(results.checks[0].ok);
+    }
+
+    #[test]
+    fn evaluate_exact_network_absent_when_expected_absent() {
+        let config = make_network_config("badnet", false);
+        let results = evaluate_probe(&config, "__END_DOCKER_NETWORKS__\n");
         assert_eq!(results.checks.len(), 1);
         assert!(results.checks[0].ok);
     }
@@ -1048,32 +1306,48 @@ mod tests {
         let mut containers = BTreeMap::new();
         containers.insert(
             "web".to_owned(),
-            ContainerExpect {
+            Some(ContainerExpect {
                 exists: true,
                 running: None,
                 logs: None,
                 networks: vec![],
                 ports: vec![],
-            },
+            }),
         );
         let config = DockerConfig {
             images: BTreeMap::new(),
             networks: BTreeMap::new(),
             containers,
         };
-        // "present:true:" — running=true, no networks
-        let results = evaluate_probe(&config, "present:true:\n");
+        // PS dump: name\tstate\tports (tab-separated)
+        let results = evaluate_probe(&config, "web\trunning\t\n__END_DOCKER_CONTAINERS__\n");
         assert_eq!(results.checks.len(), 2); // exists + running
-        assert!(
-            results.checks[0].ok,
-            "exists check: {:?}",
-            results.checks[0]
+        assert!(results.checks[0].ok, "exists: {:?}", results.checks[0]);
+        assert!(results.checks[1].ok, "running: {:?}", results.checks[1]);
+    }
+
+    #[test]
+    fn evaluate_container_absent_fails_exists_check() {
+        let mut containers = BTreeMap::new();
+        containers.insert(
+            "web".to_owned(),
+            Some(ContainerExpect {
+                exists: true,
+                running: None,
+                logs: None,
+                networks: vec![],
+                ports: vec![],
+            }),
         );
-        assert!(
-            results.checks[1].ok,
-            "running check: {:?}",
-            results.checks[1]
-        );
+        let config = DockerConfig {
+            images: BTreeMap::new(),
+            networks: BTreeMap::new(),
+            containers,
+        };
+        // Empty PS dump
+        let results = evaluate_probe(&config, "__END_DOCKER_CONTAINERS__\n");
+        assert_eq!(results.checks.len(), 1);
+        assert!(!results.checks[0].ok, "should fail: {:?}", results.checks[0]);
     }
 
     #[test]
@@ -1081,26 +1355,218 @@ mod tests {
         let mut containers = BTreeMap::new();
         containers.insert(
             "web".to_owned(),
-            ContainerExpect {
+            Some(ContainerExpect {
                 exists: true,
                 running: Some(true),
                 logs: None,
                 networks: vec!["mynet".to_owned()],
                 ports: vec![],
-            },
+            }),
         );
         let config = DockerConfig {
             images: BTreeMap::new(),
             networks: BTreeMap::new(),
             containers,
         };
-        let results = evaluate_probe(&config, "present:true:mynet \n");
+        // PS dump + inspect dump
+        let stdout = "web\trunning\t\n__END_DOCKER_CONTAINERS__\n/web mynet \n__END_DOCKER_INSPECT__\n";
+        let results = evaluate_probe(&config, stdout);
         let net_check = results
             .checks
             .iter()
             .find(|c| c.label.contains("network"))
             .unwrap();
         assert!(net_check.ok, "network check: {:?}", net_check);
+    }
+
+    #[test]
+    fn evaluate_container_network_not_attached_when_required_fails() {
+        let mut containers = BTreeMap::new();
+        containers.insert(
+            "web".to_owned(),
+            Some(ContainerExpect {
+                exists: true,
+                running: Some(true),
+                logs: None,
+                networks: vec!["mynet".to_owned()],
+                ports: vec![],
+            }),
+        );
+        let config = DockerConfig {
+            images: BTreeMap::new(),
+            networks: BTreeMap::new(),
+            containers,
+        };
+        // Container present but on different network
+        let stdout = "web\trunning\t\n__END_DOCKER_CONTAINERS__\n/web othernet \n__END_DOCKER_INSPECT__\n";
+        let results = evaluate_probe(&config, stdout);
+        let net_check = results
+            .checks
+            .iter()
+            .find(|c| c.label.contains("network"))
+            .unwrap();
+        assert!(!net_check.ok, "should fail: {:?}", net_check);
+    }
+
+    #[test]
+    fn evaluate_container_network_negation() {
+        let mut containers = BTreeMap::new();
+        containers.insert(
+            "web".to_owned(),
+            Some(ContainerExpect {
+                exists: true,
+                running: None,
+                logs: None,
+                networks: vec!["!badnet".to_owned()],
+                ports: vec![],
+            }),
+        );
+        let config = DockerConfig {
+            images: BTreeMap::new(),
+            networks: BTreeMap::new(),
+            containers,
+        };
+        // Container on goodnet, not on badnet → !badnet check passes
+        let stdout = "web\trunning\t\n__END_DOCKER_CONTAINERS__\n/web goodnet \n__END_DOCKER_INSPECT__\n";
+        let results = evaluate_probe(&config, stdout);
+        let net_check = results
+            .checks
+            .iter()
+            .find(|c| c.label.contains("network"))
+            .unwrap();
+        assert!(net_check.ok, "negation check: {:?}", net_check);
+    }
+
+    #[test]
+    fn evaluate_container_port_published() {
+        let mut containers = BTreeMap::new();
+        containers.insert(
+            "web".to_owned(),
+            Some(ContainerExpect {
+                exists: true,
+                running: None,
+                logs: None,
+                networks: vec![],
+                ports: vec!["9400/tcp".to_owned()],
+            }),
+        );
+        let config = DockerConfig {
+            images: BTreeMap::new(),
+            networks: BTreeMap::new(),
+            containers,
+        };
+        let stdout =
+            "web\trunning\t0.0.0.0:9400->9400/tcp, :::9400->9400/tcp\n__END_DOCKER_CONTAINERS__\n";
+        let results = evaluate_probe(&config, stdout);
+        let port_check = results
+            .checks
+            .iter()
+            .find(|c| c.label.contains("port"))
+            .unwrap();
+        assert!(port_check.ok, "port published check: {:?}", port_check);
+    }
+
+    #[test]
+    fn evaluate_container_port_not_published_when_required_fails() {
+        let mut containers = BTreeMap::new();
+        containers.insert(
+            "web".to_owned(),
+            Some(ContainerExpect {
+                exists: true,
+                running: None,
+                logs: None,
+                networks: vec![],
+                ports: vec!["9400/tcp".to_owned()],
+            }),
+        );
+        let config = DockerConfig {
+            images: BTreeMap::new(),
+            networks: BTreeMap::new(),
+            containers,
+        };
+        // Port exposed but not published
+        let stdout = "web\trunning\t9400/tcp\n__END_DOCKER_CONTAINERS__\n";
+        let results = evaluate_probe(&config, stdout);
+        let port_check = results
+            .checks
+            .iter()
+            .find(|c| c.label.contains("port"))
+            .unwrap();
+        assert!(!port_check.ok, "should fail: {:?}", port_check);
+    }
+
+    #[test]
+    fn evaluate_container_port_negation() {
+        let mut containers = BTreeMap::new();
+        containers.insert(
+            "web".to_owned(),
+            Some(ContainerExpect {
+                exists: true,
+                running: None,
+                logs: None,
+                networks: vec![],
+                ports: vec!["!9000/tcp".to_owned()],
+            }),
+        );
+        let config = DockerConfig {
+            images: BTreeMap::new(),
+            networks: BTreeMap::new(),
+            containers,
+        };
+        // 9000 not published → !9000/tcp passes
+        let stdout = "web\trunning\t0.0.0.0:80->80/tcp\n__END_DOCKER_CONTAINERS__\n";
+        let results = evaluate_probe(&config, stdout);
+        let port_check = results
+            .checks
+            .iter()
+            .find(|c| c.label.contains("port"))
+            .unwrap();
+        assert!(port_check.ok, "negation port check: {:?}", port_check);
+    }
+
+    // ── null/bare map entry tests (Item 2) ────────────────────────────────────
+
+    #[test]
+    fn null_map_values_deserialize_without_error() {
+        let json = r#"{"images":{"x:local":null},"networks":{"n":null},"containers":{"c":null}}"#;
+        let config: DockerConfig = serde_json::from_str(json)
+            .expect("null map values must deserialize without error");
+        assert!(config.images.get("x:local").is_some());
+        assert!(config.networks.get("n").is_some());
+        assert!(config.containers.get("c").is_some());
+    }
+
+    #[test]
+    fn null_image_behaves_as_exists_true() {
+        // null → default → {exists: true}
+        let json = r#"{"images":{"x:local":null},"networks":{},"containers":{}}"#;
+        let config: DockerConfig = serde_json::from_str(json).unwrap();
+        let stdout = "x:local\n__END_DOCKER_IMAGES__\n";
+        let results = evaluate_probe(&config, stdout);
+        assert_eq!(results.checks.len(), 1, "{:?}", results.checks);
+        assert!(results.checks[0].ok, "null image should behave as exists:true — check should pass when image is present: {:?}", results.checks[0]);
+    }
+
+    #[test]
+    fn null_network_behaves_as_exists_true() {
+        let json = r#"{"images":{},"networks":{"n":null},"containers":{}}"#;
+        let config: DockerConfig = serde_json::from_str(json).unwrap();
+        let stdout = "n\n__END_DOCKER_NETWORKS__\n";
+        let results = evaluate_probe(&config, stdout);
+        assert_eq!(results.checks.len(), 1, "{:?}", results.checks);
+        assert!(results.checks[0].ok, "null network → exists:true: {:?}", results.checks[0]);
+    }
+
+    #[test]
+    fn null_container_behaves_as_exists_true() {
+        let json = r#"{"images":{},"networks":{},"containers":{"c":null}}"#;
+        let config: DockerConfig = serde_json::from_str(json).unwrap();
+        // Container present and running
+        let stdout = "c\trunning\t\n__END_DOCKER_CONTAINERS__\n";
+        let results = evaluate_probe(&config, stdout);
+        // exists check + running check (default effective_running = true)
+        assert!(results.checks.len() >= 1, "{:?}", results.checks);
+        assert!(results.checks[0].ok, "null container → exists:true: {:?}", results.checks[0]);
     }
 
     #[test]

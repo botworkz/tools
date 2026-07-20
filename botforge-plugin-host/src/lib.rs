@@ -211,6 +211,9 @@
 //! | 5 | Added `assert/<name>` capability slot family (`plugin_assert_build_probe`, |
 //! |   | `plugin_assert_evaluate`, `plugin_assert_free`). Fixed generic symbol names |
 //! |   | so future assert plugins need no host changes. |
+//! | 6 | Extended `assert/<name>`: added `out_error *char**` parameter to |
+//! |   | `plugin_assert_build_probe` and `plugin_assert_evaluate` so config-parse |
+//! |   | failures surface the real serde message rather than a bare error code. |
 //!
 //! # Safety policy
 //!
@@ -242,7 +245,10 @@ use thiserror::Error;
 /// `token` parameter; an `out_error` out-parameter surfaces legible error
 /// messages on failure.
 /// Version 5 adds the `assert/<name>` capability slot family.
-pub const HOST_ABI_VERSION: u32 = 5;
+/// Version 6 extends `assert/<name>`: `out_error *char**` on both
+/// `plugin_assert_build_probe` and `plugin_assert_evaluate` so config-parse
+/// failures surface the real serde message.
+pub const HOST_ABI_VERSION: u32 = 6;
 
 /// Sentinel value returned by a correct `core/ping` implementation.
 ///
@@ -344,11 +350,14 @@ pub enum LoadError {
     PublisherInvalidUrl { plugin: String },
 
     /// A `assert/<name>` build_probe or evaluate operation returned a non-zero error.
-    #[error("plugin '{plugin}' assert/{assert_name} operation failed with error code {code}")]
+    /// `message` is the human-readable error string that the plugin wrote to
+    /// `out_error` (empty when the plugin returned no message).
+    #[error("plugin '{plugin}' assert/{assert_name} operation failed (code {code}): {message}")]
     AssertProviderError {
         plugin: String,
         assert_name: String,
         code: i32,
+        message: String,
     },
 
     /// The plugin returned invalid UTF-8 from an assert operation.
@@ -751,6 +760,34 @@ impl PublisherHandle {
     }
 }
 
+/// Read a plugin-allocated NUL-terminated C string from `ptr` (which may be
+/// null) into a Rust `String`, then free it via `free_fn`.
+///
+/// Returns an empty `String` when `ptr` is null.
+///
+/// # Safety
+///
+/// This function is safe to call in error paths: when `ptr` is non-null it must
+/// be a valid, plugin-allocated NUL-terminated UTF-8 string; `free_fn` must be
+/// the same `plugin_assert_free` that allocated it.
+fn read_and_free_plugin_cstring(
+    ptr: *mut std::os::raw::c_char,
+    free_fn: unsafe extern "C" fn(*mut std::os::raw::c_char),
+) -> String {
+    if ptr.is_null() {
+        return String::new();
+    }
+    // SAFETY: ptr is non-null and the plugin guarantees it is a valid
+    // NUL-terminated UTF-8 string on the error path.
+    let s = unsafe { std::ffi::CStr::from_ptr(ptr) }
+        .to_str()
+        .unwrap_or("")
+        .to_owned();
+    // SAFETY: ptr was allocated by the plugin and must be freed via free_fn.
+    unsafe { free_fn(ptr) };
+    s
+}
+
 /// A callable handle to a wired `assert/<name>` capability.
 ///
 /// Exposes safe [`build_probe`](AssertProviderHandle::build_probe) and
@@ -769,11 +806,15 @@ impl PublisherHandle {
 pub struct AssertProviderHandle {
     plugin_name: String,
     assert_name: String,
-    build_probe_fn:
-        unsafe extern "C" fn(*const std::os::raw::c_char, *mut *mut std::os::raw::c_char) -> i32,
+    build_probe_fn: unsafe extern "C" fn(
+        *const std::os::raw::c_char,
+        *mut *mut std::os::raw::c_char,
+        *mut *mut std::os::raw::c_char,
+    ) -> i32,
     evaluate_fn: unsafe extern "C" fn(
         *const std::os::raw::c_char,
         *const std::os::raw::c_char,
+        *mut *mut std::os::raw::c_char,
         *mut *mut std::os::raw::c_char,
     ) -> i32,
     free_fn: unsafe extern "C" fn(*mut std::os::raw::c_char),
@@ -788,15 +829,21 @@ impl AssertProviderHandle {
         use std::ffi::{CStr, CString};
         let config_c = CString::new(config_json).unwrap_or_default();
         let mut out_ptr: *mut std::os::raw::c_char = std::ptr::null_mut();
+        let mut out_error: *mut std::os::raw::c_char = std::ptr::null_mut();
         // SAFETY: build_probe_fn was obtained from a live Library via dlsym.
-        // config_c is NUL-terminated. out_ptr is a valid stack address.
-        // On success the plugin writes a non-null NUL-terminated string.
-        let rc = unsafe { (self.build_probe_fn)(config_c.as_ptr(), &mut out_ptr) };
+        // config_c is NUL-terminated. out_ptr and out_error are valid stack addresses.
+        // On success the plugin writes a non-null NUL-terminated string to *out_ptr.
+        // On failure the plugin writes a NUL-terminated error message to *out_error.
+        let rc = unsafe {
+            (self.build_probe_fn)(config_c.as_ptr(), &mut out_ptr, &mut out_error)
+        };
         if rc != 0 {
+            let message = read_and_free_plugin_cstring(out_error, self.free_fn);
             return Err(LoadError::AssertProviderError {
                 plugin: self.plugin_name.clone(),
                 assert_name: self.assert_name.clone(),
                 code: rc,
+                message,
             });
         }
         // SAFETY: rc == 0 so plugin guarantees out_ptr is valid NUL-terminated.
@@ -820,14 +867,20 @@ impl AssertProviderHandle {
         let config_c = CString::new(config_json).unwrap_or_default();
         let stdout_c = CString::new(probe_stdout).unwrap_or_default();
         let mut out_ptr: *mut std::os::raw::c_char = std::ptr::null_mut();
+        let mut out_error: *mut std::os::raw::c_char = std::ptr::null_mut();
         // SAFETY: evaluate_fn was obtained from a live Library via dlsym.
-        // config_c and stdout_c are NUL-terminated. out_ptr is a valid stack address.
-        let rc = unsafe { (self.evaluate_fn)(config_c.as_ptr(), stdout_c.as_ptr(), &mut out_ptr) };
+        // config_c and stdout_c are NUL-terminated. out_ptr and out_error are valid
+        // stack addresses. On failure the plugin writes a message to *out_error.
+        let rc = unsafe {
+            (self.evaluate_fn)(config_c.as_ptr(), stdout_c.as_ptr(), &mut out_ptr, &mut out_error)
+        };
         if rc != 0 {
+            let message = read_and_free_plugin_cstring(out_error, self.free_fn);
             return Err(LoadError::AssertProviderError {
                 plugin: self.plugin_name.clone(),
                 assert_name: self.assert_name.clone(),
                 code: rc,
+                message,
             });
         }
         // SAFETY: rc == 0 so plugin guarantees out_ptr is valid NUL-terminated.
@@ -1189,10 +1242,12 @@ impl LoadedPlugin {
                     type BuildProbeFn = unsafe extern "C" fn(
                         *const std::os::raw::c_char,
                         *mut *mut std::os::raw::c_char,
+                        *mut *mut std::os::raw::c_char,
                     ) -> i32;
                     type EvaluateFn = unsafe extern "C" fn(
                         *const std::os::raw::c_char,
                         *const std::os::raw::c_char,
+                        *mut *mut std::os::raw::c_char,
                         *mut *mut std::os::raw::c_char,
                     ) -> i32;
                     type AssertFreeFn = unsafe extern "C" fn(*mut std::os::raw::c_char);
