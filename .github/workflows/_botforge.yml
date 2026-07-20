@@ -1,3 +1,4 @@
+# CI orchestrator for botworkz/tools.
 name: Botforge acceptance
 
 on:
@@ -193,6 +194,41 @@ jobs:
           exit 1
         fi
         echo "Inline assets OK: debian-base present in marker; no standalone shasset.yaml"
+    # Inject the docker assert plugin declaration into the workspace marker.
+    # libdocker.so is staged into the runtime image at
+    # /usr/share/botforge/plugins/libdocker.so, but the plugin system is
+    # config-driven with NO autoload — so it must be declared in the marker
+    # for the assert/docker capability to be wired. Without this the docker
+    # assert configs fail with "no assert provider for verb 'docker'".
+    # Done as a STRUCTURED jq merge into the marker (not a heredoc append) so
+    # the output stays a single well-formed document.
+    - name: Inject docker plugin declaration into workspace marker
+      uses: envoyproxy/toolshed/actions/jq@6a20085af231aba4c72d6866f94098343a8c5616
+      with:
+        input-format: yaml-path
+        output-path: testrepo/botforge.yaml
+        input: testrepo/botforge.yaml
+        filter: |
+          . + {
+            plugins: ((.plugins // []) + [
+              {
+                name: "docker",
+                src: "/usr/share/botforge/plugins/libdocker.so",
+                provides: ["assert/docker"]
+              }
+            ])
+          }
+    # Assert the docker plugin block actually landed as valid config.
+    - name: Assert docker plugin declaration landed in the marker
+      run: |
+        set -euo pipefail
+        if ! grep -q 'libdocker.so' testrepo/botforge.yaml; then
+          echo "ERROR: docker plugin injection failed — 'libdocker.so' not present in testrepo/botforge.yaml" >&2
+          echo "----- testrepo/botforge.yaml -----" >&2
+          cat testrepo/botforge.yaml >&2
+          exit 1
+        fi
+        echo "docker plugin declaration OK: libdocker.so present in marker"
     # Inject the pigz plugin declaration when the pigz compressor is in use.
     # Done as a STRUCTURED jq merge into the marker (not a heredoc append) so
     # the output stays a single well-formed document — the inline-assets step
@@ -207,13 +243,13 @@ jobs:
         input: testrepo/botforge.yaml
         filter: |
           . + {
-            plugins: [
+            plugins: ((.plugins // []) + [
               {
                 name: "pigz",
                 src: "/usr/share/botforge/plugins/libpigz.so",
                 provides: ["build/compressor"]
               }
-            ]
+            ])
           }
     # Assert the pigz plugin block actually landed as valid config.
     - name: Assert pigz plugin declaration landed in the marker
