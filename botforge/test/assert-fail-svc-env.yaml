@@ -1,0 +1,18 @@
+type: botforge/test
+name: test
+
+# Negative-control fixture: regression guard for assert.services: environment:.
+#
+# botwork-ci-env exports BOTWORK_MODE=production and BOTWORK_REGION=us-east-1.
+# Asserting it contains a key that was never set MUST fail, proving that the
+# environment probe reads real systemd unit state and does not trivially pass.
+#
+# `image:` is injected by .github/workflows/_botforge.yml at CI time.
+
+steps: []
+
+assert:
+  services:
+    botwork-ci-env:
+      environment:
+        contains: ["BOTWORK_NONEXISTENT_VAR=missing"]

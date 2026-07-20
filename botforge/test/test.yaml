@@ -151,3 +151,12 @@ assert:
     ssh:
       enabled: true
       active: true
+    # Positive services.environment assertion — the botwork-ci-env service is
+    # created by the build with known Environment= entries.  This proves that
+    # the environment: probe reads real systemd unit state.
+    botwork-ci-env:
+      enabled: true
+      active: true
+      environment:
+        contains: ["BOTWORK_MODE=production"]
+        not_contains: ["BOTWORK_SECRET"]

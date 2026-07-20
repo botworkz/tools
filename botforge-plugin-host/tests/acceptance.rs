@@ -1053,3 +1053,181 @@ fn get_assert_returns_none_without_plugin() {
     let reg = PluginRegistry::new();
     assert!(reg.get_assert("docker").is_none());
 }
+
+/// Structural assertion: the probe script is **batched** — one bulk listing
+/// per command type, never per-object commands.
+///
+/// Specifically:
+/// - Exactly one `docker image ls` (not one per image).
+/// - Exactly one `docker network ls` (not one per network).
+/// - Exactly one `docker ps -a` (not one per container).
+/// - Exactly one batched `docker inspect` over all containers that need it
+///   (not one `docker inspect <name>` per container).
+/// - Zero `docker port` invocations (ports come from `docker ps` output).
+///
+/// This guards the perf fix from regressing: if someone adds back per-object
+/// probes the count assertions will fail immediately.
+#[test]
+fn docker_acceptance_probe_is_batched_not_per_object() {
+    let so = require_fixture_so!(docker_so_path(), "cargo build -p botforge-plugin-docker");
+    let mut reg = PluginRegistry::new();
+    reg.load_plugin("docker", &so, None)
+        .expect("docker plugin should load cleanly");
+    let handle = reg
+        .get_assert("docker")
+        .expect("get_assert('docker') must return a handle");
+
+    // Config with multiple images, networks, and containers (each with
+    // `networks:` checks) — enough to reveal any per-object fan-out.
+    let config_json = r#"{
+        "images": {
+            "alpine:3":     {"exists": true},
+            "nginx:latest": {"exists": true},
+            "busybox:latest": {"exists": false}
+        },
+        "networks": {
+            "botwork-internal": {"exists": true},
+            "botwork-plugin":   {"exists": true},
+            "missing-net":      {"exists": false}
+        },
+        "containers": {
+            "web":   {"exists": true, "running": null, "logs": null,
+                      "networks": ["botwork-internal", "!botwork-plugin"], "ports": []},
+            "proxy": {"exists": true, "running": null, "logs": null,
+                      "networks": ["botwork-internal", "botwork-plugin"], "ports": []},
+            "db":    {"exists": true, "running": null, "logs": null,
+                      "networks": ["botwork-internal"], "ports": []}
+        }
+    }"#;
+
+    let script = handle
+        .build_probe(config_json)
+        .expect("build_probe must succeed for valid config");
+
+    // ── One bulk listing per command — never per-object ───────────────────────
+
+    // images: one "docker image ls" regardless of how many images are listed
+    let image_ls_count = script.matches("docker image ls").count();
+    assert_eq!(
+        image_ls_count, 1,
+        "expected exactly 1 'docker image ls' invocation, got {image_ls_count}: {script:?}"
+    );
+
+    // networks: one "docker network ls"
+    let network_ls_count = script.matches("docker network ls").count();
+    assert_eq!(
+        network_ls_count, 1,
+        "expected exactly 1 'docker network ls' invocation, got {network_ls_count}: {script:?}"
+    );
+
+    // containers: one "docker ps -a"
+    let ps_count = script.matches("docker ps -a").count();
+    assert_eq!(
+        ps_count, 1,
+        "expected exactly 1 'docker ps -a' invocation, got {ps_count}: {script:?}"
+    );
+
+    // inspect: one batched "docker inspect" covering all three containers
+    let inspect_count = script.matches("docker inspect").count();
+    assert_eq!(
+        inspect_count, 1,
+        "expected exactly 1 batched 'docker inspect' invocation, got {inspect_count}: {script:?}"
+    );
+    // The single inspect call must name all three containers on the same line
+    // (order follows BTreeMap key ordering: db, proxy, web).
+    assert!(
+        script.contains("'db'") && script.contains("'proxy'") && script.contains("'web'"),
+        "batched inspect must mention all three container names: {script:?}"
+    );
+
+    // ports: zero "docker port" — ports come from docker ps output, not per-container probes
+    let port_count = script.matches("docker port").count();
+    assert_eq!(
+        port_count, 0,
+        "expected zero 'docker port' invocations (ports come from docker ps), got {port_count}: {script:?}"
+    );
+}
+
+/// Null/bare map entries (`name:` → JSON null) parse without error via the
+/// real FFI boundary and `build_probe` returns a valid non-empty script.
+///
+/// This guards the null-entry parse fix: a bare YAML key with no body is
+/// serialised as JSON `null` by the host; the plugin must treat it as `{}`.
+#[test]
+fn docker_acceptance_null_entries_parse_as_defaults_via_ffi() {
+    let so = require_fixture_so!(docker_so_path(), "cargo build -p botforge-plugin-docker");
+    let mut reg = PluginRegistry::new();
+    reg.load_plugin("docker", &so, None)
+        .expect("docker plugin should load cleanly");
+    let handle = reg
+        .get_assert("docker")
+        .expect("get_assert('docker') must return a handle");
+
+    // All three map values are JSON null — must be treated as empty struct defaults.
+    let config_json =
+        r#"{"images":{"alpine:3":null},"networks":{"botwork-internal":null},"containers":{"web":null}}"#;
+
+    let script = handle
+        .build_probe(config_json)
+        .expect("null map entries must not cause a parse error via FFI");
+
+    assert!(
+        !script.is_empty(),
+        "probe script from null entries must be non-empty: {script:?}"
+    );
+    // The probe still emits all three bulk listings.
+    assert!(
+        script.contains("docker image ls"),
+        "probe from null image entry must still emit 'docker image ls': {script:?}"
+    );
+    assert!(
+        script.contains("docker network ls"),
+        "probe from null network entry must still emit 'docker network ls': {script:?}"
+    );
+    assert!(
+        script.contains("docker ps -a"),
+        "probe from null container entry must still emit 'docker ps -a': {script:?}"
+    );
+}
+
+/// Malformed config surfaces a real serde error message via the FFI boundary,
+/// not a bare "exit code 2" with no diagnostic.
+///
+/// This guards the config-parse error path: if `build_probe` returns a
+/// non-zero code, the `AssertProviderError` message must contain the serde
+/// diagnostic so operators see *what* is wrong, not just *that* it failed.
+#[test]
+fn docker_acceptance_malformed_config_surfaces_serde_message() {
+    let so = require_fixture_so!(docker_so_path(), "cargo build -p botforge-plugin-docker");
+    let mut reg = PluginRegistry::new();
+    reg.load_plugin("docker", &so, None)
+        .expect("docker plugin should load cleanly");
+    let handle = reg
+        .get_assert("docker")
+        .expect("get_assert('docker') must return a handle");
+
+    // Unknown field — serde(deny_unknown_fields) must surface a real message.
+    let bad_config = r#"{"images":{},"networks":{},"containers":{},"unknown_field":"oops"}"#;
+
+    let err = handle
+        .build_probe(bad_config)
+        .expect_err("malformed config must return an error via FFI");
+
+    match &err {
+        botforge_plugin_host::LoadError::AssertProviderError { message, .. } => {
+            assert!(
+                !message.is_empty(),
+                "error message must not be empty for malformed config: {err}"
+            );
+            // The message must contain useful diagnostic text from serde, not just
+            // a raw code.  We check for common serde_json error indicators.
+            let msg_lower = message.to_lowercase();
+            assert!(
+                msg_lower.contains("unknown") || msg_lower.contains("field") || msg_lower.contains("expected"),
+                "error message should contain serde diagnostic text \
+                 (e.g. 'unknown field'), got: {message:?}"
+            );
+        }
+        other => panic!("expected AssertProviderError, got: {other}"),
+    }
+}

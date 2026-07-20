@@ -1,0 +1,19 @@
+type: botforge/test
+name: test
+
+# Negative-control fixture: regression guard for the docker assert plugin.
+#
+# botwork-proxy has no published host ports.  Asserting it publishes 80/tcp
+# MUST fail, proving that port checks distinguish "published" (host:port→…)
+# from "exposed-only" and that `ports: ["80/tcp"]` bites when the port is
+# absent from the real daemon output.
+#
+# `image:` is injected by .github/workflows/_botforge.yml at CI time.
+
+steps: []
+
+assert:
+  docker:
+    containers:
+      botwork-proxy:
+        ports: ["80/tcp"]

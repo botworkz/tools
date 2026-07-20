@@ -1,0 +1,19 @@
+type: botforge/test
+name: test
+
+# Negative-control fixture: regression guard for the docker assert plugin.
+#
+# botwork-db is attached to botwork-internal only (NOT botwork-plugin).
+# Asserting it is on botwork-plugin MUST fail, proving that network-attachment
+# checks are real (not trivially true) and that "absent" network membership
+# is correctly detected.
+#
+# `image:` is injected by .github/workflows/_botforge.yml at CI time.
+
+steps: []
+
+assert:
+  docker:
+    containers:
+      botwork-db:
+        networks: [botwork-plugin]

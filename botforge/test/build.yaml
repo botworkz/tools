@@ -40,6 +40,83 @@ steps:
     echo 'botforge-ci-regression-fixture-0440' \
       | install -m 0440 -o root -g root /dev/stdin \
           /etc/botforge-ci-restricted/probe-test
+
+- name: Create botwork-ci-env systemd service
+  run: |
+    # Creates a persistent service with known Environment= entries so that
+    # assert.services: environment: checks can be exercised against it
+    # (positive assert in test.yaml; negative control in assert-fail-svc-env.yaml).
+    cat > /etc/systemd/system/botwork-ci-env.service << 'EOF'
+    [Unit]
+    Description=Botwork CI environment test service
+
+    [Service]
+    Environment=BOTWORK_MODE=production
+    Environment=BOTWORK_REGION=us-east-1
+    ExecStart=/bin/sleep infinity
+    Restart=always
+
+    [Install]
+    WantedBy=multi-user.target
+    EOF
+    systemctl daemon-reload
+    systemctl enable botwork-ci-env
+
+- name: Install and configure docker
+  run: |
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get -qq install -y docker.io
+    # Enable docker daemon so it starts at test-VM boot and restores containers.
+    systemctl enable docker
+    # Start docker now so we can pre-pull images and create the CI scenario.
+    systemctl start docker
+    # Wait until the docker daemon socket is ready (up to 30 s).
+    for i in $(seq 1 15); do
+      docker info > /dev/null 2>&1 && break
+      sleep 2
+    done
+    docker info > /dev/null  # hard-fail if still not up
+
+- name: Create docker CI scenario
+  run: |
+    # Pre-pull the base image so no network pull is required at test-VM boot.
+    docker pull alpine:3
+
+    # Create user-defined bridge networks.
+    docker network create botwork-internal
+    docker network create botwork-plugin
+
+    # botwork-web: botwork-internal only, publishes host port 8080 → container 80/tcp.
+    # "--restart unless-stopped" ensures docker restarts it when the daemon restarts
+    # (i.e. at test-VM boot), but does not restart it if explicitly stopped.
+    docker run -d \
+      --name botwork-web \
+      --network botwork-internal \
+      --publish 8080:80 \
+      --restart unless-stopped \
+      alpine:3 sh -c 'echo "botwork-web ready"; sleep infinity'
+
+    # botwork-proxy: both networks, no published port.
+    docker run -d \
+      --name botwork-proxy \
+      --network botwork-internal \
+      --restart unless-stopped \
+      alpine:3 sh -c 'echo "botwork-proxy ready"; sleep infinity'
+    docker network connect botwork-plugin botwork-proxy
+
+    # botwork-db: botwork-internal only, no published port.
+    docker run -d \
+      --name botwork-db \
+      --network botwork-internal \
+      --restart unless-stopped \
+      alpine:3 sh -c 'echo "botwork-db ready"; sleep infinity'
+
+    # botwork-exited: exits immediately — stays in exited state at test boot
+    # (no restart policy so docker does not restart it).
+    docker run \
+      --name botwork-exited \
+      --network botwork-internal \
+      alpine:3 sh -c 'echo "botwork-exited done"' || true
 # --- for: expansion acceptance coverage (build path) -------------------------
 # Exercises all three item forms with MULTIPLE items each so the build-time
 # loop expansion and args.N / args.KEY addressing are genuinely tested. All

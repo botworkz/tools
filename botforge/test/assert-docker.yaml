@@ -1,0 +1,64 @@
+type: botforge/test
+name: test
+
+# Positive docker assert fixture: exercises every docker check type against
+# the deterministic docker scenario created in the build step.
+#
+# Guest state set up by the build:
+#   Networks : botwork-internal, botwork-plugin
+#   botwork-web   : botwork-internal only, publishes 8080→80/tcp, running
+#   botwork-proxy : botwork-internal + botwork-plugin, no published port, running
+#   botwork-db    : botwork-internal only, no published port, running
+#   botwork-exited: botwork-internal, no restart policy → exited state
+#
+# `image:` is injected by .github/workflows/_botforge.yml at CI time.
+
+steps: []
+
+assert:
+  docker:
+    # ── Images ────────────────────────────────────────────────────────────────
+    images:
+      alpine:3:
+        exists: true
+      botwork-nonexistent-image:latest:
+        exists: false
+
+    # ── Networks ──────────────────────────────────────────────────────────────
+    networks:
+      botwork-internal:
+        exists: true
+      botwork-plugin:
+        exists: true
+      botwork-nonexistent-net:
+        exists: false
+
+    # ── Containers ────────────────────────────────────────────────────────────
+    containers:
+      # botwork-web: running, internal only, publishes 80/tcp, known log line
+      botwork-web:
+        exists: true
+        running: true
+        networks: [botwork-internal, "!botwork-plugin"]
+        ports: ["80/tcp", "!9999/tcp"]
+        logs:
+          contains: ["botwork-web ready"]
+          timeout: 30
+
+      # botwork-proxy: running, both networks, no published port
+      botwork-proxy:
+        exists: true
+        running: true
+        networks: [botwork-internal, botwork-plugin]
+        ports: ["!80/tcp"]
+
+      # botwork-db: running, internal only, no published port
+      botwork-db:
+        exists: true
+        running: true
+        networks: [botwork-internal, "!botwork-plugin"]
+
+      # botwork-exited: exists but not running (no restart policy)
+      botwork-exited:
+        exists: true
+        running: false
