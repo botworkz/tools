@@ -87,6 +87,9 @@ COPY .ci-plugins/libpigz.so /usr/share/botforge/plugins/libpigz.so
 # .ci-plugins/ by the CI job before docker buildx.
 COPY .ci-plugins/libgithub.so /usr/share/botforge/plugins/libgithub.so
 
+# Stage the docker assert/docker plugin.
+COPY .ci-plugins/libdocker.so /usr/share/botforge/plugins/libdocker.so
+
 WORKDIR /work
 
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]

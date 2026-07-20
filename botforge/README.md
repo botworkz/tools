@@ -1126,8 +1126,31 @@ uint32_t plugin_core_ping(void);  // host handshake self-test only; must return 
 | Slot | Description |
 |------|-------------|
 | `core/ping` | Host-level handshake/self-test seam (not a general-purpose capability). Must return `42` only to prove load→call round-trip. |
+| `build/compressor` | Whole-artifact compression/decompression (e.g. gzip). See `botforge-plugin-pigz` for a reference implementation. |
+| `publish/github` | Publish build artifacts to a GitHub Releases endpoint. See `botforge-plugin-github` for a reference implementation. |
+| `assert/<name>` | Boot-time declarative assertion provider. The host calls `plugin_assert_build_probe` to get a shell script, runs it on the guest, then calls `plugin_assert_evaluate` with the stdout to get a JSON check-results document. See `botforge-plugin-docker` for an example (`assert/docker`). |
 
-More slots will be added in follow-up PRs (e.g. `build/compressor`).
+#### `assert/docker` example
+
+```yaml
+assert:
+  docker:
+    images:
+      nginx:latest: { exists: true }
+      old-image:    { exists: false }
+    networks:
+      mynet: { exists: true }
+    containers:
+      web:
+        exists: true
+        running: true
+        networks: [mynet, "!badnet"]
+        ports: ["80/tcp", "!9000/tcp"]
+        logs:
+          contains: ["Started"]
+          not_contains: ["ERROR"]
+          timeout: 30
+```
 
 ### Trust boundary
 

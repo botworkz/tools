@@ -9,7 +9,9 @@ use crate::qemu::{create_overlay_image, qemu_run_args, require_kvm, spawn_qemu_w
 use crate::resolver::{AssetKind, Reference, ResolveFileContext, ResolveSpec};
 use crate::ssh::{SshOptions, TemporarySshKeypair};
 use crate::util::{create_temp_dir, ensure_command, resolve_under_root};
-use crate::workspace::{discover_context, load_inline_manifest, registry::load_committed_registry};
+use crate::workspace::{
+    discover_context, load_inline_manifest, load_plugin_entries, registry::load_committed_registry,
+};
 
 use crate::config::{
     load_test_config, validate_test_ports, validate_test_steps, TestIso, TestIsoBootstrap,
@@ -211,6 +213,17 @@ pub(crate) fn cmd_test(args: TestArgs) -> Result<()> {
         key: ssh_key_path,
     };
 
+    // Load plugins from the workspace marker so that plugin-provided assert
+    // verbs (e.g. assert/docker) are available during the assert phase.
+    let plugin_entries = load_plugin_entries(&context)?;
+    let mut plugin_registry = botforge_plugin_host::PluginRegistry::new();
+    for entry in &plugin_entries {
+        let provides_filter: Option<Vec<String>> = entry.provides.clone();
+        plugin_registry
+            .load_plugin(&entry.name, &entry.src, provides_filter.as_deref())
+            .with_context(|| format!("failed to load plugin '{}'", entry.name))?;
+    }
+
     let test_result = run_test_flow(
         &context,
         &test_config,
@@ -219,6 +232,7 @@ pub(crate) fn cmd_test(args: TestArgs) -> Result<()> {
         &manifest,
         None,
         installer_username.as_deref(),
+        &plugin_registry,
     );
     if let Err(err) = test_result {
         eprintln!("test failed: {err:#}");

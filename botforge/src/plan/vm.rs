@@ -71,6 +71,7 @@ struct RunStepContext<'a> {
 // VM runtime (formerly run.rs)
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_test_flow(
     context: &Path,
     config: &TestConfig,
@@ -79,13 +80,15 @@ pub(crate) fn run_test_flow(
     manifest: &Manifest,
     cache_dir_override: Option<&Path>,
     installer_username: Option<&str>,
+    plugin_registry: &botforge_plugin_host::PluginRegistry,
 ) -> Result<()> {
     // Run the declarative `assert:` block as a pre-steps phase (after boot /
     // SSH / cloud-init, but before the first `steps:` entry) so that
     // assertions validate the image as built rather than the post-steps state.
     let pre_steps: Option<Box<PreStepsHook<'_>>> = config.assert.as_ref().map(|assert_block| {
-        Box::new(move |ssh: &SshOptions| run_assert_phase(ssh, assert_block, installer_username))
-            as Box<PreStepsHook<'_>>
+        Box::new(move |ssh: &SshOptions| {
+            run_assert_phase(ssh, assert_block, installer_username, plugin_registry)
+        }) as Box<PreStepsHook<'_>>
     });
 
     run_step_flow(
@@ -122,6 +125,7 @@ fn run_assert_phase(
     ssh: &SshOptions,
     assert_block: &AssertBlock,
     installer_username: Option<&str>,
+    plugin_registry: &botforge_plugin_host::PluginRegistry,
 ) -> Result<()> {
     let registry = built_in_assert_registry();
     for kind in registry.iter() {
@@ -129,6 +133,75 @@ fn run_assert_phase(
             continue;
         }
         kind.run(ssh, assert_block, installer_username)?;
+    }
+
+    // Dispatch plugin-provided assert verbs.
+    for (verb, raw_value) in &assert_block.plugin_asserts {
+        let handle = plugin_registry.get_assert(verb).ok_or_else(|| {
+            let builtins = built_in_assert_registry().known_verbs().join(", ");
+            let plugin_names = plugin_registry.assert_names().join(", ");
+            let plugin_part = if plugin_names.is_empty() {
+                "(no plugin-provided assert verbs loaded)".to_owned()
+            } else {
+                format!("plugin verbs: {plugin_names}")
+            };
+            anyhow::anyhow!(
+                "no assert provider for verb '{verb}' \
+                 (built-in verbs: {builtins}; {plugin_part})"
+            )
+        })?;
+        let config_json = serde_json::to_string(raw_value)
+            .map_err(|e| anyhow::anyhow!("assert.{verb}: failed to serialize config to JSON: {e}"))?;
+        let script = handle
+            .build_probe(&config_json)
+            .map_err(|e| anyhow::anyhow!("assert.{verb}: build_probe failed: {e}"))?;
+        let probe_stdout =
+            crate::assert::run_privileged_probe(ssh, &script, "__PLUGIN_ASSERT__")
+                .map_err(|e| anyhow::anyhow!("assert.{verb}: probe failed: {e:#}"))?;
+        let results_json = handle
+            .evaluate(&config_json, &probe_stdout)
+            .map_err(|e| anyhow::anyhow!("assert.{verb}: evaluate failed: {e}"))?;
+        run_plugin_assert_checks(verb, &results_json)?;
+    }
+
+    Ok(())
+}
+
+/// Parse results JSON from a plugin assert provider and render per-check status.
+///
+/// Results JSON contract:
+/// ```json
+/// { "checks": [ { "label": "...", "ok": true, "message": null } ] }
+/// ```
+fn run_plugin_assert_checks(verb: &str, results_json: &str) -> Result<()> {
+    use serde::Deserialize;
+    #[derive(Deserialize)]
+    struct CheckResult {
+        label: String,
+        ok: bool,
+        message: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct Results {
+        checks: Vec<CheckResult>,
+    }
+
+    let results: Results = serde_json::from_str(results_json)
+        .map_err(|e| anyhow::anyhow!("assert.{verb}: invalid results JSON: {e}"))?;
+
+    let mut any_failed = false;
+    for check in &results.checks {
+        crate::plan::log::print_phase_status("assert", &check.label, check.ok);
+        if !check.ok {
+            if let Some(ref msg) = check.message {
+                eprintln!("         {msg}");
+            }
+            any_failed = true;
+        }
+    }
+
+    if any_failed {
+        anyhow::bail!("one or more assert.{verb} checks failed");
     }
     Ok(())
 }
