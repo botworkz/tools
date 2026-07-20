@@ -946,8 +946,8 @@ fn docker_acceptance_load_and_build_probe() {
         "probe script must be non-empty: {script:?}"
     );
     assert!(
-        script.contains("docker image inspect"),
-        "probe script must contain docker image inspect: {script:?}"
+        script.contains("docker image ls"),
+        "probe script must contain docker image ls: {script:?}"
     );
 }
 
@@ -965,8 +965,10 @@ fn docker_acceptance_evaluate_synthetic_stdout() {
     // Config: exact image present (exists: true), exact network absent (exists: false).
     let config_json = r#"{"images":{"nginx:latest":{"exists":true}},"networks":{"badnet":{"exists":false}},"containers":{}}"#;
 
-    // Synthetic stdout: first line = "present" (nginx:latest found), second = "absent" (badnet absent).
-    let probe_stdout = "present\nabsent\n";
+    // Synthetic stdout in new batched dump format:
+    //   - docker image ls dump: nginx:latest listed → present
+    //   - docker network ls dump: badnet NOT listed → absent (satisfies exists:false)
+    let probe_stdout = "nginx:latest\n__END_DOCKER_IMAGES__\n__END_DOCKER_NETWORKS__\n";
 
     let results_json = handle
         .evaluate(config_json, probe_stdout)
