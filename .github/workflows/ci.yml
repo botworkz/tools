@@ -36,6 +36,7 @@ on:
     - botforge-plugin-hello-badabi/**
     - botforge-plugin-pigz/**
     - botforge-plugin-github/**
+    - botforge-plugin-docker/**
   pull_request:
     branches: [main]
     paths:
@@ -56,6 +57,7 @@ on:
     - botforge-plugin-hello-badabi/**
     - botforge-plugin-pigz/**
     - botforge-plugin-github/**
+    - botforge-plugin-docker/**
   workflow_dispatch:
   release:
     types: [published]
@@ -121,6 +123,7 @@ jobs:
         -p botforge-plugin-hello-badabi
         -p botforge-plugin-pigz
         -p botforge-plugin-github
+        -p botforge-plugin-docker
     - name: Run unit test coverage
       run: cargo tarpaulin
     - name: Upload coverage report

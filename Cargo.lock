@@ -337,6 +337,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "botforge-plugin-docker"
+version = "0.1.0"
+dependencies = [
+ "botforge-plugin-host",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "botforge-plugin-github"
 version = "0.1.0"
 dependencies = [
