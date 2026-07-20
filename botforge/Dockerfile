@@ -42,7 +42,6 @@ ARG BINARY_SOURCE=source
 
 # Install orchestration toolchain:
 #   qemu-system-x86               — qemu-system-x86_64 (VM runtime)
-#   xorriso / genisoimage         — ISO building (cidata seed for `botforge test`)
 #   libnss-wrapper                — uid/gid passthrough support in entrypoint
 #   ca-certificates               — TLS roots
 #   cloud-image-utils / curl / jq — ancillary runtime utilities
@@ -54,6 +53,10 @@ ARG BINARY_SOURCE=source
 # resize are now handled natively in Rust (crate::compress::qcow2), so the
 # runtime image no longer depends on the qemu-utils package.
 #
+# xorriso and genisoimage are intentionally absent: ISO building (cidata seed
+# and payload ISOs) is now handled natively in Rust (crate::iso via hadris-iso),
+# so the runtime image no longer depends on these tools.
+#
 # hadolint ignore=DL3008
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -61,11 +64,9 @@ RUN apt-get update \
         ca-certificates \
         cloud-image-utils \
         curl \
-        genisoimage \
         jq \
         libnss-wrapper \
         qemu-system-x86 \
-        xorriso \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=binary-source /botforge /usr/local/bin/botforge
