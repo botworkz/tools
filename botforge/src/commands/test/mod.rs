@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use crate::commands::build::CpusArg;
 use crate::iso::{
-    build_iso, detect_iso_tool, generate_installer_username, render_user_data, write_seed_files,
+    detect_iso_tool, generate_installer_username, prepare_seed_image, render_user_data,
 };
 use crate::qemu::{create_overlay_image, qemu_run_args, require_kvm, spawn_qemu_with_log};
 use crate::resolver::{AssetKind, Reference, ResolveFileContext, ResolveSpec};
@@ -162,10 +162,7 @@ pub(crate) fn cmd_test(args: TestArgs) -> Result<()> {
             test_config.cloud_init.as_ref(),
         )
     };
-    write_seed_files(&seed_dir, &user_data)?;
-    build_iso(&seed_dir, &seed_iso, "cidata")?;
-    std::fs::remove_dir_all(&seed_dir)
-        .with_context(|| format!("cannot remove temp seed dir: {}", seed_dir.display()))?;
+    prepare_seed_image(&seed_dir, &seed_iso, &user_data)?;
 
     create_overlay_image(&base_image, &overlay_image)?;
 
