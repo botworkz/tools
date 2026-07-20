@@ -32,6 +32,7 @@ const MAX_EXPLICIT_COMPRESSION_THREADS: usize = 64;
 const HDR_MAGIC: usize = 0;
 const HDR_VERSION: usize = 4;
 const HDR_BACKING_FILE_OFFSET: usize = 8;
+const HDR_BACKING_FILE_SIZE: usize = 16;
 const HDR_CLUSTER_BITS: usize = 20;
 const HDR_DISK_SIZE: usize = 24;
 const HDR_L1_SIZE: usize = 36;
@@ -104,6 +105,303 @@ fn csize_mask(cluster_bits: u32) -> u64 {
 /// Mask for the host-file-offset bits of a compressed L2 entry.
 fn cluster_offset_mask(cluster_bits: u32) -> u64 {
     (1u64 << csize_shift(cluster_bits)) - 1
+}
+
+// Magic number for the qcow2 header extension that stores the backing file format name.
+const QCOW2_EXT_MAGIC_BACKING_FORMAT: u32 = 0xE2792ACA;
+
+/// Creates a native qcow2 v3 overlay image backed by `base_image`.
+///
+/// The resulting file is a fresh empty qcow2 that records writes made while
+/// `base_image` is the read-only backing store — equivalent to
+/// `qemu-img create -f qcow2 -F qcow2 -b <base> <overlay>`.
+///
+/// Virtual size and cluster geometry are inherited from the base image.
+/// All L1 entries are zero (no data in the overlay yet), so every read
+/// falls through to the backing file.
+pub(crate) fn create_qcow2_overlay(base_image: &Path, overlay_image: &Path) -> Result<()> {
+    // Inherit virtual size and cluster geometry from the base image.
+    let mut base_file = File::open(base_image)
+        .with_context(|| format!("cannot open base image: {}", base_image.display()))?;
+    let base_hdr = read_header(&mut base_file)?;
+    drop(base_file);
+
+    let virtual_size = base_hdr.virtual_size;
+    let cluster_bits = base_hdr.cluster_bits;
+    let cluster_size = 1u64 << cluster_bits;
+
+    // The backing file path is stored verbatim in the header cluster.
+    let base_path_str = base_image.to_str().with_context(|| {
+        format!(
+            "base image path is not valid UTF-8: {}",
+            base_image.display()
+        )
+    })?;
+    let backing_bytes = base_path_str.as_bytes();
+    let backing_len = u32::try_from(backing_bytes.len()).context("backing file path too long")?;
+
+    // Header extension: backing file format name "qcow2".
+    // Format: u32 magic + u32 data_len + data padded to 8-byte boundary.
+    // End-of-extensions marker: 8 zero bytes.
+    const BACKING_FMT: &[u8] = b"qcow2";
+    let ext_data_len = BACKING_FMT.len() as u32; // = 5
+    let ext_data_padded = usize::try_from(align_up(u64::from(ext_data_len), 8))
+        .context("extension data size overflow")?;
+    // Total bytes consumed by the extension (magic+len header) + padded data.
+    let ext_total = 8usize + ext_data_padded; // = 8 + 8 = 16
+    const END_MARKER_LEN: usize = 8;
+    // Backing file string starts immediately after the extension area.
+    let backing_file_offset =
+        u64::try_from(QCOW_HEADER_LENGTH_V3 as usize + ext_total + END_MARKER_LEN)
+            .context("backing_file_offset overflow")?; // = 112 + 16 + 8 = 136
+
+    // L1 table sizing: enough entries to cover virtual_size, all zero.
+    let l2_entries_per_table = cluster_size
+        .checked_div(8)
+        .context("cluster size too small for L2 table")?;
+    let guest_cluster_count = virtual_size.div_ceil(cluster_size);
+    let l1_size = if guest_cluster_count == 0 {
+        0u64
+    } else {
+        guest_cluster_count.div_ceil(l2_entries_per_table)
+    };
+    let l1_table_clusters = if l1_size == 0 {
+        1u64 // always allocate at least one cluster for the L1 table slot
+    } else {
+        l1_size
+            .checked_mul(8)
+            .context("l1 table byte length overflow")?
+            .div_ceil(cluster_size)
+    };
+
+    // Physical layout:
+    //   Cluster 0           : header cluster (with extension + backing path)
+    //   Clusters 1…1+ltc-1  : L1 table (all zeros)
+    //   Cluster  1+ltc      : refcount table
+    //   Cluster  2+ltc      : refcount block(s)
+    let l1_table_offset = cluster_size;
+    let refcount_table_offset = l1_table_offset
+        .checked_add(
+            l1_table_clusters
+                .checked_mul(cluster_size)
+                .context("l1 region size overflow")?,
+        )
+        .context("refcount table offset overflow")?;
+    let clusters_before_refcounts = refcount_table_offset / cluster_size;
+    let (refcount_table_clusters, refcount_block_clusters, total_clusters) =
+        compute_refcount_layout(clusters_before_refcounts, cluster_size)?;
+    let refcount_block_offset = refcount_table_offset
+        .checked_add(
+            refcount_table_clusters
+                .checked_mul(cluster_size)
+                .context("refcount table span overflow")?,
+        )
+        .context("refcount block offset overflow")?;
+    let file_len = refcount_block_offset
+        .checked_add(
+            refcount_block_clusters
+                .checked_mul(cluster_size)
+                .context("refcount block span overflow")?,
+        )
+        .context("overlay file length overflow")?;
+
+    // Create the output file and zero-fill to file_len (this also zeroes the
+    // L1 table, meaning all L1 entries start as 0 → no L2 tables allocated).
+    let mut out = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .open(overlay_image)
+        .with_context(|| format!("cannot create overlay image: {}", overlay_image.display()))?;
+    out.set_len(file_len)
+        .with_context(|| format!("cannot size overlay image: {}", overlay_image.display()))?;
+
+    // ── Build and write the header cluster ──────────────────────────────────
+    let cluster_usize = usize::try_from(cluster_size).context("cluster size too large")?;
+    let bf_off = usize::try_from(backing_file_offset).context("backing_file_offset too large")?;
+    if bf_off + backing_bytes.len() > cluster_usize {
+        bail!(
+            "backing file path is too long to fit in the qcow2 header cluster \
+             (path len={}, cluster_size={cluster_usize})",
+            backing_bytes.len()
+        );
+    }
+    let mut hdr = vec![0u8; cluster_usize];
+    write_be_u32(&mut hdr, HDR_MAGIC, QCOW_MAGIC);
+    write_be_u32(&mut hdr, HDR_VERSION, 3);
+    write_be_u64(&mut hdr, HDR_BACKING_FILE_OFFSET, backing_file_offset);
+    write_be_u32(&mut hdr, HDR_BACKING_FILE_SIZE, backing_len);
+    write_be_u32(&mut hdr, HDR_CLUSTER_BITS, cluster_bits);
+    write_be_u64(&mut hdr, HDR_DISK_SIZE, virtual_size);
+    // Bytes 32–35 (encryption_method) remain 0 = no encryption.
+    write_be_u32(
+        &mut hdr,
+        HDR_L1_SIZE,
+        u32::try_from(l1_size).context("l1_size does not fit u32")?,
+    );
+    write_be_u64(&mut hdr, HDR_L1_TABLE_OFFSET, l1_table_offset);
+    write_be_u64(&mut hdr, HDR_REFCOUNT_TABLE_OFFSET, refcount_table_offset);
+    write_be_u32(
+        &mut hdr,
+        HDR_REFCOUNT_TABLE_CLUSTERS,
+        u32::try_from(refcount_table_clusters)
+            .context("refcount_table_clusters does not fit u32")?,
+    );
+    // Bytes 60–63 (nb_snapshots) and 64–71 (snapshots_offset) remain 0.
+    // Bytes 72–95 (incompat/compat/autoclear features) remain 0.
+    write_be_u32(&mut hdr, HDR_REFCOUNT_ORDER, DEFAULT_REFCOUNT_ORDER);
+    write_be_u32(&mut hdr, HDR_HEADER_LENGTH, QCOW_HEADER_LENGTH_V3);
+    // Byte 104 (compression_type) remains 0 = zlib (irrelevant for an overlay).
+
+    // Write the backing-file-format name extension at offset 112.
+    let ext_off = QCOW_HEADER_LENGTH_V3 as usize; // = 112
+    write_be_u32(&mut hdr, ext_off, QCOW2_EXT_MAGIC_BACKING_FORMAT);
+    write_be_u32(&mut hdr, ext_off + 4, ext_data_len);
+    hdr[ext_off + 8..ext_off + 8 + BACKING_FMT.len()].copy_from_slice(BACKING_FMT);
+    // Padding bytes (128–135) and end-of-extensions marker (128–135 if no
+    // padding, otherwise shifted) are already zero.
+
+    // Write the backing file path string.
+    hdr[bf_off..bf_off + backing_bytes.len()].copy_from_slice(backing_bytes);
+
+    write_exact_at(&mut out, 0, &hdr)?;
+
+    // ── Refcount metadata ──────────────────────────────────────────────────
+    // Every cluster in the file is allocated exactly once.
+    let mut refcounts = BTreeMap::<u64, u64>::new();
+    increment_refcount_range(&mut refcounts, 0, file_len, cluster_size)?;
+
+    write_refcount_table(
+        &mut out,
+        refcount_table_offset,
+        refcount_block_offset,
+        refcount_table_clusters,
+        refcount_block_clusters,
+        cluster_size,
+    )?;
+    write_refcount_blocks(
+        &mut out,
+        refcount_block_offset,
+        refcount_block_clusters,
+        cluster_size,
+        total_clusters,
+        &refcounts,
+    )?;
+
+    out.sync_all()
+        .with_context(|| format!("cannot flush overlay image: {}", overlay_image.display()))?;
+    Ok(())
+}
+
+/// Parses a human-readable size string (e.g. `"10G"`, `"512M"`, `"4096"`) into bytes.
+///
+/// Supported suffixes (case-insensitive): none/`B` = bytes, `K`/`KiB`/`KB` = kibibytes,
+/// `M`/`MiB`/`MB` = mebibytes, `G`/`GiB`/`GB` = gibibytes, `T`/`TiB`/`TB` = tebibytes,
+/// `P`/`PiB`/`PB` = pebibytes.
+pub(crate) fn parse_size_string(s: &str) -> Result<u64> {
+    let s = s.trim();
+    if s.is_empty() {
+        bail!("size string is empty");
+    }
+    let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    let (digits, suffix) = s.split_at(split);
+    if digits.is_empty() {
+        bail!("size string {s:?} has no numeric part");
+    }
+    let base: u64 = digits
+        .parse()
+        .with_context(|| format!("invalid number in size string {s:?}"))?;
+    let multiplier: u64 = match suffix.to_uppercase().as_str() {
+        "" | "B" => 1,
+        "K" | "KIB" | "KB" => 1024,
+        "M" | "MIB" | "MB" => 1024 * 1024,
+        "G" | "GIB" | "GB" => 1024 * 1024 * 1024,
+        "T" | "TIB" | "TB" => 1024 * 1024 * 1024 * 1024,
+        "P" | "PIB" | "PB" => 1024 * 1024 * 1024 * 1024 * 1024,
+        _ => bail!("unknown size suffix {suffix:?} in {s:?}"),
+    };
+    base.checked_mul(multiplier)
+        .with_context(|| format!("size {s:?} overflows u64"))
+}
+
+/// Grows the virtual size of a qcow2 image in-place by updating its header.
+///
+/// This replaces `qemu-img resize <disk> <size>` on the build path.  Only
+/// growth is supported (shrinking is rejected).  The L1 table is never
+/// physically reallocated: if the resize would require more L1 table clusters
+/// than were originally allocated, the call returns an error (this situation
+/// does not occur with the 64 KiB clusters used by all standard cloud images
+/// because a single cluster covers ≥ 4 PiB of virtual address space).
+pub(crate) fn resize_qcow2_image(disk: &Path, size_str: &str) -> Result<()> {
+    let new_virtual_size = parse_size_string(size_str)?;
+
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(disk)
+        .with_context(|| format!("cannot open qcow2 for resize: {}", disk.display()))?;
+
+    let header = read_header(&mut file)?;
+
+    if new_virtual_size < header.virtual_size {
+        bail!(
+            "cannot shrink qcow2: current virtual size is {}, requested size is {}",
+            header.virtual_size,
+            new_virtual_size
+        );
+    }
+    if new_virtual_size == header.virtual_size {
+        return Ok(());
+    }
+
+    let cluster_size = header.cluster_size();
+    let l2_entries_per_table = cluster_size / 8;
+
+    let new_l1_size = new_virtual_size
+        .div_ceil(cluster_size)
+        .div_ceil(l2_entries_per_table);
+    let new_l1_size_u32 = u32::try_from(new_l1_size).context("new l1_size does not fit u32")?;
+
+    // Check that the new L1 size still fits within the existing physical
+    // allocation for the L1 table.  New entries beyond the old l1_size are
+    // already zero-initialised (qemu zeroes the L1 cluster on creation).
+    let old_l1_table_clusters = u64::from(header.l1_size)
+        .checked_mul(8)
+        .context("old l1 table byte length overflow")?
+        .div_ceil(cluster_size)
+        .max(1); // at least 1 cluster is always allocated
+    let new_l1_table_clusters = new_l1_size
+        .checked_mul(8)
+        .context("new l1 table byte length overflow")?
+        .div_ceil(cluster_size)
+        .max(1);
+
+    if new_l1_table_clusters > old_l1_table_clusters {
+        bail!(
+            "resize from {} to {} bytes requires L1 table reallocation \
+             (cluster_size={}, old_l1_size={}, new_l1_size={}): \
+             not supported — use a larger cluster size",
+            header.virtual_size,
+            new_virtual_size,
+            cluster_size,
+            header.l1_size,
+            new_l1_size,
+        );
+    }
+
+    // Patch virtual_size and l1_size directly in the on-disk header.
+    // No new physical clusters are added and no refcounts change.
+    write_u64_at(&mut file, HDR_DISK_SIZE as u64, new_virtual_size)
+        .context("cannot write new virtual_size to header")?;
+    file.seek(SeekFrom::Start(HDR_L1_SIZE as u64))
+        .context("cannot seek to HDR_L1_SIZE")?;
+    file.write_all(&new_l1_size_u32.to_be_bytes())
+        .context("cannot write new l1_size to header")?;
+    file.sync_all()
+        .with_context(|| format!("cannot flush resized qcow2: {}", disk.display()))?;
+
+    Ok(())
 }
 
 pub(crate) fn compress_qcow2_image(
@@ -3156,6 +3454,353 @@ mod tests {
             cluster_size,
             &written_clusters,
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_size_string unit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_size_string_bytes_bare_integer() {
+        assert_eq!(parse_size_string("4096").unwrap(), 4096);
+    }
+
+    #[test]
+    fn parse_size_string_bytes_with_b_suffix() {
+        assert_eq!(parse_size_string("512B").unwrap(), 512);
+    }
+
+    #[test]
+    fn parse_size_string_kib() {
+        assert_eq!(parse_size_string("1K").unwrap(), 1024);
+        assert_eq!(parse_size_string("1k").unwrap(), 1024);
+        assert_eq!(parse_size_string("2KiB").unwrap(), 2048);
+        assert_eq!(parse_size_string("2KB").unwrap(), 2048);
+    }
+
+    #[test]
+    fn parse_size_string_mib() {
+        assert_eq!(parse_size_string("1M").unwrap(), 1024 * 1024);
+        assert_eq!(parse_size_string("512M").unwrap(), 512 * 1024 * 1024);
+    }
+
+    #[test]
+    fn parse_size_string_gib() {
+        assert_eq!(parse_size_string("1G").unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(parse_size_string("10G").unwrap(), 10 * 1024 * 1024 * 1024);
+        assert_eq!(parse_size_string("20G").unwrap(), 20 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn parse_size_string_tib() {
+        assert_eq!(
+            parse_size_string("1T").unwrap(),
+            1024u64 * 1024 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn parse_size_string_pib() {
+        assert_eq!(
+            parse_size_string("1P").unwrap(),
+            1024u64 * 1024 * 1024 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn parse_size_string_unknown_suffix_errors() {
+        assert!(parse_size_string("5X").is_err());
+    }
+
+    #[test]
+    fn parse_size_string_empty_errors() {
+        assert!(parse_size_string("").is_err());
+    }
+
+    #[test]
+    fn parse_size_string_no_numeric_errors() {
+        assert!(parse_size_string("G").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // create_qcow2_overlay unit tests
+    // -----------------------------------------------------------------------
+
+    /// Verifies that create_qcow2_overlay writes a valid header with correct
+    /// backing_file_offset/size, virtual_size, cluster_bits, l1_size,
+    /// refcount_order, and header_length.
+    #[test]
+    fn create_overlay_header_fields_are_correct() {
+        let tmp = tempdir().expect("tempdir");
+        let base = tmp.path().join("base.qcow2");
+        let overlay = tmp.path().join("overlay.qcow2");
+
+        // Use a 2-cluster source image (4 KiB clusters, 8 KiB virtual size).
+        write_multi_cluster_test_image(&base, 2).expect("write base");
+
+        create_qcow2_overlay(&base, &overlay).expect("create overlay");
+
+        let mut file = File::open(&overlay).expect("open overlay");
+        let hdr = read_header(&mut file).expect("read header");
+
+        // Header must carry the backing file pointer.
+        assert_ne!(
+            hdr.backing_file_offset, 0,
+            "backing_file_offset must be set"
+        );
+
+        // Verify the stored backing path matches the base image path.
+        let mut path_buf = vec![0u8; backing_file_size_from_header(&mut file)];
+        read_exact_at(&mut file, hdr.backing_file_offset, &mut path_buf)
+            .expect("read backing path");
+        let stored_path = std::str::from_utf8(&path_buf).expect("backing path must be valid UTF-8");
+        assert_eq!(stored_path, base.to_str().unwrap(), "stored backing path");
+
+        // Virtual size must match the base image.
+        let base_stats = read_qcow2_image_stats(&base).expect("base stats");
+        assert_eq!(hdr.virtual_size, base_stats.virtual_size, "virtual_size");
+
+        // cluster_bits must match the base image.
+        let mut base_file = File::open(&base).expect("open base");
+        let base_hdr = read_header(&mut base_file).expect("read base header");
+        assert_eq!(hdr.cluster_bits, base_hdr.cluster_bits, "cluster_bits");
+
+        // l1_size must be non-zero and sufficient to cover virtual_size.
+        let cluster_size = hdr.cluster_size();
+        let l2_entries = cluster_size / 8;
+        let guest_clusters = hdr.virtual_size.div_ceil(cluster_size);
+        let expected_l1_size = guest_clusters.div_ceil(l2_entries) as u32;
+        assert_eq!(hdr.l1_size, expected_l1_size, "l1_size");
+
+        // Standard v3 metadata.
+        assert_eq!(hdr.refcount_order, DEFAULT_REFCOUNT_ORDER, "refcount_order");
+        assert_eq!(hdr.header_length, QCOW_HEADER_LENGTH_V3, "header_length");
+        // No incompatible features (empty overlay).
+        assert_eq!(hdr.incompatible_features, 0, "incompatible_features");
+    }
+
+    /// Verifies that the backing-file-format extension "qcow2" is written
+    /// immediately after the fixed header at offset 112.
+    #[test]
+    fn create_overlay_backing_format_extension_is_present() {
+        let tmp = tempdir().expect("tempdir");
+        let base = tmp.path().join("base.qcow2");
+        let overlay = tmp.path().join("overlay.qcow2");
+        write_multi_cluster_test_image(&base, 2).expect("write base");
+        create_qcow2_overlay(&base, &overlay).expect("create overlay");
+
+        let mut file = File::open(&overlay).expect("open overlay");
+        // Extension starts at offset 112 (QCOW_HEADER_LENGTH_V3).
+        let ext_magic =
+            read_u64_at(&mut file, QCOW_HEADER_LENGTH_V3 as u64).expect("read extension magic+len");
+        let magic = (ext_magic >> 32) as u32;
+        let len = (ext_magic & 0xffff_ffff) as u32;
+        assert_eq!(magic, QCOW2_EXT_MAGIC_BACKING_FORMAT, "extension magic");
+        assert_eq!(len, 5, "extension data length for 'qcow2'");
+
+        let mut ext_data = [0u8; 5];
+        read_exact_at(&mut file, QCOW_HEADER_LENGTH_V3 as u64 + 8, &mut ext_data)
+            .expect("read extension data");
+        assert_eq!(&ext_data, b"qcow2", "extension data");
+    }
+
+    /// Verifies that the L1 table in a fresh overlay is all zeros (no data).
+    #[test]
+    fn create_overlay_l1_table_is_all_zeros() {
+        let tmp = tempdir().expect("tempdir");
+        let base = tmp.path().join("base.qcow2");
+        let overlay = tmp.path().join("overlay.qcow2");
+        write_multi_cluster_test_image(&base, 4).expect("write base");
+        create_qcow2_overlay(&base, &overlay).expect("create overlay");
+
+        let mut file = File::open(&overlay).expect("open overlay");
+        let hdr = read_header(&mut file).expect("read header");
+        let l1_entries = read_u64_table(&mut file, hdr.l1_table_offset, hdr.l1_size as usize)
+            .expect("read l1 table");
+        for (i, &entry) in l1_entries.iter().enumerate() {
+            assert_eq!(entry, 0, "L1 entry {i} must be zero in an empty overlay");
+        }
+    }
+
+    /// Verifies that the refcount table and blocks correctly account for all
+    /// clusters in the overlay file (every cluster must have refcount ≥ 1).
+    #[test]
+    fn create_overlay_all_clusters_have_positive_refcount() {
+        let tmp = tempdir().expect("tempdir");
+        let base = tmp.path().join("base.qcow2");
+        let overlay = tmp.path().join("overlay.qcow2");
+        write_multi_cluster_test_image(&base, 4).expect("write base");
+        create_qcow2_overlay(&base, &overlay).expect("create overlay");
+
+        let mut file = File::open(&overlay).expect("open overlay");
+        let hdr = read_header(&mut file).expect("read header");
+        let cluster_size = hdr.cluster_size();
+        let file_len = file.metadata().expect("metadata").len();
+        let total_clusters = file_len / cluster_size;
+
+        let entries_per_block = cluster_size / 2; // 16-bit refcounts
+        let rt_entries = read_u64_table(
+            &mut file,
+            hdr.refcount_table_offset,
+            usize::try_from(hdr.refcount_table_clusters).expect("rtc")
+                * (cluster_size as usize / 8),
+        )
+        .expect("read refcount table");
+
+        for cluster_idx in 0..total_clusters {
+            let block_idx = cluster_idx / entries_per_block;
+            let rt_entry = rt_entries.get(block_idx as usize).copied().unwrap_or(0);
+            assert_ne!(
+                rt_entry, 0,
+                "refcount table entry for block {block_idx} must be non-zero"
+            );
+            let block_offset = aligned_data_offset(rt_entry, cluster_size);
+            let rc = read_exact_refcount16(&mut file, block_offset, cluster_idx);
+            assert!(
+                rc >= 1,
+                "cluster {cluster_idx} has refcount {rc} (expected ≥ 1)"
+            );
+        }
+    }
+
+    // qemu-img oracle: if qemu-img is present, verify that a natively-created
+    // overlay passes qemu-img check.
+    #[test]
+    fn native_overlay_qemu_img_check() {
+        if !qemu_img_available() {
+            eprintln!("qemu-img not found — skipping overlay qemu-img check");
+            return;
+        }
+        let tmp = tempdir().expect("tempdir");
+        let base = tmp.path().join("base.qcow2");
+        let overlay = tmp.path().join("overlay.qcow2");
+        write_multi_cluster_test_image(&base, 4).expect("write base");
+        create_qcow2_overlay(&base, &overlay).expect("create overlay");
+        assert_qemu_img_check(&base);
+        assert_qemu_img_check(&overlay);
+    }
+
+    // qemu-img oracle: verify overlay created with a larger base (multi-L1).
+    #[test]
+    fn native_overlay_qemu_img_check_multi_l1_base() {
+        if !qemu_img_available() {
+            eprintln!("qemu-img not found — skipping multi-L1 overlay check");
+            return;
+        }
+        let cluster_size = 65536u64;
+        let tmp = tempdir().expect("tempdir");
+        let base = tmp.path().join("base.qcow2");
+        let overlay = tmp.path().join("overlay.qcow2");
+        make_multi_l1_source_qcow2(&base, cluster_size, 3);
+        create_qcow2_overlay(&base, &overlay).expect("create multi-l1 overlay");
+        assert_qemu_img_check(&overlay);
+    }
+
+    // -----------------------------------------------------------------------
+    // resize_qcow2_image unit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resize_updates_virtual_size_and_l1_size_in_header() {
+        let tmp = tempdir().expect("tempdir");
+        let image = tmp.path().join("disk.qcow2");
+
+        // Base image: 2-cluster, 4 KiB clusters → virtual_size = 8192.
+        write_multi_cluster_test_image(&image, 2).expect("write image");
+
+        let before = read_qcow2_image_stats(&image).expect("stats before");
+        assert_eq!(before.virtual_size, 8192);
+
+        // Grow to 64 KiB (many more clusters than the original 2).
+        resize_qcow2_image(&image, "64K").expect("resize");
+
+        let mut file = File::open(&image).expect("open resized");
+        let hdr = read_header(&mut file).expect("read header");
+        assert_eq!(hdr.virtual_size, 64 * 1024, "virtual_size after resize");
+
+        // l1_size must cover the new virtual size.
+        let cluster_size = hdr.cluster_size();
+        let l2_entries = cluster_size / 8;
+        let expected_l1_size = (64u64 * 1024).div_ceil(cluster_size).div_ceil(l2_entries) as u32;
+        assert_eq!(hdr.l1_size, expected_l1_size, "l1_size after resize");
+    }
+
+    #[test]
+    fn resize_no_op_when_same_size() {
+        let tmp = tempdir().expect("tempdir");
+        let image = tmp.path().join("disk.qcow2");
+        write_multi_cluster_test_image(&image, 2).expect("write image");
+
+        let before = std::fs::read(&image).expect("read before");
+        resize_qcow2_image(&image, "8192").expect("resize same");
+        let after = std::fs::read(&image).expect("read after");
+
+        assert_eq!(
+            before, after,
+            "file must be unchanged when resizing to same size"
+        );
+    }
+
+    #[test]
+    fn resize_rejects_shrink() {
+        let tmp = tempdir().expect("tempdir");
+        let image = tmp.path().join("disk.qcow2");
+        write_multi_cluster_test_image(&image, 2).expect("write image");
+        // virtual_size is 8192; try to shrink to 4096.
+        assert!(resize_qcow2_image(&image, "4096").is_err());
+    }
+
+    // qemu-img oracle: verify that a natively-resized image passes qemu-img check.
+    #[test]
+    fn native_resize_qemu_img_check() {
+        if !qemu_img_available() {
+            eprintln!("qemu-img not found — skipping resize qemu-img check");
+            return;
+        }
+        let cluster_size = 65536u64;
+        let tmp = tempdir().expect("tempdir");
+        let image = tmp.path().join("disk.qcow2");
+        // Start with a 3-cluster 65 KiB image (larger than 1 cluster so the
+        // initial l1_size is non-trivial), then grow it to 100 MiB.
+        write_test_image_with_cluster_size(&image, 3, cluster_size).expect("write image");
+        assert_qemu_img_check(&image);
+
+        resize_qcow2_image(&image, "100M").expect("resize");
+        assert_qemu_img_check(&image);
+    }
+
+    // qemu-img oracle: overlay + resize chain: create an overlay over a resized
+    // image, then check both.
+    #[test]
+    fn native_overlay_over_resized_image_qemu_img_check() {
+        if !qemu_img_available() {
+            eprintln!("qemu-img not found — skipping overlay+resize chain check");
+            return;
+        }
+        let cluster_size = 65536u64;
+        let tmp = tempdir().expect("tempdir");
+        let base = tmp.path().join("base.qcow2");
+        let overlay = tmp.path().join("overlay.qcow2");
+        write_test_image_with_cluster_size(&base, 3, cluster_size).expect("write base");
+
+        // Grow the base image before creating the overlay.
+        resize_qcow2_image(&base, "200M").expect("resize base");
+        assert_qemu_img_check(&base);
+
+        create_qcow2_overlay(&base, &overlay).expect("create overlay");
+        assert_qemu_img_check(&overlay);
+    }
+
+    // -----------------------------------------------------------------------
+    // Helper used by overlay tests
+    // -----------------------------------------------------------------------
+
+    /// Read backing_file_size from the header (field at byte 16–19).
+    fn backing_file_size_from_header(file: &mut File) -> usize {
+        let mut raw = [0u8; 4];
+        read_exact_at(file, HDR_BACKING_FILE_SIZE as u64, &mut raw)
+            .expect("read backing_file_size");
+        u32::from_be_bytes(raw) as usize
     }
 }
 
