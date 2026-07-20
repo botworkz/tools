@@ -1,3 +1,4 @@
+# CI orchestrator for botworkz/tools.
 name: Botforge acceptance
 
 on:
@@ -143,6 +144,12 @@ jobs:
         cp -a botforge/test/for-fragment-test.steps.yaml testrepo/
         cp -a botforge/test/files-fragment.steps.yaml testrepo/
         cp -a botforge/test/fragment-file-fixture.txt testrepo/
+        cp -a botforge/test/assert-docker.yaml testrepo/
+        cp -a botforge/test/assert-fail-docker-running.yaml testrepo/
+        cp -a botforge/test/assert-fail-docker-network.yaml testrepo/
+        cp -a botforge/test/assert-fail-docker-ports.yaml testrepo/
+        cp -a botforge/test/assert-fail-docker-logs.yaml testrepo/
+        cp -a botforge/test/assert-fail-svc-env.yaml testrepo/
     - name: Set runtime environment
       run: |
         {
@@ -187,6 +194,41 @@ jobs:
           exit 1
         fi
         echo "Inline assets OK: debian-base present in marker; no standalone shasset.yaml"
+    # Inject the docker assert plugin declaration into the workspace marker.
+    # libdocker.so is staged into the runtime image at
+    # /usr/share/botforge/plugins/libdocker.so, but the plugin system is
+    # config-driven with NO autoload — so it must be declared in the marker
+    # for the assert/docker capability to be wired. Without this the docker
+    # assert configs fail with "no assert provider for verb 'docker'".
+    # Done as a STRUCTURED jq merge into the marker (not a heredoc append) so
+    # the output stays a single well-formed document.
+    - name: Inject docker plugin declaration into workspace marker
+      uses: envoyproxy/toolshed/actions/jq@6a20085af231aba4c72d6866f94098343a8c5616
+      with:
+        input-format: yaml-path
+        output-path: testrepo/botforge.yaml
+        input: testrepo/botforge.yaml
+        filter: |
+          . + {
+            plugins: ((.plugins // []) + [
+              {
+                name: "docker",
+                src: "/usr/share/botforge/plugins/libdocker.so",
+                provides: ["assert/docker"]
+              }
+            ])
+          }
+    # Assert the docker plugin block actually landed as valid config.
+    - name: Assert docker plugin declaration landed in the marker
+      run: |
+        set -euo pipefail
+        if ! grep -q 'libdocker.so' testrepo/botforge.yaml; then
+          echo "ERROR: docker plugin injection failed — 'libdocker.so' not present in testrepo/botforge.yaml" >&2
+          echo "----- testrepo/botforge.yaml -----" >&2
+          cat testrepo/botforge.yaml >&2
+          exit 1
+        fi
+        echo "docker plugin declaration OK: libdocker.so present in marker"
     # Inject the pigz plugin declaration when the pigz compressor is in use.
     # Done as a STRUCTURED jq merge into the marker (not a heredoc append) so
     # the output stays a single well-formed document — the inline-assets step
@@ -201,13 +243,13 @@ jobs:
         input: testrepo/botforge.yaml
         filter: |
           . + {
-            plugins: [
+            plugins: ((.plugins // []) + [
               {
                 name: "pigz",
                 src: "/usr/share/botforge/plugins/libpigz.so",
                 provides: ["build/compressor"]
               }
-            ]
+            ])
           }
     # Assert the pigz plugin block actually landed as valid config.
     - name: Assert pigz plugin declaration landed in the marker
@@ -280,6 +322,48 @@ jobs:
         filter: '. + {image: "@artifact://foo.qcow2"}'
         output-path: testrepo/assert-fail-rootfile.yaml
         input: botforge/test/assert-fail-rootfile.yaml
+    - name: Create assert-docker config
+      uses: envoyproxy/toolshed/actions/jq@6a20085af231aba4c72d6866f94098343a8c5616
+      with:
+        input-format: yaml-path
+        filter: '. + {image: "@artifact://foo.qcow2"}'
+        output-path: testrepo/assert-docker.yaml
+        input: botforge/test/assert-docker.yaml
+    - name: Create assert-fail-docker-running config
+      uses: envoyproxy/toolshed/actions/jq@6a20085af231aba4c72d6866f94098343a8c5616
+      with:
+        input-format: yaml-path
+        filter: '. + {image: "@artifact://foo.qcow2"}'
+        output-path: testrepo/assert-fail-docker-running.yaml
+        input: botforge/test/assert-fail-docker-running.yaml
+    - name: Create assert-fail-docker-network config
+      uses: envoyproxy/toolshed/actions/jq@6a20085af231aba4c72d6866f94098343a8c5616
+      with:
+        input-format: yaml-path
+        filter: '. + {image: "@artifact://foo.qcow2"}'
+        output-path: testrepo/assert-fail-docker-network.yaml
+        input: botforge/test/assert-fail-docker-network.yaml
+    - name: Create assert-fail-docker-ports config
+      uses: envoyproxy/toolshed/actions/jq@6a20085af231aba4c72d6866f94098343a8c5616
+      with:
+        input-format: yaml-path
+        filter: '. + {image: "@artifact://foo.qcow2"}'
+        output-path: testrepo/assert-fail-docker-ports.yaml
+        input: botforge/test/assert-fail-docker-ports.yaml
+    - name: Create assert-fail-docker-logs config
+      uses: envoyproxy/toolshed/actions/jq@6a20085af231aba4c72d6866f94098343a8c5616
+      with:
+        input-format: yaml-path
+        filter: '. + {image: "@artifact://foo.qcow2"}'
+        output-path: testrepo/assert-fail-docker-logs.yaml
+        input: botforge/test/assert-fail-docker-logs.yaml
+    - name: Create assert-fail-svc-env config
+      uses: envoyproxy/toolshed/actions/jq@6a20085af231aba4c72d6866f94098343a8c5616
+      with:
+        input-format: yaml-path
+        filter: '. + {image: "@artifact://foo.qcow2"}'
+        output-path: testrepo/assert-fail-svc-env.yaml
+        input: botforge/test/assert-fail-svc-env.yaml
 
     - name: Print marker (botforge.yaml with inline assets)
       uses: envoyproxy/toolshed/actions/jq@6a20085af231aba4c72d6866f94098343a8c5616
@@ -400,6 +484,84 @@ jobs:
           exit 1
         fi
         echo "Negative-control passed: botforge correctly rejected wrong root-only file assertion"
+      working-directory: testrepo
+
+    - name: Run acceptance tests (docker assert)
+      run: |
+        . .botforge.env
+        botforge test \
+          --test-config assert-docker.yaml
+      working-directory: testrepo
+
+    - name: Negative-control — docker exited container must not pass running check
+      run: |
+        set -euo pipefail
+        . .botforge.env
+        # botwork-exited has no restart policy and exits immediately; asserting
+        # it is running MUST fail, proving the running-state check bites on a
+        # real daemon.
+        if botforge test \
+             --test-config assert-fail-docker-running.yaml; then
+          echo "ERROR: botforge should have exited non-zero for running check on exited container" >&2
+          exit 1
+        fi
+        echo "Negative-control passed: botforge correctly rejected running assertion on exited container"
+      working-directory: testrepo
+
+    - name: Negative-control — wrong docker network attachment must fail
+      run: |
+        set -euo pipefail
+        . .botforge.env
+        # botwork-db is on botwork-internal only; asserting it is on
+        # botwork-plugin MUST fail, proving network-membership checks bite.
+        if botforge test \
+             --test-config assert-fail-docker-network.yaml; then
+          echo "ERROR: botforge should have exited non-zero for wrong network attachment" >&2
+          exit 1
+        fi
+        echo "Negative-control passed: botforge correctly rejected wrong network attachment"
+      working-directory: testrepo
+
+    - name: Negative-control — unpublished port assertion must fail
+      run: |
+        set -euo pipefail
+        . .botforge.env
+        # botwork-proxy has no published host ports; asserting it publishes
+        # 80/tcp MUST fail, proving port checks distinguish published vs exposed.
+        if botforge test \
+             --test-config assert-fail-docker-ports.yaml; then
+          echo "ERROR: botforge should have exited non-zero for unpublished port assertion" >&2
+          exit 1
+        fi
+        echo "Negative-control passed: botforge correctly rejected unpublished port assertion"
+      working-directory: testrepo
+
+    - name: Negative-control — missing docker log line must fail
+      run: |
+        set -euo pipefail
+        . .botforge.env
+        # Asserts a log substring that never appears (timeout 3 s).
+        # MUST fail, proving logs.contains bites when the line is absent.
+        if botforge test \
+             --test-config assert-fail-docker-logs.yaml; then
+          echo "ERROR: botforge should have exited non-zero for missing log line assertion" >&2
+          exit 1
+        fi
+        echo "Negative-control passed: botforge correctly rejected missing log line assertion"
+      working-directory: testrepo
+
+    - name: Negative-control — missing services.environment entry must fail
+      run: |
+        set -euo pipefail
+        . .botforge.env
+        # botwork-ci-env does not set BOTWORK_NONEXISTENT_VAR; asserting it
+        # contains that key MUST fail, proving environment: checks bite.
+        if botforge test \
+             --test-config assert-fail-svc-env.yaml; then
+          echo "ERROR: botforge should have exited non-zero for missing environment entry" >&2
+          exit 1
+        fi
+        echo "Negative-control passed: botforge correctly rejected missing environment entry"
       working-directory: testrepo
 
     # ── Publish acceptance ────────────────────────────────────────────────────

@@ -1,0 +1,22 @@
+type: botforge/test
+name: test
+
+# Negative-control fixture: regression guard for the docker assert plugin.
+#
+# Asserts a log substring that is never emitted by any container.  The check
+# MUST fail (timeout fires, grep never matches), proving that `logs.contains`
+# bites on a real daemon when the expected output never appears.
+#
+# timeout is kept deliberately short (3 s) so the negative control is fast.
+#
+# `image:` is injected by .github/workflows/_botforge.yml at CI time.
+
+steps: []
+
+assert:
+  docker:
+    containers:
+      botwork-web:
+        logs:
+          contains: ["botwork-ci-log-line-never-appears-xyzzy"]
+          timeout: 3
