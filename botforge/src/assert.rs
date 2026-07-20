@@ -131,23 +131,21 @@ pub(crate) struct AssertPackage {
 }
 
 /// A single service expectation inside `assert.services:`.
-///
-/// Both `enabled:` and `active:` are optional — omitting either means that
-/// aspect is not checked.  Unknown attributes are rejected at config-load
-/// time via `#[serde(deny_unknown_fields)]`.
 #[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct AssertService {
-    /// When `true`, the service must report `enabled` from `systemctl is-enabled`.
-    /// When `false`, the service must not report `enabled`.
-    /// When absent, the enabled state is not checked.
-    #[serde(default)]
-    pub(crate) enabled: Option<bool>,
-    /// When `true`, the service must report `active` from `systemctl is-active`.
-    /// When `false`, the service must not report `active`.
-    /// When absent, the active state is not checked.
-    #[serde(default)]
-    pub(crate) active: Option<bool>,
+    /// When `false`, the unit must NOT exist on the guest. Defaults to `true`.
+    /// When `false`, `enabled`/`active` must be omitted (rejected at load time).
+    #[serde(default = "default_assert_exists")]
+    pub(crate) exists: bool,
+    /// When `true`, `systemctl is-enabled` must report `enabled`.
+    /// When `false`, it must not. Defaults to `true`. Only meaningful when `exists: true`.
+    #[serde(default = "default_assert_exists")]
+    pub(crate) enabled: bool,
+    /// When `true`, `systemctl is-active` must report `active`.
+    /// When `false`, it must not. Defaults to `true`. Only meaningful when `exists: true`.
+    #[serde(default = "default_assert_exists")]
+    pub(crate) active: bool,
 }
 
 /// Validated `assert:` block from a `type: botforge/test` document.
@@ -266,10 +264,15 @@ fn validate_assert_package_entry(
     Ok(())
 }
 
-fn validate_assert_service_entry(_name: &str, _expectation: &AssertService) -> Result<()> {
-    // Unknown attributes are already rejected at deserialization time via
-    // `#[serde(deny_unknown_fields)]` on `AssertService`.  No further
-    // validation is required in v1.
+fn validate_assert_service_entry(name: &str, expectation: &AssertService) -> Result<()> {
+    // Parse-time validation catches explicit `enabled` / `active` keys when
+    // `exists: false` (including explicit `true`). Keep this invariant check
+    // for structural consistency with other assert entry validators.
+    if !expectation.exists && (!expectation.enabled || !expectation.active) {
+        anyhow::bail!(
+            "assert.services: entry '{name}': enabled/active must not be set when `exists: false`"
+        );
+    }
     Ok(())
 }
 
@@ -1112,15 +1115,9 @@ fn parse_dpkg_installed<'a>(lines: &mut impl Iterator<Item = &'a str>) -> Vec<St
 
 /// Run the `assert.services:` phase.
 ///
-/// For each declared service, probes via `systemctl is-enabled` and
-/// `systemctl is-active` in a single batched SSH script.  Each line of
-/// output is `<enabled-state>:<active-state>` (e.g. `enabled:active`).
-///
-/// - `enabled: true` → `systemctl is-enabled` must output `enabled`.
-/// - `enabled: false` → `systemctl is-enabled` must not output `enabled`.
-/// - `active: true` → `systemctl is-active` must output `active`.
-/// - `active: false` → `systemctl is-active` must not output `active`.
-/// - Absent `enabled:`/`active:` → that aspect is not checked.
+/// For each declared service, probes via `systemctl cat`, `systemctl is-enabled`,
+/// and `systemctl is-active` in a single batched SSH script. Each line of output
+/// is `<exists>:<enabled-state>:<active-state>` (e.g. `present:enabled:active`).
 pub(crate) fn run_assert_services(ssh: &SshOptions, assert_block: &AssertBlock) -> Result<()> {
     if assert_block.services.is_empty() {
         return Ok(());
@@ -1131,9 +1128,10 @@ pub(crate) fn run_assert_services(ssh: &SshOptions, assert_block: &AssertBlock) 
         let q = shell_single_quote(name);
         script.push_str(&format!(
             concat!(
+                "if systemctl cat {q} >/dev/null 2>&1; then _x=present; else _x=absent; fi\n",
                 "_e=$(systemctl is-enabled {q} 2>/dev/null || true)\n",
                 "_a=$(systemctl is-active {q} 2>/dev/null || true)\n",
-                "printf '%s:%s\\n' \"$_e\" \"$_a\"\n",
+                "printf '%s:%s:%s\\n' \"$_x\" \"$_e\" \"$_a\"\n",
             ),
             q = q
         ));
@@ -1152,35 +1150,24 @@ pub(crate) fn run_assert_services(ssh: &SshOptions, assert_block: &AssertBlock) 
     let mut any_failed = false;
 
     for (name, expectation) in &assert_block.services {
-        let raw_line = lines.next().unwrap_or(":");
-        let mut parts = raw_line.splitn(2, ':');
-        let enabled_state = parts.next().unwrap_or("").trim();
-        let active_state = parts.next().unwrap_or("").trim();
-
-        if let Some(expected_enabled) = expectation.enabled {
-            let actual_enabled = enabled_state == "enabled";
-            let ok = actual_enabled == expected_enabled;
+        let raw_line = lines.next().unwrap_or("absent::");
+        let result = check_one_service(name, expectation, raw_line);
+        print_phase_status(
+            "assert",
+            &format!("service {name} exists"),
+            result.exists_ok,
+        );
+        if let Some(ok) = result.enabled_ok {
             print_phase_status("assert", &format!("service {name} enabled"), ok);
-            if !ok {
-                eprintln!(
-                    "         service {name}: expected enabled={expected_enabled}, \
-                     but systemctl is-enabled returned '{enabled_state}'"
-                );
-                any_failed = true;
-            }
         }
-
-        if let Some(expected_active) = expectation.active {
-            let actual_active = active_state == "active";
-            let ok = actual_active == expected_active;
+        if let Some(ok) = result.active_ok {
             print_phase_status("assert", &format!("service {name} active"), ok);
-            if !ok {
-                eprintln!(
-                    "         service {name}: expected active={expected_active}, \
-                     but systemctl is-active returned '{active_state}'"
-                );
-                any_failed = true;
+        }
+        if !result.failures.is_empty() {
+            for msg in &result.failures {
+                eprintln!("         {msg}");
             }
+            any_failed = true;
         }
     }
 
@@ -1190,9 +1177,90 @@ pub(crate) fn run_assert_services(ssh: &SshOptions, assert_block: &AssertBlock) 
     Ok(())
 }
 
+#[derive(Debug)]
+struct ServiceCheckResult {
+    exists_ok: bool,
+    enabled_ok: Option<bool>,
+    active_ok: Option<bool>,
+    failures: Vec<String>,
+}
+
+fn check_one_service(
+    name: &str,
+    expectation: &AssertService,
+    raw_line: &str,
+) -> ServiceCheckResult {
+    let mut parts = raw_line.splitn(3, ':');
+    let exists_state = parts.next().unwrap_or("").trim();
+    let enabled_state = parts.next().unwrap_or("").trim();
+    let active_state = parts.next().unwrap_or("").trim();
+
+    let mut result = ServiceCheckResult {
+        exists_ok: false,
+        enabled_ok: None,
+        active_ok: None,
+        failures: Vec::new(),
+    };
+
+    let is_present = match exists_state {
+        "present" => true,
+        "absent" => false,
+        _ => {
+            result.failures.push(format!(
+                "assert.services: unexpected probe output for '{name}': {raw_line}"
+            ));
+            return result;
+        }
+    };
+
+    if !expectation.exists {
+        result.exists_ok = !is_present;
+        if is_present {
+            result.failures.push(format!(
+                "service {name}: expected absent, but the unit exists"
+            ));
+        }
+        return result;
+    }
+
+    if !is_present {
+        result.failures.push(format!(
+            "service {name}: expected present, but the unit does not exist"
+        ));
+        return result;
+    }
+
+    result.exists_ok = true;
+
+    let actual_enabled = enabled_state == "enabled";
+    let enabled_ok = actual_enabled == expectation.enabled;
+    result.enabled_ok = Some(enabled_ok);
+    if !enabled_ok {
+        result.failures.push(format!(
+            "service {name}: expected enabled={}, but systemctl is-enabled returned '{enabled_state}'",
+            expectation.enabled
+        ));
+    }
+
+    let actual_active = active_state == "active";
+    let active_ok = actual_active == expectation.active;
+    result.active_ok = Some(active_ok);
+    if !active_ok {
+        result.failures.push(format!(
+            "service {name}: expected active={}, but systemctl is-active returned '{active_state}'",
+            expectation.active
+        ));
+    }
+
+    result
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{check_one_path, normalize_mode, AssertFile, AssertFileType};
+    use super::{
+        check_one_path, check_one_service, normalize_mode, AssertFile, AssertFileType,
+        AssertService,
+    };
 
     fn file_expectation(
         exists: bool,
@@ -1341,6 +1409,85 @@ mod tests {
             "all four attributes should fail: {:?}",
             failures
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // check_one_service tests
+    // ---------------------------------------------------------------------------
+
+    fn service_expectation(exists: bool, enabled: bool, active: bool) -> AssertService {
+        AssertService {
+            exists,
+            enabled,
+            active,
+        }
+    }
+
+    #[test]
+    fn test_check_one_service_present_enabled_active_passes() {
+        let exp = service_expectation(true, true, true);
+        let result = check_one_service("ssh", &exp, "present:enabled:active");
+        assert!(result.exists_ok);
+        assert_eq!(result.enabled_ok, Some(true));
+        assert_eq!(result.active_ok, Some(true));
+        assert!(result.failures.is_empty(), "{result:?}");
+    }
+
+    #[test]
+    fn test_check_one_service_absent_expected_absent_passes() {
+        let exp = service_expectation(false, true, true);
+        let result = check_one_service("obsolete", &exp, "absent:not-found:inactive");
+        assert!(result.exists_ok);
+        assert_eq!(result.enabled_ok, None);
+        assert_eq!(result.active_ok, None);
+        assert!(result.failures.is_empty(), "{result:?}");
+    }
+
+    #[test]
+    fn test_check_one_service_absent_expected_present_fails() {
+        let exp = service_expectation(true, true, true);
+        let result = check_one_service("ssh", &exp, "absent:not-found:inactive");
+        assert!(!result.exists_ok);
+        assert_eq!(result.enabled_ok, None);
+        assert_eq!(result.active_ok, None);
+        assert_eq!(result.failures.len(), 1);
+        assert!(
+            result.failures[0].contains("expected present"),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn test_check_one_service_present_but_disabled_fails_when_enabled_expected_true() {
+        let exp = service_expectation(true, true, true);
+        let result = check_one_service("ssh", &exp, "present:disabled:active");
+        assert!(result.exists_ok);
+        assert_eq!(result.enabled_ok, Some(false));
+        assert_eq!(result.active_ok, Some(true));
+        assert!(
+            result.failures.iter().any(|m| m.contains("enabled=true")),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn test_check_one_service_present_but_disabled_passes_when_enabled_expected_false() {
+        let exp = service_expectation(true, false, true);
+        let result = check_one_service("ssh", &exp, "present:disabled:active");
+        assert!(result.exists_ok);
+        assert_eq!(result.enabled_ok, Some(true));
+        assert_eq!(result.active_ok, Some(true));
+        assert!(result.failures.is_empty(), "{result:?}");
+    }
+
+    #[test]
+    fn test_check_one_service_present_inactive_passes_when_active_expected_false() {
+        let exp = service_expectation(true, true, false);
+        let result = check_one_service("worker", &exp, "present:enabled:inactive");
+        assert!(result.exists_ok);
+        assert_eq!(result.enabled_ok, Some(true));
+        assert_eq!(result.active_ok, Some(true));
+        assert!(result.failures.is_empty(), "{result:?}");
     }
 
     // ---------------------------------------------------------------------------
@@ -2102,22 +2249,30 @@ steps: []
 assert:
   services:
     ssh:
+      exists: true
       enabled: true
       active: true
     nginx:
       enabled: false
+    botwork-api: {}
 "#,
             )
             .unwrap();
             let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
             let assert_block = config.assert.unwrap();
-            assert_eq!(assert_block.services.len(), 2);
+            assert_eq!(assert_block.services.len(), 3);
             let ssh = assert_block.services.get("ssh").unwrap();
-            assert_eq!(ssh.enabled, Some(true));
-            assert_eq!(ssh.active, Some(true));
+            assert!(ssh.exists);
+            assert!(ssh.enabled);
+            assert!(ssh.active);
             let nginx = assert_block.services.get("nginx").unwrap();
-            assert_eq!(nginx.enabled, Some(false));
-            assert!(nginx.active.is_none());
+            assert!(nginx.exists);
+            assert!(!nginx.enabled);
+            assert!(nginx.active);
+            let api = assert_block.services.get("botwork-api").unwrap();
+            assert!(api.exists);
+            assert!(api.enabled);
+            assert!(api.active);
         }
 
         #[test]
@@ -2139,8 +2294,81 @@ assert:
             let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
             let assert_block = config.assert.unwrap();
             let cron = assert_block.services.get("cron").unwrap();
-            assert!(cron.enabled.is_none(), "enabled should be absent");
-            assert_eq!(cron.active, Some(true));
+            assert!(cron.exists);
+            assert!(cron.enabled);
+            assert!(cron.active);
+        }
+
+        #[test]
+        fn test_load_test_config_assert_services_exists_false() {
+            let repo = TempDir::new().unwrap();
+            fs::write(
+                repo.path().join("test.yaml"),
+                r#"
+type: botforge/test
+name: test
+steps: []
+assert:
+  services:
+    retired:
+      exists: false
+"#,
+            )
+            .unwrap();
+            let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+            let assert_block = config.assert.unwrap();
+            let retired = assert_block.services.get("retired").unwrap();
+            assert!(!retired.exists);
+            assert!(retired.enabled);
+            assert!(retired.active);
+        }
+
+        #[test]
+        fn test_load_test_config_assert_services_exists_false_rejects_enabled_or_active() {
+            let repo = TempDir::new().unwrap();
+            fs::write(
+                repo.path().join("test.yaml"),
+                r#"
+type: botforge/test
+name: test
+steps: []
+assert:
+  services:
+    retired:
+      exists: false
+      enabled: true
+"#,
+            )
+            .unwrap();
+            let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("exists: false"),
+                "error should mention exists:false: {msg}"
+            );
+        }
+
+        #[test]
+        fn test_load_test_config_assert_services_bare_defaults_to_all_true() {
+            let repo = TempDir::new().unwrap();
+            fs::write(
+                repo.path().join("test.yaml"),
+                r#"
+type: botforge/test
+name: test
+steps: []
+assert:
+  services:
+    foo: {}
+"#,
+            )
+            .unwrap();
+            let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+            let assert_block = config.assert.unwrap();
+            let foo = assert_block.services.get("foo").unwrap();
+            assert!(foo.exists);
+            assert!(foo.enabled);
+            assert!(foo.active);
         }
 
         #[test]
