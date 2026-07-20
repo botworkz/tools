@@ -135,7 +135,7 @@ pub(crate) struct AssertPackage {
 #[serde(deny_unknown_fields)]
 pub(crate) struct AssertService {
     /// When `false`, the unit must NOT exist on the guest. Defaults to `true`.
-    /// When `false`, `enabled`/`active` must be omitted (rejected at load time).
+    /// When `false`, `enabled`/`active`/`environment` must be omitted (rejected at load time).
     #[serde(default = "default_assert_exists")]
     pub(crate) exists: bool,
     /// When `true`, `systemctl is-enabled` must report `enabled`.
@@ -146,6 +146,25 @@ pub(crate) struct AssertService {
     /// When `false`, it must not. Defaults to `true`. Only meaningful when `exists: true`.
     #[serde(default = "default_assert_exists")]
     pub(crate) active: bool,
+    /// Optional substring assertions on the unit's `Environment=` settings
+    /// (from `systemctl show -p Environment <unit>`).
+    /// Only meaningful when `exists: true`.
+    #[serde(default)]
+    pub(crate) environment: Option<ServiceEnvironmentExpect>,
+}
+
+/// Substring expectations on a systemd unit's `Environment=` line.
+///
+/// `contains` — every listed substring must appear in the environment output.
+/// `not_contains` — none of the listed substrings may appear.
+/// Substring matching, not regex (consistent with `expect.stdout`).
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ServiceEnvironmentExpect {
+    #[serde(default)]
+    pub(crate) contains: Vec<String>,
+    #[serde(default)]
+    pub(crate) not_contains: Vec<String>,
 }
 
 /// Validated `assert:` block from a `type: botforge/test` document.
@@ -278,6 +297,11 @@ fn validate_assert_service_entry(name: &str, expectation: &AssertService) -> Res
     if !expectation.exists && (!expectation.enabled || !expectation.active) {
         anyhow::bail!(
             "assert.services: entry '{name}': enabled/active must not be set when `exists: false`"
+        );
+    }
+    if !expectation.exists && expectation.environment.is_some() {
+        anyhow::bail!(
+            "assert.services: entry '{name}': environment must not be set when `exists: false`"
         );
     }
     Ok(())
@@ -1123,15 +1147,18 @@ fn parse_dpkg_installed<'a>(lines: &mut impl Iterator<Item = &'a str>) -> Vec<St
 /// Run the `assert.services:` phase.
 ///
 /// For each declared service, probes via `systemctl cat`, `systemctl is-enabled`,
-/// and `systemctl is-active` in a single batched SSH script. Each line of output
-/// is `<exists>:<enabled-state>:<active-state>` (e.g. `present:enabled:active`).
+/// `systemctl is-active`, and (when declared) `systemctl show -p Environment` in
+/// a single batched SSH script.  Each service emits one state line
+/// `<exists>:<enabled-state>:<active-state>` (e.g. `present:enabled:active`),
+/// followed (when `environment:` is declared) by the `Environment=...` line and
+/// a `__END_ENV_<name>__` sentinel.
 pub(crate) fn run_assert_services(ssh: &SshOptions, assert_block: &AssertBlock) -> Result<()> {
     if assert_block.services.is_empty() {
         return Ok(());
     }
 
     let mut script = String::from("set -e\n");
-    for name in assert_block.services.keys() {
+    for (name, expectation) in &assert_block.services {
         let q = shell_single_quote(name);
         script.push_str(&format!(
             concat!(
@@ -1142,6 +1169,19 @@ pub(crate) fn run_assert_services(ssh: &SshOptions, assert_block: &AssertBlock) 
             ),
             q = q
         ));
+        // Emit environment probe for services that declare environment: checks.
+        if expectation.environment.is_some() {
+            let sentinel = format!("__END_ENV_{}__", name);
+            script.push_str(&format!(
+                concat!(
+                    "_env=$(systemctl show -p Environment {q} 2>/dev/null || true)\n",
+                    "printf '%s\\n' \"$_env\"\n",
+                    "printf '{sentinel}\\n'\n",
+                ),
+                q = q,
+                sentinel = sentinel,
+            ));
+        }
     }
 
     let probe_output = ssh_capture_stdout(
@@ -1175,6 +1215,30 @@ pub(crate) fn run_assert_services(ssh: &SshOptions, assert_block: &AssertBlock) 
                 eprintln!("         {msg}");
             }
             any_failed = true;
+        }
+
+        // Consume and evaluate environment output when declared.
+        if let Some(env_expect) = &expectation.environment {
+            let sentinel = format!("__END_ENV_{}__", name);
+            // The probe emits: one `Environment=...` line + sentinel.
+            let env_output = lines.next().unwrap_or("");
+            loop {
+                match lines.next() {
+                    None => break,
+                    Some(l) if l == sentinel => break,
+                    Some(_) => {}
+                }
+            }
+            let env_failures = check_service_environment(name, env_expect, env_output);
+            for (label, ok, msg) in &env_failures {
+                print_phase_status("assert", label, *ok);
+                if !ok {
+                    if let Some(m) = msg {
+                        eprintln!("         {m}");
+                    }
+                    any_failed = true;
+                }
+            }
         }
     }
 
@@ -1260,6 +1324,53 @@ fn check_one_service(
     }
 
     result
+}
+
+/// Evaluate `environment:` substring assertions against the `Environment=...` line
+/// emitted by `systemctl show -p Environment`.
+///
+/// Returns a list of `(label, ok, Option<detail_message>)` tuples — one per
+/// substring check — in `contains` order then `not_contains` order.
+fn check_service_environment(
+    name: &str,
+    expect: &ServiceEnvironmentExpect,
+    env_output: &str,
+) -> Vec<(String, bool, Option<String>)> {
+    let mut results = Vec::new();
+
+    for substr in &expect.contains {
+        let ok = env_output.contains(substr.as_str());
+        let msg = if ok {
+            None
+        } else {
+            Some(format!(
+                "service {name}: environment does not contain {substr:?} (got: {env_output:?})"
+            ))
+        };
+        results.push((
+            format!("service {name} environment contains {substr:?}"),
+            ok,
+            msg,
+        ));
+    }
+
+    for substr in &expect.not_contains {
+        let ok = !env_output.contains(substr.as_str());
+        let msg = if ok {
+            None
+        } else {
+            Some(format!(
+                "service {name}: environment must not contain {substr:?} (got: {env_output:?})"
+            ))
+        };
+        results.push((
+            format!("service {name} environment not_contains {substr:?}"),
+            ok,
+            msg,
+        ));
+    }
+
+    results
 }
 
 #[cfg(test)]
@@ -1427,6 +1538,7 @@ mod tests {
             exists,
             enabled,
             active,
+            environment: None,
         }
     }
 
@@ -1832,7 +1944,7 @@ mod tests {
     }
 
     mod assert_block {
-        use super::super::AssertFileType;
+        use super::super::{check_service_environment, AssertFileType, ServiceEnvironmentExpect};
         use crate::config::load_test_config;
         use std::fs;
         use tempfile::TempDir;
@@ -2376,6 +2488,168 @@ assert:
             assert!(foo.exists);
             assert!(foo.enabled);
             assert!(foo.active);
+        }
+
+        #[test]
+        fn test_load_test_config_assert_services_environment_parses() {
+            let repo = TempDir::new().unwrap();
+            fs::write(
+                repo.path().join("test.yaml"),
+                r#"
+type: botforge/test
+name: test
+steps: []
+assert:
+  services:
+    botwork-launcher.service:
+      environment:
+        contains:
+          - "BOTWORK_LAUNCHER_DEFAULT_NETWORK=botwork-plugin"
+        not_contains:
+          - "DEBUG=1"
+"#,
+            )
+            .unwrap();
+            let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+            let assert_block = config.assert.unwrap();
+            let svc = assert_block
+                .services
+                .get("botwork-launcher.service")
+                .unwrap();
+            assert!(svc.exists);
+            let env = svc.environment.as_ref().unwrap();
+            assert_eq!(
+                env.contains,
+                vec!["BOTWORK_LAUNCHER_DEFAULT_NETWORK=botwork-plugin"]
+            );
+            assert_eq!(env.not_contains, vec!["DEBUG=1"]);
+        }
+
+        #[test]
+        fn test_load_test_config_assert_services_exists_false_rejects_environment() {
+            let repo = TempDir::new().unwrap();
+            fs::write(
+                repo.path().join("test.yaml"),
+                r#"
+type: botforge/test
+name: test
+steps: []
+assert:
+  services:
+    retired:
+      exists: false
+      environment:
+        contains: ["SOME=VAR"]
+"#,
+            )
+            .unwrap();
+            let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("exists: false"),
+                "error should mention exists:false: {msg}"
+            );
+        }
+
+        #[test]
+        fn test_check_service_environment_contains_present_passes() {
+            let expect = ServiceEnvironmentExpect {
+                contains: vec!["BOTWORK_LAUNCHER_DEFAULT_NETWORK=botwork-plugin".to_string()],
+                not_contains: vec![],
+            };
+            let output = "Environment=BOTWORK_LAUNCHER_DEFAULT_NETWORK=botwork-plugin FOO=bar";
+            let results = check_service_environment("svc", &expect, output);
+            assert_eq!(results.len(), 1);
+            assert!(results[0].1, "contains match should pass: {:?}", results[0]);
+        }
+
+        #[test]
+        fn test_check_service_environment_contains_missing_fails() {
+            let expect = ServiceEnvironmentExpect {
+                contains: vec!["BOTWORK_LAUNCHER_DEFAULT_NETWORK=botwork-plugin".to_string()],
+                not_contains: vec![],
+            };
+            let output = "Environment=FOO=bar";
+            let results = check_service_environment("svc", &expect, output);
+            assert_eq!(results.len(), 1);
+            assert!(!results[0].1, "contains miss should fail: {:?}", results[0]);
+        }
+
+        #[test]
+        fn test_check_service_environment_not_contains_absent_passes() {
+            let expect = ServiceEnvironmentExpect {
+                contains: vec![],
+                not_contains: vec!["DEBUG=1".to_string()],
+            };
+            let output = "Environment=BOTWORK_LAUNCHER_DEFAULT_NETWORK=botwork-plugin";
+            let results = check_service_environment("svc", &expect, output);
+            assert_eq!(results.len(), 1);
+            assert!(
+                results[0].1,
+                "not_contains (absent) should pass: {:?}",
+                results[0]
+            );
+        }
+
+        #[test]
+        fn test_check_service_environment_not_contains_present_fails() {
+            let expect = ServiceEnvironmentExpect {
+                contains: vec![],
+                not_contains: vec!["DEBUG=1".to_string()],
+            };
+            let output = "Environment=DEBUG=1 BOTWORK_LAUNCHER_DEFAULT_NETWORK=botwork-plugin";
+            let results = check_service_environment("svc", &expect, output);
+            assert_eq!(results.len(), 1);
+            assert!(
+                !results[0].1,
+                "not_contains (present) should fail: {:?}",
+                results[0]
+            );
+        }
+
+        #[test]
+        fn test_check_service_environment_empty_lists_pass() {
+            let expect = ServiceEnvironmentExpect {
+                contains: vec![],
+                not_contains: vec![],
+            };
+            let output = "Environment=ANYTHING=1";
+            let results = check_service_environment("svc", &expect, output);
+            assert!(results.is_empty(), "empty lists → no checks: {:?}", results);
+        }
+
+        #[test]
+        fn test_check_service_environment_multiple_substrings() {
+            let expect = ServiceEnvironmentExpect {
+                contains: vec!["FOO=1".to_string(), "BAR=2".to_string()],
+                not_contains: vec!["SECRET=x".to_string()],
+            };
+            let output = "Environment=FOO=1 BAR=2 BAZ=3";
+            let results = check_service_environment("svc", &expect, output);
+            assert_eq!(results.len(), 3);
+            assert!(results[0].1, "FOO=1 should be found");
+            assert!(results[1].1, "BAR=2 should be found");
+            assert!(results[2].1, "SECRET=x should be absent");
+        }
+
+        #[test]
+        fn test_check_service_environment_label_format() {
+            let expect = ServiceEnvironmentExpect {
+                contains: vec!["FOO=1".to_string()],
+                not_contains: vec!["BAR=2".to_string()],
+            };
+            let results = check_service_environment("my.service", &expect, "Environment=FOO=1");
+            assert_eq!(results.len(), 2);
+            assert!(
+                results[0].0.contains("contains"),
+                "label should contain 'contains': {}",
+                results[0].0
+            );
+            assert!(
+                results[1].0.contains("not_contains"),
+                "label should contain 'not_contains': {}",
+                results[1].0
+            );
         }
 
         #[test]
