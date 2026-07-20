@@ -208,6 +208,9 @@
 //! |   | `plugin_publish_github_free`). |
 //! | 4 | Extended `publish/github`: named-secrets array replaces `token`; |
 //! |   | `out_error` out-parameter surfaces legible failure messages. |
+//! | 5 | Added `assert/<name>` capability slot family (`plugin_assert_build_probe`, |
+//! |   | `plugin_assert_evaluate`, `plugin_assert_free`). Fixed generic symbol names |
+//! |   | so future assert plugins need no host changes. |
 //!
 //! # Safety policy
 //!
@@ -238,7 +241,8 @@ use thiserror::Error;
 /// Version 4 extends `publish/github`: named-secrets array replaces the single
 /// `token` parameter; an `out_error` out-parameter surfaces legible error
 /// messages on failure.
-pub const HOST_ABI_VERSION: u32 = 4;
+/// Version 5 adds the `assert/<name>` capability slot family.
+pub const HOST_ABI_VERSION: u32 = 5;
 
 /// Sentinel value returned by a correct `core/ping` implementation.
 ///
@@ -338,6 +342,18 @@ pub enum LoadError {
     /// The plugin returned an invalid UTF-8 release URL.
     #[error("plugin '{plugin}' publish/github returned a non-UTF-8 release URL")]
     PublisherInvalidUrl { plugin: String },
+
+    /// A `assert/<name>` build_probe or evaluate operation returned a non-zero error.
+    #[error("plugin '{plugin}' assert/{assert_name} operation failed with error code {code}")]
+    AssertProviderError {
+        plugin: String,
+        assert_name: String,
+        code: i32,
+    },
+
+    /// The plugin returned invalid UTF-8 from an assert operation.
+    #[error("plugin '{plugin}' assert/{assert_name} returned non-UTF-8 output")]
+    AssertProviderInvalidUtf8 { plugin: String, assert_name: String },
 }
 
 // ── Capability handles ────────────────────────────────────────────────────────
@@ -735,6 +751,99 @@ impl PublisherHandle {
     }
 }
 
+/// A callable handle to a wired `assert/<name>` capability.
+///
+/// Exposes safe [`build_probe`](AssertProviderHandle::build_probe) and
+/// [`evaluate`](AssertProviderHandle::evaluate) methods that call across the
+/// C ABI boundary and return owned Rust strings.
+///
+/// # Memory ownership
+///
+/// Both methods call the plugin's FFI function, copy the returned C string
+/// into a Rust `String`, then call `free_fn` exactly once.
+///
+/// # Safety
+///
+/// All function pointers are valid for as long as the originating
+/// [`LoadedPlugin`] stays alive.
+pub struct AssertProviderHandle {
+    plugin_name: String,
+    assert_name: String,
+    build_probe_fn:
+        unsafe extern "C" fn(*const std::os::raw::c_char, *mut *mut std::os::raw::c_char) -> i32,
+    evaluate_fn: unsafe extern "C" fn(
+        *const std::os::raw::c_char,
+        *const std::os::raw::c_char,
+        *mut *mut std::os::raw::c_char,
+    ) -> i32,
+    free_fn: unsafe extern "C" fn(*mut std::os::raw::c_char),
+}
+
+impl AssertProviderHandle {
+    /// Build the guest probe shell script from `config_json`.
+    ///
+    /// Returns the script string on success, or a [`LoadError`] if the plugin
+    /// returns a non-zero code or non-UTF-8 output.
+    pub fn build_probe(&self, config_json: &str) -> Result<String, LoadError> {
+        use std::ffi::{CStr, CString};
+        let config_c = CString::new(config_json).unwrap_or_default();
+        let mut out_ptr: *mut std::os::raw::c_char = std::ptr::null_mut();
+        // SAFETY: build_probe_fn was obtained from a live Library via dlsym.
+        // config_c is NUL-terminated. out_ptr is a valid stack address.
+        // On success the plugin writes a non-null NUL-terminated string.
+        let rc = unsafe { (self.build_probe_fn)(config_c.as_ptr(), &mut out_ptr) };
+        if rc != 0 {
+            return Err(LoadError::AssertProviderError {
+                plugin: self.plugin_name.clone(),
+                assert_name: self.assert_name.clone(),
+                code: rc,
+            });
+        }
+        // SAFETY: rc == 0 so plugin guarantees out_ptr is valid NUL-terminated.
+        let s = unsafe { CStr::from_ptr(out_ptr) }
+            .to_str()
+            .map(str::to_owned)
+            .map_err(|_| LoadError::AssertProviderInvalidUtf8 {
+                plugin: self.plugin_name.clone(),
+                assert_name: self.assert_name.clone(),
+            })?;
+        // SAFETY: out_ptr was allocated by plugin, freed exactly once.
+        unsafe { (self.free_fn)(out_ptr) };
+        Ok(s)
+    }
+
+    /// Evaluate captured probe stdout against `config_json`.
+    ///
+    /// Returns the results JSON string on success.
+    pub fn evaluate(&self, config_json: &str, probe_stdout: &str) -> Result<String, LoadError> {
+        use std::ffi::{CStr, CString};
+        let config_c = CString::new(config_json).unwrap_or_default();
+        let stdout_c = CString::new(probe_stdout).unwrap_or_default();
+        let mut out_ptr: *mut std::os::raw::c_char = std::ptr::null_mut();
+        // SAFETY: evaluate_fn was obtained from a live Library via dlsym.
+        // config_c and stdout_c are NUL-terminated. out_ptr is a valid stack address.
+        let rc = unsafe { (self.evaluate_fn)(config_c.as_ptr(), stdout_c.as_ptr(), &mut out_ptr) };
+        if rc != 0 {
+            return Err(LoadError::AssertProviderError {
+                plugin: self.plugin_name.clone(),
+                assert_name: self.assert_name.clone(),
+                code: rc,
+            });
+        }
+        // SAFETY: rc == 0 so plugin guarantees out_ptr is valid NUL-terminated.
+        let s = unsafe { CStr::from_ptr(out_ptr) }
+            .to_str()
+            .map(str::to_owned)
+            .map_err(|_| LoadError::AssertProviderInvalidUtf8 {
+                plugin: self.plugin_name.clone(),
+                assert_name: self.assert_name.clone(),
+            })?;
+        // SAFETY: out_ptr was allocated by plugin, freed exactly once.
+        unsafe { (self.free_fn)(out_ptr) };
+        Ok(s)
+    }
+}
+
 // ── Loaded plugin ─────────────────────────────────────────────────────────────
 
 /// A plugin that has been successfully opened and version-checked.
@@ -758,6 +867,8 @@ pub struct LoadedPlugin {
     pub compressor: Option<CompressorHandle>,
     /// `publish/github` handle, present if the plugin wired that capability.
     pub publisher: Option<PublisherHandle>,
+    /// `assert/<name>` handles, one per registered assert capability.
+    pub assert_providers: Vec<(String, AssertProviderHandle)>,
     /// The open library handle.  Must stay alive as long as any capability
     /// handles derived from it are in use.
     _lib: Library,
@@ -772,6 +883,14 @@ impl std::fmt::Debug for LoadedPlugin {
             .field("ping", &self.ping.is_some())
             .field("compressor", &self.compressor.is_some())
             .field("publisher", &self.publisher.is_some())
+            .field(
+                "assert_providers",
+                &self
+                    .assert_providers
+                    .iter()
+                    .map(|(n, _)| n.as_str())
+                    .collect::<Vec<_>>(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -932,6 +1051,7 @@ impl LoadedPlugin {
         let mut ping: Option<PingHandle> = None;
         let mut compressor: Option<CompressorHandle> = None;
         let mut publisher: Option<PublisherHandle> = None;
+        let mut assert_providers: Vec<(String, AssertProviderHandle)> = Vec::new();
 
         for (slot, _cap_name) in &provides {
             match slot.as_str() {
@@ -1063,6 +1183,60 @@ impl LoadedPlugin {
                         free_fn,
                     });
                 }
+                slot if slot.starts_with("assert/") => {
+                    let assert_name = slot.strip_prefix("assert/").unwrap_or("").to_owned();
+
+                    type BuildProbeFn = unsafe extern "C" fn(
+                        *const std::os::raw::c_char,
+                        *mut *mut std::os::raw::c_char,
+                    ) -> i32;
+                    type EvaluateFn = unsafe extern "C" fn(
+                        *const std::os::raw::c_char,
+                        *const std::os::raw::c_char,
+                        *mut *mut std::os::raw::c_char,
+                    ) -> i32;
+                    type AssertFreeFn = unsafe extern "C" fn(*mut std::os::raw::c_char);
+
+                    let build_probe_sym: Symbol<BuildProbeFn> = unsafe {
+                        lib.get(b"plugin_assert_build_probe\0").map_err(|_| {
+                            LoadError::MissingSymbol {
+                                plugin: plugin_name.to_owned(),
+                                symbol: "plugin_assert_build_probe",
+                            }
+                        })?
+                    };
+                    let build_probe_fn = *unsafe { build_probe_sym.into_raw() };
+
+                    let evaluate_sym: Symbol<EvaluateFn> = unsafe {
+                        lib.get(b"plugin_assert_evaluate\0").map_err(|_| {
+                            LoadError::MissingSymbol {
+                                plugin: plugin_name.to_owned(),
+                                symbol: "plugin_assert_evaluate",
+                            }
+                        })?
+                    };
+                    let evaluate_fn = *unsafe { evaluate_sym.into_raw() };
+
+                    let free_sym: Symbol<AssertFreeFn> = unsafe {
+                        lib.get(b"plugin_assert_free\0")
+                            .map_err(|_| LoadError::MissingSymbol {
+                                plugin: plugin_name.to_owned(),
+                                symbol: "plugin_assert_free",
+                            })?
+                    };
+                    let free_fn = *unsafe { free_sym.into_raw() };
+
+                    assert_providers.push((
+                        assert_name.clone(),
+                        AssertProviderHandle {
+                            plugin_name: plugin_name.to_owned(),
+                            assert_name,
+                            build_probe_fn,
+                            evaluate_fn,
+                            free_fn,
+                        },
+                    ));
+                }
                 other => {
                     return Err(LoadError::UnknownCapabilitySlot {
                         plugin: plugin_name.to_owned(),
@@ -1079,6 +1253,7 @@ impl LoadedPlugin {
             ping,
             compressor,
             publisher,
+            assert_providers,
             _lib: lib,
         })
     }
@@ -1201,6 +1376,39 @@ impl PluginRegistry {
             .iter()
             .find(|p| &p.name == provider)
             .and_then(|p| p.publisher.as_ref())
+    }
+
+    /// Look up the `assert/<name>` handle for a named assert capability.
+    ///
+    /// Returns `None` if no plugin is loaded that registered
+    /// `assert/<name>` under `name`.
+    pub fn get_assert(&self, name: &str) -> Option<&AssertProviderHandle> {
+        let slot = format!("assert/{name}");
+        let provider = self.entries.get(&(slot, name.to_owned()))?;
+        self.plugins
+            .iter()
+            .find(|p| &p.name == provider)
+            .and_then(|p| {
+                p.assert_providers
+                    .iter()
+                    .find(|(n, _)| n == name)
+                    .map(|(_, h)| h)
+            })
+    }
+
+    /// Returns the names of all `assert/<name>` capabilities currently
+    /// registered in this registry (from all loaded plugins).
+    pub fn assert_names(&self) -> Vec<&str> {
+        self.entries
+            .iter()
+            .filter_map(|((slot, name), _)| {
+                if slot.starts_with("assert/") {
+                    Some(name.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     /// Returns `true` if `(slot, name)` is already registered (by a built-in or

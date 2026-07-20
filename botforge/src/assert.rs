@@ -166,6 +166,10 @@ pub(crate) struct AssertBlock {
     /// Map of service name → service expectation.
     #[serde(default)]
     pub(crate) services: BTreeMap<String, AssertService>,
+    /// Plugin-provided assert subtrees, keyed by verb name.
+    /// These are retained as raw YAML and dispatched to plugin providers at run time.
+    #[serde(skip)]
+    pub(crate) plugin_asserts: BTreeMap<String, serde_yaml::Value>,
 }
 
 pub(crate) fn parse_assert_block(raw_block: &Value) -> Result<AssertBlock> {
@@ -180,13 +184,16 @@ pub(crate) fn parse_assert_block(raw_block: &Value) -> Result<AssertBlock> {
         let Some(verb) = raw_key.as_str() else {
             anyhow::bail!("assert verb keys must be strings");
         };
-        let Some(kind) = registry.get(verb) else {
-            anyhow::bail!(
-                "unknown assert verb '{verb}' (known verbs: {})",
-                registry.known_verbs().join(", ")
-            );
-        };
-        kind.parse_into(raw_value, &mut block)?;
+        if let Some(kind) = registry.get(verb) {
+            kind.parse_into(raw_value, &mut block)?;
+        } else {
+            // Non-built-in verb: retain the raw subtree.
+            // Validity requires a loaded plugin providing assert/<verb>;
+            // the run/validate phase checks this.
+            block
+                .plugin_asserts
+                .insert(verb.to_owned(), raw_value.clone());
+        }
     }
 
     Ok(block)
@@ -364,7 +371,7 @@ fn build_privileged_probe_script(inner_script: &str, heredoc_delim: &str) -> Str
     format!("sudo -n sh <<'{heredoc_delim}'\n{inner_script}{heredoc_delim}\n")
 }
 
-fn run_privileged_probe(
+pub(crate) fn run_privileged_probe(
     ssh: &SshOptions,
     inner_script: &str,
     heredoc_delim: &str,
@@ -2398,6 +2405,10 @@ assert:
 
         #[test]
         fn test_load_test_config_assert_unknown_verb_is_error() {
+            // Since parse_assert_block now retains unknown verbs in plugin_asserts
+            // (to support plugin-provided assert capabilities), parsing succeeds.
+            // The unknown verb is stored and will error at run time if no plugin
+            // provides assert/foo.
             let repo = TempDir::new().unwrap();
             fs::write(
                 repo.path().join("test.yaml"),
@@ -2412,19 +2423,20 @@ assert:
 "#,
             )
             .unwrap();
-            let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
-            let msg = format!("{err:#}");
+            let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+            let assert_block = config.assert.unwrap();
+            // Unknown verb is retained in plugin_asserts, not in built-in fields.
             assert!(
-                msg.contains("unknown assert verb 'foo'"),
-                "error should mention unknown assert verb: {msg}"
+                assert_block.plugin_asserts.contains_key("foo"),
+                "unknown verb 'foo' should be retained in plugin_asserts"
             );
             assert!(
-                msg.contains("files")
-                    && msg.contains("users")
-                    && msg.contains("groups")
-                    && msg.contains("packages")
-                    && msg.contains("services"),
-                "error should list known assert verbs: {msg}"
+                assert_block.files.is_empty()
+                    && assert_block.users.is_empty()
+                    && assert_block.groups.is_empty()
+                    && assert_block.packages.is_empty()
+                    && assert_block.services.is_empty(),
+                "built-in assert fields should be empty for unknown-verb-only block"
             );
         }
     }

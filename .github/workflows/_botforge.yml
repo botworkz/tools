@@ -56,6 +56,7 @@ jobs:
         cargo build -p botforge-plugin-hello-badabi
         cargo build -p botforge-plugin-pigz
         cargo build -p botforge-plugin-github
+        cargo build -p botforge-plugin-docker
     - name: Run plugin-host acceptance tests
       run: cargo test -p botforge-plugin-host
 
@@ -102,6 +103,24 @@ jobs:
         echo "Staging ${so_path} → .ci-plugins/libgithub.so"
         mkdir -p .ci-plugins
         cp "${so_path}" .ci-plugins/libgithub.so
+    - name: Stage libdocker.so for container build
+      run: |
+        set -euo pipefail
+        # Find the built libdocker.so (debug or release profile).
+        so_path=""
+        for dir in target/debug target/release; do
+          if [[ -f "${dir}/libdocker.so" ]]; then
+            so_path="${dir}/libdocker.so"
+            break
+          fi
+        done
+        if [[ -z "${so_path}" ]]; then
+          echo "ERROR: libdocker.so not found in target/debug or target/release" >&2
+          exit 1
+        fi
+        echo "Staging ${so_path} → .ci-plugins/libdocker.so"
+        mkdir -p .ci-plugins
+        cp "${so_path}" .ci-plugins/libdocker.so
     - name: Build botworkz/botforge:ci runtime image
       run: |
         set -euo pipefail

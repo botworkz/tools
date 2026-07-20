@@ -100,6 +100,11 @@ fn github_so_path() -> Option<PathBuf> {
     find_fixture_so("libgithub.so")
 }
 
+/// Returns the path to `libdocker.so` if it has been built, else `None`.
+fn docker_so_path() -> Option<PathBuf> {
+    find_fixture_so("libdocker.so")
+}
+
 /// Require a fixture `.so` to exist before continuing.
 ///
 /// Hard-fails (panics) with an actionable message if the fixture has not been
@@ -902,4 +907,147 @@ fn publisher_error_display_includes_message() {
     assert!(s.contains("github"), "must name plugin: {s}");
     assert!(s.contains("401"), "must contain message content: {s}");
     assert!(s.contains("-1"), "must contain code: {s}");
+}
+
+// ── docker assert/docker acceptance ──────────────────────────────────────────
+
+/// Full acceptance path for `assert/docker`: load → registered → handle →
+/// `build_probe` returns a non-empty script → `evaluate` on synthetic stdout
+/// returns expected verdict JSON.
+#[test]
+fn docker_acceptance_load_and_build_probe() {
+    let so = require_fixture_so!(docker_so_path(), "cargo build -p botforge-plugin-docker");
+    let mut reg = PluginRegistry::new();
+    reg.load_plugin("docker", &so, None)
+        .expect("docker plugin should load cleanly");
+
+    assert!(
+        reg.is_registered("assert/docker", "docker"),
+        "assert/docker must be registered under name 'docker'"
+    );
+    assert_eq!(
+        reg.provider_of("assert/docker", "docker"),
+        Some("docker"),
+        "provider must be the docker plugin"
+    );
+
+    let handle = reg
+        .get_assert("docker")
+        .expect("get_assert('docker') must return a handle");
+
+    // Build a probe from a minimal config with one exact image.
+    let config_json =
+        r#"{"images":{"nginx:latest":{"exists":true}},"networks":{},"containers":{}}"#;
+    let script = handle
+        .build_probe(config_json)
+        .expect("build_probe must succeed for valid config");
+    assert!(
+        !script.is_empty(),
+        "probe script must be non-empty: {script:?}"
+    );
+    assert!(
+        script.contains("docker image inspect"),
+        "probe script must contain docker image inspect: {script:?}"
+    );
+}
+
+/// `evaluate` on synthetic stdout matching a simple config returns correct verdict JSON.
+#[test]
+fn docker_acceptance_evaluate_synthetic_stdout() {
+    let so = require_fixture_so!(docker_so_path(), "cargo build -p botforge-plugin-docker");
+    let mut reg = PluginRegistry::new();
+    reg.load_plugin("docker", &so, None)
+        .expect("docker plugin should load cleanly");
+    let handle = reg
+        .get_assert("docker")
+        .expect("get_assert('docker') must return a handle");
+
+    // Config: exact image present (exists: true), exact network absent (exists: false).
+    let config_json = r#"{"images":{"nginx:latest":{"exists":true}},"networks":{"badnet":{"exists":false}},"containers":{}}"#;
+
+    // Synthetic stdout: first line = "present" (nginx:latest found), second = "absent" (badnet absent).
+    let probe_stdout = "present\nabsent\n";
+
+    let results_json = handle
+        .evaluate(config_json, probe_stdout)
+        .expect("evaluate must succeed for valid config and matching stdout");
+
+    // Verify it's parseable JSON with a "checks" array.
+    let parsed: serde_json::Value =
+        serde_json::from_str(&results_json).expect("evaluate must return valid JSON");
+    let checks = parsed["checks"]
+        .as_array()
+        .expect("results must have a 'checks' array");
+
+    assert_eq!(checks.len(), 2, "should have 2 checks: {results_json}");
+
+    // First check: nginx:latest present → ok = true.
+    assert_eq!(
+        checks[0]["ok"],
+        serde_json::Value::Bool(true),
+        "nginx:latest present check should pass: {results_json}"
+    );
+    assert!(
+        checks[0]["label"]
+            .as_str()
+            .unwrap_or("")
+            .contains("nginx:latest"),
+        "label should mention nginx:latest: {results_json}"
+    );
+
+    // Second check: badnet absent → ok = true (badnet is indeed absent).
+    assert_eq!(
+        checks[1]["ok"],
+        serde_json::Value::Bool(true),
+        "badnet absent check should pass: {results_json}"
+    );
+}
+
+/// Same `(slot, name)` collision for `assert/docker` — mirrors the pigz
+/// collision test.
+#[test]
+fn docker_collision_same_slot_name() {
+    let so = require_fixture_so!(docker_so_path(), "cargo build -p botforge-plugin-docker");
+    let mut reg = PluginRegistry::new();
+    reg.load_plugin("docker", &so, None)
+        .expect("first docker should load");
+    let err = reg
+        .load_plugin("docker-2", &so, None)
+        .expect_err("second docker under same slot+name must collide");
+    match &err {
+        botforge_plugin_host::LoadError::CapabilityCollision {
+            slot,
+            name,
+            existing_provider,
+            new_provider,
+        } => {
+            assert_eq!(slot, "assert/docker");
+            assert_eq!(name, "docker");
+            assert_eq!(existing_provider, "docker");
+            assert_eq!(new_provider, "docker-2");
+        }
+        other => panic!("expected CapabilityCollision, got: {other}"),
+    }
+    assert_eq!(reg.plugins.len(), 1, "second plugin must not be wired");
+}
+
+/// `assert_names` lists 'docker' after loading the docker plugin.
+#[test]
+fn docker_appears_in_assert_names() {
+    let so = require_fixture_so!(docker_so_path(), "cargo build -p botforge-plugin-docker");
+    let mut reg = PluginRegistry::new();
+    reg.load_plugin("docker", &so, None)
+        .expect("docker plugin should load cleanly");
+    let names = reg.assert_names();
+    assert!(
+        names.contains(&"docker"),
+        "docker should appear in assert_names: {names:?}"
+    );
+}
+
+/// `get_assert` returns `None` when no assert plugin is loaded.
+#[test]
+fn get_assert_returns_none_without_plugin() {
+    let reg = PluginRegistry::new();
+    assert!(reg.get_assert("docker").is_none());
 }
