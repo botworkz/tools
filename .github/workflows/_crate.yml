@@ -192,7 +192,6 @@ jobs:
         if [ "$CRATE" = "botforge" ]; then
           docker run --rm --user 1001:1001 "botwork/botforge:ci" --help
           docker run --rm --entrypoint qemu-img "botwork/botforge:ci" --version
-          docker run --rm --entrypoint xorriso "botwork/botforge:ci" -version
 
           # botforge build: on a KVM-less CI runner we cannot boot a guest, so
           # `botforge build` fails fast on its /dev/kvm precondition. Assert that

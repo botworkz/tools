@@ -1,11 +1,17 @@
 use anyhow::{bail, Context, Result};
+use hadris_iso::joliet::JolietLevel;
+use hadris_iso::read::PathSeparator;
+use hadris_iso::rrip::RripOptions;
+use hadris_iso::write::options::{BaseIsoLevel, CreationFeatures, FormatOptions};
+use hadris_iso::write::{InputFiles, IsoImageWriter};
 #[cfg(test)]
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
 use std::io::Read;
+use std::io::{Seek, Write};
 use std::path::{Path, PathBuf};
 
-use crate::util::{command_exists, run_command_capture, unique_suffix};
+use crate::util::unique_suffix;
 
 /// A single entry in a cloud-init `bootcmd:` list.
 ///
@@ -193,16 +199,6 @@ pub(crate) fn prepare_seed_image(seed_dir: &Path, seed_iso: &Path, user_data: &s
     Ok(())
 }
 
-pub(crate) fn detect_iso_tool() -> Result<&'static str> {
-    if command_exists("xorriso") {
-        return Ok("xorriso");
-    }
-    if command_exists("genisoimage") {
-        return Ok("genisoimage");
-    }
-    bail!("neither 'xorriso' nor 'genisoimage' is available on PATH")
-}
-
 pub(crate) fn build_iso(src_dir: &Path, out: &Path, volume_id: &str) -> Result<()> {
     if !src_dir.is_dir() {
         bail!("source directory does not exist: {}", src_dir.display());
@@ -212,7 +208,6 @@ pub(crate) fn build_iso(src_dir: &Path, out: &Path, volume_id: &str) -> Result<(
             .with_context(|| format!("cannot create output dir: {}", parent.display()))?;
     }
 
-    let tool = detect_iso_tool()?;
     let file_name = out
         .file_name()
         .and_then(|name| name.to_str())
@@ -222,8 +217,8 @@ pub(crate) fn build_iso(src_dir: &Path, out: &Path, volume_id: &str) -> Result<(
         .unwrap_or_else(|| Path::new("."))
         .join(format!(".{file_name}.{}.tmp", unique_suffix()));
 
-    let args = iso_args(tool, src_dir, &tmp_out, volume_id)?;
-    if let Err(err) = run_command_capture(tool, &args, &[], &format!("{tool} failed")) {
+    let result = build_iso_to_path(src_dir, &tmp_out, volume_id);
+    if let Err(err) = result {
         let _ = std::fs::remove_file(&tmp_out);
         return Err(err);
     }
@@ -242,35 +237,61 @@ pub(crate) fn build_iso(src_dir: &Path, out: &Path, volume_id: &str) -> Result<(
     Ok(())
 }
 
-pub(crate) fn iso_args(
-    tool: &str,
-    src_dir: &Path,
-    out: &Path,
-    volume_id: &str,
-) -> Result<Vec<String>> {
-    let mut args = match tool {
-        "xorriso" => vec!["-as".into(), "mkisofs".into()],
-        "genisoimage" => Vec::new(),
-        _ => bail!("unsupported iso tool '{tool}'"),
+fn build_iso_to_path(src_dir: &Path, out: &Path, volume_id: &str) -> Result<()> {
+    let input_files = InputFiles::from_fs(src_dir, PathSeparator::ForwardSlash)
+        .with_context(|| format!("cannot read source directory: {}", src_dir.display()))?;
+
+    let options = FormatOptions {
+        volume_name: volume_id.to_string(),
+        system_id: None,
+        volume_set_id: None,
+        publisher_id: None,
+        preparer_id: None,
+        application_id: None,
+        sector_size: 2048,
+        path_separator: PathSeparator::ForwardSlash,
+        features: CreationFeatures {
+            filenames: BaseIsoLevel::Level1 {
+                supports_lowercase: false,
+                supports_rrip: true,
+            },
+            long_filenames: false,
+            joliet: Some(JolietLevel::Level3),
+            rock_ridge: Some(RripOptions::default()),
+            el_torito: None,
+            hybrid_boot: None,
+        },
+        strict_charset: false,
     };
-    args.extend([
-        "-r".into(),
-        "-J".into(),
-        "-V".into(),
-        volume_id.into(),
-        "-o".into(),
-        out.display().to_string(),
-        src_dir.display().to_string(),
-    ]);
-    Ok(args)
+
+    let estimated = hadris_iso::write::estimator::estimate(&input_files, &options).minimum_bytes();
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(out)
+        .with_context(|| format!("cannot create output file: {}", out.display()))?;
+
+    if estimated > 0 {
+        file.seek(std::io::SeekFrom::Start(estimated as u64 - 1))
+            .and_then(|_| file.write_all(&[0u8]))
+            .and_then(|_| file.seek(std::io::SeekFrom::Start(0)))
+            .with_context(|| format!("cannot pre-allocate output file: {}", out.display()))?;
+    }
+
+    IsoImageWriter::format_new(&mut file, input_files, options)
+        .with_context(|| format!("ISO build failed writing to {}", out.display()))?;
+
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        generate_installer_username, iso_args, render_user_data, write_seed_files, BootcmdEntry,
+        build_iso, generate_installer_username, render_user_data, write_seed_files, BootcmdEntry,
     };
-    use std::path::Path;
     use tempfile::TempDir;
 
     /// Build a `serde_yaml::Mapping` with a single `bootcmd:` key containing the
@@ -866,50 +887,131 @@ mod tests {
     }
 
     #[test]
-    fn iso_args_xorriso_match_expected_argv() {
-        let args = iso_args(
-            "xorriso",
-            Path::new("/tmp/src"),
-            Path::new("/tmp/out.iso"),
-            "cidata",
-        )
-        .unwrap();
+    fn build_iso_cidata_joliet_label_is_lowercase() {
+        // The cidata seed ISO must carry a Joliet volume label of exactly "cidata"
+        // (case-sensitive) so cloud-init's NoCloud datasource can find it.
+        let seed_dir = TempDir::new().unwrap();
+        write_seed_files(seed_dir.path(), "#cloud-config\n").unwrap();
+
+        let out_dir = TempDir::new().unwrap();
+        let iso_path = out_dir.path().join("seed.iso");
+        build_iso(seed_dir.path(), &iso_path, "cidata").unwrap();
+
+        // Re-open the ISO and verify the Joliet SVD volume identifier is "cidata".
+        let joliet_label = read_joliet_volume_label(&iso_path);
         assert_eq!(
-            args,
-            vec![
-                "-as",
-                "mkisofs",
-                "-r",
-                "-J",
-                "-V",
-                "cidata",
-                "-o",
-                "/tmp/out.iso",
-                "/tmp/src"
-            ]
+            joliet_label.as_deref(),
+            Some("cidata"),
+            "Joliet volume label must be exactly 'cidata' (lowercase) for cloud-init"
         );
     }
 
     #[test]
-    fn iso_args_genisoimage_match_expected_argv() {
-        let args = iso_args(
-            "genisoimage",
-            Path::new("/tmp/src"),
-            Path::new("/tmp/out.iso"),
-            "BOTFORGE",
-        )
-        .unwrap();
+    fn build_iso_seed_files_round_trip() {
+        // Files written to the seed directory must be byte-identical when read back.
+        let seed_dir = TempDir::new().unwrap();
+        let user_data = "#cloud-config\nssh_authorized_keys:\n  - ssh-ed25519 AAAA test\n";
+        write_seed_files(seed_dir.path(), user_data).unwrap();
+
+        let out_dir = TempDir::new().unwrap();
+        let iso_path = out_dir.path().join("seed.iso");
+        build_iso(seed_dir.path(), &iso_path, "cidata").unwrap();
+
+        // Read user-data and meta-data back from the ISO.
+        let (ud, md) = read_iso_files(&iso_path, &["user-data", "meta-data"]);
         assert_eq!(
-            args,
-            vec![
-                "-r",
-                "-J",
-                "-V",
-                "BOTFORGE",
-                "-o",
-                "/tmp/out.iso",
-                "/tmp/src"
-            ]
+            String::from_utf8(ud).unwrap(),
+            user_data,
+            "user-data must round-trip byte-identically"
         );
+        assert!(!md.is_empty(), "meta-data must be present in the ISO");
+    }
+
+    #[test]
+    fn build_iso_custom_volume_label() {
+        // Payload ISOs use a caller-supplied volume ID; verify it round-trips.
+        let src_dir = TempDir::new().unwrap();
+        std::fs::write(src_dir.path().join("payload.bin"), b"payload data").unwrap();
+        std::fs::create_dir(src_dir.path().join("images")).unwrap();
+        std::fs::write(src_dir.path().join("images").join("disk.img"), b"disk").unwrap();
+
+        let out_dir = TempDir::new().unwrap();
+        let iso_path = out_dir.path().join("payload.iso");
+        build_iso(src_dir.path(), &iso_path, "botwork-payload").unwrap();
+
+        let joliet_label = read_joliet_volume_label(&iso_path);
+        assert_eq!(
+            joliet_label.as_deref(),
+            Some("botwork-payload"),
+            "custom volume label must be preserved in Joliet SVD"
+        );
+    }
+
+    /// Open the produced ISO and return the Joliet SVD volume identifier,
+    /// decoded from UTF-16 BE.
+    fn read_joliet_volume_label(iso_path: &std::path::Path) -> Option<String> {
+        use hadris_iso::joliet::JolietLevel;
+        use hadris_iso::read::IsoImage;
+        use hadris_iso::volume::VolumeDescriptor;
+        use std::io::Cursor;
+
+        let data = std::fs::read(iso_path).expect("cannot read ISO");
+        let image = IsoImage::open(Cursor::new(data)).expect("cannot open ISO");
+
+        for vd in image.read_volume_descriptors() {
+            if let Ok(VolumeDescriptor::Supplementary(svd)) = vd {
+                // Check if this is a Joliet SVD (escape sequences match any Joliet level)
+                if JolietLevel::from_escape_sequence(&svd.escape_sequences).is_some() {
+                    // volume_identifier is a fixed 32-byte field stored as UTF-16 BE
+                    let raw: &[u8] = svd.volume_identifier.as_bytes();
+                    // Strip trailing UTF-16 BE spaces (0x00, 0x20)
+                    let mut end = raw.len();
+                    while end >= 2 && raw[end - 2] == 0x00 && raw[end - 1] == 0x20 {
+                        end -= 2;
+                    }
+                    let trimmed = &raw[..end];
+                    let chars: Vec<u16> = trimmed
+                        .chunks_exact(2)
+                        .map(|b| u16::from_be_bytes([b[0], b[1]]))
+                        .collect();
+                    return Some(String::from_utf16_lossy(&chars).to_string());
+                }
+            }
+        }
+        None
+    }
+
+    /// Open the ISO and return the raw byte contents of each named file
+    /// (looked up case-insensitively via the best available directory tree).
+    fn read_iso_files(iso_path: &std::path::Path, names: &[&str]) -> (Vec<u8>, Vec<u8>) {
+        use hadris_iso::read::IsoImage;
+        use std::io::Cursor;
+
+        let data = std::fs::read(iso_path).expect("cannot read ISO");
+        let image = IsoImage::open(Cursor::new(data)).expect("cannot open ISO");
+        let root = image.root_dir();
+
+        let mut result: Vec<Vec<u8>> = vec![Vec::new(); names.len()];
+        for entry_result in root.iter(&image).entries() {
+            let entry = entry_result.expect("dir entry read failed");
+            if entry.is_special() {
+                continue;
+            }
+            // Prefer RRIP display_name (lowercase) over raw ISO name (uppercased).
+            let display = entry.display_name();
+            let name_str = display.as_ref();
+            // Strip version suffix (";1") which ISO 9660 may append.
+            let name_clean = if let Some(pos) = name_str.rfind(';') {
+                &name_str[..pos]
+            } else {
+                name_str
+            };
+            for (i, &want) in names.iter().enumerate() {
+                if name_clean.eq_ignore_ascii_case(want) {
+                    result[i] = image.read_file(&entry).expect("cannot read file");
+                }
+            }
+        }
+        (result.remove(0), result.remove(0))
     }
 }
