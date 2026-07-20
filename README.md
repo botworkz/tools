@@ -15,7 +15,6 @@ See each app's `README.md` for usage, schema, and container instructions.
 ├── shasset/        # shasset crate, container image, bin/update-deps, lib/*.sh
 ├── botforge/       # botforge crate and container image
 ├── viscous/        # viscous crate, template fixtures, container image
-├── Earthfile       # +shasset-image, +botforge-image, +viscous-image, +images
 ├── Cargo.toml      # workspace root (members: shasset, botforge, viscous)
 ├── VERSION         # release version consumed by .github/workflows/ci.yml
 └── .github/workflows/
@@ -25,13 +24,12 @@ See each app's `README.md` for usage, schema, and container instructions.
 
 ## Building locally
 
-All images are built with [EarthBuild](https://github.com/EarthBuild/earthbuild):
+Each image is built with `docker buildx build` from the repo root:
 
 ```sh
-earthly +shasset-image      # → botwork/shasset:local
-earthly +botforge-image     # → botwork/botforge:local
-earthly +viscous-image      # → botwork/viscous:local
-earthly +images             # all of the above
+docker buildx build --platform linux/amd64 -f shasset/Dockerfile .   # → load with -t botwork/shasset:local --load
+docker buildx build --platform linux/amd64 -f botforge/Dockerfile .   # → load with -t botwork/botforge:local --load
+docker buildx build --platform linux/amd64 -f viscous/Dockerfile .    # → load with -t botwork/viscous:local --load
 ```
 
 ## Releasing
