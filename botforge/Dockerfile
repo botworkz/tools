@@ -41,7 +41,7 @@ FROM debian:trixie-slim
 ARG BINARY_SOURCE=source
 
 # Install orchestration toolchain:
-#   qemu-system-x86 / qemu-utils  — qemu-system-x86_64, qemu-img
+#   qemu-system-x86               — qemu-system-x86_64 (VM runtime)
 #   xorriso / genisoimage         — ISO building (cidata seed for `botforge test`)
 #   libnss-wrapper                — uid/gid passthrough support in entrypoint
 #   ca-certificates               — TLS roots
@@ -49,6 +49,10 @@ ARG BINARY_SOURCE=source
 #
 # openssh-client is intentionally absent: botforge uses a pure-Rust SSH/SFTP
 # implementation (russh + russh-sftp) and no longer shells out to ssh/scp/ssh-keygen.
+#
+# qemu-utils (qemu-img) is intentionally absent: overlay creation and disk
+# resize are now handled natively in Rust (crate::compress::qcow2), so the
+# runtime image no longer depends on the qemu-utils package.
 #
 # hadolint ignore=DL3008
 RUN apt-get update \
@@ -61,7 +65,6 @@ RUN apt-get update \
         jq \
         libnss-wrapper \
         qemu-system-x86 \
-        qemu-utils \
         xorriso \
     && rm -rf /var/lib/apt/lists/*
 
