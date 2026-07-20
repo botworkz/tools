@@ -18,8 +18,8 @@ use crate::qemu::{qemu_build_args, require_kvm, spawn_qemu_with_log};
 use crate::resolver::{AssetKind, ResolveFileContext, ResolveSpec, ARTIFACT_DIR};
 use crate::ssh::{scp_with_retry, ssh_with_retry, SshOptions, TemporarySshKeypair};
 use crate::util::{
-    botforge_debug_enabled, context_relative_display, create_temp_dir, default_cache_dir,
-    ensure_command, format_bytes_human, resolve_under_root, unique_suffix,
+    botforge_debug_enabled, create_temp_dir, default_cache_dir, ensure_command, format_bytes_human,
+    resolve_under_root, unique_suffix,
 };
 
 use crate::compress::{
@@ -311,12 +311,6 @@ pub(crate) fn cmd_build(args: BuildArgs) -> Result<()> {
         args.cpus.resolve(),
         guest_reclaim_uses_discard,
     );
-    let spec_display = context_relative_display(&context, &spec_path);
-    let source_display = context_relative_display(&context, &source);
-    crate::plan::print_phase(
-        "vm",
-        &format!("Starting vm (spec: {spec_display}, image: {source_display})"),
-    );
     let mut vm_child = Some(spawn_qemu_with_log(&qemu_args, &vm_log)?);
     let ssh_options = SshOptions {
         host: args.ssh_host.clone(),
@@ -491,12 +485,10 @@ pub(crate) fn cmd_build(args: BuildArgs) -> Result<()> {
         std::time::Duration::from_secs(build_config.timeout),
     );
     if let Err(err) = shutdown_result {
-        crate::plan::print_phase_status("vm", "Stopping vm", false);
         eprintln!("build VM shutdown failed: {err:#}");
         print_log_tail(&vm_log, 200);
         return Err(err);
     }
-    crate::plan::print_phase_status("vm", "Stopping vm", true);
 
     if matches!(reclaim_mode, ReclaimMode::Discard) {
         reclaim_host_discard_offline(&partial)?;

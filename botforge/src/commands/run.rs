@@ -63,6 +63,7 @@ pub(crate) fn cmd_run(args: RunArgs) -> Result<()> {
         qemu_args.push("-daemonize".into());
     }
 
+    crate::plan::print_phase("vm", "Starting vm");
     run_command("qemu-system-x86_64", &qemu_args, &[], "qemu launch failed")?;
     Ok(())
 }
