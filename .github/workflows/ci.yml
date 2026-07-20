@@ -23,7 +23,6 @@ on:
     - .github/workflows/_crate.yml
     - .github/workflows/_botforge.yml
     - .dockerignore
-    - Earthfile
     - Makefile
     - tarpaulin.toml
     - VERSION
@@ -44,7 +43,6 @@ on:
     - .github/workflows/_crate.yml
     - .github/workflows/_botforge.yml
     - .dockerignore
-    - Earthfile
     - Makefile
     - tarpaulin.toml
     - VERSION
@@ -220,17 +218,13 @@ jobs:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
 
-    - name: Install EarthBuild
+    - name: Authenticate buildah to GHCR
       if: steps.version.outputs.is_release == 'true'
       run: |
-        set -euo pipefail
-        tmp="$(mktemp -d)"
-        base="https://github.com/EarthBuild/earthbuild/releases/download/v0.8.17"
-        curl -fsSL -o "${tmp}/earth-linux-amd64" "${base}/earth-linux-amd64"
-        curl -fsSL -o "${tmp}/checksum.asc" "${base}/checksum.asc"
-        ( cd "${tmp}" && grep ' earth-linux-amd64$' checksum.asc | sha256sum -c - )
-        sudo install -m 0755 "${tmp}/earth-linux-amd64" /usr/local/bin/earthly
-        earthly bootstrap
+        echo "${{ secrets.GITHUB_TOKEN }}" | \
+          buildah login ghcr.io \
+            --username "${{ github.actor }}" \
+            --password-stdin
 
     - uses: actions/download-artifact@v4
       if: steps.version.outputs.is_release == 'true'
@@ -238,45 +232,32 @@ jobs:
         pattern: '*-binary'
         path: .ci-artifacts
 
-    - name: Build CI toolchain image (rust:1-slim-bookworm + rustfmt + clippy)
-      if: steps.version.outputs.is_release == 'true'
-      run: |
-        docker build -t ci-tools:local - <<'EOF'
-        FROM rust:1-slim-bookworm
-        RUN rustup component add rustfmt clippy
-        EOF
-
-    - name: Build and stage botforge plugins for container build
-      if: steps.version.outputs.is_release == 'true'
-      run: |
-        set -euo pipefail
-        # Build libpigz.so and libgithub.so in the same bookworm container as
-        # the prebuilt binary so glibc/ABI versions match at dlopen time.
-        for plugin in botforge-plugin-pigz botforge-plugin-github; do
-          docker run --rm \
-            --user "$(id -u):$(id -g)" \
-            -v "$GITHUB_WORKSPACE:/workspace" \
-            -v "$HOME/.cargo:/cargo" \
-            -w /workspace \
-            -e CARGO_HOME=/cargo \
-            ci-tools:local \
-            cargo build -p "$plugin" --release --locked
-        done
-        # Stage into .ci-plugins/ so the botforge/Dockerfile COPY finds them.
-        mkdir -p .ci-plugins
-        cp target/release/libpigz.so   .ci-plugins/libpigz.so
-        cp target/release/libgithub.so .ci-plugins/libgithub.so
-        echo "Staged plugins: $(ls -lh .ci-plugins/*.so)"
-
     - name: Publish container images
       if: steps.version.outputs.is_release == 'true'
-      run: |
-        set -euo pipefail
-        VERSION="${{ steps.version.outputs.version }}"
-        for crate in shasset botforge viscous; do
-          install -D -m 0755 ".ci-artifacts/${crate}-binary/${crate}" ".ci-prebuilt/${crate}/${crate}"
-          earthly --push "+${crate}-image" --BINARY_SOURCE=prebuilt --TAG="${VERSION}"
-        done
+      uses: envoyproxy/toolshed/actions/oci/collector@6a20085af231aba4c72d6866f94098343a8c5616
+      with:
+        artifacts-pattern: oci-amd64-*
+        manifest-config: |
+          {"manifests": [
+            {"name": "shasset",
+             "tag": "${{ steps.version.outputs.version }}",
+             "registry": "ghcr.io/botworkz/tools",
+             "architectures": ["amd64"],
+             "artifact-pattern": "oci-{arch}-{name}.tar",
+             "additional-tags": ["latest"]},
+            {"name": "botforge",
+             "tag": "${{ steps.version.outputs.version }}",
+             "registry": "ghcr.io/botworkz/tools",
+             "architectures": ["amd64"],
+             "artifact-pattern": "oci-{arch}-{name}.tar",
+             "additional-tags": ["latest"]},
+            {"name": "viscous",
+             "tag": "${{ steps.version.outputs.version }}",
+             "registry": "ghcr.io/botworkz/tools",
+             "architectures": ["amd64"],
+             "artifact-pattern": "oci-{arch}-{name}.tar",
+             "additional-tags": ["latest"]}
+          ]}
 
     - name: Collect release files
       if: steps.version.outputs.is_release == 'true'

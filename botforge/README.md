@@ -34,10 +34,10 @@ docker run --rm \
 
 ### Build the image locally
 
-From the repo root, with [EarthBuild](https://github.com/EarthBuild/earthbuild):
+From the repo root, with `docker buildx build`:
 
 ```sh
-earthly +botforge-image
+docker buildx build --platform linux/amd64 -f botforge/Dockerfile -t botwork/botforge:local --load .
 ```
 
 This produces the stable local tag `botwork/botforge:local`.
