@@ -1,0 +1,20 @@
+type: botforge/test
+name: test
+
+# Negative-control fixture: regression guard for the docker assert plugin.
+#
+# botwork-exited is deliberately created without a restart policy and exits
+# immediately — it is in "exited" state at test time.  Asserting `running: true`
+# MUST fail, proving that the running-state check bites on a real daemon and
+# that "exited" is never silently reported as "running".
+#
+# `image:` is injected by .github/workflows/_botforge.yml at CI time.
+
+steps: []
+
+assert:
+  docker:
+    containers:
+      botwork-exited:
+        exists: true
+        running: true
