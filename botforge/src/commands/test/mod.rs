@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 
 use crate::commands::build::CpusArg;
 use crate::iso::{generate_installer_username, prepare_seed_image, render_user_data};
-use crate::qemu::{create_overlay_image, qemu_run_args, require_kvm, spawn_qemu_with_log};
+use crate::qemu::{
+    create_overlay_image, qemu_run_args, require_kvm, spawn_qemu_attached, spawn_qemu_with_log,
+};
 use crate::resolver::{AssetKind, Reference, ResolveFileContext, ResolveSpec};
 use crate::ssh::{SshOptions, TemporarySshKeypair};
 use crate::util::{create_temp_dir, ensure_command, resolve_under_root};
@@ -16,7 +18,9 @@ use crate::workspace::{
 use crate::config::{
     load_test_config, validate_test_ports, validate_test_steps, TestIso, TestIsoBootstrap,
 };
-use crate::plan::{cleanup_test, collect_test_diagnostics, print_log_tail, run_test_flow};
+use crate::plan::{
+    cleanup_test, collect_test_diagnostics, init_force_color, print_log_tail, run_test_flow,
+};
 
 #[derive(Args, Debug)]
 #[command(group(ArgGroup::new("target").required(true).args(["name", "test_config"])))]
@@ -62,9 +66,32 @@ pub(crate) struct TestArgs {
     /// Controls the runner VM only; does not affect the output image.
     #[arg(long, default_value = "4")]
     cpus: CpusArg,
+    /// Force ANSI color output even when stderr is not a TTY.
+    /// When set, color is always emitted regardless of TTY detection and wins over
+    /// the `NO_COLOR` environment variable.  Alternatively, set `FORCE_COLOR=1` or
+    /// `CLICOLOR_FORCE=1` in the environment (useful in CI without threading the
+    /// flag everywhere).
+    #[arg(long)]
+    pub(crate) color: bool,
+    /// Attach an interactive serial console to the VM.
+    ///
+    /// Adds `-serial mon:stdio` to the QEMU argv and inherits stdin/stdout/stderr
+    /// so the operator can interact with the guest serial console directly.
+    /// Use `Ctrl-A c` to toggle between the serial console and the QEMU monitor.
+    ///
+    /// If stdin is not a TTY (e.g. under CI), falls back to the default
+    /// non-interactive background mode with a warning.
+    ///
+    /// Note: in attach mode the VM log file is not written (stdout/stderr are
+    /// inherited rather than redirected), so failure diagnostics via `print_log_tail`
+    /// will show an empty log.  Use non-attach mode for automated CI runs.
+    #[arg(long)]
+    pub(crate) attach: bool,
 }
 
 pub(crate) fn cmd_test(args: TestArgs) -> Result<()> {
+    // Initialize force-color from the --color flag before any logging output.
+    init_force_color(args.color);
     require_kvm()?;
     ensure_command("qemu-system-x86_64")?;
     ensure_command("qemu-img")?;
@@ -198,7 +225,12 @@ pub(crate) fn cmd_test(args: TestArgs) -> Result<()> {
         args.cpus.resolve(),
     );
 
-    let mut vm_child = Some(spawn_qemu_with_log(&qemu_args, &vm_log)?);
+    let (mut vm_child, _terminal_guard) = if args.attach {
+        let (child, guard) = spawn_qemu_attached(&qemu_args, &vm_log)?;
+        (Some(child), guard)
+    } else {
+        (Some(spawn_qemu_with_log(&qemu_args, &vm_log)?), None)
+    };
     // Capture the installer username before it is moved into ssh_options.
     // This is only meaningful when botforge owns the installer (_kept_keypair is Some).
     let installer_username: Option<String> = if _kept_keypair.is_some() {

@@ -87,4 +87,123 @@ mod tests {
             "top-level help must not advertise removed -c/--config: {help}"
         );
     }
+
+    // --- --color and --attach flag parsing tests ---
+
+    #[test]
+    fn build_accepts_color_flag() {
+        // --color must be accepted by `botforge build`.
+        // We pass a fake NAME and rely on the parser not reaching the filesystem.
+        let result = Cli::try_parse_from(["botforge", "build", "my-build", "--color"]);
+        match result {
+            Ok(cli) => match cli.command {
+                Commands::Build(args) => {
+                    assert!(args.color, "--color should be true");
+                }
+                _ => panic!("expected Build command"),
+            },
+            // Parsing succeeds; any downstream error (missing file etc.) is irrelevant here.
+            Err(e) => panic!("build --color parse failed: {e}"),
+        }
+    }
+
+    #[test]
+    fn build_accepts_attach_flag() {
+        let result = Cli::try_parse_from(["botforge", "build", "my-build", "--attach"]);
+        match result {
+            Ok(cli) => match cli.command {
+                Commands::Build(args) => {
+                    assert!(args.attach, "--attach should be true");
+                }
+                _ => panic!("expected Build command"),
+            },
+            Err(e) => panic!("build --attach parse failed: {e}"),
+        }
+    }
+
+    #[test]
+    fn test_accepts_color_flag() {
+        let result = Cli::try_parse_from(["botforge", "test", "my-test", "--color"]);
+        match result {
+            Ok(cli) => match cli.command {
+                Commands::Test(args) => {
+                    assert!(args.color, "--color should be true");
+                }
+                _ => panic!("expected Test command"),
+            },
+            Err(e) => panic!("test --color parse failed: {e}"),
+        }
+    }
+
+    #[test]
+    fn test_accepts_attach_flag() {
+        let result = Cli::try_parse_from(["botforge", "test", "my-test", "--attach"]);
+        match result {
+            Ok(cli) => match cli.command {
+                Commands::Test(args) => {
+                    assert!(args.attach, "--attach should be true");
+                }
+                _ => panic!("expected Test command"),
+            },
+            Err(e) => panic!("test --attach parse failed: {e}"),
+        }
+    }
+
+    #[test]
+    fn build_color_defaults_to_false() {
+        let result = Cli::try_parse_from(["botforge", "build", "my-build"]);
+        match result {
+            Ok(cli) => match cli.command {
+                Commands::Build(args) => {
+                    assert!(!args.color, "--color should default to false");
+                    assert!(!args.attach, "--attach should default to false");
+                }
+                _ => panic!("expected Build command"),
+            },
+            Err(e) => panic!("build parse failed: {e}"),
+        }
+    }
+
+    #[test]
+    fn test_color_defaults_to_false() {
+        let result = Cli::try_parse_from(["botforge", "test", "my-test"]);
+        match result {
+            Ok(cli) => match cli.command {
+                Commands::Test(args) => {
+                    assert!(!args.color, "--color should default to false");
+                    assert!(!args.attach, "--attach should default to false");
+                }
+                _ => panic!("expected Test command"),
+            },
+            Err(e) => panic!("test parse failed: {e}"),
+        }
+    }
+
+    #[test]
+    fn build_help_mentions_color_and_attach() {
+        let err = Cli::try_parse_from(["botforge", "build", "--help"]).unwrap_err();
+        let help = err.to_string();
+        assert!(
+            help.contains("--color"),
+            "build --help must mention --color: {help}"
+        );
+        assert!(
+            help.contains("--attach"),
+            "build --help must mention --attach: {help}"
+        );
+    }
+
+    #[test]
+    fn test_help_mentions_color_and_attach() {
+        let err = Cli::try_parse_from(["botforge", "test", "--help"]).unwrap_err();
+        let help = err.to_string();
+        assert!(
+            help.contains("--color"),
+            "test --help must mention --color: {help}"
+        );
+        assert!(
+            help.contains("--attach"),
+            "test --help must mention --attach: {help}"
+        );
+    }
 }

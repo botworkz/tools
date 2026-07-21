@@ -46,13 +46,13 @@ This produces the stable local tag `botwork/botforge:local`.
 
 | Command | Summary |
 |---|---|
-| `botforge build --spec <file> [--source <qcow2>] [--cache-dir <dir>] [--repo-root <dir>] [--memory <MiB>] [--cpus <N\|auto>]` | Resolve `image:` from the inline `assets:` block in the botforge workspace marker, fetch + verify + cache the qcow2, boot it under qemu, inject an ephemeral in-harness SSH keypair via cloud-init, run `type: build` plan steps, and commit the result on clean shutdown. `--source` is an optional local override that bypasses asset resolution. Output is declared in the spec via top-level `output:` and materialized at `build/artifact/<spec-dir>/<output>`. `--memory` (default 4096 MiB) and `--cpus` (default 4, or `auto` for host core count) control the runner VM and do not affect the output image. |
+| `botforge build --spec <file> [--source <qcow2>] [--cache-dir <dir>] [--repo-root <dir>] [--memory <MiB>] [--cpus <N\|auto>] [--color] [--attach]` | Resolve `image:` from the inline `assets:` block in the botforge workspace marker, fetch + verify + cache the qcow2, boot it under qemu, inject an ephemeral in-harness SSH keypair via cloud-init, run `type: build` plan steps, and commit the result on clean shutdown. `--source` is an optional local override that bypasses asset resolution. Output is declared in the spec via top-level `output:` and materialized at `build/artifact/<spec-dir>/<output>`. `--memory` (default 4096 MiB) and `--cpus` (default 4, or `auto` for host core count) control the runner VM and do not affect the output image. `--color` forces ANSI color output (see [Color output](#color-output---color-force_color-clicolor_force)). `--attach` gives an interactive serial console (see [VM console attachment](#vm-console-attachment---attach)). |
 | `botforge deps [--context <dir>] --out <dir> [name ...]` | Fetch + stage assets from the inline `assets:` block in the workspace marker. `--context` selects the workspace (otherwise botforge walks up from cwd), and `--cache-dir`, `--no-reverify`, and `--executable` (set 0o755) are optional. |
 | `botforge deps [--context <dir>] --prune [--dry-run] [--cache-dir <dir>]` | Prune the shasset cache using assets referenced by the workspace marker's inline manifest. `--dry-run` previews what would be removed without deleting. `--prune` and `--out` are mutually exclusive; `--out` is required only in fetch mode. Example: `botforge deps --prune --cache-dir .shasset-cache` (add `--dry-run` to preview first). |
 | `botforge iso --src <dir> --out <file> [--volume-id <id>]` | Build an ISO image from a source tree. Also supports generating a cidata seed ISO with an injected SSH key. |
 | `botforge payload --spec <file> --out <file>` | Build a payload ISO from a spec-driven staging plan. |
 | `botforge run …` | Launch a VM with qemu (KVM-only). Accepts `--memory <MiB>` (default 4096) and `--cpus <N\|auto>` (default 4). |
-| `botforge test …` | Boot a packed qcow2 with a cloud-init cidata seed, SSH in, and execute the steps in a `test-packed.yaml` plan. Accepts `--memory <MiB>` (default 4096) and `--cpus <N\|auto>` (default 4) to control the runner VM. |
+| `botforge test … [--color] [--attach]` | Boot a packed qcow2 with a cloud-init cidata seed, SSH in, and execute the steps in a `test-packed.yaml` plan. Accepts `--memory <MiB>` (default 4096) and `--cpus <N\|auto>` (default 4) to control the runner VM. `--color` forces ANSI color output. `--attach` gives an interactive serial console. |
 
 ## Ephemeral installer identity
 
@@ -383,7 +383,9 @@ replaces the old `step N ok/failed` line: green `✓ (<n>) <name>` with a
 dimmed name on success, or red `✗ (<n>) <name>` on failure. The
 `🤖`/`✓`/`✗` glyphs always print regardless of color support. `scp` progress
 output is suppressed by default and restored under `BOTFORGE_DEBUG=1` /
-`BOTFORGE_SSH_VERBOSE=1`.
+`BOTFORGE_SSH_VERBOSE=1`.  Color can be forced on with `--color` or the
+`FORCE_COLOR`/`CLICOLOR_FORCE` environment variables (see
+[Color output](#color-output---color-force_color-clicolor_force)).
 
 In addition to the per-step numbered titles, `botforge build` emits several
 **lifecycle phase lines** that frame the build lifecycle phases:
@@ -1037,7 +1039,90 @@ BOTFORGE_DEBUG=1         # broader debug flag; implies verbose ssh
 
 Accepted truthy values are `1`, `true`, and `yes` (case-insensitive).
 
-## CI gate — qcow2 compression e2e oracle
+## Color output (`--color`, `FORCE_COLOR`, `CLICOLOR_FORCE`)
+
+By default, `botforge build` and `botforge test` emit ANSI color on stderr only
+when stderr is a TTY and `NO_COLOR` is unset.  Two mechanisms force color on
+regardless of TTY detection:
+
+### `--color` flag
+
+Pass `--color` to either `botforge build` or `botforge test` to force color on:
+
+```sh
+botforge build my-build --color
+botforge test  my-test  --color
+```
+
+When `--color` is set, ANSI color is always emitted.  This wins over the
+`NO_COLOR` environment variable (explicit user intent takes precedence).
+
+### Environment variables
+
+Set one of these variables to a truthy value to force color on without threading
+the flag everywhere — useful in CI compose services:
+
+| Variable         | Accepted truthy values                  |
+|------------------|-----------------------------------------|
+| `FORCE_COLOR`    | `1`, `true`, `yes` (case-insensitive)   |
+| `CLICOLOR_FORCE` | `1`, `true`, `yes` (case-insensitive)   |
+
+Example (`docker-compose.yml`):
+
+```yaml
+services:
+  my-service:
+    environment:
+      FORCE_COLOR: "1"
+```
+
+### Precedence
+
+1. `--color` flag **or** `FORCE_COLOR`/`CLICOLOR_FORCE` truthy → **always on**
+   (wins over `NO_COLOR`).
+2. `NO_COLOR` set (and no force override) → **always off**.
+3. Fallback: `std::io::stderr().is_terminal()`.
+
+Setting `TERM=xterm` alone does *not* help — botforge gates on `is_terminal()`,
+not `$TERM`.
+
+## VM console attachment (`--attach`)
+
+By default, `botforge build` and `botforge test` launch QEMU as a background
+child with stdout/stderr redirected to a log file (`build/build-vm.log` or
+`build/test-vm.log`).  Botforge drives the guest entirely over SSH; you have
+no direct console access.
+
+Pass `--attach` to get an interactive serial console:
+
+```sh
+botforge build my-build --attach
+botforge test  my-test  --attach
+```
+
+What `--attach` does:
+
+- Appends `-serial mon:stdio` to the QEMU argv, multiplexing the guest serial
+  console and the QEMU monitor on process stdio.
+- Launches QEMU with inherited stdin/stdout/stderr so keystrokes reach the guest.
+- Use `Ctrl-A c` to toggle between the serial console and the QEMU monitor (the
+  standard QEMU `-nographic` key binding).
+- Saves the terminal's raw-mode state before spawning QEMU and restores it on
+  all exit paths (normal completion, error, or panic) via an RAII guard.
+
+**Non-TTY fallback**: if stdin is not a TTY when `--attach` is passed (e.g.
+under CI without a PTY allocation), botforge prints a warning and falls back to
+the default non-interactive background mode automatically.
+
+**Log file tradeoff**: in attach mode stdout/stderr are inherited rather than
+redirected, so the VM log file is created but left empty.  The failure
+diagnostics path (`print_log_tail`) will show an empty log.  Use non-attach mode
+for automated CI runs where log tailing on failure is important.
+
+**Default behavior is unchanged**: without `--attach`, the VM is always launched
+in background mode with log redirection, exactly as before.
+
+
 
 Before botforge is published a **KVM-backed end-to-end compression gate** runs in
 `.github/workflows/_e2e-compress.yml`.  It is a required gate: publishing is

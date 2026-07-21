@@ -321,6 +321,7 @@ dependencies = [
  "glob",
  "globset",
  "hadris-iso",
+ "nix",
  "object_store",
  "rayon",
  "russh",

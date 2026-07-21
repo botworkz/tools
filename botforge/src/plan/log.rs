@@ -3,10 +3,42 @@ use serde::Serialize;
 use std::fs::File;
 use std::io::{BufWriter, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
+
+/// Process-global flag set by `--color` / [`init_force_color`].  When `true`,
+/// ANSI color is always emitted regardless of TTY detection and wins over
+/// `NO_COLOR`.
+static FORCE_COLOR_FLAG: AtomicBool = AtomicBool::new(false);
+
+/// Set the force-color flag from the parsed `--color` CLI argument.
+///
+/// Call this once at program startup, before any logging output is produced.
+/// The flag is write-once in practice (it is only set during argument parsing)
+/// but uses `Relaxed` ordering because color decisions are purely cosmetic and
+/// require no memory-ordering guarantees.
+pub(crate) fn init_force_color(force: bool) {
+    FORCE_COLOR_FLAG.store(force, Ordering::Relaxed);
+}
+
+/// Returns `true` when `FORCE_COLOR` or `CLICOLOR_FORCE` is set to a truthy
+/// value (`1`, `true`, or `yes`, case-insensitive).
+fn is_force_color_env() -> bool {
+    for var in &["FORCE_COLOR", "CLICOLOR_FORCE"] {
+        if let Ok(val) = std::env::var(var) {
+            if matches!(
+                val.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes"
+            ) {
+                return true;
+            }
+        }
+    }
+    false
+}
 
 #[derive(Clone, Copy)]
 pub(super) enum StepOutputStream {
@@ -94,7 +126,17 @@ pub(super) fn step_log_path(log_dir: &Path, step_idx: usize, step_name: &str) ->
 }
 
 fn stderr_color_enabled() -> bool {
-    std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none()
+    // Explicit --color flag or FORCE_COLOR/CLICOLOR_FORCE env → always on,
+    // even if NO_COLOR is set (explicit user intent wins).
+    if FORCE_COLOR_FLAG.load(Ordering::Relaxed) || is_force_color_env() {
+        return true;
+    }
+    // NO_COLOR opt-out (only when no explicit force-color).
+    if std::env::var_os("NO_COLOR").is_some() {
+        return false;
+    }
+    // Fall back to TTY detection.
+    std::io::stderr().is_terminal()
 }
 
 fn step_title_line(step_idx: usize, name: &str, id: Option<&str>, color: bool) -> String {
@@ -683,6 +725,197 @@ mod tests {
         assert!(
             !s.contains("\x1b[2mStopping vm\x1b[0m"),
             "failure should NOT dim name: {s:?}"
+        );
+    }
+
+    // --- color-gating precedence ---
+
+    /// Global mutex to serialize tests that mutate environment variables.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Run `f` with the named environment variable set to `val` (or unset when
+    /// `val` is `None`), then restore the previous value.  The `ENV_LOCK` mutex
+    /// is acquired for the duration so concurrent tests cannot race.
+    fn with_env<F: FnOnce()>(vars: &[(&str, Option<&str>)], f: F) {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Save current values and apply new ones.
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> = vars
+            .iter()
+            .map(|(k, _)| (*k, std::env::var_os(k)))
+            .collect();
+        for (k, v) in vars {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
+        f();
+        // Restore.
+        for (k, prev) in &saved {
+            match prev {
+                Some(p) => std::env::set_var(k, p),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    #[test]
+    fn color_gating_no_color_disables_when_no_force() {
+        use super::{is_force_color_env, stderr_color_enabled, FORCE_COLOR_FLAG};
+        use std::sync::atomic::Ordering;
+
+        with_env(
+            &[
+                ("NO_COLOR", Some("1")),
+                ("FORCE_COLOR", None),
+                ("CLICOLOR_FORCE", None),
+            ],
+            || {
+                FORCE_COLOR_FLAG.store(false, Ordering::SeqCst);
+                assert!(
+                    !is_force_color_env(),
+                    "is_force_color_env should be false with no force vars"
+                );
+                // NO_COLOR is set and force is off → color disabled.
+                // In the test environment stderr is not a TTY, so the final
+                // is_terminal() fallback is also false.
+                assert!(
+                    !stderr_color_enabled(),
+                    "NO_COLOR with no force-color should disable color"
+                );
+                FORCE_COLOR_FLAG.store(false, Ordering::SeqCst);
+            },
+        );
+    }
+
+    #[test]
+    fn color_gating_force_color_flag_wins_over_no_color() {
+        use super::{stderr_color_enabled, FORCE_COLOR_FLAG};
+        use std::sync::atomic::Ordering;
+
+        // FORCE_COLOR_FLAG is stored INSIDE the env-lock so no concurrent
+        // test can race the global.
+        with_env(
+            &[
+                ("NO_COLOR", Some("1")),
+                ("FORCE_COLOR", None),
+                ("CLICOLOR_FORCE", None),
+            ],
+            || {
+                FORCE_COLOR_FLAG.store(true, Ordering::SeqCst);
+                assert!(
+                    stderr_color_enabled(),
+                    "FORCE_COLOR_FLAG=true should force color even when NO_COLOR is set"
+                );
+                FORCE_COLOR_FLAG.store(false, Ordering::SeqCst);
+            },
+        );
+    }
+
+    #[test]
+    fn color_gating_force_color_env_var_enables_color() {
+        use super::{is_force_color_env, stderr_color_enabled, FORCE_COLOR_FLAG};
+        use std::sync::atomic::Ordering;
+
+        // FORCE_COLOR=1 => color enabled regardless of NO_COLOR.
+        with_env(
+            &[
+                ("FORCE_COLOR", Some("1")),
+                ("CLICOLOR_FORCE", None),
+                ("NO_COLOR", Some("1")),
+            ],
+            || {
+                FORCE_COLOR_FLAG.store(false, Ordering::SeqCst);
+                assert!(
+                    is_force_color_env(),
+                    "is_force_color_env should be true with FORCE_COLOR=1"
+                );
+                assert!(
+                    stderr_color_enabled(),
+                    "FORCE_COLOR=1 should enable color even when NO_COLOR is set"
+                );
+                FORCE_COLOR_FLAG.store(false, Ordering::SeqCst);
+            },
+        );
+
+        // CLICOLOR_FORCE=1 => color enabled regardless of NO_COLOR.
+        with_env(
+            &[
+                ("CLICOLOR_FORCE", Some("1")),
+                ("FORCE_COLOR", None),
+                ("NO_COLOR", Some("1")),
+            ],
+            || {
+                FORCE_COLOR_FLAG.store(false, Ordering::SeqCst);
+                assert!(
+                    is_force_color_env(),
+                    "is_force_color_env should be true with CLICOLOR_FORCE=1"
+                );
+                assert!(
+                    stderr_color_enabled(),
+                    "CLICOLOR_FORCE=1 should enable color even when NO_COLOR is set"
+                );
+                FORCE_COLOR_FLAG.store(false, Ordering::SeqCst);
+            },
+        );
+    }
+
+    #[test]
+    fn color_gating_force_color_env_truthy_values() {
+        use super::{is_force_color_env, FORCE_COLOR_FLAG};
+        use std::sync::atomic::Ordering;
+
+        for truthy in &["1", "true", "TRUE", "True", "yes", "YES", "Yes"] {
+            with_env(
+                &[("FORCE_COLOR", Some(truthy)), ("CLICOLOR_FORCE", None)],
+                || {
+                    FORCE_COLOR_FLAG.store(false, Ordering::SeqCst);
+                    assert!(
+                        is_force_color_env(),
+                        "is_force_color_env should be true for FORCE_COLOR={truthy:?}"
+                    );
+                    FORCE_COLOR_FLAG.store(false, Ordering::SeqCst);
+                },
+            );
+        }
+
+        for falsy in &["0", "false", "no", "", "off"] {
+            with_env(
+                &[("FORCE_COLOR", Some(falsy)), ("CLICOLOR_FORCE", None)],
+                || {
+                    FORCE_COLOR_FLAG.store(false, Ordering::SeqCst);
+                    assert!(
+                        !is_force_color_env(),
+                        "is_force_color_env should be false for FORCE_COLOR={falsy:?}"
+                    );
+                    FORCE_COLOR_FLAG.store(false, Ordering::SeqCst);
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn color_gating_default_no_tty_no_force() {
+        use super::{stderr_color_enabled, FORCE_COLOR_FLAG};
+        use std::sync::atomic::Ordering;
+
+        // In the test environment stderr is not a TTY, so with no force and no
+        // NO_COLOR, color is disabled.
+        with_env(
+            &[
+                ("FORCE_COLOR", None),
+                ("CLICOLOR_FORCE", None),
+                ("NO_COLOR", None),
+            ],
+            || {
+                FORCE_COLOR_FLAG.store(false, Ordering::SeqCst);
+                // stderr is not a TTY in the test runner, so color is off.
+                assert!(
+                    !stderr_color_enabled(),
+                    "without a TTY and without force-color, color should be disabled"
+                );
+                FORCE_COLOR_FLAG.store(false, Ordering::SeqCst);
+            },
         );
     }
 }

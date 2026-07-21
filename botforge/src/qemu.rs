@@ -2,6 +2,7 @@ use anyhow::{bail, Context, Result};
 use serde::de::{self, Deserializer};
 use serde::Deserialize;
 use std::fs::File;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
@@ -168,6 +169,103 @@ pub(crate) fn spawn_qemu_with_log(args: &[String], log_path: &Path) -> Result<Ch
         .stderr(Stdio::from(log_err))
         .spawn()
         .context("failed to launch qemu in background")
+}
+
+/// RAII guard that saves and restores the terminal's raw-mode state.
+///
+/// Constructed by [`spawn_qemu_attached`] before QEMU is spawned with inherited
+/// stdio.  On drop (normal exit, early return, or panic) the original terminal
+/// attributes are restored via `tcsetattr(STDIN_FILENO, TCSANOW, …)`.
+///
+/// When stdin is not a TTY the guard is a no-op (`None` variant), which is why
+/// [`spawn_qemu_attached`] returns `Option<TerminalGuard>` rather than the
+/// guard directly.
+pub(crate) struct TerminalGuard {
+    saved: nix::sys::termios::Termios,
+}
+
+impl TerminalGuard {
+    /// Save the current terminal attributes for stdin.  Returns `None` when
+    /// stdin is not a TTY (i.e. when `tcgetattr` would fail).
+    fn save() -> Option<Self> {
+        use nix::sys::termios;
+        // STDIN_FILENO = 0
+        termios::tcgetattr(std::io::stdin())
+            .ok()
+            .map(|saved| Self { saved })
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        use nix::sys::termios::{tcsetattr, SetArg};
+        // Restore terminal on every exit path (normal, early return, or panic).
+        // Ignore errors — we are in a destructor and cannot propagate them.
+        let _ = tcsetattr(std::io::stdin(), SetArg::TCSANOW, &self.saved);
+    }
+}
+
+/// Spawn QEMU with an interactive serial console attached to the process stdio.
+///
+/// Compared to [`spawn_qemu_with_log`] this function:
+/// - Appends `-serial mon:stdio` to `args` (guest serial console + QEMU monitor
+///   multiplexed on stdio; use `Ctrl-A c` to toggle between them).
+/// - Launches QEMU with stdin/stdout/stderr **inherited** from the current
+///   process rather than redirected to a log file.
+/// - If stdin is a TTY: saves the current terminal attributes and returns a
+///   [`TerminalGuard`] that restores them on drop, so that the terminal is
+///   always returned to its original state even if QEMU is killed with SIGKILL.
+///   QEMU itself also calls `cfmakeraw` internally; the guard covers the case
+///   where QEMU is killed before it can clean up.
+///
+/// **Tradeoff vs. non-attach mode**: in attach mode stdout/stderr are inherited,
+/// so no VM console output is written to `log_path`.  The `log_path` file is
+/// still created (empty) so that call sites that call `print_log_tail` on
+/// failure do not panic on a missing path; the tail will simply be empty.
+///
+/// # Non-TTY fallback
+/// If stdin is **not** a TTY (e.g. under CI without a PTY), a warning is printed
+/// and the function falls back to non-interactive background mode — identical to
+/// [`spawn_qemu_with_log`] — and returns `None` for the guard.
+pub(crate) fn spawn_qemu_attached(
+    args: &[String],
+    log_path: &Path,
+) -> Result<(Child, Option<TerminalGuard>)> {
+    if !std::io::stdin().is_terminal() {
+        eprintln!(
+            "warning: --attach requested but stdin is not a TTY; \
+             falling back to non-interactive background mode"
+        );
+        let child = spawn_qemu_with_log(args, log_path)?;
+        return Ok((child, None));
+    }
+
+    crate::plan::print_phase(
+        "vm",
+        "Starting vm (attached console — Ctrl-A c for QEMU monitor)",
+    );
+
+    // Create an empty log file so that call sites that call `print_log_tail`
+    // on the failure path do not fail on a missing file.
+    File::create(log_path)
+        .with_context(|| format!("cannot create VM log file: {}", log_path.display()))?;
+
+    // Save terminal state before QEMU takes over raw mode.
+    let guard = TerminalGuard::save();
+
+    let mut qemu_args = args.to_vec();
+    qemu_args.push("-serial".into());
+    qemu_args.push("mon:stdio".into());
+
+    let child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .context("failed to launch qemu with attached console")?;
+
+    Ok((child, guard))
 }
 
 #[cfg(test)]
@@ -377,6 +475,90 @@ mod tests {
         assert_eq!(
             drive_arg,
             "file=/build/out.qcow2.partial,if=virtio,format=qcow2,discard=unmap"
+        );
+    }
+
+    // --- attach path argv tests ---
+    //
+    // These tests verify that:
+    // 1. The non-attach argv (qemu_run_args / qemu_build_args) is NOT modified.
+    // 2. The attach path appends `-serial mon:stdio` on top of the base args.
+
+    #[test]
+    fn attach_path_run_args_include_serial_mon_stdio() {
+        // The base args from qemu_run_args must NOT contain -serial.
+        let base = qemu_run_args(
+            Path::new("/overlay.qcow2"),
+            Path::new("/seed.iso"),
+            &[],
+            2222,
+            &[],
+            4096,
+            4,
+        );
+        assert!(
+            !base.iter().any(|a| a == "-serial"),
+            "non-attach qemu_run_args must not contain -serial: {base:?}"
+        );
+        assert!(
+            base.contains(&"-nographic".to_string()),
+            "non-attach qemu_run_args must still have -nographic: {base:?}"
+        );
+
+        // The attach variant appends -serial mon:stdio.
+        let mut attach_args = base.clone();
+        attach_args.push("-serial".into());
+        attach_args.push("mon:stdio".into());
+
+        let serial_idx = attach_args
+            .iter()
+            .position(|a| a == "-serial")
+            .expect("-serial must be present in attach args");
+        assert_eq!(
+            attach_args[serial_idx + 1],
+            "mon:stdio",
+            "attach args must have mon:stdio after -serial"
+        );
+        assert!(
+            attach_args.contains(&"-nographic".to_string()),
+            "attach args must keep -nographic"
+        );
+    }
+
+    #[test]
+    fn attach_path_build_args_include_serial_mon_stdio() {
+        use super::qemu_build_args;
+
+        let base = qemu_build_args(
+            Path::new("/partial.qcow2"),
+            Path::new("/seed.iso"),
+            2222,
+            4096,
+            4,
+            false,
+        );
+        assert!(
+            !base.iter().any(|a| a == "-serial"),
+            "non-attach qemu_build_args must not contain -serial: {base:?}"
+        );
+        assert!(
+            base.contains(&"-nographic".to_string()),
+            "non-attach qemu_build_args must keep -nographic"
+        );
+
+        // Attach variant appends -serial mon:stdio.
+        let mut attach_args = base.clone();
+        attach_args.push("-serial".into());
+        attach_args.push("mon:stdio".into());
+
+        let serial_idx = attach_args
+            .iter()
+            .position(|a| a == "-serial")
+            .expect("-serial must be present in attach args");
+        assert_eq!(
+            attach_args[serial_idx + 1],
+            "mon:stdio",
+            "attach args must have mon:stdio after -serial"
         );
     }
 }
