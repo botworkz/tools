@@ -157,7 +157,9 @@ jobs:
           echo "HOST_UID=$(id -u)"
           echo "HOST_GID=$(id -g)"
           echo "HOST_KVM_GID=$(getent group kvm | cut -d: -f3)"
+          echo "SHASSET_CACHE=${GITHUB_WORKSPACE}/testrepo/.shasset-cache"
         } >> "$GITHUB_ENV"
+        mkdir -p "${GITHUB_WORKSPACE}/testrepo/.shasset-cache"
     # Inline the shasset asset manifest INTO the workspace marker
     # (testrepo/botforge.yaml). botforge no longer reads a standalone
     # shasset.yaml — assets live under the marker's `assets:` block, located
@@ -386,6 +388,15 @@ jobs:
         options: -C
         input: testrepo/test.yaml
         print-output: true
+    - name: Restore shasset cache
+      id: shasset-cache
+      uses: actions/cache/restore@v4
+      with:
+        path: testrepo/.shasset-cache
+        key: shasset-botforge-v1-${{ hashFiles('botforge/test/shasset.yaml') }}
+        restore-keys: |
+          shasset-botforge-v1-
+
     - run: |
         . .botforge.env
         botforge build --spec build.yaml
@@ -635,3 +646,10 @@ jobs:
         AWS_DEFAULT_REGION=us-east-1 \
         aws --endpoint-url http://localhost:9000 s3 ls s3://botforge-ci/publish/
         echo "publish s3 OK"
+
+    - name: Save shasset cache
+      if: inputs.name == 'none' && steps.shasset-cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: testrepo/.shasset-cache
+        key: ${{ steps.shasset-cache.outputs.cache-primary-key }}
