@@ -12,7 +12,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use crate::iso::{generate_installer_username, prepare_seed_image, render_user_data};
-use crate::qemu::{qemu_build_args, require_kvm, spawn_qemu_with_log};
+use crate::qemu::{qemu_build_args, require_kvm, spawn_qemu_attached, spawn_qemu_with_log};
 use crate::resolver::{AssetKind, ResolveFileContext, ResolveSpec, ARTIFACT_DIR};
 use crate::ssh::{scp_with_retry, ssh_with_retry, SshOptions, TemporarySshKeypair};
 use crate::util::{
@@ -28,7 +28,9 @@ use crate::compress::{
 use crate::compress::{CompressConfig, ReclaimMode};
 use crate::config::{load_build_config, validate_build_steps};
 use crate::plan::vm::{StepFlowPlan, StepTimeoutPolicy};
-use crate::plan::{preserve_failed_build_disk, print_log_tail, run_step_flow, shutdown_build_vm};
+use crate::plan::{
+    init_force_color, preserve_failed_build_disk, print_log_tail, run_step_flow, shutdown_build_vm,
+};
 use crate::step::{ArchiveStep, StepTarget, TestStep};
 use crate::workspace::{
     discover_context, load_inline_manifest, load_plugin_entries, registry::load_committed_registry,
@@ -117,9 +119,32 @@ pub(crate) struct BuildArgs {
     /// Controls the runner VM only; does not affect the output image.
     #[arg(long, default_value = "4")]
     cpus: CpusArg,
+    /// Force ANSI color output even when stderr is not a TTY.
+    /// When set, color is always emitted regardless of TTY detection and wins over
+    /// the `NO_COLOR` environment variable.  Alternatively, set `FORCE_COLOR=1` or
+    /// `CLICOLOR_FORCE=1` in the environment (useful in CI without threading the
+    /// flag everywhere).
+    #[arg(long)]
+    pub(crate) color: bool,
+    /// Attach an interactive serial console to the VM.
+    ///
+    /// Adds `-serial mon:stdio` to the QEMU argv and inherits stdin/stdout/stderr
+    /// so the operator can interact with the guest serial console directly.
+    /// Use `Ctrl-A c` to toggle between the serial console and the QEMU monitor.
+    ///
+    /// If stdin is not a TTY (e.g. under CI), falls back to the default
+    /// non-interactive background mode with a warning.
+    ///
+    /// Note: in attach mode the VM log file is not written (stdout/stderr are
+    /// inherited rather than redirected), so failure diagnostics via `print_log_tail`
+    /// will show an empty log.  Use non-attach mode for automated CI runs.
+    #[arg(long)]
+    pub(crate) attach: bool,
 }
 
 pub(crate) fn cmd_build(args: BuildArgs) -> Result<()> {
+    // Initialize force-color from the --color flag before any logging output.
+    init_force_color(args.color);
     require_kvm()?;
     ensure_command("qemu-system-x86_64")?;
 
@@ -303,7 +328,12 @@ pub(crate) fn cmd_build(args: BuildArgs) -> Result<()> {
         args.cpus.resolve(),
         guest_reclaim_uses_discard,
     );
-    let mut vm_child = Some(spawn_qemu_with_log(&qemu_args, &vm_log)?);
+    let (mut vm_child, _terminal_guard) = if args.attach {
+        let (child, guard) = spawn_qemu_attached(&qemu_args, &vm_log)?;
+        (Some(child), guard)
+    } else {
+        (Some(spawn_qemu_with_log(&qemu_args, &vm_log)?), None)
+    };
     let ssh_options = SshOptions {
         host: args.ssh_host.clone(),
         port: args.ssh_port,
