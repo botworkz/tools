@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::resolver::ResolveFileContext;
+use crate::signal;
 use crate::ssh::{
     journalctl_command, scp_with_retry, ssh_capture_stdout, ssh_exec_logged, ssh_with_retry,
     wait_for_ssh, SshExecOutcome, SshOptions,
@@ -592,6 +593,7 @@ fn run_ssh_step_capturing(
     let logger = Arc::new(StepLogWriter::create(log_path)?);
     let mut attempts = 0usize;
     loop {
+        signal::poll_interrupt()?;
         let mut pending_out: Vec<u8> = Vec::new();
         let mut pending_err: Vec<u8> = Vec::new();
         let mut cap_out: Vec<u8> = Vec::new();
@@ -656,6 +658,7 @@ fn run_ssh_step_capturing(
                 if attempts >= retries {
                     anyhow::bail!("ssh command failed (transport error, retries exhausted): {e:#}");
                 }
+                signal::poll_interrupt()?;
                 std::thread::sleep(retry_delay);
             }
         }
@@ -727,6 +730,7 @@ fn run_host_step_capturing(
 
     let step_deadline = Instant::now() + budget.step_timeout;
     let exit_result: Result<i32> = loop {
+        signal::poll_interrupt()?;
         match child
             .try_wait()
             .with_context(|| format!("failed to wait for host step '{name}'"))?
@@ -751,6 +755,7 @@ fn run_host_step_capturing(
                     }
                     None => {}
                 }
+                signal::poll_interrupt()?;
                 std::thread::sleep(Duration::from_millis(200));
             }
         }
@@ -851,6 +856,7 @@ fn overall_timeout_error(overall_timeout: Duration) -> anyhow::Error {
 }
 
 fn ensure_overall_budget(overall_deadline: Instant, overall_timeout: Duration) -> Result<()> {
+    signal::poll_interrupt()?;
     if Instant::now() >= overall_deadline {
         return Err(overall_timeout_error(overall_timeout));
     }
@@ -912,6 +918,7 @@ fn run_ssh_step_with_step_log(
     let logger = Arc::new(StepLogWriter::create(log_path)?);
     let mut attempts = 0usize;
     loop {
+        signal::poll_interrupt()?;
         // Per-attempt output buffers for line-oriented log writing.
         let mut pending_out: Vec<u8> = Vec::new();
         let mut pending_err: Vec<u8> = Vec::new();
@@ -969,6 +976,7 @@ fn run_ssh_step_with_step_log(
                 if attempts >= retries {
                     anyhow::bail!("ssh command failed (transport error, retries exhausted): {e:#}");
                 }
+                signal::poll_interrupt()?;
                 std::thread::sleep(retry_delay);
             }
         }
@@ -1043,6 +1051,7 @@ fn run_host_step(
 
     let step_deadline = Instant::now() + budget.step_timeout;
     let step_result = loop {
+        signal::poll_interrupt()?;
         match child
             .try_wait()
             .with_context(|| format!("failed to wait for host step '{name}'"))?
@@ -1072,6 +1081,7 @@ fn run_host_step(
                     }
                     None => {}
                 }
+                signal::poll_interrupt()?;
                 std::thread::sleep(Duration::from_millis(200));
             }
         }
@@ -1424,8 +1434,7 @@ pub(crate) fn print_log_tail(path: &Path, line_count: usize) {
 pub(crate) fn cleanup_test(vm_child: &mut Option<Child>, overlay_image: &Path) {
     crate::plan::print_phase("vm", "Stopping vm");
     if let Some(child) = vm_child.as_mut() {
-        let _ = child.kill();
-        let _ = child.wait();
+        signal::kill_child(child);
     }
     *vm_child = None;
     let _ = std::fs::remove_file(overlay_image);
@@ -1470,10 +1479,22 @@ pub(crate) fn shutdown_build_vm(
     overall_timeout: Duration,
 ) -> Result<()> {
     crate::plan::print_phase("vm", "Stopping vm");
+    if signal::is_interrupted() {
+        if let Some(child) = vm_child.as_mut() {
+            signal::kill_child(child);
+        }
+        *vm_child = None;
+        preserve_failed_build_disk(partial, failed_partial)?;
+        crate::plan::print_phase_status("vm", "Stopping vm", false);
+        anyhow::bail!(
+            "build interrupted; tainted partial disk left at {} for post-mortem",
+            failed_partial.display()
+        );
+    }
+
     if Instant::now() >= overall_deadline {
         if let Some(child) = vm_child.as_mut() {
-            let _ = child.kill();
-            let _ = child.wait();
+            signal::kill_child(child);
         }
         *vm_child = None;
         preserve_failed_build_disk(partial, failed_partial)?;
@@ -1493,30 +1514,33 @@ pub(crate) fn shutdown_build_vm(
     }
 
     let mut timed_out_overall = false;
+    let mut interrupted = false;
     let clean_exit = if let Some(child) = vm_child.as_mut() {
         let deadline = Instant::now() + BUILD_POWEROFF_TIMEOUT;
         loop {
+            if signal::is_interrupted() {
+                signal::kill_child(child);
+                interrupted = true;
+                break false;
+            }
             match child.try_wait() {
                 Ok(Some(status)) => {
                     break status.success();
                 }
                 Ok(None) => {
                     if Instant::now() >= overall_deadline {
-                        let _ = child.kill();
-                        let _ = child.wait();
+                        signal::kill_child(child);
                         timed_out_overall = true;
                         break false;
                     }
                     if Instant::now() >= deadline {
-                        let _ = child.kill();
-                        let _ = child.wait();
+                        signal::kill_child(child);
                         break false; // timeout
                     }
                     std::thread::sleep(Duration::from_millis(500));
                 }
                 Err(e) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    signal::kill_child(child);
                     eprintln!("warning: failed to poll build VM status: {e}");
                     break false;
                 }
@@ -1531,6 +1555,13 @@ pub(crate) fn shutdown_build_vm(
         preserve_failed_build_disk(partial, failed_partial)?;
         crate::plan::print_phase_status("vm", "Stopping vm", false);
         Err(overall_timeout_error(overall_timeout))
+    } else if interrupted {
+        preserve_failed_build_disk(partial, failed_partial)?;
+        crate::plan::print_phase_status("vm", "Stopping vm", false);
+        anyhow::bail!(
+            "build interrupted; tainted partial disk left at {} for post-mortem",
+            failed_partial.display()
+        )
     } else if clean_exit {
         crate::plan::print_phase_status("vm", "Stopping vm", true);
         Ok(())
