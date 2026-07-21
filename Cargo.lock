@@ -337,7 +337,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "botforge-plugin-docker"
+name = "botforge-docker-plugin"
 version = "0.1.0"
 dependencies = [
  "botforge-plugin-host",
@@ -346,7 +346,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "botforge-plugin-github"
+name = "botforge-github-plugin"
 version = "0.1.0"
 dependencies = [
  "botforge-plugin-host",
@@ -356,17 +356,26 @@ dependencies = [
 ]
 
 [[package]]
-name = "botforge-plugin-hello"
+name = "botforge-hello-badabi-plugin"
 version = "0.1.0"
 dependencies = [
  "botforge-plugin-host",
 ]
 
 [[package]]
-name = "botforge-plugin-hello-badabi"
+name = "botforge-hello-plugin"
 version = "0.1.0"
 dependencies = [
  "botforge-plugin-host",
+]
+
+[[package]]
+name = "botforge-pigz-plugin"
+version = "0.1.0"
+dependencies = [
+ "botforge-plugin-host",
+ "flate2",
+ "gzp",
 ]
 
 [[package]]
@@ -378,15 +387,6 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tiny_http",
-]
-
-[[package]]
-name = "botforge-plugin-pigz"
-version = "0.1.0"
-dependencies = [
- "botforge-plugin-host",
- "flate2",
- "gzp",
 ]
 
 [[package]]

@@ -1,5 +1,5 @@
 [package]
-name = "botforge-plugin-pigz"
+name = "botforge-pigz-plugin"
 version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
@@ -16,7 +16,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 # Reference the host's ABI version constant so the plugin can never drift.
-botforge-plugin-host = { path = "../botforge-plugin-host" }
+botforge-plugin-host = { path = "../../botforge-plugin-host" }
 # Parallel gzip implementation. gzp provides multi-threaded gzip compression
 # analogous to the pigz command-line tool. Falls back to flate2 for
 # decompression (gzp's decompress API is single-threaded; flate2 is simpler

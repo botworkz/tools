@@ -1,5 +1,5 @@
 [package]
-name = "botforge-plugin-github"
+name = "botforge-github-plugin"
 version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
@@ -16,7 +16,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 # Reference the host's ABI version constant so the plugin can never drift.
-botforge-plugin-host = { path = "../botforge-plugin-host" }
+botforge-plugin-host = { path = "../../botforge-plugin-host" }
 # HTTP client for GitHub Releases REST API calls.  Uses blocking mode to keep
 # the FFI boundary synchronous; rustls-tls for pure-Rust TLS with no system
 # library dependency so the .so is self-contained.

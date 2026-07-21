@@ -32,11 +32,7 @@ on:
     - botforge/**
     - viscous/**
     - botforge-plugin-host/**
-    - botforge-plugin-hello/**
-    - botforge-plugin-hello-badabi/**
-    - botforge-plugin-pigz/**
-    - botforge-plugin-github/**
-    - botforge-plugin-docker/**
+    - botforge-plugins/**
   pull_request:
     branches: [main]
     paths:
@@ -53,11 +49,7 @@ on:
     - botforge/**
     - viscous/**
     - botforge-plugin-host/**
-    - botforge-plugin-hello/**
-    - botforge-plugin-hello-badabi/**
-    - botforge-plugin-pigz/**
-    - botforge-plugin-github/**
-    - botforge-plugin-docker/**
+    - botforge-plugins/**
   workflow_dispatch:
   release:
     types: [published]
@@ -119,11 +111,11 @@ jobs:
     - name: Build plugin fixture cdylibs
       run: >-
         cargo build
-        -p botforge-plugin-hello
-        -p botforge-plugin-hello-badabi
-        -p botforge-plugin-pigz
-        -p botforge-plugin-github
-        -p botforge-plugin-docker
+        -p botforge-hello-plugin
+        -p botforge-hello-badabi-plugin
+        -p botforge-pigz-plugin
+        -p botforge-github-plugin
+        -p botforge-docker-plugin
     - name: Run unit test coverage
       run: cargo tarpaulin
     - name: Upload coverage report
