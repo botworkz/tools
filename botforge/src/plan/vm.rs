@@ -192,7 +192,7 @@ fn run_plugin_assert_checks(verb: &str, results_json: &str) -> Result<()> {
 
     let mut any_failed = false;
     for check in &results.checks {
-        crate::plan::log::print_phase_status("assert", &check.label, check.ok);
+        crate::plan::log::print_phase_status("assert", &check.label, check.ok, None);
         if !check.ok {
             if let Some(ref msg) = check.message {
                 eprintln!("         {msg}");
@@ -230,25 +230,52 @@ pub(crate) fn run_step_flow(
         )
     })?;
     ensure_overall_budget(overall_deadline, timeouts.overall_timeout)?;
-    wait_for_ssh(
+    crate::plan::print_phase("vm", "Waiting for SSH");
+    let wait_for_ssh_started = Instant::now();
+    let wait_for_ssh_result = wait_for_ssh(
         ssh,
         remaining_budget(overall_deadline).min(TEST_SSH_READY_TIMEOUT),
-    )?;
+    );
+    crate::plan::print_phase_status(
+        "vm",
+        "Waiting for SSH",
+        wait_for_ssh_result.is_ok(),
+        Some(wait_for_ssh_started.elapsed()),
+    );
+    wait_for_ssh_result?;
     ensure_overall_budget(overall_deadline, timeouts.overall_timeout)?;
-    ssh_with_retry(
+    crate::plan::print_phase("vm", "Waiting for cloud-init");
+    let cloud_init_started = Instant::now();
+    let cloud_init_result = ssh_with_retry(
         ssh,
         "sudo cloud-init status --wait",
         TEST_TRANSPORT_RETRIES,
         TEST_TRANSPORT_RETRY_DELAY,
         remaining_budget(overall_deadline).min(timeouts.cloud_init_timeout),
-    )?;
-    require_stable_ssh_with_deadline(
+    );
+    crate::plan::print_phase_status(
+        "vm",
+        "Waiting for cloud-init",
+        cloud_init_result.is_ok(),
+        Some(cloud_init_started.elapsed()),
+    );
+    cloud_init_result?;
+    crate::plan::print_phase("vm", "Waiting for stable SSH");
+    let stable_ssh_started = Instant::now();
+    let stable_ssh_result = require_stable_ssh_with_deadline(
         ssh,
         TEST_STABLE_SSH_ATTEMPTS,
         TEST_STABLE_SSH_REQUIRED,
         overall_deadline,
         timeouts.overall_timeout,
-    )?;
+    );
+    crate::plan::print_phase_status(
+        "vm",
+        "Waiting for stable SSH",
+        stable_ssh_result.is_ok(),
+        Some(stable_ssh_started.elapsed()),
+    );
+    stable_ssh_result?;
 
     for bootstrap in plan.bootstraps {
         ensure_overall_budget(overall_deadline, timeouts.overall_timeout)?;
@@ -321,6 +348,7 @@ pub(crate) fn run_step_flow(
         // The file is created by StepLogWriter::create inside each step runner;
         // no pre-creation needed here (the directory was already created above).
         print_step_title(step_idx, step.display_name(), step.display_id());
+        let step_started = Instant::now();
         let step_result = match step {
             TestStep::Run(step) => run_run_step(&run_context, step_idx, step, &mut accumulated_env),
             TestStep::Archive(step) => {
@@ -345,6 +373,7 @@ pub(crate) fn run_step_flow(
             step.display_name(),
             step.display_id(),
             step_result.is_ok(),
+            Some(step_started.elapsed()),
         );
         step_result?;
     }
@@ -1319,6 +1348,7 @@ pub(crate) fn run_local_steps(context: &Path, steps: &[TestStep]) -> Result<()> 
         }
 
         print_step_title(step_idx, step.display_name(), step.display_id());
+        let step_started = Instant::now();
 
         let log_path = step_log_path(&step_log_dir, step_idx, &run.name);
         let step_timeout = resolve_step_timeout(run.timeout, default_step_timeout);
@@ -1386,6 +1416,7 @@ pub(crate) fn run_local_steps(context: &Path, steps: &[TestStep]) -> Result<()> 
             step.display_name(),
             step.display_id(),
             step_result.is_ok(),
+            Some(step_started.elapsed()),
         );
         step_result?;
     }
@@ -1433,11 +1464,20 @@ pub(crate) fn print_log_tail(path: &Path, line_count: usize) {
 
 pub(crate) fn cleanup_test(vm_child: &mut Option<Child>, overlay_image: &Path) {
     crate::plan::print_phase("vm", "Stopping vm");
+    let mut stopped_cleanly = true;
     if let Some(child) = vm_child.as_mut() {
+        // TODO(#509): Prefer graceful test VM shutdown before forced termination.
+        if child.kill().is_err() {
+            stopped_cleanly = false;
+        }
+        if child.wait().is_err() {
+            stopped_cleanly = false;
+        }
         signal::kill_child(child);
     }
     *vm_child = None;
     let _ = std::fs::remove_file(overlay_image);
+    crate::plan::print_phase_status("vm", "Stopping vm", stopped_cleanly, None);
 }
 
 pub(crate) fn preserve_failed_build_disk(partial: &Path, failed_partial: &Path) -> Result<()> {
@@ -1498,7 +1538,7 @@ pub(crate) fn shutdown_build_vm(
         }
         *vm_child = None;
         preserve_failed_build_disk(partial, failed_partial)?;
-        crate::plan::print_phase_status("vm", "Stopping vm", false);
+        crate::plan::print_phase_status("vm", "Stopping vm", false, None);
         return Err(overall_timeout_error(overall_timeout));
     }
 
@@ -1553,7 +1593,7 @@ pub(crate) fn shutdown_build_vm(
 
     if timed_out_overall {
         preserve_failed_build_disk(partial, failed_partial)?;
-        crate::plan::print_phase_status("vm", "Stopping vm", false);
+        crate::plan::print_phase_status("vm", "Stopping vm", false, None);
         Err(overall_timeout_error(overall_timeout))
     } else if interrupted {
         preserve_failed_build_disk(partial, failed_partial)?;
@@ -1563,11 +1603,11 @@ pub(crate) fn shutdown_build_vm(
             failed_partial.display()
         )
     } else if clean_exit {
-        crate::plan::print_phase_status("vm", "Stopping vm", true);
+        crate::plan::print_phase_status("vm", "Stopping vm", true, None);
         Ok(())
     } else {
         preserve_failed_build_disk(partial, failed_partial)?;
-        crate::plan::print_phase_status("vm", "Stopping vm", false);
+        crate::plan::print_phase_status("vm", "Stopping vm", false, None);
         anyhow::bail!(
             "build VM did not shut down cleanly; \
              partial disk left at {} for post-mortem",
