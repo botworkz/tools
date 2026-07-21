@@ -3,7 +3,8 @@
 use anyhow::{anyhow, bail, Context, Result};
 #[allow(deprecated)]
 use bollard::container::{
-    Config, CreateContainerOptions, LogsOptions, StartContainerOptions, WaitContainerOptions,
+    AttachContainerOptions, Config, CreateContainerOptions, StartContainerOptions,
+    WaitContainerOptions,
 };
 use bollard::errors::Error as BollardError;
 #[allow(deprecated)]
@@ -13,8 +14,9 @@ use bollard::Docker;
 use futures_util::stream::TryStreamExt;
 use nix::unistd::{Gid, Group, Uid};
 use std::fs::OpenOptions;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const MARKER_FILE: &str = "botforge.yaml";
 const VERSION_FILE: &str = ".botforgeversion";
@@ -33,8 +35,7 @@ async fn main() {
 }
 
 async fn run() -> Result<i64> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let verbose = env_truthy("BOTSPAWN_VERBOSE");
+    let launch = parse_launch_args();
 
     let cwd = std::env::current_dir().context("failed to determine current directory")?;
     let repo_root = discover_repo_root(&cwd)?;
@@ -45,10 +46,10 @@ async fn run() -> Result<i64> {
     let docker = preflight_docker().await?;
     preflight_kvm()?;
 
-    ensure_image_present(&docker, &image, verbose).await?;
+    ensure_image_present(&docker, &image, launch.verbose).await?;
 
     eprintln!("botspawn: launching botforge from {image}");
-    run_container(&docker, &repo_root, &image, &host_ids, &args).await
+    run_container(&docker, &repo_root, &image, &host_ids, &launch.command).await
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -56,6 +57,45 @@ struct HostIds {
     uid: u32,
     gid: u32,
     kvm_gid: u32,
+}
+
+#[derive(Debug, Clone)]
+struct LaunchArgs {
+    verbose: bool,
+    command: Vec<String>,
+}
+
+fn parse_launch_args() -> LaunchArgs {
+    parse_launch_args_from(std::env::args().skip(1))
+}
+
+fn parse_launch_args_from(args: impl IntoIterator<Item = String>) -> LaunchArgs {
+    let mut verbose = env_truthy("BOTSPAWN_VERBOSE");
+    let mut command = Vec::new();
+    let mut parse_spawn_flags = true;
+
+    for arg in args {
+        if parse_spawn_flags {
+            match arg.as_str() {
+                "-v" | "--verbose" => {
+                    verbose = true;
+                    continue;
+                }
+                "-q" | "--quiet" => {
+                    verbose = false;
+                    continue;
+                }
+                "--" => {
+                    parse_spawn_flags = false;
+                    continue;
+                }
+                _ => parse_spawn_flags = false,
+            }
+        }
+        command.push(arg);
+    }
+
+    LaunchArgs { verbose, command }
 }
 
 fn discover_repo_root(start: &Path) -> Result<PathBuf> {
@@ -245,6 +285,7 @@ async fn run_container(
         .to_str()
         .ok_or_else(|| anyhow!("repo root is not valid utf-8: {}", repo_root.display()))?
         .to_string();
+    let tty = io::stdout().is_terminal();
 
     let env = vec![
         "HOME=/tmp".to_string(),
@@ -271,6 +312,11 @@ async fn run_container(
         } else {
             Some(args.to_vec())
         },
+        tty: Some(tty),
+        open_stdin: Some(true),
+        attach_stdin: Some(true),
+        attach_stdout: Some(true),
+        attach_stderr: Some(true),
         host_config: Some(HostConfig {
             auto_remove: Some(true),
             binds: Some(vec![format!("{root}:{root}")]),
@@ -295,18 +341,40 @@ async fn run_container(
         .await
         .context("failed to start botforge container")?;
 
-    let mut logs = docker.logs(
-        &response.id,
-        Some(LogsOptions::<String> {
-            follow: true,
-            stdout: true,
-            stderr: true,
-            ..Default::default()
-        }),
-    );
+    let bollard::container::AttachContainerResults {
+        mut output,
+        mut input,
+    } = docker
+        .attach_container(
+            &response.id,
+            Some(AttachContainerOptions::<String> {
+                stdin: Some(true),
+                stdout: Some(true),
+                stderr: Some(true),
+                stream: Some(true),
+                logs: Some(true),
+                detach_keys: None,
+            }),
+        )
+        .await
+        .context("failed to attach to botforge container streams")?;
 
-    while let Some(output) = logs.try_next().await? {
-        match output {
+    let stdin_task = tokio::spawn(async move {
+        let mut stdin = tokio::io::stdin();
+        let mut buf = [0_u8; 8192];
+        loop {
+            let n = stdin.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            input.write_all(&buf[..n]).await?;
+        }
+        input.shutdown().await?;
+        Ok::<(), io::Error>(())
+    });
+
+    while let Some(frame) = output.try_next().await? {
+        match frame {
             bollard::container::LogOutput::StdOut { message }
             | bollard::container::LogOutput::Console { message } => {
                 io::stdout().write_all(&message)?;
@@ -326,12 +394,15 @@ async fn run_container(
         .await?
         .ok_or_else(|| anyhow!("docker wait returned no result"))?;
 
+    stdin_task.abort();
+    let _ = stdin_task.await;
+
     Ok(status.status_code)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{discover_repo_root, pin_digest_image};
+    use super::{discover_repo_root, parse_launch_args_from, pin_digest_image};
     use std::fs;
     use tempfile::TempDir;
 
@@ -354,6 +425,23 @@ mod tests {
             format!("{err:#}").contains("not inside a botforge workspace"),
             "unexpected error: {err:#}"
         );
+    }
+
+    #[test]
+    fn parse_launch_args_reads_verbose_flags_before_command() {
+        let parsed = parse_launch_args_from(vec![
+            "--verbose".to_string(),
+            "--".to_string(),
+            "--quiet".to_string(),
+        ]);
+        assert!(parsed.verbose);
+        assert_eq!(parsed.command, vec!["--quiet".to_string()]);
+    }
+
+    #[test]
+    fn parse_launch_args_does_not_strip_botforge_flags() {
+        let parsed = parse_launch_args_from(vec!["build".to_string(), "-q".to_string()]);
+        assert_eq!(parsed.command, vec!["build".to_string(), "-q".to_string()]);
     }
 
     #[test]

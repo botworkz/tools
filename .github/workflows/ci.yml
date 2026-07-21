@@ -22,6 +22,7 @@ on:
     - .github/workflows/ci.yml
     - .github/workflows/_crate.yml
     - .github/workflows/_botforge.yml
+    - .github/workflows/_botspawn.yml
     - .dockerignore
     - Makefile
     - tarpaulin.toml
@@ -30,6 +31,7 @@ on:
     - Cargo.lock
     - shasset/**
     - botforge/**
+    - botspawn/**
     - viscous/**
     - botforge-plugin-host/**
     - botforge-plugins/**
@@ -39,6 +41,7 @@ on:
     - .github/workflows/ci.yml
     - .github/workflows/_crate.yml
     - .github/workflows/_botforge.yml
+    - .github/workflows/_botspawn.yml
     - .dockerignore
     - Makefile
     - tarpaulin.toml
@@ -47,6 +50,7 @@ on:
     - Cargo.lock
     - shasset/**
     - botforge/**
+    - botspawn/**
     - viscous/**
     - botforge-plugin-host/**
     - botforge-plugins/**
@@ -69,6 +73,7 @@ jobs:
         crate:
         - shasset
         - botforge
+        - botspawn
         - viscous
     uses: ./.github/workflows/_crate.yml
     with:
@@ -159,11 +164,16 @@ jobs:
       compressor_opts: ${{ matrix.variant.compressor_opts }}
       name: ${{ matrix.variant.name }}
 
+  botspawn:
+    needs: crate
+    uses: ./.github/workflows/_botspawn.yml
+
   publish:
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     needs:
     - crate
     - botforge
+    - botspawn
     runs-on: ubuntu-latest
     permissions:
       contents: write

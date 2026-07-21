@@ -13,7 +13,7 @@ anyhow = "1"
 bollard = "0.19"
 futures-util = "0.3"
 nix = { version = "0.31", default-features = false, features = ["user"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["io-std", "io-util", "macros", "rt-multi-thread"] }
 
 [dev-dependencies]
 tempfile = "3"

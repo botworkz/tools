@@ -1,0 +1,101 @@
+name: Botspawn acceptance
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  botspawn:
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@v4
+    - uses: docker/setup-buildx-action@v3
+
+    - name: Enable KVM via udev
+      run: |
+        echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+          | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+        sudo udevadm control --reload-rules
+        sudo udevadm trigger --name-match=kvm
+
+    - name: Assert /dev/kvm is present (hard requirement — no TCG fallback)
+      run: |
+        set -euo pipefail
+        if [[ ! -e /dev/kvm ]]; then
+          echo "ERROR: /dev/kvm is unavailable." >&2
+          echo "KVM is a hard requirement for this gate; no TCG fallback is accepted." >&2
+          exit 1
+        fi
+        echo "KVM OK: $(ls -la /dev/kvm)"
+
+    - name: Build botforge plugin cdylibs (.so)
+      run: |
+        cargo build -p botforge-pigz-plugin
+        cargo build -p botforge-github-plugin
+        cargo build -p botforge-docker-plugin
+
+    - name: Stage botforge plugins for container build
+      run: |
+        set -euo pipefail
+        mkdir -p .ci-plugins
+        cp target/debug/libpigz.so .ci-plugins/libpigz.so
+        cp target/debug/libgithub.so .ci-plugins/libgithub.so
+        cp target/debug/libdocker.so .ci-plugins/libdocker.so
+
+    - name: Download pre-built botforge binary
+      uses: actions/download-artifact@v4
+      with:
+        name: botforge-binary
+        path: .ci-prebuilt/botforge
+    - name: Make botforge binary executable
+      run: chmod +x .ci-prebuilt/botforge/botforge
+
+    - name: Build botworkz/botforge:ci runtime image
+      run: |
+        set -euo pipefail
+        docker buildx build \
+          --platform linux/amd64 \
+          --load \
+          --build-arg BINARY_SOURCE=prebuilt \
+          -t botworkz/botforge:ci \
+          -f botforge/Dockerfile \
+          .
+
+    - name: Download pre-built botspawn binary
+      uses: actions/download-artifact@v4
+      with:
+        name: botspawn-binary
+        path: .ci-prebuilt/botspawn
+    - name: Make botspawn binary executable
+      run: chmod +x .ci-prebuilt/botspawn/botspawn
+
+    - name: Create botspawn test workspace
+      run: |
+        set -euo pipefail
+        mkdir -p testrepo/work/tree
+        : > testrepo/botforge.yaml
+        printf '%s\n' 'botworkz/botforge:ci' > testrepo/.botforgeversion
+
+    - name: Dogfood botspawn from nested path (success path)
+      run: |
+        set -euo pipefail
+        BOTSPAWN_BIN="${GITHUB_WORKSPACE}/.ci-prebuilt/botspawn/botspawn"
+        cd testrepo/work/tree
+        "${BOTSPAWN_BIN}" --help 2>&1 | tee /tmp/botspawn-help.log
+        grep -q "botspawn: checking docker and kvm access" /tmp/botspawn-help.log
+        grep -q "botspawn: launching botforge from botworkz/botforge:ci" /tmp/botspawn-help.log
+        grep -q "Usage: botforge" /tmp/botspawn-help.log
+
+    - name: Dogfood botspawn exit-code propagation (negative control)
+      run: |
+        set -euo pipefail
+        BOTSPAWN_BIN="${GITHUB_WORKSPACE}/.ci-prebuilt/botspawn/botspawn"
+        cd testrepo/work/tree
+        if "${BOTSPAWN_BIN}" --definitely-invalid-flag >/tmp/botspawn-bad.log 2>&1; then
+          echo "ERROR: expected botspawn to return non-zero for invalid containerized botforge args" >&2
+          cat /tmp/botspawn-bad.log >&2
+          exit 1
+        fi
+        grep -q "unexpected argument '--definitely-invalid-flag'" /tmp/botspawn-bad.log
