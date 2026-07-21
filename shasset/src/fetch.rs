@@ -1221,8 +1221,10 @@ fn verify_digest(data: &[u8], expected_hex: &str) -> std::result::Result<(), Fet
     Ok(())
 }
 
-const MANIFEST_ACCEPT: &str =
-    "application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json";
+const MANIFEST_ACCEPT: &str = "application/vnd.oci.image.index.v1+json,\
+application/vnd.docker.distribution.manifest.list.v2+json,\
+application/vnd.oci.image.manifest.v1+json,\
+application/vnd.docker.distribution.manifest.v2+json";
 
 /// Pull an OCI image by digest, assemble an OCI image-layout tar, and return a DownloadedFile.
 ///
@@ -2703,6 +2705,132 @@ mod tests {
             std::fs::read_to_string(index_entry).unwrap().trim(),
             result.computed_sha256
         );
+    }
+
+    /// Regression test: the top-level manifest request for an OCI image index must advertise
+    /// acceptance of `application/vnd.oci.image.index.v1+json`.  Registries such as GHCR perform
+    /// strict `Accept`-based content negotiation and return 404 for an index-pinned digest when
+    /// the client does not list the index media type.
+    ///
+    /// This test uses a transport that mimics GHCR's behaviour: it returns HTTP 404 for manifest
+    /// requests that do not include `application/vnd.oci.image.index.v1+json` in the `Accept`
+    /// header, and returns the index bytes when that type is present.
+    #[test]
+    fn oci_manifest_accept_includes_oci_image_index_media_type() {
+        let (child_manifest_bytes, config_bytes, layer_gz, child_manifest_hex) =
+            make_oci_test_fixtures();
+        let config_hex = sha256_hex(&config_bytes);
+        let layer_gz_hex = sha256_hex(&layer_gz);
+        let child_digest = format!("sha256:{child_manifest_hex}");
+
+        let index = serde_json::json!({
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "manifests": [
+                {
+                    "digest": child_digest,
+                    "platform": {"os": "linux", "architecture": "amd64"}
+                }
+            ]
+        });
+        let index_bytes = serde_json::to_vec(&index).unwrap();
+        let index_hex = sha256_hex(&index_bytes);
+
+        let asset = Asset {
+            uri: format!("oci://ghcr.io/botworkz/svc@sha256:{index_hex}"),
+            version: String::new(),
+            checksum: None,
+            digest: None,
+            filename: Some("svc.tar".to_string()),
+            auth: None,
+            platform: None,
+            archive: false,
+            labels: Default::default(),
+        };
+
+        // Build a transport that enforces GHCR-style Accept content negotiation:
+        // manifest requests for an OCI image index return 404 unless the Accept
+        // header contains `application/vnd.oci.image.index.v1+json`.
+        struct GhcrLikeTransport {
+            manifest_url: String,
+            index_bytes: Vec<u8>,
+            inner: MockTransport,
+        }
+
+        impl Transport for GhcrLikeTransport {
+            fn get(
+                &self,
+                uri: &str,
+                auth: Option<&str>,
+                accept: Option<&str>,
+            ) -> std::result::Result<DownloadResponse, FetchError> {
+                if uri == self.manifest_url {
+                    // Enforce: index media type must be present in Accept
+                    if !accept
+                        .unwrap_or("")
+                        .contains("application/vnd.oci.image.index.v1+json")
+                    {
+                        return Err(http_status_error(404, uri));
+                    }
+                }
+                self.inner.get(uri, auth, accept)
+            }
+        }
+
+        let manifest_url =
+            format!("https://ghcr.io/v2/botworkz/svc/manifests/sha256:{index_hex}");
+
+        let (inner, calls) = MockTransport::with_outcomes(vec![
+            MockOutcome::Body {
+                body: index_bytes,
+                content_length: None,
+            },
+            MockOutcome::Body {
+                body: child_manifest_bytes,
+                content_length: None,
+            },
+            MockOutcome::Body {
+                body: config_bytes,
+                content_length: None,
+            },
+            MockOutcome::Body {
+                body: layer_gz,
+                content_length: None,
+            },
+        ]);
+
+        let transport = GhcrLikeTransport {
+            manifest_url,
+            index_bytes: serde_json::to_vec(&serde_json::json!({})).unwrap(),
+            inner,
+        };
+
+        let cache = TempDir::new().unwrap();
+        let result = fetch_asset(FetchParams {
+            name: "my-svc",
+            asset: &asset,
+            out_dir: None,
+            cache_dir: cache.path(),
+            retries: 0,
+            backoff: &Backoff::default(),
+            compute_checksum: true,
+            no_reverify: false,
+            materialize_mode: MaterializeMode::Copy,
+            transport: Some(Box::new(transport)),
+        });
+
+        assert!(
+            result.is_ok(),
+            "fetch failed (MANIFEST_ACCEPT likely missing OCI index media type): {:#}",
+            result.unwrap_err()
+        );
+        assert_eq!(MockTransport::call_count(&calls), 4);
+        assert!(
+            MANIFEST_ACCEPT.contains("application/vnd.oci.image.index.v1+json"),
+            "MANIFEST_ACCEPT must include 'application/vnd.oci.image.index.v1+json' \
+             to avoid GHCR 404 on index-pinned digests"
+        );
+        let _ = config_hex;
+        let _ = layer_gz_hex;
     }
 
     #[test]
