@@ -392,6 +392,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "botspawn"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "tempfile",
+]
+
+[[package]]
 name = "bstr"
 version = "1.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -30,6 +30,7 @@ on:
     - Cargo.lock
     - shasset/**
     - botforge/**
+    - botspawn/**
     - viscous/**
     - botforge-plugin-host/**
     - botforge-plugins/**
@@ -47,6 +48,7 @@ on:
     - Cargo.lock
     - shasset/**
     - botforge/**
+    - botspawn/**
     - viscous/**
     - botforge-plugin-host/**
     - botforge-plugins/**
@@ -69,6 +71,7 @@ jobs:
         crate:
         - shasset
         - botforge
+        - botspawn
         - viscous
     uses: ./.github/workflows/_crate.yml
     with:
