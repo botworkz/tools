@@ -1164,8 +1164,7 @@ fn docker_acceptance_null_entries_parse_as_defaults_via_ffi() {
         .expect("get_assert('docker') must return a handle");
 
     // All three map values are JSON null — must be treated as empty struct defaults.
-    let config_json =
-        r#"{"images":{"alpine:3":null},"networks":{"botwork-internal":null},"containers":{"web":null}}"#;
+    let config_json = r#"{"images":{"alpine:3":null},"networks":{"botwork-internal":null},"containers":{"web":null}}"#;
 
     let script = handle
         .build_probe(config_json)
@@ -1223,7 +1222,9 @@ fn docker_acceptance_malformed_config_surfaces_serde_message() {
             // a raw code.  We check for common serde_json error indicators.
             let msg_lower = message.to_lowercase();
             assert!(
-                msg_lower.contains("unknown") || msg_lower.contains("field") || msg_lower.contains("expected"),
+                msg_lower.contains("unknown")
+                    || msg_lower.contains("field")
+                    || msg_lower.contains("expected"),
                 "error message should contain serde diagnostic text \
                  (e.g. 'unknown field'), got: {message:?}"
             );
