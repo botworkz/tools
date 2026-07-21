@@ -9,6 +9,7 @@ use crate::qemu::{
     create_overlay_image, qemu_run_args, require_kvm, spawn_qemu_attached, spawn_qemu_with_log,
 };
 use crate::resolver::{AssetKind, Reference, ResolveFileContext, ResolveSpec};
+use crate::signal;
 use crate::ssh::{SshOptions, TemporarySshKeypair};
 use crate::util::{create_temp_dir, ensure_command, resolve_under_root};
 use crate::workspace::{
@@ -21,6 +22,23 @@ use crate::config::{
 use crate::plan::{
     cleanup_test, collect_test_diagnostics, init_force_color, print_log_tail, run_test_flow,
 };
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TestCompletion {
+    Passed,
+    Failed,
+    Interrupted,
+}
+
+fn classify_test_completion(run_result_ok: bool, interrupted: bool) -> TestCompletion {
+    if interrupted {
+        TestCompletion::Interrupted
+    } else if run_result_ok {
+        TestCompletion::Passed
+    } else {
+        TestCompletion::Failed
+    }
+}
 
 #[derive(Args, Debug)]
 #[command(group(ArgGroup::new("target").required(true).args(["name", "test_config"])))]
@@ -231,6 +249,11 @@ pub(crate) fn cmd_test(args: TestArgs) -> Result<()> {
     } else {
         (Some(spawn_qemu_with_log(&qemu_args, &vm_log)?), None)
     };
+    let _interrupt_guard = if args.attach {
+        None
+    } else {
+        Some(signal::arm_interrupts()?)
+    };
     // Capture the installer username before it is moved into ssh_options.
     // This is only meaningful when botforge owns the installer (_kept_keypair is Some).
     let installer_username: Option<String> = if _kept_keypair.is_some() {
@@ -266,21 +289,32 @@ pub(crate) fn cmd_test(args: TestArgs) -> Result<()> {
         installer_username.as_deref(),
         &plugin_registry,
     );
-    if let Err(err) = test_result {
-        eprintln!("test failed: {err:#}");
-        collect_test_diagnostics(&ssh_options, &test_config.diagnostics_units);
-        print_log_tail(&vm_log, 200);
-        if !args.keep_running {
-            cleanup_test(&mut vm_child, &overlay_image);
+    match classify_test_completion(test_result.is_ok(), signal::is_interrupted()) {
+        TestCompletion::Interrupted => {
+            eprintln!("interrupted — shutting down VM…");
+            if !args.keep_running {
+                cleanup_test(&mut vm_child, &overlay_image);
+            }
+            Err(anyhow::anyhow!("test interrupted"))
         }
-        return Err(err);
+        TestCompletion::Failed => {
+            let err = test_result.expect_err("classified failed must have error");
+            eprintln!("test failed: {err:#}");
+            collect_test_diagnostics(&ssh_options, &test_config.diagnostics_units);
+            print_log_tail(&vm_log, 200);
+            if !args.keep_running {
+                cleanup_test(&mut vm_child, &overlay_image);
+            }
+            Err(err)
+        }
+        TestCompletion::Passed => {
+            if !args.keep_running {
+                cleanup_test(&mut vm_child, &overlay_image);
+            }
+            println!("test passed");
+            Ok(())
+        }
     }
-
-    if !args.keep_running {
-        cleanup_test(&mut vm_child, &overlay_image);
-    }
-    println!("test passed");
-    Ok(())
 }
 
 fn resolve_test_base_image(
@@ -334,13 +368,31 @@ fn resolve_test_iso_path(context: &Path, manifest: &Manifest, path: &Path) -> Re
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_test_base_image, resolve_test_iso_path};
+    use super::{
+        classify_test_completion, resolve_test_base_image, resolve_test_iso_path, TestCompletion,
+    };
     use crate::cli::{Cli, Commands};
     use crate::resolver::Reference;
     use clap::Parser;
     use shasset::manifest::Manifest;
     use std::path::PathBuf;
     use tempfile::TempDir;
+
+    #[test]
+    fn classify_completion_prefers_interrupt_over_success() {
+        assert_eq!(
+            classify_test_completion(true, true),
+            TestCompletion::Interrupted
+        );
+    }
+
+    #[test]
+    fn classify_completion_prefers_interrupt_over_failure() {
+        assert_eq!(
+            classify_test_completion(false, true),
+            TestCompletion::Interrupted
+        );
+    }
 
     #[test]
     fn test_test_cli_no_context_parses_ok() {
