@@ -1,0 +1,22 @@
+[package]
+name = "botspawn"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+
+[[bin]]
+name = "botspawn"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+bollard = "0.19"
+futures-util = "0.3"
+nix = { version = "0.31", default-features = false, features = ["user"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true
