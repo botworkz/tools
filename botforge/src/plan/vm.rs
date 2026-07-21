@@ -1525,7 +1525,7 @@ pub(crate) fn shutdown_build_vm(
         }
         *vm_child = None;
         preserve_failed_build_disk(partial, failed_partial)?;
-        crate::plan::print_phase_status("vm", "Stopping vm", false);
+        crate::plan::print_phase_status("vm", "Stopping vm", false, None);
         anyhow::bail!(
             "build interrupted; tainted partial disk left at {} for post-mortem",
             failed_partial.display()
@@ -1597,7 +1597,7 @@ pub(crate) fn shutdown_build_vm(
         Err(overall_timeout_error(overall_timeout))
     } else if interrupted {
         preserve_failed_build_disk(partial, failed_partial)?;
-        crate::plan::print_phase_status("vm", "Stopping vm", false);
+        crate::plan::print_phase_status("vm", "Stopping vm", false, None);
         anyhow::bail!(
             "build interrupted; tainted partial disk left at {} for post-mortem",
             failed_partial.display()
