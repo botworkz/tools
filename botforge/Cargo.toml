@@ -18,6 +18,7 @@ gix = { version = "0.70", default-features = false, features = ["index"] }
 glob = "0.3"
 globset = "0.4"
 hadris-iso = { version = "1.2.1", features = ["joliet", "read"] }
+nix = { version = "0.31", default-features = false, features = ["term"] }
 rayon = "1"
 walkdir = "2"
 russh = { version = "0.62.2", default-features = false, features = ["ring", "flate2"] }
