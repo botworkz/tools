@@ -3,6 +3,7 @@ pub(super) mod log;
 pub(crate) mod vm;
 
 pub(crate) use log::init_force_color;
+pub(crate) use log::print_final_outcome;
 pub(crate) use log::print_phase;
 pub(crate) use log::print_phase_status;
 pub(crate) use vm::{

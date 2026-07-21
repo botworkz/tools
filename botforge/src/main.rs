@@ -14,28 +14,33 @@ mod step;
 mod util;
 mod workspace;
 
-use anyhow::Result;
 use clap::Parser;
 
 use crate::cli::{Cli, Commands};
 
 fn main() {
-    if let Err(e) = run() {
+    let (result, final_outcome_command) = run();
+    if let Err(e) = &result {
         eprintln!("error: {e:#}");
+    }
+    if let Some(command) = final_outcome_command {
+        crate::plan::print_final_outcome(command, result.is_ok());
+    }
+    if result.is_err() {
         std::process::exit(1);
     }
 }
 
-fn run() -> Result<()> {
+fn run() -> (anyhow::Result<()>, Option<&'static str>) {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Build(args) => commands::build::cmd_build(args),
-        Commands::Config { context, sub } => commands::config::cmd_config(context, sub),
-        Commands::Deps(args) => commands::deps::cmd_deps(args),
-        Commands::Iso(args) => commands::iso::cmd_iso(args),
-        Commands::Payload(args) => commands::payload::cmd_payload(args),
-        Commands::Publish(args) => commands::publish::cmd_publish(args),
-        Commands::Run(args) => commands::run::cmd_run(args),
-        Commands::Test(args) => commands::test::cmd_test(args),
+        Commands::Build(args) => (commands::build::cmd_build(args), Some("build")),
+        Commands::Config { context, sub } => (commands::config::cmd_config(context, sub), None),
+        Commands::Deps(args) => (commands::deps::cmd_deps(args), None),
+        Commands::Iso(args) => (commands::iso::cmd_iso(args), None),
+        Commands::Payload(args) => (commands::payload::cmd_payload(args), None),
+        Commands::Publish(args) => (commands::publish::cmd_publish(args), None),
+        Commands::Run(args) => (commands::run::cmd_run(args), None),
+        Commands::Test(args) => (commands::test::cmd_test(args), Some("test")),
     }
 }

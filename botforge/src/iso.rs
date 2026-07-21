@@ -195,7 +195,7 @@ pub(crate) fn prepare_seed_image(seed_dir: &Path, seed_iso: &Path, user_data: &s
     build_iso(seed_dir, seed_iso, "cidata")?;
     std::fs::remove_dir_all(seed_dir)
         .with_context(|| format!("cannot remove temp seed dir: {}", seed_dir.display()))?;
-    crate::plan::print_phase_status("setup", "Preparing environment (seed image)", true);
+    crate::plan::print_phase_status("setup", "Preparing environment (seed image)", true, None);
     Ok(())
 }
 
