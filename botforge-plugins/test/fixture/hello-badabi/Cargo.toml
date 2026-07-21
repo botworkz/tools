@@ -1,5 +1,5 @@
 [package]
-name = "botforge-plugin-hello-badabi"
+name = "botforge-hello-badabi-plugin"
 version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
@@ -13,7 +13,7 @@ name = "hello_badabi"
 crate-type = ["cdylib"]
 
 [dependencies]
-botforge-plugin-host = { path = "../botforge-plugin-host" }
+botforge-plugin-host = { path = "../../../../botforge-plugin-host" }
 
 [lints]
 workspace = true

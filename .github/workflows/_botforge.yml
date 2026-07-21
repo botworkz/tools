@@ -53,11 +53,11 @@ jobs:
     # against the real compiled .so files.
     - name: Build plugin cdylibs (.so)
       run: |
-        cargo build -p botforge-plugin-hello
-        cargo build -p botforge-plugin-hello-badabi
-        cargo build -p botforge-plugin-pigz
-        cargo build -p botforge-plugin-github
-        cargo build -p botforge-plugin-docker
+        cargo build -p botforge-hello-plugin
+        cargo build -p botforge-hello-badabi-plugin
+        cargo build -p botforge-pigz-plugin
+        cargo build -p botforge-github-plugin
+        cargo build -p botforge-docker-plugin
     - name: Run plugin-host acceptance tests
       run: cargo test -p botforge-plugin-host
 

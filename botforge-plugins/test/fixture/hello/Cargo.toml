@@ -1,5 +1,5 @@
 [package]
-name = "botforge-plugin-hello"
+name = "botforge-hello-plugin"
 version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
@@ -17,7 +17,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 # Reference the host's ABI version constant so the fixture can never drift.
-botforge-plugin-host = { path = "../botforge-plugin-host" }
+botforge-plugin-host = { path = "../../../../botforge-plugin-host" }
 
 [features]
 default = []

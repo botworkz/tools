@@ -80,7 +80,7 @@ jobs:
           ci-tools:local \
           cargo build -p "$CRATE" --release --locked
 
-    - name: Build botforge-plugin-pigz and stage for container
+    - name: Build botforge-pigz-plugin and stage for container
       if: env.CRATE == 'botforge'
       run: |
         set -euo pipefail
@@ -93,13 +93,13 @@ jobs:
           -w /workspace \
           -e CARGO_HOME=/cargo \
           ci-tools:local \
-          cargo build -p botforge-plugin-pigz --release --locked
+          cargo build -p botforge-pigz-plugin --release --locked
         # Stage into .ci-plugins/ so the Dockerfile COPY finds it.
         mkdir -p .ci-plugins
         cp target/release/libpigz.so .ci-plugins/libpigz.so
         echo "Staged $(du -sh .ci-plugins/libpigz.so | cut -f1) libpigz.so"
 
-    - name: Build botforge-plugin-github and stage for container
+    - name: Build botforge-github-plugin and stage for container
       if: env.CRATE == 'botforge'
       run: |
         set -euo pipefail
@@ -112,13 +112,13 @@ jobs:
           -w /workspace \
           -e CARGO_HOME=/cargo \
           ci-tools:local \
-          cargo build -p botforge-plugin-github --release --locked
+          cargo build -p botforge-github-plugin --release --locked
         # Stage into .ci-plugins/ so the Dockerfile COPY finds it.
         mkdir -p .ci-plugins
         cp target/release/libgithub.so .ci-plugins/libgithub.so
         echo "Staged $(du -sh .ci-plugins/libgithub.so | cut -f1) libgithub.so"
 
-    - name: Build botforge-plugin-docker and stage for container
+    - name: Build botforge-docker-plugin and stage for container
       if: env.CRATE == 'botforge'
       run: |
         set -euo pipefail
@@ -131,7 +131,7 @@ jobs:
           -w /workspace \
           -e CARGO_HOME=/cargo \
           ci-tools:local \
-          cargo build -p botforge-plugin-docker --release --locked
+          cargo build -p botforge-docker-plugin --release --locked
         # Stage into .ci-plugins/ so the Dockerfile COPY finds it.
         mkdir -p .ci-plugins
         cp target/release/libdocker.so .ci-plugins/libdocker.so
