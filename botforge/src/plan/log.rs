@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::Duration;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
@@ -157,20 +158,23 @@ fn step_status_marker(
     success: bool,
     id: Option<&str>,
     color: bool,
+    duration: Option<Duration>,
 ) -> String {
     let counter = match id {
         Some(id) => format!("{step_idx}/{id}"),
         None => format!("{step_idx}"),
     };
+    let duration_suffix = completion_duration_suffix(duration);
+    let description = format!("{name}{duration_suffix}");
     if color {
         if success {
-            format!(" \x1b[32m✓\x1b[0m \x1b[2m({counter})\x1b[0m \x1b[2m{name}\x1b[0m")
+            format!(" \x1b[32m✓\x1b[0m \x1b[2m({counter})\x1b[0m \x1b[2m{description}\x1b[0m")
         } else {
-            format!(" \x1b[31m✗\x1b[0m \x1b[2m({counter})\x1b[0m {name}")
+            format!(" \x1b[31m✗\x1b[0m \x1b[2m({counter})\x1b[0m {description}")
         }
     } else {
         let tick = if success { '✓' } else { '✗' };
-        format!(" {tick} ({counter}) {name}")
+        format!(" {tick} ({counter}) {description}")
     }
 }
 
@@ -201,16 +205,24 @@ pub(crate) fn print_phase(label: &str, description: &str) {
     );
 }
 
-fn phase_status_marker(label: &str, description: &str, success: bool, color: bool) -> String {
+fn phase_status_marker_with_duration(
+    label: &str,
+    description: &str,
+    success: bool,
+    color: bool,
+    duration: Option<Duration>,
+) -> String {
+    let duration_suffix = completion_duration_suffix(duration);
+    let full_description = format!("{description}{duration_suffix}");
     if color {
         if success {
-            format!(" \x1b[32m✓\x1b[0m \x1b[2m({label})\x1b[0m \x1b[2m{description}\x1b[0m")
+            format!(" \x1b[32m✓\x1b[0m \x1b[2m({label})\x1b[0m \x1b[2m{full_description}\x1b[0m")
         } else {
-            format!(" \x1b[31m✗\x1b[0m \x1b[2m({label})\x1b[0m {description}")
+            format!(" \x1b[31m✗\x1b[0m \x1b[2m({label})\x1b[0m {full_description}")
         }
     } else {
         let tick = if success { '✓' } else { '✗' };
-        format!(" {tick} ({label}) {description}")
+        format!(" {tick} ({label}) {full_description}")
     }
 }
 
@@ -218,10 +230,21 @@ fn phase_status_marker(label: &str, description: &str, success: bool, color: boo
 /// ` ✗ (<label>) <description>`.
 ///
 /// Mirrors [`print_step_status`] but uses a plain string label instead of a step index.
-pub(crate) fn print_phase_status(label: &str, description: &str, success: bool) {
+pub(crate) fn print_phase_status(
+    label: &str,
+    description: &str,
+    success: bool,
+    duration: Option<Duration>,
+) {
     eprintln!(
         "{}",
-        phase_status_marker(label, description, success, stderr_color_enabled())
+        phase_status_marker_with_duration(
+            label,
+            description,
+            success,
+            stderr_color_enabled(),
+            duration
+        )
     );
 }
 
@@ -230,6 +253,7 @@ pub(super) fn print_step_status(
     step_name: &str,
     step_id: Option<&str>,
     success: bool,
+    duration: Option<Duration>,
 ) {
     eprintln!(
         "{}",
@@ -238,8 +262,47 @@ pub(super) fn print_step_status(
             step_name,
             success,
             step_id,
-            stderr_color_enabled()
+            stderr_color_enabled(),
+            duration
         )
+    );
+}
+
+fn format_completion_duration(duration: Duration) -> String {
+    let total_seconds = duration.as_secs();
+    if total_seconds >= 60 {
+        let minutes = total_seconds / 60;
+        let seconds = total_seconds % 60;
+        format!("{minutes}m {seconds:02}s")
+    } else {
+        format!("{total_seconds}s")
+    }
+}
+
+fn completion_duration_suffix(duration: Option<Duration>) -> String {
+    duration
+        .map(|elapsed| format!(" (completed in {})", format_completion_duration(elapsed)))
+        .unwrap_or_default()
+}
+
+fn final_outcome_line(command: &str, success: bool, color: bool) -> String {
+    let summary = if success {
+        format!("{command} completed")
+    } else {
+        format!("{command} failed")
+    };
+    let emoji = if success { '😎' } else { '😩' };
+    if color && success {
+        format!("{emoji} \x1b[2m{summary}\x1b[0m")
+    } else {
+        format!("{emoji} {summary}")
+    }
+}
+
+pub(crate) fn print_final_outcome(command: &str, success: bool) {
+    eprintln!(
+        "{}",
+        final_outcome_line(command, success, stderr_color_enabled())
     );
 }
 
@@ -390,8 +453,8 @@ pub(super) fn join_output_forwarders(handles: Vec<JoinHandle<Result<()>>>) -> Re
 #[cfg(test)]
 mod tests {
     use super::{
-        phase_status_marker, phase_title_line, step_log_path, step_skipped_marker,
-        step_status_marker, step_title_line,
+        final_outcome_line, format_completion_duration, phase_status_marker_with_duration,
+        phase_title_line, step_log_path, step_skipped_marker, step_status_marker, step_title_line,
     };
     use crate::util::write_all_resilient;
     use std::path::PathBuf;
@@ -411,14 +474,14 @@ mod tests {
     #[test]
     fn test_step_status_marker_formats_result() {
         assert_eq!(
-            step_status_marker(4, "mcp-smoke", false, None, false),
+            step_status_marker(4, "mcp-smoke", false, None, false, None),
             " ✗ (4) mcp-smoke"
         );
         assert_eq!(
-            step_status_marker(4, "mcp-smoke", true, None, false),
+            step_status_marker(4, "mcp-smoke", true, None, false, None),
             " ✓ (4) mcp-smoke"
         );
-        let success_color = step_status_marker(4, "mcp-smoke", true, None, true);
+        let success_color = step_status_marker(4, "mcp-smoke", true, None, true, None);
         assert!(
             success_color.starts_with(' '),
             "success color marker should start with a space: {success_color:?}"
@@ -443,7 +506,7 @@ mod tests {
             success_color.contains("\x1b[0m"),
             "success color should reset: {success_color:?}"
         );
-        let failure_color = step_status_marker(4, "mcp-smoke", false, None, true);
+        let failure_color = step_status_marker(4, "mcp-smoke", false, None, true, None);
         assert!(
             failure_color.starts_with(' '),
             "failure color marker should start with a space: {failure_color:?}"
@@ -469,14 +532,14 @@ mod tests {
     #[test]
     fn test_step_status_marker_with_id() {
         assert_eq!(
-            step_status_marker(4, "mcp-smoke", true, Some("build"), false),
+            step_status_marker(4, "mcp-smoke", true, Some("build"), false, None),
             " ✓ (4/build) mcp-smoke"
         );
         assert_eq!(
-            step_status_marker(4, "mcp-smoke", false, Some("build"), false),
+            step_status_marker(4, "mcp-smoke", false, Some("build"), false, None),
             " ✗ (4/build) mcp-smoke"
         );
-        let success_color = step_status_marker(4, "mcp-smoke", true, Some("build"), true);
+        let success_color = step_status_marker(4, "mcp-smoke", true, Some("build"), true, None);
         assert!(
             success_color.contains("\x1b[2m(4/build)\x1b[0m"),
             "success color with id should dim counter: {success_color:?}"
@@ -493,7 +556,7 @@ mod tests {
             success_color.contains("\x1b[0m"),
             "success color with id should contain reset: {success_color:?}"
         );
-        let failure_color = step_status_marker(4, "mcp-smoke", false, Some("build"), true);
+        let failure_color = step_status_marker(4, "mcp-smoke", false, Some("build"), true, None);
         assert!(
             failure_color.contains("\x1b[2m(4/build)\x1b[0m"),
             "failure color with id should dim counter: {failure_color:?}"
@@ -678,11 +741,12 @@ mod tests {
     #[test]
     fn test_phase_status_marker_no_color_success() {
         assert_eq!(
-            phase_status_marker(
+            phase_status_marker_with_duration(
                 "setup",
                 "Preparing build environment (seed image)",
                 true,
-                false
+                false,
+                None
             ),
             " ✓ (setup) Preparing build environment (seed image)"
         );
@@ -691,11 +755,12 @@ mod tests {
     #[test]
     fn test_phase_status_marker_no_color_failure() {
         assert_eq!(
-            phase_status_marker(
+            phase_status_marker_with_duration(
                 "setup",
                 "Preparing build environment (seed image)",
                 false,
-                false
+                false,
+                None
             ),
             " ✗ (setup) Preparing build environment (seed image)"
         );
@@ -703,7 +768,7 @@ mod tests {
 
     #[test]
     fn test_phase_status_marker_color_success() {
-        let s = phase_status_marker("vm", "Stopping vm", true, true);
+        let s = phase_status_marker_with_duration("vm", "Stopping vm", true, true, None);
         assert!(s.starts_with(' '), "should start with space: {s:?}");
         assert!(s.contains("\x1b[32m"), "should contain green: {s:?}");
         assert!(s.contains('✓'), "should contain tick: {s:?}");
@@ -717,7 +782,7 @@ mod tests {
 
     #[test]
     fn test_phase_status_marker_color_failure() {
-        let s = phase_status_marker("vm", "Stopping vm", false, true);
+        let s = phase_status_marker_with_duration("vm", "Stopping vm", false, true, None);
         assert!(s.starts_with(' '), "should start with space: {s:?}");
         assert!(s.contains("\x1b[31m"), "should contain red: {s:?}");
         assert!(s.contains('✗'), "should contain cross: {s:?}");
@@ -725,6 +790,71 @@ mod tests {
         assert!(
             !s.contains("\x1b[2mStopping vm\x1b[0m"),
             "failure should NOT dim name: {s:?}"
+        );
+    }
+
+    #[test]
+    fn test_format_completion_duration() {
+        assert_eq!(format_completion_duration(Duration::from_millis(250)), "0s");
+        assert_eq!(format_completion_duration(Duration::from_secs(9)), "9s");
+        assert_eq!(
+            format_completion_duration(Duration::from_secs(60)),
+            "1m 00s"
+        );
+        assert_eq!(
+            format_completion_duration(Duration::from_secs(125)),
+            "2m 05s"
+        );
+    }
+
+    #[test]
+    fn test_step_status_marker_duration_suffix_only_when_present() {
+        assert_eq!(
+            step_status_marker(7, "warmup", true, None, false, None),
+            " ✓ (7) warmup"
+        );
+        assert_eq!(
+            step_status_marker(
+                7,
+                "warmup",
+                true,
+                None,
+                false,
+                Some(Duration::from_secs(125))
+            ),
+            " ✓ (7) warmup (completed in 2m 05s)"
+        );
+    }
+
+    #[test]
+    fn test_phase_status_marker_duration_suffix_only_when_present() {
+        assert_eq!(
+            phase_status_marker_with_duration("vm", "Waiting for SSH", true, false, None),
+            " ✓ (vm) Waiting for SSH"
+        );
+        assert_eq!(
+            phase_status_marker_with_duration(
+                "vm",
+                "Waiting for SSH",
+                true,
+                false,
+                Some(Duration::from_secs(13))
+            ),
+            " ✓ (vm) Waiting for SSH (completed in 13s)"
+        );
+    }
+
+    #[test]
+    fn test_final_outcome_line() {
+        assert_eq!(
+            final_outcome_line("build", true, false),
+            "😎 build completed"
+        );
+        assert_eq!(final_outcome_line("test", false, false), "😩 test failed");
+        let colored_success = final_outcome_line("build", true, true);
+        assert!(
+            colored_success.contains("\x1b[2mbuild completed\x1b[0m"),
+            "success outcome should dim summary in color mode: {colored_success:?}"
         );
     }
 

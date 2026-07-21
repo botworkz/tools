@@ -443,7 +443,7 @@ fn evaluate_probe_results(files: &BTreeMap<String, AssertFile>, probe_output: &s
         let raw_line = lines.next().unwrap_or("absent");
         let failures = check_one_path(path, expectation, raw_line);
         let ok = failures.is_empty();
-        print_phase_status("assert", path, ok);
+        print_phase_status("assert", path, ok, None);
         if !ok {
             for msg in &failures {
                 eprintln!("         {msg}");
@@ -675,7 +675,7 @@ pub(crate) fn run_assert_users(
         let raw_line = lines.next().unwrap_or("absent");
         let failures = check_one_user(name, expectation, raw_line, None);
         let ok = failures.is_empty();
-        print_phase_status("assert", &format!("user {name}"), ok);
+        print_phase_status("assert", &format!("user {name}"), ok, None);
         if !ok {
             for msg in &failures {
                 eprintln!("         {msg}");
@@ -688,7 +688,7 @@ pub(crate) fn run_assert_users(
             let groups_line = lines.next().unwrap_or("");
             let group_failures = check_user_groups(name, expectation, groups_line);
             if !group_failures.is_empty() {
-                print_phase_status("assert", &format!("user {name} groups"), false);
+                print_phase_status("assert", &format!("user {name} groups"), false, None);
                 for msg in &group_failures {
                     eprintln!("         {msg}");
                 }
@@ -697,7 +697,7 @@ pub(crate) fn run_assert_users(
                 // Only print a pass line if the existence check also passed.
                 let existence_ok = failures.is_empty();
                 if existence_ok {
-                    print_phase_status("assert", &format!("user {name} groups"), true);
+                    print_phase_status("assert", &format!("user {name} groups"), true, None);
                 }
             }
         }
@@ -730,7 +730,7 @@ pub(crate) fn run_assert_users(
                         ),
                         None => format!(r#"no user matching "{pattern}""#),
                     };
-                    print_phase_status("assert", &format!("users: {label}"), true);
+                    print_phase_status("assert", &format!("users: {label}"), true, None);
                 } else {
                     for found in matched {
                         let label = match installer_username {
@@ -742,7 +742,7 @@ pub(crate) fn run_assert_users(
                             ),
                         };
                         eprintln!("         {label}");
-                        print_phase_status("assert", &format!("users: {label}"), false);
+                        print_phase_status("assert", &format!("users: {label}"), false, None);
                         any_failed = true;
                     }
                 }
@@ -756,13 +756,14 @@ pub(crate) fn run_assert_users(
                 if matched.is_empty() {
                     let label = format!(r#"expected a user matching "{pattern}", but none found"#);
                     eprintln!("         {label}");
-                    print_phase_status("assert", &format!("users: {label}"), false);
+                    print_phase_status("assert", &format!("users: {label}"), false, None);
                     any_failed = true;
                 } else {
                     print_phase_status(
                         "assert",
                         &format!(r#"users: at least one user matching "{pattern}""#),
                         true,
+                        None,
                     );
                 }
             }
@@ -912,7 +913,7 @@ pub(crate) fn run_assert_groups(
         } else {
             format!("group {name}: expected absent, but present")
         };
-        print_phase_status("assert", &format!("group {name}"), ok);
+        print_phase_status("assert", &format!("group {name}"), ok, None);
         if !ok {
             eprintln!("         {description}");
             any_failed = true;
@@ -945,7 +946,7 @@ pub(crate) fn run_assert_groups(
                         ),
                         None => format!(r#"no group matching "{pattern}""#),
                     };
-                    print_phase_status("assert", &format!("groups: {label}"), true);
+                    print_phase_status("assert", &format!("groups: {label}"), true, None);
                 } else {
                     for found in matched {
                         let label = match installer_username {
@@ -957,7 +958,7 @@ pub(crate) fn run_assert_groups(
                             ),
                         };
                         eprintln!("         {label}");
-                        print_phase_status("assert", &format!("groups: {label}"), false);
+                        print_phase_status("assert", &format!("groups: {label}"), false, None);
                         any_failed = true;
                     }
                 }
@@ -972,13 +973,14 @@ pub(crate) fn run_assert_groups(
                 if matched.is_empty() {
                     let label = format!(r#"expected a group matching "{pattern}", but none found"#);
                     eprintln!("         {label}");
-                    print_phase_status("assert", &format!("groups: {label}"), false);
+                    print_phase_status("assert", &format!("groups: {label}"), false, None);
                     any_failed = true;
                 } else {
                     print_phase_status(
                         "assert",
                         &format!(r#"groups: at least one group matching "{pattern}""#),
                         true,
+                        None,
                     );
                 }
             }
@@ -1100,7 +1102,7 @@ pub(crate) fn run_assert_packages(ssh: &SshOptions, assert_block: &AssertBlock) 
         let raw_line = lines.next().unwrap_or("absent");
         let is_installed = raw_line == "present";
         let ok = is_installed == expectation.installed;
-        print_phase_status("assert", &format!("package {name}"), ok);
+        print_phase_status("assert", &format!("package {name}"), ok, None);
         if !ok {
             let msg = if expectation.installed {
                 format!("package {name}: expected installed, but not installed")
@@ -1133,6 +1135,7 @@ pub(crate) fn run_assert_packages(ssh: &SshOptions, assert_block: &AssertBlock) 
                         "assert",
                         &format!(r#"packages: expected no installed package matching "{pattern}""#),
                         true,
+                        None,
                     );
                 } else {
                     for found in matched {
@@ -1140,7 +1143,7 @@ pub(crate) fn run_assert_packages(ssh: &SshOptions, assert_block: &AssertBlock) 
                             r#"packages: expected no installed package matching "{pattern}", but found "{found}""#
                         );
                         eprintln!("         {label}");
-                        print_phase_status("assert", &label, false);
+                        print_phase_status("assert", &label, false, None);
                         any_failed = true;
                     }
                 }
@@ -1156,13 +1159,14 @@ pub(crate) fn run_assert_packages(ssh: &SshOptions, assert_block: &AssertBlock) 
                         r#"packages: expected ≥1 installed matching "{pattern}", found none"#
                     );
                     eprintln!("         {label}");
-                    print_phase_status("assert", &label, false);
+                    print_phase_status("assert", &label, false, None);
                     any_failed = true;
                 } else {
                     print_phase_status(
                         "assert",
                         &format!(r#"packages: at least one installed matching "{pattern}""#),
                         true,
+                        None,
                     );
                 }
             }
@@ -1259,12 +1263,13 @@ pub(crate) fn run_assert_services(ssh: &SshOptions, assert_block: &AssertBlock) 
             "assert",
             &format!("service {name} exists"),
             result.exists_ok,
+            None,
         );
         if let Some(ok) = result.enabled_ok {
-            print_phase_status("assert", &format!("service {name} enabled"), ok);
+            print_phase_status("assert", &format!("service {name} enabled"), ok, None);
         }
         if let Some(ok) = result.active_ok {
-            print_phase_status("assert", &format!("service {name} active"), ok);
+            print_phase_status("assert", &format!("service {name} active"), ok, None);
         }
         if !result.failures.is_empty() {
             for msg in &result.failures {
@@ -1287,7 +1292,7 @@ pub(crate) fn run_assert_services(ssh: &SshOptions, assert_block: &AssertBlock) 
             }
             let env_failures = check_service_environment(name, env_expect, env_output);
             for (label, ok, msg) in &env_failures {
-                print_phase_status("assert", label, *ok);
+                print_phase_status("assert", label, *ok, None);
                 if !ok {
                     if let Some(m) = msg {
                         eprintln!("         {m}");
