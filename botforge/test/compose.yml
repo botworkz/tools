@@ -7,6 +7,7 @@ x-botforge-base: &botforge-base
   environment:
     HOME: /tmp
     XDG_CACHE_HOME: /tmp/.cache
+    SHASSET_CACHE: ${SHASSET_CACHE:-}
     HOST_UID: ${HOST_UID}
     HOST_GID: ${HOST_GID}
     HOST_KVM_GID: ${HOST_KVM_GID}
