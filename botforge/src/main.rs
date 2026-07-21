@@ -8,6 +8,7 @@ mod iso;
 mod plan;
 mod qemu;
 mod resolver;
+mod signal;
 mod ssh;
 mod step;
 mod util;

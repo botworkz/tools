@@ -8,12 +8,13 @@ use serde_yaml::Value;
 use shasset::fetch::{fetch_asset, FetchParams, MaterializeMode};
 use shasset::manifest::Manifest;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 use crate::iso::{generate_installer_username, prepare_seed_image, render_user_data};
 use crate::qemu::{qemu_build_args, require_kvm, spawn_qemu_attached, spawn_qemu_with_log};
 use crate::resolver::{AssetKind, ResolveFileContext, ResolveSpec, ARTIFACT_DIR};
+use crate::signal;
 use crate::ssh::{scp_with_retry, ssh_with_retry, SshOptions, TemporarySshKeypair};
 use crate::util::{
     botforge_debug_enabled, create_temp_dir, default_cache_dir, ensure_command, format_bytes_human,
@@ -334,6 +335,11 @@ pub(crate) fn cmd_build(args: BuildArgs) -> Result<()> {
     } else {
         (Some(spawn_qemu_with_log(&qemu_args, &vm_log)?), None)
     };
+    let _interrupt_guard = if args.attach {
+        None
+    } else {
+        Some(signal::arm_interrupts()?)
+    };
     let ssh_options = SshOptions {
         host: args.ssh_host.clone(),
         port: args.ssh_port,
@@ -375,15 +381,20 @@ pub(crate) fn cmd_build(args: BuildArgs) -> Result<()> {
     let overall_deadline = match step_result {
         Ok(overall_deadline) => overall_deadline,
         Err(err) => {
+            if signal::is_interrupted() {
+                return Err(handle_build_interrupt(
+                    &mut vm_child,
+                    &partial,
+                    &failed_partial,
+                )?);
+            }
             eprintln!("build steps failed: {err:#}");
             print_log_tail(&vm_log, 200);
             // Kill the VM. On step failure the partial is tainted — preserve it at
             // <output>.partial.failed for post-mortem instead of the stale .partial path.
-            if let Some(child) = vm_child.as_mut() {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-            if let Err(preserve_err) = preserve_failed_build_disk(&partial, &failed_partial) {
+            if let Err(preserve_err) =
+                preserve_tainted_partial(&mut vm_child, &partial, &failed_partial)
+            {
                 return Err(err.context(format!(
                     "additionally failed to preserve tainted partial at {}: {preserve_err:#}",
                     failed_partial.display()
@@ -404,6 +415,13 @@ pub(crate) fn cmd_build(args: BuildArgs) -> Result<()> {
     // SSH. If botforge owns the installer account, that means reclaim must
     // happen before the detached teardown service is queued.
     // ---------------------------------------------------------------------------
+    if signal::is_interrupted() {
+        return Err(handle_build_interrupt(
+            &mut vm_child,
+            &partial,
+            &failed_partial,
+        )?);
+    }
     let compress_phase_runs = !matches!(reclaim_mode, ReclaimMode::None)
         || build_config.compress.as_ref().is_some_and(|c| c.enabled);
     if compress_phase_runs {
@@ -413,14 +431,26 @@ pub(crate) fn cmd_build(args: BuildArgs) -> Result<()> {
         );
     }
     if matches!(reclaim_mode, ReclaimMode::Fstrim) {
+        if signal::is_interrupted() {
+            return Err(handle_build_interrupt(
+                &mut vm_child,
+                &partial,
+                &failed_partial,
+            )?);
+        }
         if let Err(err) = run_guest_reclaim_fstrim(&ssh_options, overall_deadline) {
+            if signal::is_interrupted() {
+                return Err(handle_build_interrupt(
+                    &mut vm_child,
+                    &partial,
+                    &failed_partial,
+                )?);
+            }
             eprintln!("guest reclaim fstrim failed: {err:#}");
             print_log_tail(&vm_log, 200);
-            if let Some(child) = vm_child.as_mut() {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-            if let Err(preserve_err) = preserve_failed_build_disk(&partial, &failed_partial) {
+            if let Err(preserve_err) =
+                preserve_tainted_partial(&mut vm_child, &partial, &failed_partial)
+            {
                 return Err(err.context(format!(
                     "additionally failed to preserve tainted partial at {}: {preserve_err:#}",
                     failed_partial.display()
@@ -434,14 +464,26 @@ pub(crate) fn cmd_build(args: BuildArgs) -> Result<()> {
         }
     }
 
+    if signal::is_interrupted() {
+        return Err(handle_build_interrupt(
+            &mut vm_child,
+            &partial,
+            &failed_partial,
+        )?);
+    }
     if let Err(err) = run_guest_cloud_init_clean(&ssh_options, overall_deadline) {
+        if signal::is_interrupted() {
+            return Err(handle_build_interrupt(
+                &mut vm_child,
+                &partial,
+                &failed_partial,
+            )?);
+        }
         eprintln!("guest cloud-init clean failed: {err:#}");
         print_log_tail(&vm_log, 200);
-        if let Some(child) = vm_child.as_mut() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        if let Err(preserve_err) = preserve_failed_build_disk(&partial, &failed_partial) {
+        if let Err(preserve_err) =
+            preserve_tainted_partial(&mut vm_child, &partial, &failed_partial)
+        {
             return Err(err.context(format!(
                 "additionally failed to preserve tainted partial at {}: {preserve_err:#}",
                 failed_partial.display()
@@ -469,16 +511,28 @@ pub(crate) fn cmd_build(args: BuildArgs) -> Result<()> {
     // acceptable.
     // ---------------------------------------------------------------------------
     if botforge_owned {
+        if signal::is_interrupted() {
+            return Err(handle_build_interrupt(
+                &mut vm_child,
+                &partial,
+                &failed_partial,
+            )?);
+        }
         let teardown_result =
             run_installer_teardown(&ssh_options, &installer_user, overall_deadline);
         if let Err(err) = teardown_result {
+            if signal::is_interrupted() {
+                return Err(handle_build_interrupt(
+                    &mut vm_child,
+                    &partial,
+                    &failed_partial,
+                )?);
+            }
             eprintln!("installer teardown failed: {err:#}");
             print_log_tail(&vm_log, 200);
-            if let Some(child) = vm_child.as_mut() {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-            if let Err(preserve_err) = preserve_failed_build_disk(&partial, &failed_partial) {
+            if let Err(preserve_err) =
+                preserve_tainted_partial(&mut vm_child, &partial, &failed_partial)
+            {
                 return Err(err.context(format!(
                     "additionally failed to preserve tainted partial at {}: {preserve_err:#}",
                     failed_partial.display()
@@ -497,6 +551,13 @@ pub(crate) fn cmd_build(args: BuildArgs) -> Result<()> {
     // ---------------------------------------------------------------------------
     // Disk lifecycle step 7 (was 5): graceful shutdown
     // ---------------------------------------------------------------------------
+    if signal::is_interrupted() {
+        return Err(handle_build_interrupt(
+            &mut vm_child,
+            &partial,
+            &failed_partial,
+        )?);
+    }
     let shutdown_result = shutdown_build_vm(
         &mut vm_child,
         &partial,
@@ -507,9 +568,21 @@ pub(crate) fn cmd_build(args: BuildArgs) -> Result<()> {
         std::time::Duration::from_secs(build_config.timeout),
     );
     if let Err(err) = shutdown_result {
+        if signal::is_interrupted() {
+            eprintln!("interrupted — shutting down VM…");
+            return Err(build_interrupt_error(&failed_partial));
+        }
         eprintln!("build VM shutdown failed: {err:#}");
         print_log_tail(&vm_log, 200);
         return Err(err);
+    }
+
+    if signal::is_interrupted() {
+        return Err(handle_build_interrupt(
+            &mut vm_child,
+            &partial,
+            &failed_partial,
+        )?);
     }
 
     if matches!(reclaim_mode, ReclaimMode::Discard) {
@@ -1365,6 +1438,43 @@ fn failed_partial_path(output: &Path) -> PathBuf {
     parent.join(name)
 }
 
+fn kill_vm_child(vm_child: &mut Option<Child>) {
+    if let Some(child) = vm_child.as_mut() {
+        signal::kill_child(child);
+    }
+    *vm_child = None;
+}
+
+fn preserve_tainted_partial(
+    vm_child: &mut Option<Child>,
+    partial: &Path,
+    failed_partial: &Path,
+) -> Result<()> {
+    kill_vm_child(vm_child);
+    preserve_failed_build_disk(partial, failed_partial)
+}
+
+fn build_interrupt_error(failed_partial: &Path) -> anyhow::Error {
+    anyhow::anyhow!(
+        "build interrupted; tainted partial disk left at {} for post-mortem",
+        failed_partial.display()
+    )
+}
+
+fn handle_build_interrupt(
+    vm_child: &mut Option<Child>,
+    partial: &Path,
+    failed_partial: &Path,
+) -> Result<anyhow::Error> {
+    eprintln!("interrupted — shutting down VM…");
+    preserve_tainted_partial(vm_child, partial, failed_partial)?;
+    eprintln!(
+        "tainted partial disk left at {} for post-mortem",
+        failed_partial.display()
+    );
+    Ok(build_interrupt_error(failed_partial))
+}
+
 fn output_stem(output: &Path) -> String {
     output
         .file_stem()
@@ -1403,12 +1513,12 @@ fn resize_qcow2(disk: &Path, size: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        archive_unpack_relative_path, check_same_directory_output_filename_clash,
-        cloud_init_clean_guest_command, derive_artifact_output_path, failed_partial_path,
-        fstrim_guest_command, fstrim_mount_args, guest_untar_command, installer_teardown_command,
-        mount_discard_args, output_stem, parse_archive_asset_key, partial_path,
-        qemu_nbd_connect_args, qemu_nbd_disconnect_args, should_run_zero_cluster_sparsify,
-        unpack_archive_to_dir,
+        archive_unpack_relative_path, build_interrupt_error,
+        check_same_directory_output_filename_clash, cloud_init_clean_guest_command,
+        derive_artifact_output_path, failed_partial_path, fstrim_guest_command, fstrim_mount_args,
+        guest_untar_command, installer_teardown_command, mount_discard_args, output_stem,
+        parse_archive_asset_key, partial_path, preserve_tainted_partial, qemu_nbd_connect_args,
+        qemu_nbd_disconnect_args, should_run_zero_cluster_sparsify, unpack_archive_to_dir,
     };
     use crate::cli::{Cli, Commands};
     use crate::compress::ReclaimMode;
@@ -1433,6 +1543,32 @@ mod tests {
     fn failed_partial_path_appends_failed_suffix() {
         let out = failed_partial_path(Path::new("/build/out.qcow2"));
         assert_eq!(out, Path::new("/build/out.qcow2.partial.failed"));
+    }
+
+    #[test]
+    fn preserve_tainted_partial_moves_partial_to_failed_path() {
+        let dir = TempDir::new().unwrap();
+        let partial = dir.path().join("artifact.qcow2.partial");
+        let failed = dir.path().join("artifact.qcow2.partial.failed");
+        std::fs::write(&partial, "partial").unwrap();
+        let mut vm_child = None;
+        preserve_tainted_partial(&mut vm_child, &partial, &failed).unwrap();
+        assert!(!partial.exists(), "partial should be moved");
+        assert!(failed.exists(), "failed partial should exist");
+    }
+
+    #[test]
+    fn build_interrupt_error_mentions_failed_partial_path() {
+        let err = build_interrupt_error(Path::new("/build/out.qcow2.partial.failed"));
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("interrupted"),
+            "interrupt message should be explicit"
+        );
+        assert!(
+            msg.contains("/build/out.qcow2.partial.failed"),
+            "interrupt message should point to preserved partial: {msg}"
+        );
     }
 
     #[test]

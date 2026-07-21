@@ -1093,6 +1093,16 @@ child with stdout/stderr redirected to a log file (`build/build-vm.log` or
 `build/test-vm.log`).  Botforge drives the guest entirely over SSH; you have
 no direct console access.
 
+In this default (non-attach) mode, `Ctrl-C`/`SIGINT` and `SIGTERM` are handled
+as an orderly stop request:
+
+- First interrupt: botforge prints `interrupted — shutting down VM…`, performs
+  normal teardown, and exits non-zero.
+  - `build`: kills the VM and preserves the tainted partial disk at
+    `<output>.partial.failed` for post-mortem.
+  - `test`: runs the normal VM cleanup path (unless `--keep-running` is set).
+- Second interrupt during teardown: botforge exits immediately (status 130).
+
 Pass `--attach` to get an interactive serial console:
 
 ```sh
@@ -1120,7 +1130,9 @@ diagnostics path (`print_log_tail`) will show an empty log.  Use non-attach mode
 for automated CI runs where log tailing on failure is important.
 
 **Default behavior is unchanged**: without `--attach`, the VM is always launched
-in background mode with log redirection, exactly as before.
+in background mode with log redirection; unlike `--attach`, host `Ctrl-C` is
+consumed by botforge for orderly teardown instead of being forwarded to the
+guest serial console.
 
 
 
