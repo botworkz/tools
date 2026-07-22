@@ -20,7 +20,7 @@ globset = "0.4"
 hadris-iso = { version = "1.2.1", features = ["joliet", "read"] }
 nix = { version = "0.31", default-features = false, features = ["term"] }
 rayon = "1"
-signal-hook = "0.3"
+signal-hook = "0.4"
 walkdir = "2"
 russh = { version = "0.62.2", default-features = false, features = ["ring", "flate2"] }
 russh-sftp = "2.3.0"
