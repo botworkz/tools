@@ -3,6 +3,7 @@ use serde::de::{self, Deserializer};
 use serde::Deserialize;
 use std::fs::File;
 use std::io::IsTerminal;
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
@@ -165,6 +166,13 @@ pub(crate) fn spawn_qemu_with_log(args: &[String], log_path: &Path) -> Result<Ch
         .with_context(|| format!("cannot clone VM log file handle: {}", log_path.display()))?;
     Command::new("qemu-system-x86_64")
         .args(args)
+        // Place QEMU in its own process group so that keyboard-generated
+        // signals (Ctrl-C SIGINT, SIGQUIT, SIGTSTP) from the controlling
+        // terminal are NOT delivered directly to QEMU by the kernel.  Only
+        // botforge (the foreground process) receives the signal; botforge's
+        // interrupt-aware teardown is then responsible for shutting down QEMU.
+        // process_group(0) sets the child's PGID to its own PID.
+        .process_group(0)
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err))
         .spawn()
