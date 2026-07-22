@@ -20,7 +20,7 @@ jobs:
   copilot-setup-steps:
     runs-on: ubuntu-24.04
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
 
     - name: Enable KVM via udev
       run: |

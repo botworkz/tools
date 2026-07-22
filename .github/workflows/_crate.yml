@@ -18,12 +18,12 @@ jobs:
       DOCKERFILE: ${{ inputs.crate }}/Dockerfile
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
     # Host toolchain is used only by Swatinem/rust-cache to compute cache keys;
     # all cargo commands run inside the bookworm container below.
     - uses: dtolnay/rust-toolchain@stable
     - uses: Swatinem/rust-cache@v2
-    - uses: docker/setup-buildx-action@v3
+    - uses: docker/setup-buildx-action@v4
 
     - name: Build CI toolchain image (rust:1-slim-bookworm + rustfmt + clippy)
       run: |
@@ -329,13 +329,13 @@ jobs:
           docker-daemon:botwork/$CRATE:ci \
           oci-archive:oci-amd64-$CRATE.tar
 
-    - uses: actions/upload-artifact@v4
+    - uses: actions/upload-artifact@v7
       with:
         name: oci-amd64-${{ inputs.crate }}
         path: oci-amd64-${{ inputs.crate }}.tar
         if-no-files-found: error
 
-    - uses: actions/upload-artifact@v4
+    - uses: actions/upload-artifact@v7
       with:
         name: ${{ inputs.crate }}-binary
         path: target/release/${{ inputs.crate }}
