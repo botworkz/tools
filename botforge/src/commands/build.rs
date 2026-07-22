@@ -381,6 +381,7 @@ pub(crate) fn cmd_build(args: BuildArgs) -> Result<()> {
         },
         Some(&mut archive_executor),
         None,
+        vm_child.as_mut(),
     );
     let overall_deadline = match step_result {
         Ok(overall_deadline) => overall_deadline,

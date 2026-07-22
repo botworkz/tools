@@ -292,6 +292,7 @@ pub(crate) fn cmd_test(args: TestArgs) -> Result<()> {
         None,
         installer_username.as_deref(),
         &plugin_registry,
+        vm_child.as_mut(),
     );
     match classify_test_completion(test_result.is_ok(), signal::is_interrupted()) {
         TestCompletion::Interrupted => {
