@@ -79,7 +79,7 @@ jobs:
     permissions:
       contents: read
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
     - uses: dtolnay/rust-toolchain@nightly
     - uses: Swatinem/rust-cache@v2
       with:
@@ -94,7 +94,7 @@ jobs:
   coverage:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
     - uses: dtolnay/rust-toolchain@stable
     - uses: Swatinem/rust-cache@v2
       with:
@@ -119,7 +119,7 @@ jobs:
     - name: Run unit test coverage
       run: cargo tarpaulin
     - name: Upload coverage report
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: coverage-report
         path: target/tarpaulin/
@@ -170,7 +170,7 @@ jobs:
       packages: write
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
 
     - name: Read VERSION
       id: version
@@ -207,7 +207,7 @@ jobs:
 
     - name: Log in to GHCR
       if: steps.version.outputs.is_release == 'true'
-      uses: docker/login-action@v3
+      uses: docker/login-action@v4
       with:
         registry: ghcr.io
         username: ${{ github.actor }}
@@ -221,7 +221,7 @@ jobs:
             --username "${{ github.actor }}" \
             --password-stdin
 
-    - uses: actions/download-artifact@v4
+    - uses: actions/download-artifact@v8
       if: steps.version.outputs.is_release == 'true'
       with:
         pattern: '*-binary'
@@ -229,7 +229,7 @@ jobs:
 
     - name: Publish container images
       if: steps.version.outputs.is_release == 'true'
-      uses: envoyproxy/toolshed/actions/oci/collector@6a20085af231aba4c72d6866f94098343a8c5616
+      uses: envoyproxy/toolshed/actions/oci/collector@303f50e2d2bfcd0259230e3227cd08e8a95f2c69
       with:
         artifacts-pattern: oci-amd64-*
         manifest-config: |
@@ -267,7 +267,7 @@ jobs:
 
     - name: Create GitHub Release and upload binaries
       if: steps.version.outputs.is_release == 'true'
-      uses: softprops/action-gh-release@v2
+      uses: softprops/action-gh-release@v3
       with:
         tag_name: v${{ steps.version.outputs.version }}
         name: v${{ steps.version.outputs.version }}
@@ -281,7 +281,7 @@ jobs:
       contents: write
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
       with:
         ref: main
         token: ${{ secrets.GITHUB_TOKEN }}
