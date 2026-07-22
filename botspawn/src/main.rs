@@ -1,15 +1,10 @@
 #![forbid(unsafe_code)]
 
 use anyhow::{anyhow, bail, Context, Result};
-#[allow(deprecated)]
-use bollard::container::{
-    AttachContainerOptions, Config, CreateContainerOptions, StartContainerOptions,
-    WaitContainerOptions,
-};
+use bollard::container::{AttachContainerResults, LogOutput};
 use bollard::errors::Error as BollardError;
-#[allow(deprecated)]
-use bollard::image::CreateImageOptions;
-use bollard::models::{DeviceMapping, HostConfig};
+use bollard::models::{ContainerCreateBody, DeviceMapping, HostConfig};
+use bollard::query_parameters::{AttachContainerOptionsBuilder, CreateImageOptionsBuilder};
 use bollard::Docker;
 use futures_util::stream::TryStreamExt;
 use nix::unistd::{Gid, Group, Uid};
@@ -238,24 +233,27 @@ fn preflight_kvm() -> Result<()> {
     }
 }
 
-#[allow(deprecated)]
 async fn ensure_image_present(docker: &Docker, image: &str, verbose: bool) -> Result<()> {
     if docker.inspect_image(image).await.is_ok() {
         return Ok(());
     }
 
     eprintln!("botspawn: pulling botforge image...");
-    #[allow(deprecated)]
-    let options = Some(CreateImageOptions {
-        from_image: image.to_string(),
-        ..Default::default()
-    });
+    let options = Some(CreateImageOptionsBuilder::new().from_image(image).build());
 
     let mut stream = docker.create_image(options, None, None);
     while let Some(info) = stream.try_next().await? {
         if verbose {
             if let Some(status) = info.status {
-                match (info.id, info.progress) {
+                let progress =
+                    info.progress_detail
+                        .and_then(|detail| match (detail.current, detail.total) {
+                            (Some(current), Some(total)) => Some(format!("{current}/{total}")),
+                            (Some(current), None) => Some(current.to_string()),
+                            (None, Some(total)) => Some(format!("0/{total}")),
+                            (None, None) => None,
+                        });
+                match (info.id, progress) {
                     (Some(id), Some(progress)) => eprintln!("[{id}] {status} {progress}"),
                     (Some(id), None) => eprintln!("[{id}] {status}"),
                     (None, Some(progress)) => eprintln!("{status} {progress}"),
@@ -273,7 +271,6 @@ fn passthrough_env(key: &str) -> String {
     format!("{key}={}", std::env::var(key).unwrap_or_default())
 }
 
-#[allow(deprecated)]
 async fn run_container(
     docker: &Docker,
     repo_root: &Path,
@@ -301,8 +298,7 @@ async fn run_container(
         passthrough_env("AWS_ENDPOINT_URL"),
     ];
 
-    #[allow(deprecated)]
-    let config = Config::<String> {
+    let config = ContainerCreateBody {
         image: Some(image.to_string()),
         user: Some(format!("{}:{}", host_ids.uid, host_ids.gid)),
         working_dir: Some(root.clone()),
@@ -332,29 +328,30 @@ async fn run_container(
     };
 
     let response = docker
-        .create_container(None::<CreateContainerOptions<String>>, config)
+        .create_container(None, config)
         .await
         .context("failed to create botforge container")?;
 
     docker
-        .start_container(&response.id, None::<StartContainerOptions<String>>)
+        .start_container(&response.id, None)
         .await
         .context("failed to start botforge container")?;
 
-    let bollard::container::AttachContainerResults {
+    let AttachContainerResults {
         mut output,
         mut input,
     } = docker
         .attach_container(
             &response.id,
-            Some(AttachContainerOptions::<String> {
-                stdin: Some(true),
-                stdout: Some(true),
-                stderr: Some(true),
-                stream: Some(true),
-                logs: Some(true),
-                detach_keys: None,
-            }),
+            Some(
+                AttachContainerOptionsBuilder::new()
+                    .stdin(true)
+                    .stdout(true)
+                    .stderr(true)
+                    .stream(true)
+                    .logs(true)
+                    .build(),
+            ),
         )
         .await
         .context("failed to attach to botforge container streams")?;
@@ -375,12 +372,11 @@ async fn run_container(
 
     while let Some(frame) = output.try_next().await? {
         match frame {
-            bollard::container::LogOutput::StdOut { message }
-            | bollard::container::LogOutput::Console { message } => {
+            LogOutput::StdOut { message } | LogOutput::Console { message } => {
                 io::stdout().write_all(&message)?;
                 io::stdout().flush()?;
             }
-            bollard::container::LogOutput::StdErr { message } => {
+            LogOutput::StdErr { message } => {
                 io::stderr().write_all(&message)?;
                 io::stderr().flush()?;
             }
@@ -388,7 +384,7 @@ async fn run_container(
         }
     }
 
-    let mut wait = docker.wait_container(&response.id, None::<WaitContainerOptions<String>>);
+    let mut wait = docker.wait_container(&response.id, None);
     let status = wait
         .try_next()
         .await?
