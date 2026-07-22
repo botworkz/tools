@@ -243,16 +243,20 @@ pub(crate) fn cmd_test(args: TestArgs) -> Result<()> {
         args.cpus.resolve(),
     );
 
+    // Arm the interrupt handler BEFORE spawning QEMU so that Ctrl-C
+    // (SIGINT) is caught by botforge from the very first moment the VM
+    // exists.  On the --attach path the handler is deliberately NOT armed
+    // (Ctrl-C is forwarded to the guest).
+    let _interrupt_guard = if args.attach {
+        None
+    } else {
+        Some(signal::arm_interrupts()?)
+    };
     let (mut vm_child, _terminal_guard) = if args.attach {
         let (child, guard) = spawn_qemu_attached(&qemu_args, &vm_log)?;
         (Some(child), guard)
     } else {
         (Some(spawn_qemu_with_log(&qemu_args, &vm_log)?), None)
-    };
-    let _interrupt_guard = if args.attach {
-        None
-    } else {
-        Some(signal::arm_interrupts()?)
     };
     // Capture the installer username before it is moved into ssh_options.
     // This is only meaningful when botforge owns the installer (_kept_keypair is Some).
