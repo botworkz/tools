@@ -382,7 +382,7 @@ fn discover_via_git_index(context_root: &Path, glob_set: &GlobSet) -> Result<Vec
     })?;
 
     // Bare repos have no work-tree.
-    let work_dir = repo.work_dir().ok_or_else(|| {
+    let work_dir = repo.workdir().ok_or_else(|| {
         anyhow::anyhow!(
             "repo-only: true requires a git repository with a work-tree \
              (the repository at '{}' is bare)",
