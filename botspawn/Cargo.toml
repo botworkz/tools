@@ -10,7 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
-bollard = "0.19"
+bollard = "0.21"
 futures-util = "0.3"
 nix = { version = "0.31", default-features = false, features = ["user"] }
 tokio = { version = "1", features = ["io-std", "io-util", "macros", "rt-multi-thread"] }
