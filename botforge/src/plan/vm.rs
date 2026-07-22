@@ -82,6 +82,7 @@ pub(crate) fn run_test_flow(
     cache_dir_override: Option<&Path>,
     installer_username: Option<&str>,
     plugin_registry: &botforge_plugin_host::PluginRegistry,
+    vm_child: Option<&mut Child>,
 ) -> Result<()> {
     // Run the declarative `assert:` block as a pre-steps phase (after boot /
     // SSH / cloud-init, but before the first `steps:` entry) so that
@@ -109,6 +110,7 @@ pub(crate) fn run_test_flow(
         },
         None,
         pre_steps.as_deref(),
+        vm_child,
     )
     .map(|_| ())
 }
@@ -220,6 +222,7 @@ pub(crate) fn run_step_flow(
     timeouts: StepTimeoutPolicy,
     mut archive_executor: Option<&mut ArchiveExecutor<'_>>,
     pre_steps: Option<&PreStepsHook<'_>>,
+    vm_child: Option<&mut Child>,
 ) -> Result<Instant> {
     let overall_deadline = Instant::now() + timeouts.overall_timeout;
     let step_log_dir = context.join("build").join("logs");
@@ -235,6 +238,7 @@ pub(crate) fn run_step_flow(
     let wait_for_ssh_result = wait_for_ssh(
         ssh,
         remaining_budget(overall_deadline).min(TEST_SSH_READY_TIMEOUT),
+        vm_child,
     );
     crate::plan::print_phase_status(
         "vm",

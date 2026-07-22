@@ -20,6 +20,7 @@ use russh::{ChannelMsg, Disconnect};
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::OpenFlags;
 use std::path::{Path, PathBuf};
+use std::process::Child;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
@@ -444,7 +445,15 @@ async fn upload_async(ssh: &SshOptions, src: &Path, dest: &str) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Poll until SSH connect+auth succeeds or `timeout` elapses.
-pub(crate) fn wait_for_ssh(ssh: &SshOptions, timeout: Duration) -> Result<()> {
+///
+/// If `vm_child` is provided, the loop also polls `try_wait()` on the child
+/// process and returns an error immediately if the child has exited, instead
+/// of waiting out the full timeout against a VM that can never come up.
+pub(crate) fn wait_for_ssh(
+    ssh: &SshOptions,
+    timeout: Duration,
+    mut vm_child: Option<&mut Child>,
+) -> Result<()> {
     let deadline = Instant::now() + timeout;
     let rt = make_rt();
     loop {
@@ -456,6 +465,22 @@ pub(crate) fn wait_for_ssh(ssh: &SshOptions, timeout: Duration) -> Result<()> {
         }
         if Instant::now() >= deadline {
             bail!("timed out waiting for SSH");
+        }
+        // If we have a handle to the VM child, check whether it has exited
+        // early (crashed, stopped, or killed) so we fail fast with a clear
+        // error rather than blocking until the full SSH timeout.
+        if let Some(child) = vm_child.as_mut() {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    bail!(
+                        "VM process exited unexpectedly ({}); \
+                         check the VM log for details",
+                        status
+                    );
+                }
+                Ok(None) => {} // still running — keep polling
+                Err(e) => bail!("failed to poll VM process status: {e}"),
+            }
         }
         std::thread::sleep(Duration::from_secs(2));
     }
@@ -725,6 +750,58 @@ mod tests {
         assert!(
             !should_retry(&SshExecOutcome::Success, 0, 10),
             "success must not trigger a retry"
+        );
+    }
+
+    // ── wait_for_ssh child-liveness regression ───────────────────────────────
+
+    /// `wait_for_ssh` must detect when the VM child has exited and fail fast
+    /// with a descriptive error, rather than waiting out the full SSH timeout
+    /// against a VM that can never come up.
+    ///
+    /// This is a regression test for the case where a background QEMU child
+    /// exits or is stopped before the SSH port opens; without the liveness
+    /// check the caller would block until the full TEST_SSH_READY_TIMEOUT
+    /// (300 s) elapsed.
+    #[test]
+    fn wait_for_ssh_fails_fast_when_child_has_exited() {
+        use super::{wait_for_ssh, SshOptions};
+        use std::path::PathBuf;
+        use std::process::Command;
+        use std::time::{Duration, Instant};
+
+        // Spawn a child that exits immediately.
+        let mut child = Command::new("true")
+            .spawn()
+            .expect("failed to spawn 'true'");
+        // Let the child finish.
+        child.wait().expect("wait failed");
+
+        // Build a dummy SshOptions pointing at a port with nothing listening.
+        // The connect attempt will fail fast ("connection refused"), then the
+        // child-liveness check should fire.
+        let ssh = SshOptions {
+            host: "127.0.0.1".into(),
+            port: 19_753, // arbitrary port unlikely to be in use
+            user: "nobody".into(),
+            key: PathBuf::from("/nonexistent-key"),
+        };
+
+        let start = Instant::now();
+        let result = wait_for_ssh(&ssh, Duration::from_secs(60), Some(&mut child));
+        let elapsed = start.elapsed();
+
+        // Must return an error long before the 60-second timeout.
+        assert!(
+            elapsed < Duration::from_secs(15),
+            "wait_for_ssh did not fail fast after child exit: elapsed {:?}",
+            elapsed
+        );
+        assert!(result.is_err(), "expected error when child has exited");
+        let err_msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            err_msg.contains("VM process exited unexpectedly"),
+            "error message should mention early exit; got: {err_msg:?}"
         );
     }
 }
