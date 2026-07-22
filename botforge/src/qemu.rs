@@ -173,6 +173,12 @@ pub(crate) fn spawn_qemu_with_log(args: &[String], log_path: &Path) -> Result<Ch
         // interrupt-aware teardown is then responsible for shutting down QEMU.
         // process_group(0) sets the child's PGID to its own PID.
         .process_group(0)
+        // Detach stdin from the controlling TTY.  Background QEMU (-nographic)
+        // does not need interactive serial console input; with stdin null it
+        // cannot be stopped by SIGTTIN/SIGTTOU when it is in a non-foreground
+        // process group.  (The --attach path uses spawn_qemu_attached which
+        // intentionally inherits stdio for the interactive serial console.)
+        .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err))
         .spawn()
@@ -568,5 +574,66 @@ mod tests {
             "mon:stdio",
             "attach args must have mon:stdio after -serial"
         );
+    }
+
+    // ── Background-spawn process-group/stdin regression ──────────────────────
+
+    /// A background child spawned in its own process group with stdin=null must
+    /// not be left in the stopped (`T`) state.  Before the fix, inheriting the
+    /// controlling TTY stdin while in a non-foreground process group caused the
+    /// kernel to deliver SIGTTIN and stop QEMU before it emitted any output,
+    /// producing the silent hang at "(vm) Waiting for SSH".
+    ///
+    /// This test uses `sleep 5` as a stand-in for `qemu-system-x86_64` so
+    /// it runs without KVM.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn background_child_with_null_stdin_is_not_stopped() {
+        use std::fs::File;
+        use std::os::unix::process::CommandExt as _;
+        use std::process::Stdio;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "botforge-spawn-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&tmp);
+        let log_path = tmp.join("test.log");
+        let log = File::create(&log_path).expect("cannot create test log");
+        let log_err = log.try_clone().expect("cannot clone log handle");
+
+        // Spawn `sleep 5` with the same settings as spawn_qemu_with_log:
+        // process_group(0) + stdin(null).  It must not be stopped by SIGTTIN.
+        let mut child = std::process::Command::new("sleep")
+            .arg("5")
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log))
+            .stderr(Stdio::from(log_err))
+            .spawn()
+            .expect("failed to spawn 'sleep 5'");
+
+        // Give the kernel a moment to potentially deliver SIGTTIN.
+        std::thread::sleep(std::time::Duration::from_millis(150));
+
+        // Read /proc/<pid>/stat to check the process state character.
+        let pid = child.id();
+        let stat =
+            std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+        // The stat file has the format: "pid (comm) state ..."
+        // Find the closing ')' then take the next non-whitespace token.
+        let state = stat
+            .find(')')
+            .and_then(|i| stat[i + 1..].split_whitespace().next())
+            .unwrap_or("");
+        assert_ne!(
+            state, "T",
+            "background child must not be in stopped state \
+             (T means SIGTTIN/SIGTTOU stopped it); /proc stat: {stat:?}"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
