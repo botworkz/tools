@@ -14,7 +14,7 @@ path = "src/lib.rs"
 # rationale: this is the designated blast-radius container for all
 # .so / FFI-loading code in the botforge plugin system.
 [dependencies]
-libloading = "0.8"
+libloading = "0.9"
 thiserror = "2"
 
 [dev-dependencies]
