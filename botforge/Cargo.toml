@@ -14,7 +14,7 @@ botforge-plugin-host = { path = "../botforge-plugin-host" }
 clap = { version = "4", features = ["derive", "env"] }
 flate2 = "1.1.9"
 getrandom = { version = "0.4", features = ["sys_rng"] }
-gix = { version = "0.83", default-features = false, features = ["index", "sha1"] }
+gix = { version = "0.85", default-features = false, features = ["index", "sha1"] }
 glob = "0.3"
 globset = "0.4"
 hadris-iso = { version = "1.2.1", features = ["joliet", "read"] }
