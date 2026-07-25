@@ -428,9 +428,13 @@ fn run_run_step(
                 // Propagate the scp error early if upload failed.
                 scp_result?;
                 // Initialize the remote env file so the script can append to it via $BOTFORGE_ENV.
+                // Chmod world-writable so both the SSH user and root (sudo) can append.
                 let _ = ssh_with_retry(
                     context.ssh,
-                    &format!(": > {}", shell_single_quote(&remote_env_path)),
+                    &format!(
+                        ": > {path} && chmod 0666 {path}",
+                        path = shell_single_quote(&remote_env_path)
+                    ),
                     1,
                     Duration::from_secs(0),
                     Duration::from_secs(10),
@@ -472,9 +476,13 @@ fn run_run_step(
                 // Standard path: exit 0 required, no output capture.
                 let result = if scp_result.is_ok() {
                     // Initialize the remote env file so the script can append to it via $BOTFORGE_ENV.
+                    // Chmod world-writable so both the SSH user and root (sudo) can append.
                     let _ = ssh_with_retry(
                         context.ssh,
-                        &format!(": > {}", shell_single_quote(&remote_env_path)),
+                        &format!(
+                            ": > {path} && chmod 0666 {path}",
+                            path = shell_single_quote(&remote_env_path)
+                        ),
                         1,
                         Duration::from_secs(0),
                         Duration::from_secs(10),
@@ -711,9 +719,21 @@ fn run_host_step_capturing(
     accumulated_env: &[(String, String)],
     files: HostStepFiles<'_>,
 ) -> Result<(StepCapture, i32)> {
-    // Create/truncate the env file so `>>` always works inside the step.
+    // Create/truncate the env file so `>>` always works inside the step, and make
+    // it world-writable so that both root and the non-root ephemeral identity can
+    // append via $BOTFORGE_ENV regardless of which one the step runs as.
     std::fs::write(files.env_file, b"")
         .with_context(|| format!("failed to create env file for host step '{name}'"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(files.env_file)
+            .with_context(|| format!("failed to stat env file for host step '{name}'"))?
+            .permissions();
+        perms.set_mode(0o666);
+        std::fs::set_permissions(files.env_file, perms)
+            .with_context(|| format!("failed to chmod env file for host step '{name}'"))?;
+    }
 
     let script = std::env::temp_dir().join(format!("botforge-host-step-{}.sh", unique_suffix()));
     std::fs::write(&script, run.as_bytes())
@@ -1046,9 +1066,21 @@ fn run_host_step(
     accumulated_env: &[(String, String)],
     files: HostStepFiles<'_>,
 ) -> Result<()> {
-    // Create/truncate the env file so `>>` always works inside the step.
+    // Create/truncate the env file so `>>` always works inside the step, and make
+    // it world-writable so that both root and the non-root ephemeral identity can
+    // append via $BOTFORGE_ENV regardless of which one the step runs as.
     std::fs::write(files.env_file, b"")
         .with_context(|| format!("failed to create env file for host step '{name}'"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(files.env_file)
+            .with_context(|| format!("failed to stat env file for host step '{name}'"))?
+            .permissions();
+        perms.set_mode(0o666);
+        std::fs::set_permissions(files.env_file, perms)
+            .with_context(|| format!("failed to chmod env file for host step '{name}'"))?;
+    }
 
     let script = std::env::temp_dir().join(format!("botforge-host-step-{}.sh", unique_suffix()));
     std::fs::write(&script, run.as_bytes())
@@ -1819,6 +1851,70 @@ mod tests {
         assert!(
             contents.contains("WRITTEN=yes"),
             "env file should contain written value, got: {contents:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_host_step_env_file_is_world_writable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let tmpl = resolve_shell(None).unwrap();
+        let env_file = tmp_env_file();
+        let log_file = tmp_step_log(dir.path());
+        let result = run_host_step(
+            "mode-check",
+            "true",
+            dir.path(),
+            test_budget(),
+            &tmpl,
+            &[],
+            HostStepFiles {
+                env_file: &env_file,
+                log_path: &log_file,
+            },
+        );
+        let mode = std::fs::metadata(&env_file)
+            .map(|m| m.permissions().mode())
+            .unwrap_or(0);
+        let _ = std::fs::remove_file(&env_file);
+        assert!(result.is_ok(), "step should succeed: {result:?}");
+        assert_eq!(
+            mode & 0o777,
+            0o666,
+            "env file should be world-writable (0666), got mode {mode:#o}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_host_step_capturing_env_file_is_world_writable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let tmpl = resolve_shell(Some("sh")).unwrap();
+        let env_file = tmp_env_file();
+        let log_file = tmp_step_log(dir.path());
+        let result = super::run_host_step_capturing(
+            "mode-check-capturing",
+            "true",
+            dir.path(),
+            test_budget(),
+            &tmpl,
+            &[],
+            HostStepFiles {
+                env_file: &env_file,
+                log_path: &log_file,
+            },
+        );
+        let mode = std::fs::metadata(&env_file)
+            .map(|m| m.permissions().mode())
+            .unwrap_or(0);
+        let _ = std::fs::remove_file(&env_file);
+        assert!(result.is_ok(), "step should succeed");
+        assert_eq!(
+            mode & 0o777,
+            0o666,
+            "capturing env file should be world-writable (0666), got mode {mode:#o}"
         );
     }
 
