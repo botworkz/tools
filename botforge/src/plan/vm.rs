@@ -431,10 +431,7 @@ fn run_run_step(
                 // Chmod world-writable so both the SSH user and root (sudo) can append.
                 let _ = ssh_with_retry(
                     context.ssh,
-                    &format!(
-                        ": > {path} && chmod 0666 {path}",
-                        path = shell_single_quote(&remote_env_path)
-                    ),
+                    &guest_env_init_cmd(&remote_env_path),
                     1,
                     Duration::from_secs(0),
                     Duration::from_secs(10),
@@ -479,10 +476,7 @@ fn run_run_step(
                     // Chmod world-writable so both the SSH user and root (sudo) can append.
                     let _ = ssh_with_retry(
                         context.ssh,
-                        &format!(
-                            ": > {path} && chmod 0666 {path}",
-                            path = shell_single_quote(&remote_env_path)
-                        ),
+                        &guest_env_init_cmd(&remote_env_path),
                         1,
                         Duration::from_secs(0),
                         Duration::from_secs(10),
@@ -1219,6 +1213,12 @@ fn shell_single_quote(value: &str) -> String {
     crate::util::shell_single_quote(value)
 }
 
+fn guest_env_init_cmd(remote_env_path: &str) -> String {
+    let path = shell_single_quote(remote_env_path);
+    let payload = format!("umask 000; : > {path}; chmod 0666 {path}");
+    format!("sudo sh -c {}", shell_single_quote(&payload))
+}
+
 fn build_guest_ssh_cmd(
     template: &[String],
     remote_script: &str,
@@ -1655,8 +1655,8 @@ pub(crate) fn shutdown_build_vm(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_guest_ssh_cmd, env_merge, parse_env_file, resolve_step_timeout, run_host_step,
-        shell_single_quote, HostStepFiles, StepExecutionBudget,
+        build_guest_ssh_cmd, env_merge, guest_env_init_cmd, parse_env_file, resolve_step_timeout,
+        run_host_step, shell_single_quote, HostStepFiles, StepExecutionBudget,
     };
     use crate::step::{resolve_shell, RunStep, StepTarget};
     use crate::util::unique_suffix;
@@ -2142,6 +2142,23 @@ mod tests {
     }
 
     // --- build_guest_ssh_cmd env injection ---
+
+    #[test]
+    fn test_guest_env_init_cmd_uses_sudo_umask_and_quoted_path() {
+        let path = "/tmp/botforge env 1";
+        let cmd = guest_env_init_cmd(path);
+        assert!(
+            cmd.starts_with("sudo sh -c "),
+            "expected sudo sh -c prefix: {cmd}"
+        );
+        assert!(cmd.contains("umask 000"), "expected umask 000: {cmd}");
+        assert!(cmd.contains("chmod 0666"), "expected chmod 0666: {cmd}");
+        let quoted_path = shell_single_quote(path);
+        assert!(
+            cmd.contains(&quoted_path),
+            "expected safely quoted path {quoted_path} in command: {cmd}"
+        );
+    }
 
     #[test]
     fn test_build_guest_ssh_cmd_prefixes_sudo_for_guest_root_step() {
