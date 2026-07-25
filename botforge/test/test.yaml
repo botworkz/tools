@@ -7,6 +7,7 @@ steps:
 - uses: "@://hello.steps.yaml"
 - uses: "@://for-fragment-test.steps.yaml"
 - uses: "@://files-fragment.steps.yaml"
+- uses: "@://env-threading.steps.yaml"
 - name: Base install test
   run: |
     whoami | grep root

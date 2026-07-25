@@ -1,0 +1,36 @@
+type: botforge/fragment
+steps:
+- on: guest
+  name: env write as root (sudo)
+  sudo: true
+  run: |
+    whoami | grep -qx root
+    echo "KEY_GUEST_ROOT=guest-root-ok" >> "$BOTFORGE_ENV"
+
+- on: guest
+  name: env write as ephemeral user (no sudo)
+  sudo: false
+  run: |
+    test "$(whoami)" != root
+    echo "KEY_GUEST_USER=guest-user-ok" >> "$BOTFORGE_ENV"
+
+- on: host
+  name: env write on host
+  run: |
+    echo "KEY_HOST=host-ok" >> "$BOTFORGE_ENV"
+
+- on: host
+  name: host sees guest-written env
+  run: |
+    test "$KEY_GUEST_ROOT" = guest-root-ok
+    test "$KEY_GUEST_USER" = guest-user-ok
+
+- on: guest
+  name: guest sees host-written env
+  sudo: true
+  run: |
+    test "$KEY_HOST" = host-ok
+    echo "all-threading-ok"
+  expect:
+    stdout:
+      contains: [all-threading-ok]
