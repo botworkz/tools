@@ -141,6 +141,7 @@ jobs:
         cp -a botforge/test/hello.steps.yaml testrepo/
         cp -a botforge/test/assert-fail.yaml testrepo/
         cp -a botforge/test/env-threading.steps.yaml testrepo/
+        cp -a botforge/test/expressions.steps.yaml testrepo/
         cp -a botforge/test/for-fragment-build.steps.yaml testrepo/
         cp -a botforge/test/for-fragment-test.steps.yaml testrepo/
         cp -a botforge/test/files-fragment.steps.yaml testrepo/
