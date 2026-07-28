@@ -751,7 +751,7 @@ steps:
     }
 
     #[test]
-    fn test_load_test_config_fragment_missing_active_namespace_input_still_errors() {
+    fn test_load_test_config_fragment_missing_active_namespace_input_is_soft_empty() {
         let repo = TempDir::new().unwrap();
         std::fs::write(
             repo.path().join("frag.yaml"),
@@ -780,8 +780,9 @@ steps:
         )
         .unwrap();
 
-        let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
-        assert!(format!("{err:#}").contains("missing required input 'typo'"));
+        let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+        assert_eq!(config.steps.len(), 1);
+        assert_eq!(run_ref(&config.steps[0]).run, "echo ");
     }
 
     #[test]
@@ -805,7 +806,7 @@ steps:
 
         let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("unsupported expression"));
+        assert!(msg.contains("unknown namespace"));
         assert!(msg.contains("bogus.x"));
     }
 
