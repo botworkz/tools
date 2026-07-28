@@ -21,6 +21,7 @@ use self::expressions::{
     expand_raw_step, extract_fragment_input_declarations, resolve_fragment_inputs,
     substitute_inputs_in_value,
 };
+pub(crate) use self::expressions::{yaml_scalar_to_string, yaml_scalar_truthiness};
 use crate::assert::{parse_assert_block, validate_assert_block, AssertBlock};
 use crate::plan::files::FileEntry;
 use crate::step::{deserialize_optional_positive_seconds, resolve_shell, StepTarget, TestStep};
@@ -306,7 +307,7 @@ impl<'de> Deserialize<'de> for RawTestStep {
 struct TestStepInclude {
     uses: String,
     #[serde(default)]
-    with: BTreeMap<String, String>,
+    with: BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1045,7 +1046,7 @@ fn expand_test_steps(
 fn load_test_steps_fragment(
     path: &Path,
     uses: &str,
-    with: &BTreeMap<String, String>,
+    with: &BTreeMap<String, Value>,
 ) -> Result<(
     Vec<RawTestStep>,
     Option<serde_yaml::Mapping>,

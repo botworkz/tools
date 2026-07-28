@@ -8,6 +8,15 @@ steps:
 - uses: "@://for-fragment-test.steps.yaml"
 - uses: "@://files-fragment.steps.yaml"
 - uses: "@://env-threading.steps.yaml"
+- uses: "@://expressions.steps.yaml"
+  with:
+    str_a: hello
+    str_b: hello
+    booly: false
+    booly_string: "false"
+    seconds: 42
+    cond: "yes"
+    empty_str: ""
 - name: Base install test
   run: |
     whoami | grep root
