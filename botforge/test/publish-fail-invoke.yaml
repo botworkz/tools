@@ -1,0 +1,14 @@
+type: botforge/publish
+name: ci-publish-fail-invoke
+
+steps:
+- uses: "@://hello.steps.yaml"
+
+publish:
+  fs:
+  - src: "@artifact://foo.qcow2"
+    dest: build/publish/fs
+
+  s3:
+  - src: "@artifact://foo.qcow2"
+    dest: s3://botforge-ci/publish

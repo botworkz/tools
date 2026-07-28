@@ -1,0 +1,9 @@
+type: botforge/test
+name: assert-fail-required-fragment-output
+ports:
+- 80
+steps:
+- uses: "@://fragment-outputs-required-missing.steps.yaml"
+  id: frag
+assert:
+  files: {}

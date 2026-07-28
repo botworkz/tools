@@ -1,0 +1,10 @@
+type: botforge/fragment
+steps:
+- uses: "@://nested-inner.steps.yaml"
+- on: guest
+  name: nested outer
+  run: |
+    echo nested-outer-ok
+  expect:
+    stdout:
+      contains: [nested-outer-ok]

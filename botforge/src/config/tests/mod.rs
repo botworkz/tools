@@ -6,7 +6,8 @@ use crate::plan::files::FileEntry;
 use crate::qemu::PortSpec;
 use crate::resolver::Reference;
 use crate::step::{
-    ArchiveStep, ArchiveStepSpec, ExpectBlock, RunStep, StdioExpect, StepTarget, TestStep,
+    ArchiveStep, ArchiveStepSpec, ExpectBlock, InvokeStep, RunStep, StdioExpect, StepTarget,
+    TestStep,
 };
 use std::path::PathBuf;
 use tempfile::TempDir;
@@ -25,6 +26,13 @@ fn run_ref(step: &TestStep) -> &RunStep {
     step
 }
 
+fn invoke_ref(step: &TestStep) -> &InvokeStep {
+    let TestStep::Invoke(step) = step else {
+        panic!("expected invoke step, got {:?}", step.display_name());
+    };
+    step
+}
+
 fn make_step(target: StepTarget, name: &str) -> TestStep {
     TestStep::Run(RunStep {
         target,
@@ -36,6 +44,8 @@ fn make_step(target: StepTarget, name: &str) -> TestStep {
         id: None,
         expect: None,
         condition: None,
+        outputs: vec![],
+        captured_outputs: Default::default(),
     })
 }
 
@@ -422,11 +432,14 @@ steps:
 
         let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
 
+        // The fragment is now a single Invoke step; its inner steps hold the substituted content.
         assert_eq!(config.steps.len(), 1);
-        assert_eq!(run_ref(&config.steps[0]).name, "narrative-edge");
-        assert_eq!(run_ref(&config.steps[0]).shell.as_deref(), Some("bash"));
-        assert!(run_ref(&config.steps[0]).run.contains(r#"echo "${USER}""#));
-        assert!(run_ref(&config.steps[0]).run.contains("bash /tmp/edge.sh"));
+        let inner = &invoke_ref(&config.steps[0]).steps;
+        assert_eq!(inner.len(), 1);
+        assert_eq!(run_ref(&inner[0]).name, "narrative-edge");
+        assert_eq!(run_ref(&inner[0]).shell.as_deref(), Some("bash"));
+        assert!(run_ref(&inner[0]).run.contains(r#"echo "${USER}""#));
+        assert!(run_ref(&inner[0]).run.contains("bash /tmp/edge.sh"));
     }
 
     #[test]
@@ -458,8 +471,10 @@ steps:
         let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
 
         assert_eq!(config.steps.len(), 1);
-        assert_eq!(run_ref(&config.steps[0]).name, "frag-root-step");
-        assert_eq!(run_ref(&config.steps[0]).sudo, Some(true));
+        let inner = &invoke_ref(&config.steps[0]).steps;
+        assert_eq!(inner.len(), 1);
+        assert_eq!(run_ref(&inner[0]).name, "frag-root-step");
+        assert_eq!(run_ref(&inner[0]).sudo, Some(true));
     }
 
     #[test]
@@ -613,10 +628,14 @@ steps:
         .unwrap();
 
         let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+        // Two for:-expanded Run steps in the parent scope, plus one Invoke step.
         assert_eq!(config.steps.len(), 3);
         assert_eq!(run_ref(&config.steps[0]).name, "check-one");
         assert_eq!(run_ref(&config.steps[1]).name, "check-two");
-        assert_eq!(run_ref(&config.steps[2]).name, "frag-step");
+        // The fragment becomes an Invoke with one inner Run step.
+        let inner = &invoke_ref(&config.steps[2]).steps;
+        assert_eq!(inner.len(), 1);
+        assert_eq!(run_ref(&inner[0]).name, "frag-step");
     }
 
     #[test]
@@ -641,11 +660,14 @@ steps:
 
         let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
 
-        assert_eq!(config.steps.len(), 2);
-        assert_eq!(run_ref(&config.steps[0]).name, "frag-alpha");
-        assert_eq!(run_ref(&config.steps[0]).run, "echo alpha");
-        assert_eq!(run_ref(&config.steps[1]).name, "frag-beta");
-        assert_eq!(run_ref(&config.steps[1]).run, "echo beta");
+        // The fragment becomes one Invoke step; the for:-expanded steps are inside it.
+        assert_eq!(config.steps.len(), 1);
+        let inner = &invoke_ref(&config.steps[0]).steps;
+        assert_eq!(inner.len(), 2);
+        assert_eq!(run_ref(&inner[0]).name, "frag-alpha");
+        assert_eq!(run_ref(&inner[0]).run, "echo alpha");
+        assert_eq!(run_ref(&inner[1]).name, "frag-beta");
+        assert_eq!(run_ref(&inner[1]).run, "echo beta");
     }
 
     #[test]
@@ -672,11 +694,13 @@ steps:
 
         let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
 
-        assert_eq!(config.steps.len(), 2);
-        assert_eq!(run_ref(&config.steps[0]).name, "pair-cat");
-        assert_eq!(run_ref(&config.steps[0]).run, "echo cat /usr/bin/cat");
-        assert_eq!(run_ref(&config.steps[1]).name, "pair-ls");
-        assert_eq!(run_ref(&config.steps[1]).run, "echo ls /usr/bin/ls");
+        assert_eq!(config.steps.len(), 1);
+        let inner = &invoke_ref(&config.steps[0]).steps;
+        assert_eq!(inner.len(), 2);
+        assert_eq!(run_ref(&inner[0]).name, "pair-cat");
+        assert_eq!(run_ref(&inner[0]).run, "echo cat /usr/bin/cat");
+        assert_eq!(run_ref(&inner[1]).name, "pair-ls");
+        assert_eq!(run_ref(&inner[1]).run, "echo ls /usr/bin/ls");
     }
 
     #[test]
@@ -703,11 +727,13 @@ steps:
 
         let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
 
-        assert_eq!(config.steps.len(), 2);
-        assert_eq!(run_ref(&config.steps[0]).name, "svc-coreutils-cat");
-        assert_eq!(run_ref(&config.steps[0]).run, "echo cat");
-        assert_eq!(run_ref(&config.steps[1]).name, "svc-coreutils-ls");
-        assert_eq!(run_ref(&config.steps[1]).run, "echo ls");
+        assert_eq!(config.steps.len(), 1);
+        let inner = &invoke_ref(&config.steps[0]).steps;
+        assert_eq!(inner.len(), 2);
+        assert_eq!(run_ref(&inner[0]).name, "svc-coreutils-cat");
+        assert_eq!(run_ref(&inner[0]).run, "echo cat");
+        assert_eq!(run_ref(&inner[1]).name, "svc-coreutils-ls");
+        assert_eq!(run_ref(&inner[1]).run, "echo ls");
     }
 
     #[test]
@@ -743,11 +769,13 @@ steps:
 
         let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
 
-        assert_eq!(config.steps.len(), 2);
-        assert_eq!(run_ref(&config.steps[0]).name, "api-cp");
-        assert_eq!(run_ref(&config.steps[0]).run, "echo api cp");
-        assert_eq!(run_ref(&config.steps[1]).name, "api-ls");
-        assert_eq!(run_ref(&config.steps[1]).run, "echo api ls");
+        assert_eq!(config.steps.len(), 1);
+        let inner = &invoke_ref(&config.steps[0]).steps;
+        assert_eq!(inner.len(), 2);
+        assert_eq!(run_ref(&inner[0]).name, "api-cp");
+        assert_eq!(run_ref(&inner[0]).run, "echo api cp");
+        assert_eq!(run_ref(&inner[1]).name, "api-ls");
+        assert_eq!(run_ref(&inner[1]).run, "echo api ls");
     }
 
     #[test]
@@ -782,7 +810,9 @@ steps:
 
         let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
         assert_eq!(config.steps.len(), 1);
-        assert_eq!(run_ref(&config.steps[0]).run, "echo ");
+        let inner = &invoke_ref(&config.steps[0]).steps;
+        assert_eq!(inner.len(), 1);
+        assert_eq!(run_ref(&inner[0]).run, "echo ");
     }
 
     #[test]
@@ -836,9 +866,11 @@ steps:
 
         let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
 
-        assert_eq!(config.steps.len(), 2);
+        assert_eq!(config.steps.len(), 1);
+        let inner = &invoke_ref(&config.steps[0]).steps;
+        assert_eq!(inner.len(), 2);
         assert_eq!(
-            run_ref(&config.steps[0])
+            run_ref(&inner[0])
                 .expect
                 .as_ref()
                 .unwrap()
@@ -849,7 +881,7 @@ steps:
             vec!["alpha".to_string()]
         );
         assert_eq!(
-            run_ref(&config.steps[1])
+            run_ref(&inner[1])
                 .expect
                 .as_ref()
                 .unwrap()
@@ -1154,11 +1186,259 @@ steps:
         let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
 
         assert_eq!(config.steps.len(), 1);
-        assert_eq!(run_ref(&config.steps[0]).name, "frag-step");
+        // The fragment becomes an Invoke step; the id lives inside the inner scope.
+        let inner = &invoke_ref(&config.steps[0]).steps;
+        assert_eq!(inner.len(), 1);
+        assert_eq!(run_ref(&inner[0]).name, "frag-step");
         assert_eq!(
-            run_ref(&config.steps[0]).id.as_deref(),
+            run_ref(&inner[0]).id.as_deref(),
             Some("my-frag-id"),
-            "id should be preserved through fragment splice"
+            "id should be preserved through fragment invocation"
+        );
+    }
+
+    // --- id: on uses: steps ---
+
+    #[test]
+    fn test_invoke_step_id_parses_and_is_stored() {
+        let repo = TempDir::new().unwrap();
+        std::fs::create_dir_all(repo.path().join("shared")).unwrap();
+        std::fs::write(
+            repo.path().join("shared/frag.yaml"),
+            r#"
+type: botforge/fragment
+steps:
+  - on: guest
+    name: inner-step
+    run: echo hello
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            r#"
+type: botforge/test
+name: test
+steps:
+  - uses: "@://shared/frag.yaml"
+    id: my-invoke-id
+"#,
+        )
+        .unwrap();
+
+        let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+
+        assert_eq!(config.steps.len(), 1);
+        let invoke = invoke_ref(&config.steps[0]);
+        assert_eq!(
+            invoke.id.as_deref(),
+            Some("my-invoke-id"),
+            "id on uses: step should be stored on InvokeStep"
+        );
+        assert_eq!(
+            config.steps[0].display_id(),
+            Some("my-invoke-id"),
+            "display_id() must return the invoke id"
+        );
+    }
+
+    #[test]
+    fn test_invoke_step_without_id_yields_none() {
+        let repo = TempDir::new().unwrap();
+        std::fs::create_dir_all(repo.path().join("shared")).unwrap();
+        std::fs::write(
+            repo.path().join("shared/frag.yaml"),
+            r#"
+type: botforge/fragment
+steps:
+  - on: guest
+    name: inner-step
+    run: echo hello
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            r#"
+type: botforge/test
+name: test
+steps:
+  - uses: "@://shared/frag.yaml"
+"#,
+        )
+        .unwrap();
+
+        let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+
+        assert_eq!(config.steps.len(), 1);
+        let invoke = invoke_ref(&config.steps[0]);
+        assert!(
+            invoke.id.is_none(),
+            "uses: step without id: should have None id"
+        );
+        assert!(
+            config.steps[0].display_id().is_none(),
+            "display_id() must return None when no invoke id"
+        );
+    }
+
+    #[test]
+    fn test_duplicate_invoke_ids_in_same_scope_rejected() {
+        let repo = TempDir::new().unwrap();
+        std::fs::create_dir_all(repo.path().join("shared")).unwrap();
+        std::fs::write(
+            repo.path().join("shared/frag.yaml"),
+            r#"
+type: botforge/fragment
+steps:
+  - on: guest
+    name: inner-step
+    run: echo hello
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            r#"
+type: botforge/test
+name: test
+steps:
+  - uses: "@://shared/frag.yaml"
+    id: same-id
+  - uses: "@://shared/frag.yaml"
+    id: same-id
+"#,
+        )
+        .unwrap();
+
+        let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("duplicate step id") && msg.contains("same-id"),
+            "error should mention the duplicate id: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_duplicate_id_between_invoke_and_run_step_rejected() {
+        let repo = TempDir::new().unwrap();
+        std::fs::create_dir_all(repo.path().join("shared")).unwrap();
+        std::fs::write(
+            repo.path().join("shared/frag.yaml"),
+            r#"
+type: botforge/fragment
+steps:
+  - on: guest
+    name: inner-step
+    run: echo hello
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            r#"
+type: botforge/test
+name: test
+steps:
+  - on: guest
+    name: run-step
+    id: shared-id
+    run: echo a
+  - uses: "@://shared/frag.yaml"
+    id: shared-id
+"#,
+        )
+        .unwrap();
+
+        let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("duplicate step id") && msg.contains("shared-id"),
+            "run↔invoke id collision must be rejected: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_same_id_in_different_scopes_allowed() {
+        let repo = TempDir::new().unwrap();
+        std::fs::create_dir_all(repo.path().join("shared")).unwrap();
+        // The fragment uses id "reused-id" in its inner scope.
+        std::fs::write(
+            repo.path().join("shared/frag.yaml"),
+            r#"
+type: botforge/fragment
+steps:
+  - on: guest
+    name: inner-step
+    id: reused-id
+    run: echo hello
+"#,
+        )
+        .unwrap();
+        // The parent scope also uses id "reused-id" as the invoke id.
+        // These are different scopes so there must be no conflict.
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            r#"
+type: botforge/test
+name: test
+steps:
+  - uses: "@://shared/frag.yaml"
+    id: reused-id
+"#,
+        )
+        .unwrap();
+
+        let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+        assert_eq!(config.steps.len(), 1);
+        assert_eq!(
+            invoke_ref(&config.steps[0]).id.as_deref(),
+            Some("reused-id"),
+            "invoke id in parent scope should be allowed even if same id is used in fragment scope"
+        );
+    }
+
+    #[test]
+    fn test_duplicate_run_ids_in_same_scope_still_rejected() {
+        let config_result = serde_yaml::from_str::<TestConfig>(
+            r#"
+steps:
+  - on: guest
+    name: step-a
+    id: dup-run-id
+    run: echo a
+  - on: guest
+    name: step-b
+    id: dup-run-id
+    run: echo b
+"#,
+        );
+        // serde parsing succeeds; the duplicate is caught at validate time.
+        // Use load_test_config path via a temp file.
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            r#"
+type: botforge/test
+name: test
+steps:
+  - on: guest
+    name: step-a
+    id: dup-run-id
+    run: echo a
+  - on: guest
+    name: step-b
+    id: dup-run-id
+    run: echo b
+"#,
+        )
+        .unwrap();
+        let _ = config_result; // just to use the binding
+        let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("duplicate step id") && msg.contains("dup-run-id"),
+            "run↔run id collision must still be rejected: {msg}"
         );
     }
 }
@@ -1517,10 +1797,13 @@ steps:
         assert_eq!(
             config.steps.len(),
             2,
-            "same fragment included twice must expand to two steps"
+            "same fragment included twice must produce two Invoke steps"
         );
-        assert_eq!(run_ref(&config.steps[0]).name, "reused-step");
-        assert_eq!(run_ref(&config.steps[1]).name, "reused-step");
+        // Each Invoke step contains one inner Run step.
+        let inner0 = &invoke_ref(&config.steps[0]).steps;
+        let inner1 = &invoke_ref(&config.steps[1]).steps;
+        assert_eq!(run_ref(&inner0[0]).name, "reused-step");
+        assert_eq!(run_ref(&inner1[0]).name, "reused-step");
     }
 
     #[test]
@@ -2614,7 +2897,9 @@ steps: []
         );
         let cfg = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
         assert_eq!(cfg.steps.len(), 1);
-        assert_eq!(run_ref(&cfg.steps[0]).name, "still-ok");
+        let inner = &invoke_ref(&cfg.steps[0]).steps;
+        assert_eq!(inner.len(), 1);
+        assert_eq!(run_ref(&inner[0]).name, "still-ok");
     }
 
     #[test]
@@ -2954,8 +3239,10 @@ steps:
         );
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
         assert_eq!(config.steps.len(), 1);
-        assert_eq!(run_ref(&config.steps[0]).name, "frag-step");
-        assert_eq!(run_ref(&config.steps[0]).timeout, Some(42));
+        let inner = &invoke_ref(&config.steps[0]).steps;
+        assert_eq!(inner.len(), 1);
+        assert_eq!(run_ref(&inner[0]).name, "frag-step");
+        assert_eq!(run_ref(&inner[0]).timeout, Some(42));
     }
 
     #[test]
@@ -3012,11 +3299,13 @@ steps:
 
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
 
-        assert_eq!(config.steps.len(), 2);
-        assert_eq!(run_ref(&config.steps[0]).name, "build-alpha");
-        assert_eq!(run_ref(&config.steps[0]).run, "echo alpha");
-        assert_eq!(run_ref(&config.steps[1]).name, "build-beta");
-        assert_eq!(run_ref(&config.steps[1]).run, "echo beta");
+        assert_eq!(config.steps.len(), 1);
+        let inner = &invoke_ref(&config.steps[0]).steps;
+        assert_eq!(inner.len(), 2);
+        assert_eq!(run_ref(&inner[0]).name, "build-alpha");
+        assert_eq!(run_ref(&inner[0]).run, "echo alpha");
+        assert_eq!(run_ref(&inner[1]).name, "build-beta");
+        assert_eq!(run_ref(&inner[1]).run, "echo beta");
     }
 
     #[test]
@@ -3048,8 +3337,10 @@ steps:
         );
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
         assert_eq!(config.steps.len(), 1);
-        assert_eq!(run_ref(&config.steps[0]).name, "frag-step");
-        assert_eq!(run_ref(&config.steps[0]).sudo, Some(true));
+        let inner = &invoke_ref(&config.steps[0]).steps;
+        assert_eq!(inner.len(), 1);
+        assert_eq!(run_ref(&inner[0]).name, "frag-step");
+        assert_eq!(run_ref(&inner[0]).sudo, Some(true));
     }
 
     #[test]
@@ -3120,9 +3411,11 @@ steps:
         );
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
         assert_eq!(config.steps.len(), 1);
-        assert_eq!(run_ref(&config.steps[0]).name, "frag-step");
+        let inner = &invoke_ref(&config.steps[0]).steps;
+        assert_eq!(inner.len(), 1);
+        assert_eq!(run_ref(&inner[0]).name, "frag-step");
         assert_eq!(
-            run_ref(&config.steps[0]).expect,
+            run_ref(&inner[0]).expect,
             Some(ExpectBlock {
                 exit: Some(0),
                 stdout: Some(StdioExpect {
@@ -3168,7 +3461,10 @@ steps:
 "#,
         );
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
-        assert_eq!(run_ref(&config.steps[0]).timeout, Some(75));
+        assert_eq!(config.steps.len(), 1);
+        let inner = &invoke_ref(&config.steps[0]).steps;
+        assert_eq!(inner.len(), 1);
+        assert_eq!(run_ref(&inner[0]).timeout, Some(75));
     }
 
     #[test]
@@ -4316,7 +4612,10 @@ steps:
 
         let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
         use crate::step::TestStep;
-        let TestStep::Run(step) = &config.steps[0] else {
+        let TestStep::Invoke(inv) = &config.steps[0] else {
+            panic!("expected invoke step");
+        };
+        let TestStep::Run(step) = &inv.steps[0] else {
             panic!("expected run step");
         };
         assert_eq!(step.timeout, Some(42));
@@ -4370,6 +4669,1183 @@ steps:
         assert!(
             !msg.is_empty(),
             "timeout: ${{{{ inputs.t }}}} with unset input must fail: {msg}"
+        );
+    }
+}
+
+mod outputs_validation {
+    use super::*;
+    use crate::step::{OutputDecl, OutputType};
+
+    fn make_run_step_with_outputs(name: &str, outputs: Vec<OutputDecl>) -> TestStep {
+        TestStep::Run(RunStep {
+            target: StepTarget::Guest,
+            name: name.to_string(),
+            run: "echo ok".to_string(),
+            timeout: None,
+            shell: None,
+            sudo: None,
+            id: None,
+            expect: None,
+            condition: None,
+            outputs,
+            captured_outputs: Default::default(),
+        })
+    }
+
+    fn decl(name: &str, t: OutputType) -> OutputDecl {
+        OutputDecl {
+            name: name.to_string(),
+            output_type: t,
+            required: false,
+        }
+    }
+
+    // --- closed type set (parse-time) ---
+
+    #[test]
+    fn test_output_type_string_accepted() {
+        let step = make_run_step_with_outputs("s", vec![decl("x", OutputType::String)]);
+        assert!(validate_test_steps(&[step], &[]).is_ok());
+    }
+
+    #[test]
+    fn test_output_type_number_accepted() {
+        let step = make_run_step_with_outputs("s", vec![decl("n", OutputType::Number)]);
+        assert!(validate_test_steps(&[step], &[]).is_ok());
+    }
+
+    #[test]
+    fn test_output_type_secret_accepted() {
+        let step = make_run_step_with_outputs("s", vec![decl("token", OutputType::Secret)]);
+        assert!(validate_test_steps(&[step], &[]).is_ok());
+    }
+
+    #[test]
+    fn test_output_type_bool_accepted() {
+        let step = make_run_step_with_outputs("s", vec![decl("b", OutputType::Bool)]);
+        assert!(validate_test_steps(&[step], &[]).is_ok());
+    }
+
+    #[test]
+    fn test_output_unknown_type_rejected_by_serde() {
+        // The closed type set is enforced by serde's enum deserializer.
+        let yaml =
+            "name: s\nrun: echo ok\ntarget: host\noutputs:\n  - name: x\n    type: integer\n";
+        let err = serde_yaml::from_str::<RunStep>(yaml).unwrap_err();
+        assert!(
+            !err.to_string().is_empty(),
+            "unknown type 'integer' should be rejected at parse time"
+        );
+    }
+
+    #[test]
+    fn test_output_type_list_closed_set_object_rejected() {
+        let yaml = "name: s\nrun: echo ok\ntarget: host\noutputs:\n  - name: x\n    type: object\n";
+        let err = serde_yaml::from_str::<RunStep>(yaml).unwrap_err();
+        assert!(
+            !err.to_string().is_empty(),
+            "type 'object' is not in the closed set"
+        );
+    }
+
+    // --- duplicate output names ---
+
+    #[test]
+    fn test_duplicate_output_names_rejected() {
+        let step = make_run_step_with_outputs(
+            "my-step",
+            vec![
+                decl("result", OutputType::String),
+                decl("result", OutputType::Number),
+            ],
+        );
+        let err = validate_test_steps(&[step], &[]).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("result") || msg.contains("duplicate"),
+            "error should mention the duplicate name: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_duplicate_output_names_rejected_in_build() {
+        let step = make_run_step_with_outputs(
+            "my-step",
+            vec![
+                decl("out", OutputType::Bool),
+                decl("out", OutputType::String),
+            ],
+        );
+        let err = validate_build_steps(&[step]).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("out") || msg.contains("duplicate"),
+            "error should mention the duplicate name: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_no_outputs_is_valid() {
+        let step = make_run_step_with_outputs("s", vec![]);
+        assert!(validate_test_steps(&[step], &[]).is_ok());
+    }
+
+    #[test]
+    fn test_multiple_distinct_outputs_is_valid() {
+        let step = make_run_step_with_outputs(
+            "s",
+            vec![
+                decl("name", OutputType::String),
+                decl("count", OutputType::Number),
+                decl("ready", OutputType::Bool),
+            ],
+        );
+        assert!(validate_test_steps(&[step], &[]).is_ok());
+    }
+
+    // --- required flag roundtrip via YAML ---
+
+    #[test]
+    fn test_output_required_parses_from_yaml() {
+        let yaml =
+            "name: s\nrun: echo ok\noutputs:\n  - name: x\n    type: string\n    required: true\n";
+        let step: RunStep = serde_yaml::from_str(yaml).unwrap();
+        assert!(step.outputs[0].required);
+    }
+
+    #[test]
+    fn test_output_required_false_parses_from_yaml() {
+        let yaml =
+            "name: s\nrun: echo ok\noutputs:\n  - name: x\n    type: number\n    required: false\n";
+        let step: RunStep = serde_yaml::from_str(yaml).unwrap();
+        assert!(!step.outputs[0].required);
+    }
+}
+
+// ── Stage 3: fragment `outputs:` declaration, load-time validation, and
+//             boundary re-export resolution ──────────────────────────────────
+
+#[cfg(test)]
+mod fragment_outputs {
+    use super::*;
+    use crate::plan::vm::resolve_invoke_outputs_for_test;
+    use crate::step::{CapturedOutput, FragmentOutputDecl, OutputType, OutputValue};
+
+    // ────────────────────────────────────────────────────────────────
+    // Helpers
+    // ────────────────────────────────────────────────────────────────
+
+    /// Write a minimal `type: botforge/test` entrypoint that uses `frag.yaml`.
+    fn write_test_yaml(repo: &TempDir, frag_name: &str) {
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            format!("type: botforge/test\nname: test\nsteps:\n  - uses: \"@://{frag_name}\"\n"),
+        )
+        .unwrap();
+    }
+
+    /// Load the config and return the single `InvokeStep`.
+    fn load_invoke(repo: &TempDir) -> InvokeStep {
+        let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+        assert_eq!(config.steps.len(), 1, "expected exactly one top-level step");
+        let TestStep::Invoke(invoke) = config.steps.into_iter().next().unwrap() else {
+            panic!("expected Invoke step");
+        };
+        invoke
+    }
+
+    /// Try to load the config and return the error string (full chain via `{:#}`).
+    fn load_err(repo: &TempDir) -> String {
+        format!(
+            "{:#}",
+            load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err()
+        )
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // Parsing: closed type set
+    // ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_fragment_output_type_string_parses() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("frag.yaml"),
+            r#"
+type: botforge/fragment
+steps:
+  - on: guest
+    id: s1
+    name: emit
+    run: echo "label=hi" >> "$BF_OUT"
+    outputs:
+      - name: label
+        type: string
+        required: true
+outputs:
+  - name: result
+    type: string
+    from-step: s1
+    from-output: label
+    required: true
+"#,
+        )
+        .unwrap();
+        write_test_yaml(&repo, "frag.yaml");
+        let invoke = load_invoke(&repo);
+        assert_eq!(invoke.output_decls.len(), 1);
+        assert_eq!(invoke.output_decls[0].output_type, OutputType::String);
+        assert_eq!(invoke.output_decls[0].name, "result");
+        assert_eq!(invoke.output_decls[0].from_step, "s1");
+        assert_eq!(invoke.output_decls[0].from_output, "label");
+        assert!(invoke.output_decls[0].required);
+        assert!(invoke.output_decls[0].default.is_none());
+    }
+
+    #[test]
+    fn test_fragment_output_type_number_parses() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("frag.yaml"),
+            r#"
+type: botforge/fragment
+steps:
+  - on: guest
+    id: counter
+    name: count
+    run: echo "n=5" >> "$BF_OUT"
+    outputs:
+      - name: n
+        type: number
+        required: true
+outputs:
+  - name: count
+    type: number
+    from-step: counter
+    from-output: n
+    required: true
+"#,
+        )
+        .unwrap();
+        write_test_yaml(&repo, "frag.yaml");
+        let invoke = load_invoke(&repo);
+        assert_eq!(invoke.output_decls[0].output_type, OutputType::Number);
+    }
+
+    #[test]
+    fn test_fragment_output_type_bool_parses() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("frag.yaml"),
+            r#"
+type: botforge/fragment
+steps:
+  - on: guest
+    id: check
+    name: chk
+    run: echo "ok=true" >> "$BF_OUT"
+    outputs:
+      - name: ok
+        type: bool
+        required: true
+outputs:
+  - name: ready
+    type: bool
+    from-step: check
+    from-output: ok
+    required: true
+"#,
+        )
+        .unwrap();
+        write_test_yaml(&repo, "frag.yaml");
+        let invoke = load_invoke(&repo);
+        assert_eq!(invoke.output_decls[0].output_type, OutputType::Bool);
+    }
+
+    #[test]
+    fn test_fragment_output_type_secret_parses() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("frag.yaml"),
+            r#"
+type: botforge/fragment
+steps:
+  - on: guest
+    id: emit
+    name: emit
+    run: echo "token=s3cr3t" >> "$BF_OUT"
+    outputs:
+      - name: token
+        type: secret
+        required: true
+outputs:
+  - name: token
+    type: secret
+    from-step: emit
+    from-output: token
+    required: true
+"#,
+        )
+        .unwrap();
+        write_test_yaml(&repo, "frag.yaml");
+        let invoke = load_invoke(&repo);
+        assert_eq!(invoke.output_decls[0].output_type, OutputType::Secret);
+    }
+
+    #[test]
+    fn test_fragment_output_unknown_type_is_rejected() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("frag.yaml"),
+            r#"
+type: botforge/fragment
+steps:
+  - on: guest
+    id: s1
+    name: s
+    run: true
+    outputs:
+      - name: x
+        type: string
+        required: true
+outputs:
+  - name: x
+    type: integer
+    from-step: s1
+    from-output: x
+    required: true
+"#,
+        )
+        .unwrap();
+        write_test_yaml(&repo, "frag.yaml");
+        let err = load_err(&repo);
+        assert!(
+            err.contains("integer")
+                || err.contains("unknown variant")
+                || err.contains("expected one of"),
+            "error should mention the bad type: {err}"
+        );
+    }
+
+    #[test]
+    fn test_fragment_output_unknown_field_is_rejected() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("frag.yaml"),
+            r#"
+type: botforge/fragment
+steps:
+  - on: guest
+    id: s1
+    name: s
+    run: true
+    outputs:
+      - name: x
+        type: string
+        required: true
+outputs:
+  - name: x
+    type: string
+    from-step: s1
+    from-output: x
+    required: true
+    surprise: bad
+"#,
+        )
+        .unwrap();
+        write_test_yaml(&repo, "frag.yaml");
+        let err = load_err(&repo);
+        assert!(
+            err.contains("unknown field") || err.contains("surprise"),
+            "unknown field in fragment output decl should be rejected: {err}"
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // Required-or-default rule (mirror of inputs R1)
+    // ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_fragment_output_neither_required_nor_default_is_error() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("frag.yaml"),
+            r#"
+type: botforge/fragment
+steps:
+  - on: guest
+    id: s1
+    name: s
+    run: true
+    outputs:
+      - name: x
+        type: string
+        required: true
+outputs:
+  - name: x
+    type: string
+    from-step: s1
+    from-output: x
+"#,
+        )
+        .unwrap();
+        write_test_yaml(&repo, "frag.yaml");
+        let err = load_err(&repo);
+        assert!(
+            err.contains("required") || err.contains("default"),
+            "missing required-or-default should be an error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_fragment_output_required_true_without_default_is_valid() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("frag.yaml"),
+            r#"
+type: botforge/fragment
+steps:
+  - on: guest
+    id: s1
+    name: s
+    run: true
+    outputs:
+      - name: x
+        type: string
+        required: true
+outputs:
+  - name: x
+    type: string
+    from-step: s1
+    from-output: x
+    required: true
+"#,
+        )
+        .unwrap();
+        write_test_yaml(&repo, "frag.yaml");
+        let invoke = load_invoke(&repo);
+        assert!(invoke.output_decls[0].required);
+        assert!(invoke.output_decls[0].default.is_none());
+    }
+
+    #[test]
+    fn test_fragment_output_default_without_required_is_valid() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("frag.yaml"),
+            r#"
+type: botforge/fragment
+steps:
+  - on: guest
+    id: s1
+    name: s
+    run: true
+    outputs:
+      - name: x
+        type: string
+        required: false
+outputs:
+  - name: x
+    type: string
+    from-step: s1
+    from-output: x
+    default: fallback
+"#,
+        )
+        .unwrap();
+        write_test_yaml(&repo, "frag.yaml");
+        let invoke = load_invoke(&repo);
+        assert!(!invoke.output_decls[0].required);
+        assert_eq!(
+            invoke.output_decls[0].default,
+            Some(OutputValue::String("fallback".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_fragment_output_both_required_and_default_is_error() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("frag.yaml"),
+            r#"
+type: botforge/fragment
+steps:
+  - on: guest
+    id: s1
+    name: s
+    run: true
+    outputs:
+      - name: x
+        type: string
+        required: true
+outputs:
+  - name: x
+    type: string
+    from-step: s1
+    from-output: x
+    required: true
+    default: oops
+"#,
+        )
+        .unwrap();
+        write_test_yaml(&repo, "frag.yaml");
+        let err = load_err(&repo);
+        assert!(
+            err.contains("required") && err.contains("default"),
+            "both required and default should be an error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_fragment_output_default_number_is_coerced() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("frag.yaml"),
+            r#"
+type: botforge/fragment
+steps:
+  - on: guest
+    id: s1
+    name: s
+    run: true
+    outputs:
+      - name: n
+        type: number
+        required: false
+outputs:
+  - name: count
+    type: number
+    from-step: s1
+    from-output: n
+    default: 42
+"#,
+        )
+        .unwrap();
+        write_test_yaml(&repo, "frag.yaml");
+        let invoke = load_invoke(&repo);
+        assert_eq!(
+            invoke.output_decls[0].default,
+            Some(OutputValue::Number(42.0))
+        );
+    }
+
+    #[test]
+    fn test_fragment_output_default_bool_is_coerced() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("frag.yaml"),
+            r#"
+type: botforge/fragment
+steps:
+  - on: guest
+    id: s1
+    name: s
+    run: true
+    outputs:
+      - name: flag
+        type: bool
+        required: false
+outputs:
+  - name: ready
+    type: bool
+    from-step: s1
+    from-output: flag
+    default: false
+"#,
+        )
+        .unwrap();
+        write_test_yaml(&repo, "frag.yaml");
+        let invoke = load_invoke(&repo);
+        assert_eq!(
+            invoke.output_decls[0].default,
+            Some(OutputValue::Bool(false))
+        );
+    }
+
+    #[test]
+    fn test_fragment_output_default_wrong_type_is_error() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("frag.yaml"),
+            r#"
+type: botforge/fragment
+steps:
+  - on: guest
+    id: s1
+    name: s
+    run: true
+    outputs:
+      - name: n
+        type: number
+        required: false
+outputs:
+  - name: count
+    type: number
+    from-step: s1
+    from-output: n
+    default: not-a-number
+"#,
+        )
+        .unwrap();
+        write_test_yaml(&repo, "frag.yaml");
+        let err = load_err(&repo);
+        assert!(
+            err.contains("coercion") || err.contains("number") || err.contains("default"),
+            "invalid default type should be rejected: {err}"
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // Referenced step and output existence
+    // ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_fragment_output_nonexistent_step_is_error() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("frag.yaml"),
+            r#"
+type: botforge/fragment
+steps:
+  - on: guest
+    id: real-step
+    name: s
+    run: true
+    outputs:
+      - name: x
+        type: string
+        required: true
+outputs:
+  - name: x
+    type: string
+    from-step: ghost-step
+    from-output: x
+    required: true
+"#,
+        )
+        .unwrap();
+        write_test_yaml(&repo, "frag.yaml");
+        let err = load_err(&repo);
+        assert!(
+            err.contains("ghost-step"),
+            "error should name the missing step id: {err}"
+        );
+    }
+
+    #[test]
+    fn test_fragment_output_nonexistent_output_on_step_is_error() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("frag.yaml"),
+            r#"
+type: botforge/fragment
+steps:
+  - on: guest
+    id: s1
+    name: s
+    run: true
+    outputs:
+      - name: real-output
+        type: string
+        required: true
+outputs:
+  - name: x
+    type: string
+    from-step: s1
+    from-output: ghost-output
+    required: true
+"#,
+        )
+        .unwrap();
+        write_test_yaml(&repo, "frag.yaml");
+        let err = load_err(&repo);
+        assert!(
+            err.contains("ghost-output"),
+            "error should name the missing output: {err}"
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // Step↔fragment type-match
+    // ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_fragment_output_type_match_succeeds() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("frag.yaml"),
+            r#"
+type: botforge/fragment
+steps:
+  - on: guest
+    id: s1
+    name: s
+    run: echo "val=hello" >> "$BF_OUT"
+    outputs:
+      - name: val
+        type: string
+        required: true
+outputs:
+  - name: val
+    type: string
+    from-step: s1
+    from-output: val
+    required: true
+"#,
+        )
+        .unwrap();
+        write_test_yaml(&repo, "frag.yaml");
+        // Should succeed without error.
+        let invoke = load_invoke(&repo);
+        assert_eq!(invoke.output_decls[0].output_type, OutputType::String);
+    }
+
+    #[test]
+    fn test_fragment_output_type_mismatch_is_error() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("frag.yaml"),
+            r#"
+type: botforge/fragment
+steps:
+  - on: guest
+    id: s1
+    name: s
+    run: true
+    outputs:
+      - name: n
+        type: number
+        required: true
+outputs:
+  - name: n
+    type: string
+    from-step: s1
+    from-output: n
+    required: true
+"#,
+        )
+        .unwrap();
+        write_test_yaml(&repo, "frag.yaml");
+        let err = load_err(&repo);
+        assert!(
+            err.contains("mismatch") || (err.contains("string") && err.contains("number")),
+            "type mismatch should be an error naming both types: {err}"
+        );
+    }
+
+    #[test]
+    fn test_fragment_output_type_mismatch_error_names_both_sides() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("frag.yaml"),
+            r#"
+type: botforge/fragment
+steps:
+  - on: guest
+    id: s1
+    name: s
+    run: true
+    outputs:
+      - name: flag
+        type: bool
+        required: true
+outputs:
+  - name: flag
+    type: number
+    from-step: s1
+    from-output: flag
+    required: true
+"#,
+        )
+        .unwrap();
+        write_test_yaml(&repo, "frag.yaml");
+        let err = load_err(&repo);
+        // Error should name both the fragment-declared type and the step's type.
+        assert!(
+            err.contains("number") && err.contains("bool"),
+            "type mismatch error should name both sides (bool vs number): {err}"
+        );
+    }
+
+    #[test]
+    fn test_fragment_output_secret_type_mismatch_is_error() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("frag.yaml"),
+            r#"
+type: botforge/fragment
+steps:
+  - on: guest
+    id: s1
+    name: s
+    run: true
+    outputs:
+      - name: token
+        type: secret
+        required: true
+outputs:
+  - name: token
+    type: string
+    from-step: s1
+    from-output: token
+    required: true
+"#,
+        )
+        .unwrap();
+        write_test_yaml(&repo, "frag.yaml");
+        let err = load_err(&repo);
+        assert!(
+            err.contains("mismatch") && err.contains("secret") && err.contains("string"),
+            "secret/string mismatch should fail load-time with both types named: {err}"
+        );
+    }
+
+    #[test]
+    fn test_fragment_output_secret_invalid_default_masks_raw_value() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("frag.yaml"),
+            r#"
+type: botforge/fragment
+steps:
+  - on: guest
+    id: s1
+    name: s
+    run: true
+    outputs:
+      - name: token
+        type: secret
+        required: false
+outputs:
+  - name: token
+    type: secret
+    from-step: s1
+    from-output: token
+    default:
+      leaked: super-secret-value
+"#,
+        )
+        .unwrap();
+        write_test_yaml(&repo, "frag.yaml");
+        let err = load_err(&repo);
+        assert!(
+            err.contains("invalid default value for secret output"),
+            "error should report invalid secret default: {err}"
+        );
+        assert!(
+            !err.contains("super-secret-value"),
+            "secret default value must be masked in error output: {err}"
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // Duplicate output name
+    // ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_fragment_output_duplicate_name_is_error() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("frag.yaml"),
+            r#"
+type: botforge/fragment
+steps:
+  - on: guest
+    id: s1
+    name: s
+    run: true
+    outputs:
+      - name: x
+        type: string
+        required: true
+      - name: y
+        type: string
+        required: true
+outputs:
+  - name: x
+    type: string
+    from-step: s1
+    from-output: x
+    required: true
+  - name: x
+    type: string
+    from-step: s1
+    from-output: y
+    required: true
+"#,
+        )
+        .unwrap();
+        write_test_yaml(&repo, "frag.yaml");
+        let err = load_err(&repo);
+        assert!(
+            err.contains("duplicate") || err.contains("x"),
+            "duplicate output name should be rejected: {err}"
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // Multiple outputs (valid)
+    // ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_fragment_multiple_outputs_parse_correctly() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("frag.yaml"),
+            r#"
+type: botforge/fragment
+steps:
+  - on: guest
+    id: s1
+    name: emit
+    run: |
+      echo "label=hi" >> "$BF_OUT"
+      echo "count=7" >> "$BF_OUT"
+      echo "ok=true" >> "$BF_OUT"
+    outputs:
+      - name: label
+        type: string
+        required: true
+      - name: count
+        type: number
+        required: true
+      - name: ok
+        type: bool
+        required: true
+outputs:
+  - name: label
+    type: string
+    from-step: s1
+    from-output: label
+    required: true
+  - name: count
+    type: number
+    from-step: s1
+    from-output: count
+    required: true
+  - name: ok
+    type: bool
+    from-step: s1
+    from-output: ok
+    required: true
+"#,
+        )
+        .unwrap();
+        write_test_yaml(&repo, "frag.yaml");
+        let invoke = load_invoke(&repo);
+        assert_eq!(invoke.output_decls.len(), 3);
+        assert_eq!(invoke.output_decls[0].name, "label");
+        assert_eq!(invoke.output_decls[0].output_type, OutputType::String);
+        assert_eq!(invoke.output_decls[1].name, "count");
+        assert_eq!(invoke.output_decls[1].output_type, OutputType::Number);
+        assert_eq!(invoke.output_decls[2].name, "ok");
+        assert_eq!(invoke.output_decls[2].output_type, OutputType::Bool);
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // Fragment with no outputs: should still work (backward compat)
+    // ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_fragment_without_outputs_block_has_empty_decls() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("frag.yaml"),
+            r#"
+type: botforge/fragment
+steps:
+  - on: guest
+    name: plain
+    run: echo ok
+"#,
+        )
+        .unwrap();
+        write_test_yaml(&repo, "frag.yaml");
+        let invoke = load_invoke(&repo);
+        assert!(invoke.output_decls.is_empty());
+        // The captured_outputs slot is None before execution.
+        assert!(invoke.captured_outputs.borrow().is_none());
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // Boundary re-export resolution (unit tests against `resolve_invoke_outputs`)
+    // ────────────────────────────────────────────────────────────────
+
+    fn make_invoke_with_captured_inner(
+        inner_id: &str,
+        output_name: &str,
+        inner_value: OutputValue,
+        decl: FragmentOutputDecl,
+    ) -> InvokeStep {
+        // Build a RunStep that has already had its captured_outputs populated.
+        let run = RunStep {
+            target: StepTarget::Host,
+            name: "inner-step".to_string(),
+            run: "true".to_string(),
+            timeout: None,
+            shell: None,
+            sudo: None,
+            id: Some(inner_id.to_string()),
+            expect: None,
+            condition: None,
+            outputs: vec![crate::step::OutputDecl {
+                name: output_name.to_string(),
+                output_type: decl.output_type,
+                required: true,
+            }],
+            captured_outputs: std::cell::RefCell::new(Some(vec![CapturedOutput {
+                name: output_name.to_string(),
+                declared_type: decl.output_type,
+                value: inner_value,
+            }])),
+        };
+        InvokeStep {
+            uses: "@://test-frag.yaml".to_string(),
+            id: None,
+            steps: vec![TestStep::Run(run)],
+            output_decls: vec![decl],
+            captured_outputs: std::cell::RefCell::new(None),
+        }
+    }
+
+    #[test]
+    fn test_resolve_invoke_outputs_string_value_is_re_exported() {
+        let decl = FragmentOutputDecl {
+            name: "result".to_string(),
+            output_type: OutputType::String,
+            from_step: "inner".to_string(),
+            from_output: "label".to_string(),
+            required: true,
+            default: None,
+        };
+        let invoke = make_invoke_with_captured_inner(
+            "inner",
+            "label",
+            OutputValue::String("hello".to_string()),
+            decl,
+        );
+        resolve_invoke_outputs_for_test(&invoke).unwrap();
+        let captured = invoke.captured_outputs.borrow();
+        let outputs = captured.as_ref().unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].name, "result");
+        assert_eq!(outputs[0].value, OutputValue::String("hello".to_string()));
+        assert_eq!(outputs[0].declared_type, OutputType::String);
+    }
+
+    #[test]
+    fn test_resolve_invoke_outputs_number_value_is_re_exported() {
+        let decl = FragmentOutputDecl {
+            name: "count".to_string(),
+            output_type: OutputType::Number,
+            from_step: "inner".to_string(),
+            from_output: "n".to_string(),
+            required: true,
+            default: None,
+        };
+        let invoke = make_invoke_with_captured_inner("inner", "n", OutputValue::Number(99.0), decl);
+        resolve_invoke_outputs_for_test(&invoke).unwrap();
+        let captured = invoke.captured_outputs.borrow();
+        let outputs = captured.as_ref().unwrap();
+        assert_eq!(outputs[0].value, OutputValue::Number(99.0));
+    }
+
+    #[test]
+    fn test_resolve_invoke_outputs_bool_value_is_re_exported() {
+        let decl = FragmentOutputDecl {
+            name: "ok".to_string(),
+            output_type: OutputType::Bool,
+            from_step: "inner".to_string(),
+            from_output: "flag".to_string(),
+            required: false,
+            default: Some(OutputValue::Bool(false)),
+        };
+        let invoke =
+            make_invoke_with_captured_inner("inner", "flag", OutputValue::Bool(true), decl);
+        resolve_invoke_outputs_for_test(&invoke).unwrap();
+        let captured = invoke.captured_outputs.borrow();
+        let outputs = captured.as_ref().unwrap();
+        assert_eq!(outputs[0].value, OutputValue::Bool(true));
+    }
+
+    #[test]
+    fn test_resolve_invoke_outputs_null_inner_applies_default() {
+        let decl = FragmentOutputDecl {
+            name: "label".to_string(),
+            output_type: OutputType::String,
+            from_step: "inner".to_string(),
+            from_output: "x".to_string(),
+            required: false,
+            default: Some(OutputValue::String("default-val".to_string())),
+        };
+        let invoke = make_invoke_with_captured_inner("inner", "x", OutputValue::Null, decl);
+        resolve_invoke_outputs_for_test(&invoke).unwrap();
+        let captured = invoke.captured_outputs.borrow();
+        let outputs = captured.as_ref().unwrap();
+        assert_eq!(
+            outputs[0].value,
+            OutputValue::String("default-val".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_invoke_outputs_required_null_with_no_default_is_error() {
+        let decl = FragmentOutputDecl {
+            name: "must-have".to_string(),
+            output_type: OutputType::String,
+            from_step: "inner".to_string(),
+            from_output: "x".to_string(),
+            required: true,
+            default: None,
+        };
+        let invoke = make_invoke_with_captured_inner("inner", "x", OutputValue::Null, decl);
+        let err = resolve_invoke_outputs_for_test(&invoke).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("required") && msg.contains("must-have"),
+            "error should mention required output name: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_invoke_outputs_no_decls_leaves_captured_as_none() {
+        let invoke = InvokeStep {
+            uses: "@://empty-frag.yaml".to_string(),
+            id: None,
+            steps: vec![],
+            output_decls: vec![],
+            captured_outputs: std::cell::RefCell::new(None),
+        };
+        resolve_invoke_outputs_for_test(&invoke).unwrap();
+        // With no declarations, captured_outputs stays None.
+        assert!(invoke.captured_outputs.borrow().is_none());
+    }
+
+    #[test]
+    fn test_resolve_invoke_outputs_sets_captured_outputs_to_some() {
+        let decl = FragmentOutputDecl {
+            name: "result".to_string(),
+            output_type: OutputType::String,
+            from_step: "s1".to_string(),
+            from_output: "val".to_string(),
+            required: true,
+            default: None,
+        };
+        let invoke = make_invoke_with_captured_inner(
+            "s1",
+            "val",
+            OutputValue::String("ok".to_string()),
+            decl,
+        );
+        assert!(
+            invoke.captured_outputs.borrow().is_none(),
+            "should be None before resolution"
+        );
+        resolve_invoke_outputs_for_test(&invoke).unwrap();
+        assert!(
+            invoke.captured_outputs.borrow().is_some(),
+            "should be Some after resolution"
         );
     }
 }

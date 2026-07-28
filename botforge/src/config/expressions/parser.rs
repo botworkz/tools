@@ -13,6 +13,18 @@ pub(super) enum ExprNode {
         namespace: String,
         name: String,
     },
+    /// `steps.<id>.outputs.<name>` reference to a fragment invocation's captured
+    /// output.  Deferred at load time (values only exist after the referenced
+    /// `uses:` step has run); resolved lazily at execution time.
+    StepOutputReference {
+        step_id: String,
+        output_name: String,
+    },
+    /// `outputs.<name>` reference to the current fragment's declared output.
+    /// Deferred at load time and resolved lazily at execution time.
+    FragmentOutputReference {
+        output_name: String,
+    },
     /// `func(arg)` function call, e.g. `to_json(x)` or `from_json(s)`.
     FunctionCall {
         name: String,
@@ -137,6 +149,50 @@ impl Parser {
                                 anyhow::bail!("invalid input name '{name}'");
                             }
                             self.advance()?;
+                            // `steps.<id>.outputs.<name>` — step output reference
+                            // (four dotted segments).
+                            if identifier == "steps" {
+                                self.expect_token(Token::Dot).map_err(|_| {
+                                    anyhow::anyhow!(
+                                        "invalid 'steps' reference: expected \
+                                         'steps.<id>.outputs.<name>'"
+                                    )
+                                })?;
+                                match self.current.clone() {
+                                    Token::Identifier(seg) if seg == "outputs" => {}
+                                    other => anyhow::bail!(
+                                        "invalid 'steps' reference: expected 'outputs' \
+                                         after 'steps.{name}.', found {other:?}"
+                                    ),
+                                }
+                                self.advance()?;
+                                self.expect_token(Token::Dot).map_err(|_| {
+                                    anyhow::anyhow!(
+                                        "invalid 'steps' reference: expected \
+                                         'steps.<id>.outputs.<name>'"
+                                    )
+                                })?;
+                                let output_name = match self.current.clone() {
+                                    Token::Identifier(n) => n,
+                                    Token::NumberLiteral(n) => n,
+                                    other => anyhow::bail!(
+                                        "expected output name after 'steps.{name}.outputs.', \
+                                         found {other:?}"
+                                    ),
+                                };
+                                if !is_reference_name_valid(&output_name) {
+                                    anyhow::bail!("invalid output name '{output_name}'");
+                                }
+                                self.advance()?;
+                                return Ok(ExprNode::StepOutputReference {
+                                    step_id: name,
+                                    output_name,
+                                });
+                            }
+                            // `outputs.<name>` — current fragment output reference.
+                            if identifier == "outputs" {
+                                return Ok(ExprNode::FragmentOutputReference { output_name: name });
+                            }
                             Ok(ExprNode::Reference {
                                 namespace: identifier,
                                 name,

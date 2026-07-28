@@ -1,0 +1,12 @@
+type: botforge/test
+name: assert-fail-output-scope-violation
+ports:
+- 80
+steps:
+- uses: "@://fragment-outputs.steps.yaml"
+  id: frag
+- on: host
+  name: illegal-scope-reference
+  run: echo "${{ steps.emit.outputs.version }}"
+assert:
+  files: {}
