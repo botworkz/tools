@@ -6,6 +6,14 @@ use std::path::Path;
 
 use crate::step::TestStep;
 
+mod eval;
+mod lexer;
+mod parser;
+mod value;
+
+use eval::evaluate_expression_span;
+use value::{EvaluatedSpan, EvaluatedValue};
+
 const DEFAULT_SENTINEL: &str = "__default__";
 
 // ---------------------------------------------------------------------------
@@ -26,8 +34,15 @@ pub(super) struct InputDeclaration {
     pub(super) input_type: InputType,
     #[serde(default)]
     pub(super) required: bool,
-    pub(super) default: Option<String>,
+    pub(super) default: Option<std::string::String>,
 }
+
+/// Map of resolved input values together with their declared types.
+///
+/// This carries type information from `InputDeclaration` through to the expression
+/// evaluator so that `inputs.flag` (declared `boolean`) evaluates to `Bool(false)`,
+/// not the string `"false"`.
+pub(super) type TypedInputMap = BTreeMap<std::string::String, (std::string::String, InputType)>;
 
 // ---------------------------------------------------------------------------
 // `for:` expansion helpers
@@ -87,7 +102,7 @@ pub(super) fn expand_raw_step(step: Value) -> Result<Vec<TestStep>> {
     Ok(expanded)
 }
 
-fn resolve_for_args(item: &Value) -> Result<BTreeMap<String, String>> {
+fn resolve_for_args(item: &Value) -> Result<BTreeMap<std::string::String, std::string::String>> {
     let mut args = BTreeMap::new();
     match item {
         Value::Sequence(values) => {
@@ -111,7 +126,7 @@ fn resolve_for_args(item: &Value) -> Result<BTreeMap<String, String>> {
     Ok(args)
 }
 
-fn scalar_value_to_string(value: &Value) -> Result<String> {
+fn scalar_value_to_string(value: &Value) -> Result<std::string::String> {
     match value {
         Value::String(text) => Ok(text.clone()),
         Value::Bool(flag) => Ok(flag.to_string()),
@@ -127,7 +142,7 @@ fn scalar_value_to_string(value: &Value) -> Result<String> {
 
 pub(super) fn extract_fragment_input_declarations(
     value: &Value,
-) -> Result<BTreeMap<String, InputDeclaration>> {
+) -> Result<BTreeMap<std::string::String, InputDeclaration>> {
     let mapping = match value {
         Value::Mapping(m) => m,
         _ => return Ok(BTreeMap::new()),
@@ -136,7 +151,7 @@ pub(super) fn extract_fragment_input_declarations(
     match mapping.get(&inputs_key) {
         None => Ok(BTreeMap::new()),
         Some(inputs_value) => {
-            let declarations: BTreeMap<String, InputDeclaration> =
+            let declarations: BTreeMap<std::string::String, InputDeclaration> =
                 serde_yaml::from_value(inputs_value.clone())
                     .context("invalid inputs: declaration")?;
             Ok(declarations)
@@ -144,11 +159,16 @@ pub(super) fn extract_fragment_input_declarations(
     }
 }
 
+/// Resolve declared input values from a `with:` call-site map, returning a
+/// [`TypedInputMap`] that pairs each value with its declared [`InputType`].
+///
+/// Carries type information through to the expression evaluator so that boolean
+/// inputs evaluate as `Bool` (falsy/truthy correctly) rather than strings.
 pub(super) fn resolve_fragment_inputs(
     path: &Path,
-    declarations: &BTreeMap<String, InputDeclaration>,
-    with: &BTreeMap<String, String>,
-) -> Result<BTreeMap<String, String>> {
+    declarations: &BTreeMap<std::string::String, InputDeclaration>,
+    with: &BTreeMap<std::string::String, std::string::String>,
+) -> Result<TypedInputMap> {
     // Declaration-time validation: required: true + default: together is a contradiction.
     for (name, decl) in declarations {
         if decl.required && decl.default.is_some() {
@@ -170,7 +190,7 @@ pub(super) fn resolve_fragment_inputs(
         }
     }
 
-    let mut resolved = BTreeMap::new();
+    let mut resolved = TypedInputMap::new();
 
     for (name, decl) in declarations {
         let caller_value = with.get(name.as_str());
@@ -178,10 +198,11 @@ pub(super) fn resolve_fragment_inputs(
         // Resolution pipeline:
         //   omitted key or "__default__" sentinel → declared default (or unset if none).
         //   any other value (including "") → take literally.
-        let effective: Option<String> = match caller_value.map(String::as_str) {
-            None | Some(DEFAULT_SENTINEL) => decl.default.clone(),
-            Some(v) => Some(v.to_string()),
-        };
+        let effective: Option<std::string::String> =
+            match caller_value.map(std::string::String::as_str) {
+                None | Some(DEFAULT_SENTINEL) => decl.default.clone(),
+                Some(v) => Some(v.to_string()),
+            };
 
         // Type-validate the resolved value (sentinel is already gone at this point).
         if let Some(ref v) = effective {
@@ -194,7 +215,7 @@ pub(super) fn resolve_fragment_inputs(
         }
 
         if let Some(v) = effective {
-            resolved.insert(name.clone(), v);
+            resolved.insert(name.clone(), (v, decl.input_type));
         }
     }
 
@@ -219,34 +240,76 @@ fn validate_input_type(name: &str, input_type: InputType, value: &str) -> Result
 // `${{ }}` substitution engine
 // ---------------------------------------------------------------------------
 
+/// Substitute `${{ inputs.NAME }}` expressions in `value`, resolving each reference
+/// using the declared type from `typed_inputs`.
+///
+/// After this pass, any `${{ args.NAME }}` references are preserved as-is (deferred)
+/// for the subsequent [`substitute_args_in_value`] call.
 pub(super) fn substitute_inputs_in_value(
     value: &mut Value,
-    inputs: &BTreeMap<String, String>,
+    typed_inputs: &TypedInputMap,
 ) -> Result<()> {
-    substitute_namespace_in_value(value, "inputs", inputs)
+    substitute_namespace_in_value(value, "inputs", typed_inputs, &BTreeMap::new())
 }
 
-fn substitute_args_in_value(value: &mut Value, args: &BTreeMap<String, String>) -> Result<()> {
-    substitute_namespace_in_value(value, "args", args)
+/// Substitute `${{ args.NAME }}` expressions in `value`.
+///
+/// `args.*` references have no type declaration and are always resolved as strings.
+/// This is the final substitution pass; after it completes, every `${{ }}` span
+/// must be resolved (no `Deferred` spans should remain).
+pub(super) fn substitute_args_in_value(
+    value: &mut Value,
+    args: &BTreeMap<std::string::String, std::string::String>,
+) -> Result<()> {
+    substitute_namespace_in_value(value, "args", &TypedInputMap::new(), args)
 }
 
 fn substitute_namespace_in_value(
     value: &mut Value,
-    namespace: &str,
-    values: &BTreeMap<String, String>,
+    active_namespace: &str,
+    typed_inputs: &TypedInputMap,
+    args: &BTreeMap<std::string::String, std::string::String>,
 ) -> Result<()> {
     match value {
         Value::String(text) => {
-            *text = substitute_namespace_in_string(text, namespace, values)?;
+            // For single pure expressions (`${{ expr }}` with no surrounding text),
+            // preserve the typed result. For mixed-content strings, use string
+            // interpolation (the "interpolation into surrounding text" path).
+            let text_clone = text.clone();
+            match try_substitute_pure_expression(&text_clone, active_namespace, typed_inputs, args)?
+            {
+                PureResult::Typed(ev) => {
+                    *value = ev.to_yaml_value();
+                }
+                PureResult::Deferred => {
+                    // Leave the placeholder intact for the next substitution pass.
+                }
+                PureResult::NotPure => {
+                    *text = substitute_namespace_in_string(
+                        &text_clone,
+                        active_namespace,
+                        typed_inputs,
+                        args,
+                    )?;
+                }
+            }
         }
         Value::Sequence(items) => {
             for item in items {
-                substitute_namespace_in_value(item, namespace, values)?;
+                substitute_namespace_in_value(item, active_namespace, typed_inputs, args)?;
             }
         }
         Value::Mapping(entries) => {
-            for (_, value) in entries.iter_mut() {
-                substitute_namespace_in_value(value, namespace, values)?;
+            for (key, val) in entries.iter_mut() {
+                // The `if:` field requires typed evaluation (not string interpolation):
+                // `${{ inputs.booly }}` for a declared boolean false must produce
+                // Bool(false) → falsy, not String("false") → truthy.
+                let is_if_key = key.as_str() == Some("if");
+                if is_if_key {
+                    substitute_if_condition_in_value(val, active_namespace, typed_inputs, args)?;
+                } else {
+                    substitute_namespace_in_value(val, active_namespace, typed_inputs, args)?;
+                }
             }
         }
         _ => {}
@@ -254,12 +317,93 @@ fn substitute_namespace_in_value(
     Ok(())
 }
 
+/// Result of attempting to evaluate a value as a pure single-expression.
+enum PureResult {
+    /// A single `${{ expr }}` was fully evaluated; use `EvaluatedValue::to_yaml_value()`.
+    Typed(EvaluatedValue),
+    /// A single `${{ expr }}` was encountered but references an inactive namespace.
+    Deferred,
+    /// Not a pure single expression (has surrounding text, or no expression at all).
+    NotPure,
+}
+
+/// Check if `text` is a pure `${{ expr }}` (no surrounding text) and evaluate it.
+fn try_substitute_pure_expression(
+    text: &str,
+    active_namespace: &str,
+    typed_inputs: &TypedInputMap,
+    args: &BTreeMap<std::string::String, std::string::String>,
+) -> Result<PureResult> {
+    let Some(expr) = extract_pure_expression(text) else {
+        return Ok(PureResult::NotPure);
+    };
+    match evaluate_expression_span(expr, active_namespace, typed_inputs, args)? {
+        EvaluatedSpan::Value(ev) => Ok(PureResult::Typed(ev)),
+        EvaluatedSpan::Deferred => Ok(PureResult::Deferred),
+    }
+}
+
+/// If the entire `text` is a single `${{ expr }}` with nothing outside it, return
+/// the trimmed inner expression string. Otherwise return `None`.
+fn extract_pure_expression(text: &str) -> Option<&str> {
+    if let Some(rest) = text.strip_prefix("${{") {
+        if let Some(end) = rest.find("}}") {
+            if rest[end + 2..].is_empty() {
+                return Some(rest[..end].trim());
+            }
+        }
+    }
+    None
+}
+
+/// Handle the `if:` field with typed evaluation.
+///
+/// When the value is a pure `${{ expr }}`:
+/// - Evaluate to a typed `EvaluatedValue`
+/// - Apply truthiness → store as `Bool(result)` so that `deserialize_step_condition`
+///   receives a YAML bool, not a string.
+///
+/// For non-expression values (plain YAML bool/string/number) or mixed-content strings,
+/// fall through to normal string substitution; `deserialize_step_condition` handles them.
+fn substitute_if_condition_in_value(
+    value: &mut Value,
+    active_namespace: &str,
+    typed_inputs: &TypedInputMap,
+    args: &BTreeMap<std::string::String, std::string::String>,
+) -> Result<()> {
+    if let Value::String(text) = value {
+        if let Some(expr) = extract_pure_expression(text) {
+            match evaluate_expression_span(expr, active_namespace, typed_inputs, args)? {
+                EvaluatedSpan::Value(ev) => {
+                    *value = Value::Bool(ev.truthy());
+                    return Ok(());
+                }
+                EvaluatedSpan::Deferred => {
+                    // Leave placeholder intact.
+                    return Ok(());
+                }
+            }
+        }
+        // Mixed-content `if:` value (has surrounding text): string interpolation.
+        let text_clone = text.clone();
+        *text = substitute_namespace_in_string(&text_clone, active_namespace, typed_inputs, args)?;
+    }
+    // Already a typed YAML value (bool/number/null); leave for deserialize_step_condition.
+    Ok(())
+}
+
+/// Interpolate all `${{ expr }}` spans in `text` into a string.
+///
+/// This is the **string-interpolation path** (used when there is surrounding text).
+/// Values are rendered via `EvaluatedValue::to_interpolated_string()` (faithful,
+/// not truthiness-collapsed). Only `Empty` yields `""`.
 fn substitute_namespace_in_string(
     text: &str,
-    namespace: &str,
-    values: &BTreeMap<String, String>,
-) -> Result<String> {
-    let mut rendered = String::with_capacity(text.len());
+    active_namespace: &str,
+    typed_inputs: &TypedInputMap,
+    args: &BTreeMap<std::string::String, std::string::String>,
+) -> Result<std::string::String> {
+    let mut rendered = std::string::String::with_capacity(text.len());
     let mut rest = text;
     while let Some(start) = rest.find("${{") {
         rendered.push_str(&rest[..start]);
@@ -269,7 +413,7 @@ fn substitute_namespace_in_string(
             .ok_or_else(|| anyhow::anyhow!("unterminated input expression in '{text}'"))?;
         let expr = after_open[..end].trim();
         let placeholder = &rest[start..start + 3 + end + 2];
-        match evaluate_expression_span(expr, namespace, values)
+        match evaluate_expression_span(expr, active_namespace, typed_inputs, args)
             .with_context(|| format!("while evaluating expression '${{{{{expr}}}}}' in '{text}'"))?
         {
             EvaluatedSpan::Value(value) => rendered.push_str(&value.to_interpolated_string()),
@@ -281,457 +425,6 @@ fn substitute_namespace_in_string(
     Ok(rendered)
 }
 
-#[derive(Clone, Debug, PartialEq)]
-enum EvaluatedValue {
-    String(String),
-    Number(f64),
-    Bool(bool),
-    Empty,
-}
-
-impl EvaluatedValue {
-    fn truthy(&self) -> bool {
-        match self {
-            Self::Empty => false,
-            Self::Bool(flag) => *flag,
-            Self::Number(number) => *number != 0.0,
-            Self::String(text) => !text.is_empty(),
-        }
-    }
-
-    fn to_interpolated_string(&self) -> String {
-        if !self.truthy() {
-            return String::new();
-        }
-        match self {
-            Self::String(text) => text.clone(),
-            Self::Number(number) => number.to_string(),
-            Self::Bool(true) => "true".to_string(),
-            Self::Bool(false) | Self::Empty => String::new(),
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-enum EvaluatedSpan {
-    Value(EvaluatedValue),
-    Deferred,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-enum ExprNode {
-    String(String),
-    Number(f64),
-    Bool(bool),
-    Reference { namespace: String, name: String },
-    Not(Box<ExprNode>),
-    Equal(Box<ExprNode>, Box<ExprNode>),
-    NotEqual(Box<ExprNode>, Box<ExprNode>),
-    And(Box<ExprNode>, Box<ExprNode>),
-    Or(Box<ExprNode>, Box<ExprNode>),
-}
-
-#[derive(Clone, Debug, PartialEq)]
-enum Token {
-    OrOr,
-    AndAnd,
-    EqEq,
-    NotEq,
-    Bang,
-    LParen,
-    RParen,
-    Dot,
-    Identifier(String),
-    StringLiteral(String),
-    NumberLiteral(String),
-    End,
-}
-
-struct Lexer {
-    chars: Vec<char>,
-    pos: usize,
-}
-
-impl Lexer {
-    fn new(input: &str) -> Self {
-        Self {
-            chars: input.chars().collect(),
-            pos: 0,
-        }
-    }
-
-    fn next_token(&mut self) -> Result<Token> {
-        self.skip_whitespace();
-        if self.pos >= self.chars.len() {
-            return Ok(Token::End);
-        }
-
-        let ch = self.chars[self.pos];
-        match ch {
-            '|' => {
-                if self.peek_char(1) == Some('|') {
-                    self.pos += 2;
-                    Ok(Token::OrOr)
-                } else {
-                    anyhow::bail!("unexpected '|' at position {}", self.pos);
-                }
-            }
-            '&' => {
-                if self.peek_char(1) == Some('&') {
-                    self.pos += 2;
-                    Ok(Token::AndAnd)
-                } else {
-                    anyhow::bail!("unexpected '&' at position {}", self.pos);
-                }
-            }
-            '=' => {
-                if self.peek_char(1) == Some('=') {
-                    self.pos += 2;
-                    Ok(Token::EqEq)
-                } else {
-                    anyhow::bail!("unexpected '=' at position {}; use '=='", self.pos);
-                }
-            }
-            '!' => {
-                if self.peek_char(1) == Some('=') {
-                    self.pos += 2;
-                    Ok(Token::NotEq)
-                } else {
-                    self.pos += 1;
-                    Ok(Token::Bang)
-                }
-            }
-            '(' => {
-                self.pos += 1;
-                Ok(Token::LParen)
-            }
-            ')' => {
-                self.pos += 1;
-                Ok(Token::RParen)
-            }
-            '.' => {
-                self.pos += 1;
-                Ok(Token::Dot)
-            }
-            '\'' => self.read_single_quoted_string(),
-            '0'..='9' => self.read_number(),
-            _ if is_identifier_char(ch) => self.read_identifier(),
-            _ => anyhow::bail!("unexpected character '{}' at position {}", ch, self.pos),
-        }
-    }
-
-    fn read_single_quoted_string(&mut self) -> Result<Token> {
-        self.pos += 1; // opening '
-        let mut output = String::new();
-        while self.pos < self.chars.len() {
-            let ch = self.chars[self.pos];
-            self.pos += 1;
-            match ch {
-                '\'' => return Ok(Token::StringLiteral(output)),
-                '\\' => {
-                    let Some(next) = self.chars.get(self.pos).copied() else {
-                        anyhow::bail!("unterminated escape in string literal");
-                    };
-                    self.pos += 1;
-                    output.push(match next {
-                        '\'' => '\'',
-                        '\\' => '\\',
-                        'n' => '\n',
-                        'r' => '\r',
-                        't' => '\t',
-                        other => other,
-                    });
-                }
-                other => output.push(other),
-            }
-        }
-        anyhow::bail!("unterminated string literal")
-    }
-
-    fn read_number(&mut self) -> Result<Token> {
-        let start = self.pos;
-        let mut seen_dot = false;
-        while self.pos < self.chars.len() {
-            match self.chars[self.pos] {
-                '0'..='9' => self.pos += 1,
-                '.' if !seen_dot => {
-                    seen_dot = true;
-                    self.pos += 1;
-                }
-                _ => break,
-            }
-        }
-        let literal: String = self.chars[start..self.pos].iter().collect();
-        Ok(Token::NumberLiteral(literal))
-    }
-
-    fn read_identifier(&mut self) -> Result<Token> {
-        let start = self.pos;
-        while self.pos < self.chars.len() && is_identifier_char(self.chars[self.pos]) {
-            self.pos += 1;
-        }
-        let identifier: String = self.chars[start..self.pos].iter().collect();
-        if identifier.is_empty() {
-            anyhow::bail!("expected identifier at position {}", start);
-        }
-        Ok(Token::Identifier(identifier))
-    }
-
-    fn skip_whitespace(&mut self) {
-        while self.pos < self.chars.len() && self.chars[self.pos].is_whitespace() {
-            self.pos += 1;
-        }
-    }
-
-    fn peek_char(&self, offset: usize) -> Option<char> {
-        self.chars.get(self.pos + offset).copied()
-    }
-}
-
-struct Parser {
-    lexer: Lexer,
-    current: Token,
-}
-
-impl Parser {
-    fn parse(input: &str) -> Result<ExprNode> {
-        let mut parser = Self {
-            lexer: Lexer::new(input),
-            current: Token::End,
-        };
-        parser.current = parser.lexer.next_token()?;
-        let expr = parser.parse_or_expression()?;
-        if parser.current != Token::End {
-            anyhow::bail!(
-                "unexpected trailing token in expression: {:?}",
-                parser.current
-            );
-        }
-        Ok(expr)
-    }
-
-    fn parse_or_expression(&mut self) -> Result<ExprNode> {
-        let mut node = self.parse_and_expression()?;
-        while self.current == Token::OrOr {
-            self.advance()?;
-            let rhs = self.parse_and_expression()?;
-            node = ExprNode::Or(Box::new(node), Box::new(rhs));
-        }
-        Ok(node)
-    }
-
-    fn parse_and_expression(&mut self) -> Result<ExprNode> {
-        let mut node = self.parse_equality_expression()?;
-        while self.current == Token::AndAnd {
-            self.advance()?;
-            let rhs = self.parse_equality_expression()?;
-            node = ExprNode::And(Box::new(node), Box::new(rhs));
-        }
-        Ok(node)
-    }
-
-    fn parse_equality_expression(&mut self) -> Result<ExprNode> {
-        let mut node = self.parse_unary_expression()?;
-        loop {
-            let op = match self.current {
-                Token::EqEq => Some(true),
-                Token::NotEq => Some(false),
-                _ => None,
-            };
-            let Some(is_eq) = op else { break };
-            self.advance()?;
-            let rhs = self.parse_unary_expression()?;
-            node = if is_eq {
-                ExprNode::Equal(Box::new(node), Box::new(rhs))
-            } else {
-                ExprNode::NotEqual(Box::new(node), Box::new(rhs))
-            };
-        }
-        Ok(node)
-    }
-
-    fn parse_unary_expression(&mut self) -> Result<ExprNode> {
-        if self.current == Token::Bang {
-            self.advance()?;
-            return Ok(ExprNode::Not(Box::new(self.parse_unary_expression()?)));
-        }
-        self.parse_primary()
-    }
-
-    fn parse_primary(&mut self) -> Result<ExprNode> {
-        match self.current.clone() {
-            Token::StringLiteral(text) => {
-                self.advance()?;
-                Ok(ExprNode::String(text))
-            }
-            Token::NumberLiteral(number) => {
-                let parsed = number
-                    .parse::<f64>()
-                    .with_context(|| format!("invalid number literal '{number}'"))?;
-                self.advance()?;
-                Ok(ExprNode::Number(parsed))
-            }
-            Token::Identifier(identifier) => {
-                self.advance()?;
-                match identifier.as_str() {
-                    "true" => Ok(ExprNode::Bool(true)),
-                    "false" => Ok(ExprNode::Bool(false)),
-                    _ => {
-                        self.expect_token(Token::Dot)?;
-                        let name = match self.current.clone() {
-                            Token::Identifier(name) => name,
-                            Token::NumberLiteral(number) => number,
-                            _ => anyhow::bail!("expected reference name after '{}.'", identifier),
-                        };
-                        if !is_valid_namespace_name(&name) {
-                            anyhow::bail!("invalid input name '{name}'");
-                        }
-                        self.advance()?;
-                        Ok(ExprNode::Reference {
-                            namespace: identifier,
-                            name,
-                        })
-                    }
-                }
-            }
-            Token::LParen => {
-                self.advance()?;
-                let expr = self.parse_or_expression()?;
-                self.expect_token(Token::RParen)?;
-                Ok(expr)
-            }
-            other => anyhow::bail!("unexpected token in expression: {:?}", other),
-        }
-    }
-
-    fn expect_token(&mut self, expected: Token) -> Result<()> {
-        if self.current != expected {
-            anyhow::bail!("expected token {:?} but found {:?}", expected, self.current);
-        }
-        self.advance()
-    }
-
-    fn advance(&mut self) -> Result<()> {
-        self.current = self.lexer.next_token()?;
-        Ok(())
-    }
-}
-
-fn is_identifier_char(ch: char) -> bool {
-    ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'
-}
-
-fn evaluate_expression_span(
-    expr: &str,
-    active_namespace: &str,
-    values: &BTreeMap<String, String>,
-) -> Result<EvaluatedSpan> {
-    // Deliberately first increment: only literals, `inputs.NAME`/`args.NAME`,
-    // parentheses, and boolean/equality operators are supported. This Value/AST
-    // model is intentionally structured so future work can add functions
-    // (`to_json`/`from_json`), `steps.*.outputs`, indexing, and richer resolvers.
-    let parsed = Parser::parse(expr)?;
-    evaluate_node(&parsed, active_namespace, values)
-}
-
-fn evaluate_node(
-    node: &ExprNode,
-    active_namespace: &str,
-    values: &BTreeMap<String, String>,
-) -> Result<EvaluatedSpan> {
-    match node {
-        ExprNode::String(text) => Ok(EvaluatedSpan::Value(EvaluatedValue::String(text.clone()))),
-        ExprNode::Number(number) => Ok(EvaluatedSpan::Value(EvaluatedValue::Number(*number))),
-        ExprNode::Bool(flag) => Ok(EvaluatedSpan::Value(EvaluatedValue::Bool(*flag))),
-        ExprNode::Reference { namespace, name } => {
-            if namespace == active_namespace {
-                return Ok(EvaluatedSpan::Value(
-                    values
-                        .get(name)
-                        .map(|value| EvaluatedValue::String(value.clone()))
-                        .unwrap_or(EvaluatedValue::Empty),
-                ));
-            }
-            if is_deferred_namespace(active_namespace, namespace) {
-                return Ok(EvaluatedSpan::Deferred);
-            }
-            anyhow::bail!(
-                "unknown namespace '{}' in reference '{}.{}'",
-                namespace,
-                namespace,
-                name
-            );
-        }
-        ExprNode::Not(expr) => match evaluate_node(expr, active_namespace, values)? {
-            EvaluatedSpan::Deferred => Ok(EvaluatedSpan::Deferred),
-            EvaluatedSpan::Value(value) => {
-                Ok(EvaluatedSpan::Value(EvaluatedValue::Bool(!value.truthy())))
-            }
-        },
-        ExprNode::Equal(lhs, rhs) => evaluate_equality(lhs, rhs, active_namespace, values, true),
-        ExprNode::NotEqual(lhs, rhs) => {
-            evaluate_equality(lhs, rhs, active_namespace, values, false)
-        }
-        ExprNode::And(lhs, rhs) => {
-            let lhs_value = match evaluate_node(lhs, active_namespace, values)? {
-                EvaluatedSpan::Deferred => return Ok(EvaluatedSpan::Deferred),
-                EvaluatedSpan::Value(value) => value,
-            };
-            if !lhs_value.truthy() {
-                return Ok(EvaluatedSpan::Value(lhs_value));
-            }
-            evaluate_node(rhs, active_namespace, values)
-        }
-        ExprNode::Or(lhs, rhs) => {
-            let lhs_value = match evaluate_node(lhs, active_namespace, values)? {
-                EvaluatedSpan::Deferred => return Ok(EvaluatedSpan::Deferred),
-                EvaluatedSpan::Value(value) => value,
-            };
-            if lhs_value.truthy() {
-                return Ok(EvaluatedSpan::Value(lhs_value));
-            }
-            evaluate_node(rhs, active_namespace, values)
-        }
-    }
-}
-
-fn evaluate_equality(
-    lhs: &ExprNode,
-    rhs: &ExprNode,
-    active_namespace: &str,
-    values: &BTreeMap<String, String>,
-    equals: bool,
-) -> Result<EvaluatedSpan> {
-    let lhs = match evaluate_node(lhs, active_namespace, values)? {
-        EvaluatedSpan::Deferred => return Ok(EvaluatedSpan::Deferred),
-        EvaluatedSpan::Value(value) => value,
-    };
-    let rhs = match evaluate_node(rhs, active_namespace, values)? {
-        EvaluatedSpan::Deferred => return Ok(EvaluatedSpan::Deferred),
-        EvaluatedSpan::Value(value) => value,
-    };
-    let same = lhs.to_interpolated_string() == rhs.to_interpolated_string();
-    Ok(EvaluatedSpan::Value(EvaluatedValue::Bool(if equals {
-        same
-    } else {
-        !same
-    })))
-}
-
-fn is_deferred_namespace(active_namespace: &str, namespace: &str) -> bool {
-    matches!(
-        (active_namespace, namespace),
-        ("inputs", "args") | ("args", "inputs")
-    )
-}
-
-fn is_valid_namespace_name(name: &str) -> bool {
-    !name.is_empty()
-        && name
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -739,13 +432,59 @@ fn is_valid_namespace_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
     use std::path::Path;
+
+    // -----------------------------------------------------------------------
+    // Test helpers
+    // -----------------------------------------------------------------------
+
+    fn map(pairs: &[(&str, &str)]) -> BTreeMap<std::string::String, std::string::String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn typed_map(pairs: &[(&str, &str, InputType)]) -> TypedInputMap {
+        pairs
+            .iter()
+            .map(|(k, v, t)| (k.to_string(), (v.to_string(), *t)))
+            .collect()
+    }
+
+    /// Substitute inputs treating all as `String` type (for backward-compat tests).
+    fn substitute_inputs(text: &str, pairs: &[(&str, &str)]) -> std::string::String {
+        let tm = typed_map(
+            &pairs
+                .iter()
+                .map(|(k, v)| (*k, *v, InputType::String))
+                .collect::<Vec<_>>(),
+        );
+        substitute_namespace_in_string(text, "inputs", &tm, &BTreeMap::new()).unwrap()
+    }
+
+    fn substitute_inputs_err(text: &str, pairs: &[(&str, &str)]) -> std::string::String {
+        let tm = typed_map(
+            &pairs
+                .iter()
+                .map(|(k, v)| (*k, *v, InputType::String))
+                .collect::<Vec<_>>(),
+        );
+        let err =
+            substitute_namespace_in_string(text, "inputs", &tm, &BTreeMap::new()).unwrap_err();
+        format!("{err:#}")
+    }
+
+    fn substitute_args(text: &str, pairs: &[(&str, &str)]) -> std::string::String {
+        substitute_namespace_in_string(text, "args", &TypedInputMap::new(), &map(pairs)).unwrap()
+    }
+
+    // -----------------------------------------------------------------------
+    // Fragment input resolution tests
+    // -----------------------------------------------------------------------
 
     mod inputs {
         use super::*;
-
-        // --- fragment input contract (resolve_fragment_inputs unit tests) ---
 
         fn decl(input_type: InputType, required: bool, default: Option<&str>) -> InputDeclaration {
             InputDeclaration {
@@ -759,14 +498,16 @@ mod tests {
             Path::new("fragment.yaml")
         }
 
-        fn with_map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        fn with_map(pairs: &[(&str, &str)]) -> BTreeMap<std::string::String, std::string::String> {
             pairs
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect()
         }
 
-        fn decl_map(pairs: &[(&str, InputDeclaration)]) -> BTreeMap<String, InputDeclaration> {
+        fn decl_map(
+            pairs: &[(&str, InputDeclaration)],
+        ) -> BTreeMap<std::string::String, InputDeclaration> {
             pairs
                 .iter()
                 .map(|(k, d)| {
@@ -785,9 +526,9 @@ mod tests {
         #[test]
         fn test_resolve_inputs_declared_default_applied_when_caller_omits_key() {
             let declarations = decl_map(&[("shell", decl(InputType::String, false, Some("bash")))]);
-            let with = BTreeMap::new();
+            let with = with_map(&[]);
             let resolved = resolve_fragment_inputs(dummy_path(), &declarations, &with).unwrap();
-            assert_eq!(resolved.get("shell").map(String::as_str), Some("bash"));
+            assert_eq!(resolved.get("shell").map(|(v, _)| v.as_str()), Some("bash"));
         }
 
         #[test]
@@ -795,7 +536,7 @@ mod tests {
             let declarations = decl_map(&[("shell", decl(InputType::String, false, Some("bash")))]);
             let with = with_map(&[("shell", "__default__")]);
             let resolved = resolve_fragment_inputs(dummy_path(), &declarations, &with).unwrap();
-            assert_eq!(resolved.get("shell").map(String::as_str), Some("bash"));
+            assert_eq!(resolved.get("shell").map(|(v, _)| v.as_str()), Some("bash"));
         }
 
         #[test]
@@ -815,7 +556,7 @@ mod tests {
             let with = with_map(&[("shell", "")]);
             let resolved = resolve_fragment_inputs(dummy_path(), &declarations, &with).unwrap();
             assert_eq!(
-                resolved.get("shell").map(String::as_str),
+                resolved.get("shell").map(|(v, _)| v.as_str()),
                 Some(""),
                 "empty string must not be replaced by the declared default"
             );
@@ -830,7 +571,10 @@ mod tests {
                 result.is_ok(),
                 "empty string must satisfy required: {result:?}"
             );
-            assert_eq!(result.unwrap().get("target").map(String::as_str), Some(""));
+            assert_eq!(
+                result.unwrap().get("target").map(|(v, _)| v.as_str()),
+                Some("")
+            );
         }
 
         #[test]
@@ -885,12 +629,10 @@ mod tests {
 
         #[test]
         fn test_resolve_inputs_default_sentinel_on_typed_input_is_not_parse_error() {
-            // "__default__" on a number/boolean input resolves to the declared default,
-            // not parsed as the type — so it must never produce a type error.
             let declarations = decl_map(&[("count", decl(InputType::Number, false, Some("10")))]);
             let with = with_map(&[("count", "__default__")]);
             let resolved = resolve_fragment_inputs(dummy_path(), &declarations, &with).unwrap();
-            assert_eq!(resolved.get("count").map(String::as_str), Some("10"));
+            assert_eq!(resolved.get("count").map(|(v, _)| v.as_str()), Some("10"));
         }
 
         #[test]
@@ -908,7 +650,7 @@ mod tests {
         #[test]
         fn test_resolve_inputs_missing_required_when_omitted() {
             let declarations = decl_map(&[("target", decl(InputType::String, true, None))]);
-            let with = BTreeMap::new();
+            let with = with_map(&[]);
             let err = resolve_fragment_inputs(dummy_path(), &declarations, &with).unwrap_err();
             let msg = err.to_string();
             assert!(
@@ -920,7 +662,7 @@ mod tests {
         #[test]
         fn test_resolve_inputs_declaration_required_and_default_contradiction() {
             let declarations = decl_map(&[("shell", decl(InputType::String, true, Some("bash")))]);
-            let with = BTreeMap::new();
+            let with = with_map(&[]);
             let err = resolve_fragment_inputs(dummy_path(), &declarations, &with).unwrap_err();
             let msg = err.to_string();
             assert!(
@@ -1014,7 +756,6 @@ steps:
             )
             .unwrap();
 
-            // `inputs:` at the call site is not a recognized field; the step must fail to parse.
             assert!(
                 load_test_config(repo.path(), &repo.path().join("test.yaml")).is_err(),
                 "`inputs:` at call site must be rejected"
@@ -1106,28 +847,12 @@ steps:
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Expression evaluation tests
+    // -----------------------------------------------------------------------
+
     mod expressions {
         use super::*;
-
-        fn map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
-            pairs
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect()
-        }
-
-        fn substitute_inputs(text: &str, pairs: &[(&str, &str)]) -> String {
-            substitute_namespace_in_string(text, "inputs", &map(pairs)).unwrap()
-        }
-
-        fn substitute_inputs_err(text: &str, pairs: &[(&str, &str)]) -> String {
-            let err = substitute_namespace_in_string(text, "inputs", &map(pairs)).unwrap_err();
-            format!("{err:#}")
-        }
-
-        fn substitute_args(text: &str, pairs: &[(&str, &str)]) -> String {
-            substitute_namespace_in_string(text, "args", &map(pairs)).unwrap()
-        }
 
         #[test]
         fn test_back_compat_reference_and_splicing() {
@@ -1149,6 +874,70 @@ steps:
             );
         }
 
+        // --- Problem 3: faithful interpolation ---
+
+        #[test]
+        fn test_interpolation_is_faithful_not_truthy_collapsed() {
+            // Bool(false) and Number(0) must render faithfully, not as "".
+            // Only Empty/undefined reference yields "".
+            assert_eq!(substitute_inputs("${{ false }}", &[]), "false");
+            assert_eq!(substitute_inputs("${{ 0 }}", &[]), "0");
+            assert_eq!(substitute_inputs("${{ true }}", &[]), "true");
+            assert_eq!(substitute_inputs("${{ '' }}", &[]), "");
+            assert_eq!(substitute_inputs("${{ inputs.missing }}", &[]), "");
+            assert_eq!(substitute_inputs("${{ 1.5 }}", &[]), "1.5");
+            assert_eq!(substitute_inputs("${{ 'false' }}", &[]), "false");
+            assert_eq!(substitute_inputs("${{ '0' }}", &[]), "0");
+        }
+
+        // --- Problem 3: truthiness ---
+
+        #[test]
+        fn test_truthiness_non_empty_string_is_truthy_including_0_and_false() {
+            // Non-empty strings (including "0" and "false") are truthy.
+            // Only the NUMBER 0 and BOOL false and EMPTY are falsy.
+            assert_eq!(
+                substitute_inputs("${{ '0' && 'yes' }}", &[]),
+                "yes",
+                "'0' string must be truthy"
+            );
+            assert_eq!(
+                substitute_inputs("${{ 'false' && 'yes' }}", &[]),
+                "yes",
+                "'false' string must be truthy"
+            );
+            assert_eq!(
+                substitute_inputs("${{ 0 && 'yes' }}", &[]),
+                "0",
+                "number 0 must be falsy"
+            );
+            assert_eq!(
+                substitute_inputs("${{ false && 'yes' }}", &[]),
+                "false",
+                "bool false must be falsy"
+            );
+        }
+
+        // --- Problem 2: strict type-aware equality ---
+
+        #[test]
+        fn test_equality_cross_type_is_always_false() {
+            // 0, false, and "" are mutually unequal (cross-type comparison).
+            assert_eq!(substitute_inputs("${{ 0 == '' }}", &[]), "false");
+            assert_eq!(substitute_inputs("${{ false == '' }}", &[]), "false");
+            assert_eq!(substitute_inputs("${{ 0 == false }}", &[]), "false");
+            assert_eq!(substitute_inputs("${{ 1 == '1' }}", &[]), "false");
+        }
+
+        #[test]
+        fn test_equality_same_type_same_value_is_true() {
+            assert_eq!(substitute_inputs("${{ '' == '' }}", &[]), "true");
+            assert_eq!(substitute_inputs("${{ 0 == 0 }}", &[]), "true");
+            assert_eq!(substitute_inputs("${{ false == false }}", &[]), "true");
+            assert_eq!(substitute_inputs("${{ true == true }}", &[]), "true");
+            assert_eq!(substitute_inputs("${{ 'hello' == 'hello' }}", &[]), "true");
+        }
+
         #[test]
         fn test_equality_and_inequality_expressions() {
             assert_eq!(
@@ -1157,7 +946,7 @@ steps:
             );
             assert_eq!(
                 substitute_inputs("${{ inputs.pov == 'admin' }}", &[("pov", "user")]),
-                ""
+                "false"
             );
             assert_eq!(
                 substitute_inputs("${{ inputs.pov != 'admin' }}", &[("pov", "user")]),
@@ -1175,6 +964,78 @@ steps:
                 "true"
             );
         }
+
+        // --- Problem 1: typed boolean/number inputs ---
+
+        #[test]
+        fn test_typed_bool_input_false_is_falsy() {
+            let tm = typed_map(&[("booly", "false", InputType::Boolean)]);
+            // Bool(false) is falsy → && short-circuits, || picks right branch
+            let result = substitute_namespace_in_string(
+                "${{ inputs.booly && 'x' || 'y' }}",
+                "inputs",
+                &tm,
+                &BTreeMap::new(),
+            )
+            .unwrap();
+            assert_eq!(result, "y");
+        }
+
+        #[test]
+        fn test_typed_bool_input_true_is_truthy() {
+            let tm = typed_map(&[("booly", "true", InputType::Boolean)]);
+            let result = substitute_namespace_in_string(
+                "${{ inputs.booly && 'x' || 'y' }}",
+                "inputs",
+                &tm,
+                &BTreeMap::new(),
+            )
+            .unwrap();
+            assert_eq!(result, "x");
+        }
+
+        #[test]
+        fn test_typed_string_false_value_is_truthy() {
+            let tm = typed_map(&[("booly_string", "false", InputType::String)]);
+            // String("false") is non-empty → truthy
+            let result = substitute_namespace_in_string(
+                "${{ inputs.booly_string && 'x' || 'y' }}",
+                "inputs",
+                &tm,
+                &BTreeMap::new(),
+            )
+            .unwrap();
+            assert_eq!(result, "x");
+        }
+
+        #[test]
+        fn test_typed_number_input_zero_is_falsy() {
+            let tm = typed_map(&[("n", "0", InputType::Number)]);
+            let result = substitute_namespace_in_string(
+                "${{ inputs.n && 'x' || 'y' }}",
+                "inputs",
+                &tm,
+                &BTreeMap::new(),
+            )
+            .unwrap();
+            assert_eq!(result, "y");
+        }
+
+        #[test]
+        fn test_typed_bool_interpolation_renders_faithfully() {
+            let tm = typed_map(&[("booly", "false", InputType::Boolean)]);
+            // In a multi-span context, Bool(false) interpolates as "false" (not "").
+            let result = substitute_namespace_in_string(
+                "value=${{ inputs.booly }}",
+                "inputs",
+                &tm,
+                &BTreeMap::new(),
+            )
+            .unwrap();
+            assert_eq!(result, "value=false");
+        }
+
+        // --- Logical operators ---
 
         #[test]
         fn test_logical_operators_return_values_and_not() {
@@ -1194,7 +1055,12 @@ steps:
                 substitute_inputs("${{ inputs.a || 'fallback' }}", &[("a", "")]),
                 "fallback"
             );
-            assert_eq!(substitute_inputs("${{ !inputs.a }}", &[("a", "x")]), "");
+            // !truthy → Bool(false) → "false" (faithful interpolation)
+            assert_eq!(
+                substitute_inputs("${{ !inputs.a }}", &[("a", "x")]),
+                "false"
+            );
+            // !falsy → Bool(true) → "true"
             assert_eq!(substitute_inputs("${{ !inputs.a }}", &[("a", "")]), "true");
         }
 
@@ -1231,35 +1097,25 @@ steps:
             );
         }
 
-        #[test]
-        fn test_truthiness_and_stringification() {
-            assert_eq!(substitute_inputs("${{ '' }}", &[]), "");
-            assert_eq!(substitute_inputs("${{ false }}", &[]), "");
-            assert_eq!(substitute_inputs("${{ 0 }}", &[]), "");
-            assert_eq!(substitute_inputs("${{ inputs.missing }}", &[]), "");
-            assert_eq!(substitute_inputs("${{ true }}", &[]), "true");
-            assert_eq!(substitute_inputs("${{ 1.5 }}", &[]), "1.5");
-            assert_eq!(substitute_inputs("${{ 'false' }}", &[]), "false");
-        }
+        // --- Deferred namespaces ---
 
         #[test]
         fn test_short_circuit_with_unresolved_other_namespace() {
-            // args reference is on the dead branch during inputs pass; no deferral needed.
             assert_eq!(
                 substitute_inputs("${{ inputs.a || args.x }}", &[("a", "present")]),
                 "present"
             );
-            // args is needed here, so the expression is deferred to the args pass.
             assert_eq!(
                 substitute_inputs("${{ inputs.a || args.x }}", &[("a", "")]),
                 "${{ inputs.a || args.x }}"
             );
-            // When args are substituted first, dead branch inputs reference is not evaluated.
             assert_eq!(
                 substitute_args("${{ args.a && inputs.x }}", &[("a", "")]),
                 ""
             );
         }
+
+        // --- Syntax and namespace errors ---
 
         #[test]
         fn test_syntax_and_namespace_errors_are_hard_errors() {
@@ -1281,6 +1137,122 @@ steps:
                 "unexpected message: {err}"
             );
         }
+
+        // --- String escape sequences ---
+
+        #[test]
+        fn test_string_escape_sequences() {
+            assert_eq!(
+                substitute_inputs("${{ 'hello\\nworld' }}", &[]),
+                "hello\nworld"
+            );
+            assert_eq!(substitute_inputs("${{ 'it\\'s' }}", &[]), "it's");
+        }
+
+        // --- to_json / from_json ---
+
+        #[test]
+        fn test_to_json_function() {
+            // Bool false → JSON literal "false"
+            assert_eq!(substitute_inputs("${{ to_json(false) }}", &[]), "false");
+            // Bool true → "true"
+            assert_eq!(substitute_inputs("${{ to_json(true) }}", &[]), "true");
+            // Number 0 → "0"
+            assert_eq!(substitute_inputs("${{ to_json(0) }}", &[]), "0");
+            // Number 1.5 → "1.5"
+            assert_eq!(substitute_inputs("${{ to_json(1.5) }}", &[]), "1.5");
+            // String "false" → JSON-quoted: "\"false\""
+            assert_eq!(
+                substitute_inputs("${{ to_json('false') }}", &[]),
+                "\"false\""
+            );
+            // String "x" → "\"x\""
+            assert_eq!(substitute_inputs("${{ to_json('x') }}", &[]), "\"x\"");
+        }
+
+        #[test]
+        fn test_from_json_function() {
+            // "false" → Bool(false) → falsy → && picks right
+            assert_eq!(
+                substitute_inputs("${{ from_json('false') && 'yes' || 'no' }}", &[]),
+                "no"
+            );
+            // "true" → Bool(true) → truthy
+            assert_eq!(
+                substitute_inputs("${{ from_json('true') && 'yes' || 'no' }}", &[]),
+                "yes"
+            );
+            // "0" → Number(0) → falsy
+            assert_eq!(
+                substitute_inputs("${{ from_json('0') && 'yes' || 'no' }}", &[]),
+                "no"
+            );
+            // "1" → Number(1) → truthy
+            assert_eq!(
+                substitute_inputs("${{ from_json('1') && 'yes' || 'no' }}", &[]),
+                "yes"
+            );
+        }
+
+        #[test]
+        fn test_from_json_string_value() {
+            // A JSON-quoted string "\"hello\"" → String("hello")
+            assert_eq!(
+                substitute_inputs("${{ from_json('\"hello\"') }}", &[]),
+                "hello"
+            );
+        }
+
+        #[test]
+        fn test_from_json_null_is_empty_falsy() {
+            assert_eq!(
+                substitute_inputs("${{ from_json('null') && 'yes' || 'no' }}", &[]),
+                "no"
+            );
+        }
+
+        #[test]
+        fn test_from_json_array_is_error() {
+            let tm = TypedInputMap::new();
+            let err = substitute_namespace_in_string(
+                "${{ from_json('[1,2]') }}",
+                "inputs",
+                &tm,
+                &BTreeMap::new(),
+            )
+            .unwrap_err();
+            assert!(
+                format!("{err:#}").contains("not yet implemented"),
+                "array must produce a not-implemented error: {err:#}"
+            );
+        }
+
+        #[test]
+        fn test_unknown_function_is_error() {
+            let err = substitute_inputs_err("${{ unknown_func('x') }}", &[]);
+            assert!(
+                err.contains("unknown function"),
+                "unknown function must be a hard error: {err}"
+            );
+        }
+
+        /// Canonical example: `from_json(inputs.booly_string)` reinterprets the string
+        /// `"false"` as `Bool(false)` (falsy).
+        #[test]
+        fn test_from_json_booly_string_canonical() {
+            let tm = typed_map(&[("booly_string", "false", InputType::String)]);
+            // from_json("false") → Bool(false) → falsy → || picks right
+            let result = substitute_namespace_in_string(
+                "${{ from_json(inputs.booly_string) && 'x' || 'y' }}",
+                "inputs",
+                &tm,
+                &BTreeMap::new(),
+            )
+            .unwrap();
+            assert_eq!(result, "y");
+        }
+
+        // --- if: typed evaluation ---
 
         #[test]
         fn test_if_gate_expression_evaluates_via_truthiness() {
@@ -1368,6 +1340,85 @@ steps:
             assert!(!second.condition_enabled());
         }
 
+        /// Canonical example from the problem statement: boolean inputs must produce
+        /// correctly typed values in expressions and in `if:` conditions.
+        #[test]
+        fn test_if_gate_typed_boolean_input() {
+            use crate::config::load_test_config;
+            use crate::step::TestStep;
+            use tempfile::TempDir;
+
+            let repo = TempDir::new().unwrap();
+            std::fs::create_dir_all(repo.path().join("shared")).unwrap();
+            std::fs::write(
+                repo.path().join("shared/frag.yaml"),
+                r#"
+type: botforge/fragment
+inputs:
+  booly:
+    type: boolean
+    required: false
+  booly_string:
+    type: string
+    required: false
+steps:
+  - on: guest
+    name: bool-false-skip
+    if: ${{ inputs.booly }}
+    run: "echo bool-false"
+  - on: guest
+    name: string-false-run
+    if: ${{ inputs.booly_string }}
+    run: "echo string-false"
+  - on: guest
+    name: from-json-skip
+    if: ${{ from_json(inputs.booly_string) }}
+    run: "echo from-json"
+"#,
+            )
+            .unwrap();
+
+            // booly = false (declared boolean) → falsy → skip
+            // booly_string = "false" (declared string) → truthy (non-empty) → run
+            // from_json("false") → Bool(false) → falsy → skip
+            std::fs::write(
+                repo.path().join("test.yaml"),
+                r#"
+type: botforge/test
+name: test
+steps:
+  - uses: "@://shared/frag.yaml"
+    with:
+      booly: "false"
+      booly_string: "false"
+"#,
+            )
+            .unwrap();
+            let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+            let TestStep::Run(bool_step) = &config.steps[0] else {
+                panic!("expected run step");
+            };
+            let TestStep::Run(string_step) = &config.steps[1] else {
+                panic!("expected run step");
+            };
+            let TestStep::Run(from_json_step) = &config.steps[2] else {
+                panic!("expected run step");
+            };
+
+            assert!(
+                !bool_step.condition_enabled(),
+                "declared boolean false must be falsy in if:"
+            );
+            assert!(
+                string_step.condition_enabled(),
+                "string 'false' must be truthy in if:"
+            );
+            assert!(
+                !from_json_step.condition_enabled(),
+                "from_json('false') must be falsy in if:"
+            );
+        }
+
         #[test]
         fn test_if_gate_literal_expression_without_fragment_inputs() {
             use crate::config::load_test_config;
@@ -1402,6 +1453,21 @@ steps:
             };
             assert!(!first.condition_enabled());
             assert!(second.condition_enabled());
+        }
+
+        /// Canonical: `${{ inputs.booly }}` interpolated into surrounding text renders
+        /// faithfully as "false", not "".
+        #[test]
+        fn test_canonical_bool_interpolation_in_string_context() {
+            let tm = typed_map(&[("booly", "false", InputType::Boolean)]);
+            let result = substitute_namespace_in_string(
+                "This string has ${{ inputs.booly }} in it",
+                "inputs",
+                &tm,
+                &BTreeMap::new(),
+            )
+            .unwrap();
+            assert_eq!(result, "This string has false in it");
         }
     }
 }
