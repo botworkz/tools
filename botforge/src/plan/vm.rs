@@ -32,7 +32,7 @@ const TEST_TRANSPORT_RETRIES: usize = 10;
 const TEST_TRANSPORT_RETRY_DELAY: Duration = Duration::from_secs(2);
 const TEST_STABLE_SSH_ATTEMPTS: usize = 5;
 const TEST_STABLE_SSH_REQUIRED: usize = 2;
-type ArchiveExecutor<'a> = dyn FnMut(usize, &ArchiveStep) -> Result<()> + 'a;
+type ArchiveExecutor<'a> = dyn FnMut(&str, &ArchiveStep) -> Result<()> + 'a;
 type PreStepsHook<'a> = dyn Fn(&SshOptions) -> Result<()> + 'a;
 
 pub(crate) struct StepFlowPlan<'a> {
@@ -337,60 +337,147 @@ pub(crate) fn run_step_flow(
         hook(ssh)?;
     }
 
-    for (step_idx, step) in plan.steps.iter().enumerate() {
-        ensure_overall_budget(overall_deadline, timeouts.overall_timeout)?;
+    run_steps_inner(
+        &run_context,
+        plan.steps,
+        &[],
+        &mut accumulated_env,
+        &mut archive_executor,
+    )?;
+    Ok(overall_deadline)
+}
 
-        // Evaluate the `if:` condition before doing any work. Only RunStep carries
-        // a condition; Archive steps always run (no `if:` field).
-        if let TestStep::Run(run) = step {
-            if !run.condition_enabled() {
-                print_step_skipped(step_idx, step.display_name(), step.display_id());
-                continue;
+/// Build the human-readable hierarchical step index string.
+///
+/// - Root-level step 0 → `"0"`, step 3 → `"3"`.
+/// - Inner step 2 of an invocation at root index 3 → `"3.2"`.
+fn build_step_display(parent_indices: &[usize], step_idx: usize) -> String {
+    if parent_indices.is_empty() {
+        step_idx.to_string()
+    } else {
+        let prefix = parent_indices
+            .iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(".");
+        format!("{prefix}.{step_idx}")
+    }
+}
+
+/// Recursive inner step executor.
+///
+/// `parent_indices` is the chain of ancestor step indices leading to this call
+/// (empty for the root level).  Each `Invoke` step appends its own index to
+/// produce the hierarchical display for its children.
+///
+/// `accumulated_env` is the env accumulator for the *current* scope.  When
+/// entering an `Invoke` step the caller clones this env to form the child
+/// scope; mutations inside the invocation are discarded (not written back).
+fn run_steps_inner(
+    context: &RunStepContext<'_>,
+    steps: &[TestStep],
+    parent_indices: &[usize],
+    accumulated_env: &mut Vec<(String, String)>,
+    archive_executor: &mut Option<&mut ArchiveExecutor<'_>>,
+) -> Result<()> {
+    for (step_idx, step) in steps.iter().enumerate() {
+        ensure_overall_budget(context.overall_deadline, context.overall_timeout)?;
+
+        let display = build_step_display(parent_indices, step_idx);
+
+        match step {
+            TestStep::Invoke(invoke) => {
+                // Print the invocation boundary as its own step entry.
+                print_step_title(&display, invoke.uses.as_str(), None);
+                let invoke_started = Instant::now();
+
+                // The invocation runs with its own env scope: it inherits the
+                // caller's accumulated env but mutations are contained within.
+                let mut child_env = accumulated_env.clone();
+
+                // Build the child prefix: append this step's index.
+                let mut child_prefix = parent_indices.to_vec();
+                child_prefix.push(step_idx);
+
+                let invoke_result = run_steps_inner(
+                    context,
+                    &invoke.steps,
+                    &child_prefix,
+                    &mut child_env,
+                    archive_executor,
+                );
+                // child_env is dropped here — env mutations do not leak back out.
+
+                print_step_status(
+                    &display,
+                    invoke.uses.as_str(),
+                    None,
+                    invoke_result.is_ok(),
+                    Some(invoke_started.elapsed()),
+                );
+                invoke_result?;
             }
-        }
 
-        // The file is created by StepLogWriter::create inside each step runner;
-        // no pre-creation needed here (the directory was already created above).
-        print_step_title(step_idx, step.display_name(), step.display_id());
-        let step_started = Instant::now();
-        let step_result = match step {
-            TestStep::Run(step) => run_run_step(&run_context, step_idx, step, &mut accumulated_env),
-            TestStep::Archive(step) => {
-                if let Some(executor) = archive_executor.as_mut() {
-                    executor(step_idx, step)
+            TestStep::Run(run) => {
+                // Evaluate the `if:` condition before doing any work.
+                if !run.condition_enabled() {
+                    print_step_skipped(&display, step.display_name(), step.display_id());
+                    continue;
+                }
+
+                // The file is created by StepLogWriter::create inside each step runner;
+                // no pre-creation needed here (the directory was already created above).
+                print_step_title(&display, step.display_name(), step.display_id());
+                let step_started = Instant::now();
+                let step_result = run_run_step(context, &display, run, accumulated_env);
+                print_step_status(
+                    &display,
+                    step.display_name(),
+                    step.display_id(),
+                    step_result.is_ok(),
+                    Some(step_started.elapsed()),
+                );
+                step_result?;
+            }
+
+            TestStep::Archive(archive_step) => {
+                print_step_title(&display, step.display_name(), step.display_id());
+                let step_started = Instant::now();
+                let step_result = if let Some(executor) = archive_executor.as_mut() {
+                    executor(&display, archive_step)
                 } else {
-                    let archive_name = step
+                    let archive_name = archive_step
                         .archive
                         .name
                         .as_deref()
-                        .unwrap_or(step.archive.src.as_str());
+                        .unwrap_or(archive_step.archive.src.as_str());
                     anyhow::bail!(
                         "step {} ('{}') is an `archive` step, but archive execution is not enabled for this command",
-                        step_idx + 1,
+                        display,
                         archive_name
-                    );
-                }
+                    )
+                };
+                print_step_status(
+                    &display,
+                    step.display_name(),
+                    step.display_id(),
+                    step_result.is_ok(),
+                    Some(step_started.elapsed()),
+                );
+                step_result?;
             }
-        };
-        print_step_status(
-            step_idx,
-            step.display_name(),
-            step.display_id(),
-            step_result.is_ok(),
-            Some(step_started.elapsed()),
-        );
-        step_result?;
+        }
     }
-    Ok(overall_deadline)
+    Ok(())
 }
 
 fn run_run_step(
     context: &RunStepContext<'_>,
-    step_idx: usize,
+    step_display: &str,
     step: &RunStep,
     accumulated_env: &mut Vec<(String, String)>,
 ) -> Result<()> {
-    let step_log_path = step_log_path(context.step_log_dir, step_idx, &step.name);
+    let step_log_path = step_log_path(context.step_log_dir, step_display, &step.name);
     let step_timeout = resolve_step_timeout(step.timeout, context.default_step_timeout);
     let step_budget = StepExecutionBudget {
         step_timeout,
@@ -401,10 +488,13 @@ fn run_run_step(
     match step.target {
         StepTarget::Guest => (|| -> Result<()> {
             let suffix = unique_suffix();
+            // Use the display index (e.g. "3" or "3.2") in temp-file names; replace
+            // '.' with '-' so the path component is always filesystem-safe.
+            let safe_display = step_display.replace('.', "-");
             let local_script =
-                std::env::temp_dir().join(format!("botforge-step-{step_idx}-{suffix}.sh"));
-            let remote_script = format!("/tmp/botforge-step-{step_idx}-{suffix}.sh");
-            let remote_env_path = format!("/tmp/botforge-env-{step_idx}-{suffix}");
+                std::env::temp_dir().join(format!("botforge-step-{safe_display}-{suffix}.sh"));
+            let remote_script = format!("/tmp/botforge-step-{safe_display}-{suffix}.sh");
+            let remote_env_path = format!("/tmp/botforge-env-{safe_display}-{suffix}");
 
             // Write only the user's script body — no interpreter-specific preamble.
             std::fs::write(&local_script, step.run.as_bytes()).with_context(|| {
@@ -1368,93 +1458,97 @@ pub(crate) fn run_local_steps(context: &Path, steps: &[TestStep]) -> Result<()> 
     let mut accumulated_env: Vec<(String, String)> = Vec::new();
 
     for (step_idx, step) in steps.iter().enumerate() {
-        let TestStep::Run(run) = step else {
-            let name = step.display_name();
-            anyhow::bail!(
-                "publish step {} ('{}'): archive steps are not supported in the \
-                 publish prepare phase; only run steps are allowed",
-                step_idx + 1,
-                name
-            );
-        };
-
-        if !run.condition_enabled() {
-            print_step_skipped(step_idx, step.display_name(), step.display_id());
-            continue;
-        }
-
-        print_step_title(step_idx, step.display_name(), step.display_id());
-        let step_started = Instant::now();
-
-        let log_path = step_log_path(&step_log_dir, step_idx, &run.name);
-        let step_timeout = resolve_step_timeout(run.timeout, default_step_timeout);
-        let budget = StepExecutionBudget {
-            step_timeout,
-            overall_deadline,
-            overall_timeout,
-        };
-
-        let template =
-            resolve_shell(run.shell.as_deref()).expect("shell already validated at config load");
-        let suffix = unique_suffix();
-        let env_file = std::env::temp_dir().join(format!("botforge-publish-env-{suffix}"));
-
-        let step_result: Result<()> = if let Some(expect) = &run.expect {
-            let (capture, actual_exit) = run_host_step_capturing(
-                &run.name,
-                &run.run,
-                context,
-                budget,
-                &template,
-                &accumulated_env,
-                HostStepFiles {
-                    env_file: &env_file,
-                    log_path: &log_path,
-                },
-            )
-            .with_context(|| format!("publish step '{}' command failed", run.name))?;
-
-            if let Ok(contents) = std::fs::read_to_string(&env_file) {
-                if let Ok(new_entries) = parse_env_file(&contents) {
-                    env_merge(&mut accumulated_env, new_entries);
+        let display = step_idx.to_string();
+        match step {
+            TestStep::Run(run) => {
+                if !run.condition_enabled() {
+                    print_step_skipped(&display, step.display_name(), step.display_id());
+                    continue;
                 }
-            }
-            let _ = std::fs::remove_file(&env_file);
-            check_expect_block(&run.name, expect, &capture, actual_exit)
-        } else {
-            let result = run_host_step(
-                &run.name,
-                &run.run,
-                context,
-                budget,
-                &template,
-                &accumulated_env,
-                HostStepFiles {
-                    env_file: &env_file,
-                    log_path: &log_path,
-                },
-            )
-            .with_context(|| format!("publish step '{}' command failed", run.name));
 
-            if result.is_ok() {
-                if let Ok(contents) = std::fs::read_to_string(&env_file) {
-                    if let Ok(new_entries) = parse_env_file(&contents) {
-                        env_merge(&mut accumulated_env, new_entries);
+                print_step_title(&display, step.display_name(), step.display_id());
+                let step_started = Instant::now();
+
+                let log_path = step_log_path(&step_log_dir, &display, &run.name);
+                let step_timeout = resolve_step_timeout(run.timeout, default_step_timeout);
+                let budget = StepExecutionBudget {
+                    step_timeout,
+                    overall_deadline,
+                    overall_timeout,
+                };
+
+                let template = resolve_shell(run.shell.as_deref())
+                    .expect("shell already validated at config load");
+                let suffix = unique_suffix();
+                let env_file = std::env::temp_dir().join(format!("botforge-publish-env-{suffix}"));
+
+                let step_result: Result<()> = if let Some(expect) = &run.expect {
+                    let (capture, actual_exit) = run_host_step_capturing(
+                        &run.name,
+                        &run.run,
+                        context,
+                        budget,
+                        &template,
+                        &accumulated_env,
+                        HostStepFiles {
+                            env_file: &env_file,
+                            log_path: &log_path,
+                        },
+                    )
+                    .with_context(|| format!("publish step '{}' command failed", run.name))?;
+
+                    if let Ok(contents) = std::fs::read_to_string(&env_file) {
+                        if let Ok(new_entries) = parse_env_file(&contents) {
+                            env_merge(&mut accumulated_env, new_entries);
+                        }
                     }
-                }
-            }
-            let _ = std::fs::remove_file(&env_file);
-            result
-        };
+                    let _ = std::fs::remove_file(&env_file);
+                    check_expect_block(&run.name, expect, &capture, actual_exit)
+                } else {
+                    let result = run_host_step(
+                        &run.name,
+                        &run.run,
+                        context,
+                        budget,
+                        &template,
+                        &accumulated_env,
+                        HostStepFiles {
+                            env_file: &env_file,
+                            log_path: &log_path,
+                        },
+                    )
+                    .with_context(|| format!("publish step '{}' command failed", run.name));
 
-        print_step_status(
-            step_idx,
-            step.display_name(),
-            step.display_id(),
-            step_result.is_ok(),
-            Some(step_started.elapsed()),
-        );
-        step_result?;
+                    if result.is_ok() {
+                        if let Ok(contents) = std::fs::read_to_string(&env_file) {
+                            if let Ok(new_entries) = parse_env_file(&contents) {
+                                env_merge(&mut accumulated_env, new_entries);
+                            }
+                        }
+                    }
+                    let _ = std::fs::remove_file(&env_file);
+                    result
+                };
+
+                print_step_status(
+                    &display,
+                    step.display_name(),
+                    step.display_id(),
+                    step_result.is_ok(),
+                    Some(step_started.elapsed()),
+                );
+                step_result?;
+            }
+            TestStep::Archive(_) | TestStep::Invoke(_) => {
+                let name = step.display_name();
+                anyhow::bail!(
+                    "publish step {} ('{}'): only run steps are supported in the \
+                     publish prepare phase",
+                    display,
+                    name
+                );
+            }
+        }
     }
 
     Ok(())
