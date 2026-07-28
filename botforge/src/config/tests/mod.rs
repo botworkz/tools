@@ -4315,7 +4315,7 @@ steps:
         .unwrap();
 
         let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
-        use crate::step::{RunStep, TestStep};
+        use crate::step::TestStep;
         let TestStep::Run(step) = &config.steps[0] else {
             panic!("expected run step");
         };

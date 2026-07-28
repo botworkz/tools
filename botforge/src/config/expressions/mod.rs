@@ -857,10 +857,10 @@ mod tests {
         #[test]
         fn test_resolve_inputs_number_type_valid_native_float() {
             let declarations = decl_map(&[("ratio", decl(InputType::Number, true, None))]);
-            let with = with_val(&[("ratio", yaml("3.14"))]);
+            let with = with_val(&[("ratio", yaml("2.5"))]);
             let result = resolve_fragment_inputs(dummy_path(), &declarations, &with).unwrap();
             let v = result.get("ratio").unwrap();
-            assert!(matches!(v, EvaluatedValue::Number(n) if (*n - 3.14).abs() < 1e-9));
+            assert!(matches!(v, EvaluatedValue::Number(n) if (*n - 2.5).abs() < 1e-9));
         }
 
         /// R2: negative number and zero → OK.

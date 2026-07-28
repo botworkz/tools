@@ -703,17 +703,16 @@ expect:
 
     #[test]
     fn test_if_string_falsy_literals() {
-        for value in &["\"\""] {
-            let yaml = format!("name: s\nrun: echo ok\nif: {value}\n");
-            let step: RunStep = serde_yaml::from_str(&yaml)
-                .unwrap_or_else(|e| panic!("should parse if: {value} as falsy: {e}"));
-            assert_eq!(
-                step.condition,
-                Some(false),
-                "if: {value} should be Some(false)"
-            );
-            assert!(!step.condition_enabled(), "if: {value} should be disabled");
-        }
+        let value = "\"\"";
+        let yaml = format!("name: s\nrun: echo ok\nif: {value}\n");
+        let step: RunStep = serde_yaml::from_str(&yaml)
+            .unwrap_or_else(|e| panic!("should parse if: {value} as falsy: {e}"));
+        assert_eq!(
+            step.condition,
+            Some(false),
+            "if: {value} should be Some(false)"
+        );
+        assert!(!step.condition_enabled(), "if: {value} should be disabled");
     }
 
     #[test]
