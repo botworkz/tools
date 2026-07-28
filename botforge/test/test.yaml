@@ -8,6 +8,18 @@ steps:
 - uses: "@://for-fragment-test.steps.yaml"
 - uses: "@://files-fragment.steps.yaml"
 - uses: "@://env-threading.steps.yaml"
+- name: caller sets env before fragment invoke
+  run: |
+    echo "CALLER_VAR=caller-ok" >> "$BOTFORGE_ENV"
+- uses: "@://env-scope-fragment.steps.yaml"
+- name: caller cannot see fragment env after invoke
+  run: |
+    test "$CALLER_VAR" = caller-ok
+    test -z "${FRAGMENT_VAR:-}"
+    test "${FRAGMENT_VAR:-}" != frag-ok
+- uses: "@://env-sibling-a.steps.yaml"
+- uses: "@://env-sibling-b.steps.yaml"
+- uses: "@://nested-outer.steps.yaml"
 - uses: "@://expressions.steps.yaml"
   with:
     str_a: hello
