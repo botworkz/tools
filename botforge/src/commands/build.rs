@@ -354,12 +354,12 @@ pub(crate) fn cmd_build(args: BuildArgs) -> Result<()> {
     // ---------------------------------------------------------------------------
     // Disk lifecycle step 4: run build steps via shared flow
     // ---------------------------------------------------------------------------
-    let mut archive_executor = |step_idx: usize, step: &ArchiveStep| -> Result<()> {
+    let mut archive_executor = |step_display: &str, step: &ArchiveStep| -> Result<()> {
         run_archive_step(
             &manifest,
             &build_dir,
             args.cache_dir.as_deref(),
-            step_idx,
+            step_display,
             step,
             &ssh_options,
         )
@@ -736,7 +736,7 @@ fn run_archive_step(
     manifest: &Manifest,
     build_dir: &Path,
     cache_dir_override: Option<&Path>,
-    step_idx: usize,
+    step_display: &str,
     step: &ArchiveStep,
     ssh: &SshOptions,
 ) -> Result<()> {
@@ -793,7 +793,9 @@ fn run_archive_step(
             .map(|e| format!(".{}", e.to_string_lossy()))
             .unwrap_or_default();
         let suffix = unique_suffix();
-        let remote_archive = format!("/tmp/botforge-archive-{step_idx}-{suffix}{ext}");
+        // Replace '.' in hierarchical indices with '-' for filesystem-safe path components.
+        let safe_display = step_display.replace('.', "-");
+        let remote_archive = format!("/tmp/botforge-archive-{safe_display}-{suffix}{ext}");
 
         // Step 1: Verify that `tar` is available in the guest before doing any
         // transport, so the error is clear if the guest image lacks tar.
@@ -859,7 +861,7 @@ fn run_archive_step(
 
         println!(
             "archive step {} ('{}') extracted into guest at {}",
-            step_idx + 1,
+            step_display,
             step.archive.name.as_deref().unwrap_or(src),
             dest
         );
@@ -889,7 +891,7 @@ fn run_archive_step(
         // them directly via @://build/<path> without manual path wiring.
         println!(
             "archive step {} ('{}') unpacked to {}",
-            step_idx + 1,
+            step_display,
             step.archive.name.as_deref().unwrap_or(src),
             relative_unpacked.display()
         );
@@ -1961,10 +1963,11 @@ mod tests {
     fn guest_archive_temp_path_has_expected_prefix_and_extension() {
         // Reproduce the temp-path derivation logic from run_archive_step
         // to verify it starts with the botforge prefix and ends with the extension.
-        let step_idx: usize = 3;
+        let step_display = "3";
         let suffix = "99999-123456789";
         let ext = ".tar.gz";
-        let path = format!("/tmp/botforge-archive-{step_idx}-{suffix}{ext}");
+        let safe_display = step_display.replace('.', "-");
+        let path = format!("/tmp/botforge-archive-{safe_display}-{suffix}{ext}");
         assert!(
             path.starts_with("/tmp/botforge-archive-"),
             "temp path should be under /tmp: {path}"
@@ -1974,8 +1977,23 @@ mod tests {
             "temp path should preserve extension: {path}"
         );
         assert!(
-            path.contains(&format!("-{step_idx}-")),
-            "temp path should embed step index: {path}"
+            path.contains(&format!("-{safe_display}-")),
+            "temp path should embed step display: {path}"
+        );
+    }
+
+    #[test]
+    fn guest_archive_temp_path_hierarchical_index() {
+        // Verify that hierarchical indices (e.g. "3.2") are stored with '.' → '-'
+        // so the path component is always filesystem-safe.
+        let step_display = "3.2";
+        let suffix = "99999-123456789";
+        let ext = ".tar.gz";
+        let safe_display = step_display.replace('.', "-");
+        let path = format!("/tmp/botforge-archive-{safe_display}-{suffix}{ext}");
+        assert_eq!(
+            path, "/tmp/botforge-archive-3-2-99999-123456789.tar.gz",
+            "dot should be replaced with dash in hierarchical temp path"
         );
     }
 
