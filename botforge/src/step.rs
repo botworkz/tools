@@ -91,12 +91,12 @@ pub(crate) struct RunStep {
     /// run, does not fail the plan, and is reported with a distinct skipped marker.
     /// When `true` (or absent), the step runs as normal.
     ///
-    /// Accepted literal values (case-insensitive for strings):
-    ///   Truthy: YAML `true`, or the strings `"true"`, `"1"`, `"yes"`, `"on"`.
-    ///   Falsy:  YAML `false`, or the strings `"false"`, `"0"`, `"no"`, `"off"`.
+    /// Truthiness uses the expression engine rules:
+    /// - falsy: empty string, boolean `false`, number `0`
+    /// - truthy: everything else
     ///
-    /// Any other value is a hard load-time error. Expression syntax (`${{ ... }}`)
-    /// is not yet supported; non-literal values are rejected on load.
+    /// Expression syntax (`${{ ... }}`) is evaluated before deserialization; this
+    /// field receives the resulting scalar and applies the same truthiness coercion.
     #[serde(
         rename = "if",
         default,
@@ -193,17 +193,10 @@ impl<'de> Deserialize<'de> for TestStep {
 #[serde(untagged)]
 enum SecondsValue {
     Integer(i64),
-    String(String),
 }
 
 fn parse_positive_seconds(value: SecondsValue) -> std::result::Result<u64, String> {
-    let parsed = match value {
-        SecondsValue::Integer(value) => value,
-        SecondsValue::String(value) => value
-            .trim()
-            .parse::<i64>()
-            .map_err(|_| format!("expected a positive integer number of seconds, got '{value}'"))?,
-    };
+    let SecondsValue::Integer(parsed) = value;
     if parsed <= 0 {
         return Err(format!(
             "expected a positive integer number of seconds, got {parsed}"
@@ -225,17 +218,23 @@ where
         .map_err(de::Error::custom)
 }
 
-/// Deserialize the `if:` field into an `Option<bool>`.
+/// Deserialize the `if:` field into an `Option<bool>` using expression truthiness:
+/// - `null` => `None` (treated as absent/run)
+/// - `false`, `0`, `""` => `Some(false)`
+/// - everything else => `Some(true)`
 ///
-/// Accepts:
-/// - YAML `true` / `false` booleans → `Some(true)` / `Some(false)`
-/// - YAML strings (case-insensitive): `"true"`, `"1"`, `"yes"`, `"on"` → `Some(true)`;
-///   `"false"`, `"0"`, `"no"`, `"off"` → `Some(false)`
-/// - YAML null → `None` (treated as absent = run)
+/// R6 — single truthiness authority: the PRIMARY path for expression-based `if:` conditions
+/// is `substitute_if_condition_in_value` in the expression engine, which pre-evaluates the
+/// expression and substitutes it back as a YAML `Bool`. This function then receives that
+/// pre-evaluated `Bool` and falls through to the `Value::Bool(flag)` arm.
 ///
-/// Any other value — including expression placeholders like `"${{ expr }}"` that
-/// were not substituted — is a hard error. Expression support is reserved for a
-/// future iteration.
+/// The remaining arms handle literal YAML scalars written directly (e.g. `if: false`,
+/// `if: "false"`, `if: 0`). Their truthiness rules are consistent with `EvaluatedValue::truthy()`:
+/// - `Bool(false)` / `Number(0)` / `String("")` → falsy
+/// - non-empty strings (incl. `"false"`, `"0"`) → truthy (R6: non-empty string is ALWAYS truthy)
+/// - `Bool(true)` / non-zero numbers → truthy
+///
+/// Do NOT add implicit string→typed coercion here. `if: "false"` (string) must run.
 fn deserialize_step_condition<'de, D>(
     deserializer: D,
 ) -> std::result::Result<Option<bool>, D::Error>
@@ -243,25 +242,16 @@ where
     D: Deserializer<'de>,
 {
     let value = Value::deserialize(deserializer)?;
-    match &value {
+    let result = match &value {
         Value::Null => Ok(None),
-        Value::Bool(b) => Ok(Some(*b)),
-        Value::String(s) => match s.to_ascii_lowercase().as_str() {
-            "true" | "1" | "yes" | "on" => Ok(Some(true)),
-            "false" | "0" | "no" | "off" => Ok(Some(false)),
-            _ => Err(de::Error::custom(format!(
-                "invalid `if:` value {s:?}: only literal true/false values are supported \
-                 (accepted: true, false, \"1\", \"0\", \"yes\", \"no\", \"on\", \"off\"); \
-                 expression support (e.g. `${{{{ ... }}}}`) is not yet available"
-            ))),
-        },
+        Value::Bool(flag) => Ok(Some(*flag)),
+        Value::Number(number) => Ok(Some(number.as_f64().unwrap_or(0.0) != 0.0)),
+        Value::String(text) => Ok(Some(!text.is_empty())),
         other => Err(de::Error::custom(format!(
-            "invalid `if:` value: only literal true/false values are supported \
-             (accepted: true, false, \"1\", \"0\", \"yes\", \"no\", \"on\", \"off\"); \
-             expression support (e.g. `${{{{ ... }}}}`) is not yet available; \
-             got: {other:?}"
+            "invalid `if:` value: expected scalar (null/bool/number/string), got: {other:?}"
         ))),
-    }
+    }?;
+    Ok(result)
 }
 
 /// Resolve a step's `shell:` value into an argv template with a `{0}` slot.
@@ -669,7 +659,7 @@ expect:
 
     #[test]
     fn test_if_string_truthy_literals() {
-        for value in &["\"true\"", "\"1\"", "\"yes\"", "\"on\""] {
+        for value in &["\"true\"", "\"1\"", "\"yes\"", "\"on\"", "\"anything\""] {
             let yaml = format!("name: s\nrun: echo ok\nif: {value}\n");
             let step: RunStep = serde_yaml::from_str(&yaml)
                 .unwrap_or_else(|e| panic!("should parse if: {value} as truthy: {e}"));
@@ -684,7 +674,7 @@ expect:
 
     #[test]
     fn test_if_string_falsy_literals() {
-        for value in &["\"false\"", "\"0\"", "\"no\"", "\"off\""] {
+        for value in &["\"\""] {
             let yaml = format!("name: s\nrun: echo ok\nif: {value}\n");
             let step: RunStep = serde_yaml::from_str(&yaml)
                 .unwrap_or_else(|e| panic!("should parse if: {value} as falsy: {e}"));
@@ -706,54 +696,25 @@ expect:
                 .unwrap_or_else(|e| panic!("should accept if: {value}: {e}"));
             assert_eq!(step.condition, Some(true), "if: {value} should be truthy");
         }
-
-        let falsy_cases = ["\"False\"", "\"FALSE\"", "\"NO\"", "\"OFF\"", "\"0\""];
-        for value in &falsy_cases {
-            let yaml = format!("name: s\nrun: echo ok\nif: {value}\n");
-            let step: RunStep = serde_yaml::from_str(&yaml)
-                .unwrap_or_else(|e| panic!("should accept if: {value}: {e}"));
-            assert_eq!(step.condition, Some(false), "if: {value} should be falsy");
-        }
     }
 
     #[test]
-    fn test_if_invalid_string_is_hard_error() {
-        for value in &["maybe", "unknown", "2", "yes_ish"] {
-            let yaml = format!("name: s\nrun: echo ok\nif: \"{value}\"\n");
-            let err = serde_yaml::from_str::<RunStep>(&yaml)
-                .expect_err(&format!("if: \"{value}\" should be rejected"));
-            let msg = err.to_string();
-            assert!(
-                msg.contains("only literal true/false values are supported"),
-                "error for if: {value} should mention 'only literal': {msg}"
-            );
-        }
+    fn test_if_expression_placeholder_is_truthy_string_when_unresolved() {
+        let step: RunStep =
+            serde_yaml::from_str("name: s\nrun: echo ok\nif: \"${{ inputs.flag }}\"\n").unwrap();
+        assert_eq!(step.condition, Some(true));
+        assert!(step.condition_enabled());
     }
 
     #[test]
-    fn test_if_expression_placeholder_is_hard_error() {
-        let err = serde_yaml::from_str::<RunStep>("name: s\nrun: echo ok\nif: \"${{ x }}\"\n")
-            .unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("only literal true/false values are supported"),
-            "error should explain only literals are accepted: {msg}"
-        );
-        assert!(
-            msg.contains("expression support") || msg.contains("not yet available"),
-            "error should mention expression support is not yet available: {msg}"
-        );
-    }
+    fn test_if_number_truthiness() {
+        let step: RunStep = serde_yaml::from_str("name: s\nrun: echo ok\nif: 2\n").unwrap();
+        assert_eq!(step.condition, Some(true));
+        assert!(step.condition_enabled());
 
-    #[test]
-    fn test_if_integer_is_hard_error() {
-        // YAML integers (e.g. `if: 2`) are not accepted — only booleans and strings.
-        let err = serde_yaml::from_str::<RunStep>("name: s\nrun: echo ok\nif: 2\n").unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("only literal true/false values are supported"),
-            "if: 2 (integer) should be rejected with clear message: {msg}"
-        );
+        let step: RunStep = serde_yaml::from_str("name: s\nrun: echo ok\nif: 0\n").unwrap();
+        assert_eq!(step.condition, Some(false));
+        assert!(!step.condition_enabled());
     }
 
     #[test]
