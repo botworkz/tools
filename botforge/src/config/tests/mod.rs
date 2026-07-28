@@ -751,7 +751,7 @@ steps:
     }
 
     #[test]
-    fn test_load_test_config_fragment_missing_active_namespace_input_still_errors() {
+    fn test_load_test_config_fragment_missing_active_namespace_input_is_soft_empty() {
         let repo = TempDir::new().unwrap();
         std::fs::write(
             repo.path().join("frag.yaml"),
@@ -780,8 +780,9 @@ steps:
         )
         .unwrap();
 
-        let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
-        assert!(format!("{err:#}").contains("missing required input 'typo'"));
+        let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+        assert_eq!(config.steps.len(), 1);
+        assert_eq!(run_ref(&config.steps[0]).run, "echo ");
     }
 
     #[test]
@@ -805,7 +806,7 @@ steps:
 
         let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("unsupported expression"));
+        assert!(msg.contains("unknown namespace"));
         assert!(msg.contains("bogus.x"));
     }
 
@@ -3163,7 +3164,7 @@ output: "out.qcow2"
 steps:
   - uses: "@://frag.yaml"
     with:
-      seconds: "75"
+      seconds: 75
 "#,
         );
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
@@ -4209,6 +4210,166 @@ fs:
         assert!(
             msg.contains("fs") || msg.contains("unknown field"),
             "old top-level fs key should still error when steps is present: {msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Strict typing: timeout field (invariant B)
+    // -----------------------------------------------------------------------
+
+    /// `timeout: "23"` (a YAML string) must fail — timeout is an integer field.
+    /// No implicit string→int coercion is allowed.
+    #[test]
+    fn test_step_timeout_string_literal_is_rejected() {
+        use crate::step::RunStep;
+        let err = serde_yaml::from_str::<RunStep>("name: s\nrun: echo ok\ntimeout: \"23\"\n")
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            !msg.is_empty(),
+            "timeout: \"23\" (string) must fail deserialization: {msg}"
+        );
+    }
+
+    /// `timeout: ${{ inputs.str }}` where `str` is a **string** input (e.g. "23")
+    /// must fail: the expression yields `String("23")` → YAML string → type error
+    /// for the int `timeout:` field.
+    #[test]
+    fn test_step_timeout_string_expression_input_is_rejected() {
+        use tempfile::TempDir;
+
+        let repo = TempDir::new().unwrap();
+        std::fs::create_dir_all(repo.path().join("shared")).unwrap();
+        std::fs::write(
+            repo.path().join("shared/frag.yaml"),
+            r#"
+type: botforge/fragment
+inputs:
+  t:
+    type: string
+    required: true
+steps:
+  - on: guest
+    name: frag-step
+    timeout: ${{ inputs.t }}
+    run: echo ok
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            r#"
+type: botforge/test
+name: test
+steps:
+  - uses: "@://shared/frag.yaml"
+    with:
+      t: "23"
+"#,
+        )
+        .unwrap();
+
+        let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            !msg.is_empty(),
+            "timeout: ${{{{ inputs.t }}}} with string input must fail: {msg}"
+        );
+    }
+
+    /// `timeout: ${{ inputs.seconds }}` where `seconds` is a **number** input must
+    /// succeed: the expression yields `Number(42)` → YAML integer → deserializes as u64.
+    #[test]
+    fn test_step_timeout_number_expression_input_is_accepted() {
+        use tempfile::TempDir;
+
+        let repo = TempDir::new().unwrap();
+        std::fs::create_dir_all(repo.path().join("shared")).unwrap();
+        std::fs::write(
+            repo.path().join("shared/frag.yaml"),
+            r#"
+type: botforge/fragment
+inputs:
+  seconds:
+    type: number
+    required: true
+steps:
+  - on: guest
+    name: frag-step
+    timeout: ${{ inputs.seconds }}
+    run: echo ok
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            r#"
+type: botforge/test
+name: test
+steps:
+  - uses: "@://shared/frag.yaml"
+    with:
+      seconds: 42
+"#,
+        )
+        .unwrap();
+
+        let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+        use crate::step::TestStep;
+        let TestStep::Run(step) = &config.steps[0] else {
+            panic!("expected run step");
+        };
+        assert_eq!(step.timeout, Some(42));
+    }
+
+    /// `timeout: ${{ inputs.missing }}` where `missing` is an undeclared/unset input.
+    /// `Empty.to_yaml_value()` → `String("")` → serde type error for the int `timeout:` field.
+    /// Undefined ref into a required int field is a hard error.
+    ///
+    /// Note: for `Option<u64>` timeout, `String("")` also fails to deserialize as `u64`,
+    /// so undefined ref into optional numeric fields is also an error in the current
+    /// implementation (not silently `None`). This is a documented limitation of the
+    /// `Empty → String("")` rendering for optional numeric fields.
+    #[test]
+    fn test_step_timeout_undefined_ref_is_error() {
+        use tempfile::TempDir;
+
+        let repo = TempDir::new().unwrap();
+        std::fs::create_dir_all(repo.path().join("shared")).unwrap();
+        std::fs::write(
+            repo.path().join("shared/frag.yaml"),
+            r#"
+type: botforge/fragment
+inputs:
+  t:
+    type: number
+    required: false
+steps:
+  - on: guest
+    name: frag-step
+    timeout: ${{ inputs.t }}
+    run: echo ok
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            r#"
+type: botforge/test
+name: test
+steps:
+  - uses: "@://shared/frag.yaml"
+"#,
+        )
+        .unwrap();
+
+        // Undefined input → Empty → String("") → fails to deserialize as u64 timeout.
+        // (Required OR optional numeric field: both error on Empty, see doc comment.)
+        let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            !msg.is_empty(),
+            "timeout: ${{{{ inputs.t }}}} with unset input must fail: {msg}"
         );
     }
 }

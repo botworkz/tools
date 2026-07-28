@@ -1,0 +1,272 @@
+type: botforge/fragment
+
+inputs:
+  str_a:
+    type: string
+    default: hello
+  str_b:
+    type: string
+    default: hello
+  booly:
+    type: boolean
+    default: false
+  booly_string:
+    type: string
+    default: "false"
+  seconds:
+    type: number
+    default: 42
+  cond:
+    type: string
+    default: "yes"
+  empty_str:
+    type: string
+    default: ""
+
+steps:
+# --- Equality: strict type-aware ---
+
+# Same-type string equal → true
+- name: expr-eq-same-type
+  run: echo "${{ inputs.str_a == inputs.str_b }}"
+  expect:
+    stdout:
+      contains:
+      - "true"
+
+# Cross-type: number 1 vs string '1' → false (strict equality)
+- name: expr-eq-cross-type-num-str
+  run: echo "${{ 1 == '1' }}"
+  expect:
+    stdout:
+      contains:
+      - "false"
+
+# Cross-type: 0 == '' → false
+- name: expr-eq-cross-type-zero-empty
+  run: echo "${{ 0 == '' }}"
+  expect:
+    stdout:
+      contains:
+      - "false"
+
+# Same-type equal with literals → true
+- name: expr-eq-literal-true
+  run: echo "${{ 'hello' == 'hello' }}"
+  expect:
+    stdout:
+      contains:
+      - "true"
+
+# --- Logical value-return + short-circuit ---
+
+# truthy input → && picks right branch
+- name: expr-and-truthy-branch
+  run: echo "${{ inputs.cond && 'yes' || 'no' }}"
+  expect:
+    stdout:
+      contains:
+      - "yes"
+
+# falsy input (empty string) → || picks fallback
+- name: expr-or-fallback-empty
+  run: echo "${{ inputs.empty_str || 'fallback' }}"
+  expect:
+    stdout:
+      contains:
+      - "fallback"
+
+# ! of truthy → false
+- name: expr-not-truthy
+  run: echo "${{ !inputs.cond }}"
+  expect:
+    stdout:
+      contains:
+      - "false"
+
+# ! of empty (falsy) → true
+- name: expr-not-empty
+  run: echo "${{ !inputs.empty_str }}"
+  expect:
+    stdout:
+      contains:
+      - "true"
+
+# --- Parens / composites ---
+
+# (a==b && b==a) is true → picks 'x'
+- name: expr-parens-composite-true
+  run: echo "${{ (inputs.str_a == inputs.str_b && inputs.str_b == inputs.str_a) && 'x' || 'y' }}"
+  expect:
+    stdout:
+      contains:
+      - "x"
+
+# --- Typed bool canonicals via if: ---
+
+# boolean input false → if: ${{ inputs.booly }} → SKIPS (Bool(false) is falsy)
+# If the step runs, it exits 1 — proving it was not skipped fails the test.
+- name: expr-if-bool-false-skips
+  if: ${{ inputs.booly }}
+  run: |
+    echo "bool-false ran (WRONG)"
+    exit 1
+
+# string input 'false' → if: ${{ inputs.booly_string }} → RUNS (non-empty string is truthy)
+- name: expr-if-string-false-runs
+  if: ${{ inputs.booly_string }}
+  run: echo "string-false-runs"
+  expect:
+    stdout:
+      contains:
+      - "string-false-runs"
+
+# from_json('false') → Bool(false) → if: → SKIPS
+- name: expr-if-from-json-bool-false-skips
+  if: ${{ from_json(inputs.booly_string) }}
+  run: |
+    echo "from-json-false ran (WRONG)"
+    exit 1
+
+# --- Faithful interpolation into string context ---
+
+# ${{ false }} → "false" (faithfully rendered, not "").
+# Bracketed so a regression to "" gives "[  ]" which fails the exact match.
+- name: expr-interp-false-literal
+  run: echo "[${{ false }}]"
+  expect:
+    stdout:
+      contains:
+      - "[false]"
+
+# ${{ 0 }} → "0" (number faithfully rendered, not "").
+- name: expr-interp-zero-literal
+  run: echo "[${{ 0 }}]"
+  expect:
+    stdout:
+      contains:
+      - "[0]"
+
+# ${{ inputs.booly }} (boolean false) → "false" in string context.
+- name: expr-interp-bool-input-false
+  run: echo "[${{ inputs.booly }}]"
+  expect:
+    stdout:
+      contains:
+      - "[false]"
+
+# --- Typed int field: number input into timeout ---
+
+# timeout: ${{ inputs.seconds }} (number input → YAML int) must load and run correctly.
+- name: expr-typed-int-timeout
+  timeout: ${{ inputs.seconds }}
+  run: echo "timeout-ok"
+  expect:
+    stdout:
+      contains:
+      - "timeout-ok"
+
+# --- Undefined ref in string context → "" ---
+
+# inputs.missing is not declared → Empty → interpolated as ""
+- name: expr-undefined-ref-empty
+  run: echo "[${{ inputs.missing }}]"
+  expect:
+    stdout:
+      contains:
+      - "[]"
+
+# --- to_json / from_json scalars ---
+
+# to_json(false) → "false" (bare JSON literal); bracketed for exact-match.
+- name: expr-to-json-false
+  run: echo "[${{ to_json(false) }}]"
+  expect:
+    stdout:
+      contains:
+      - "[false]"
+
+# to_json('x') → '"x"' (JSON-quoted string); bracketed for exact-match.
+- name: expr-to-json-string-x
+  run: echo "[${{ to_json('x') }}]"
+  expect:
+    stdout:
+      contains:
+      - '["x"]'
+
+# from_json('true') → Bool(true) → truthy → 'Y'
+- name: expr-from-json-true-truthy
+  run: echo "${{ from_json('true') && 'Y' || 'N' }}"
+  expect:
+    stdout:
+      contains:
+      - "Y"
+
+# from_json('0') → Number(0) → falsy → 'N'
+- name: expr-from-json-zero-falsy
+  run: echo "${{ from_json('0') && 'Y' || 'N' }}"
+  expect:
+    stdout:
+      contains:
+      - "N"
+
+# --- != inequality ---
+
+# str_a ('hello') != 'different' → true; bracketed for exact-match.
+- name: expr-neq-true
+  run: echo "[${{ inputs.str_a != 'different' }}]"
+  expect:
+    stdout:
+      contains:
+      - "[true]"
+
+# str_a == str_b (both 'hello') → str_a != str_b is false; bracketed.
+- name: expr-neq-false
+  run: echo "[${{ inputs.str_a != inputs.str_b }}]"
+  expect:
+    stdout:
+      contains:
+      - "[false]"
+
+# --- Short-circuit: dead branch not evaluated ---
+
+# inputs.empty_str is "" (falsy) → && short-circuits before evaluating inputs.missing.
+# The undefined ref on the dead side must NOT cause an error; || then yields 'ok'.
+- name: expr-short-circuit-dead-branch
+  run: echo "[${{ inputs.empty_str && inputs.missing || 'ok' }}]"
+  expect:
+    stdout:
+      contains:
+      - "[ok]"
+
+# --- args.* inside an expression (not just bare ${{ args.0 }}) ---
+
+# Exercises typed evaluation over the args namespace with an operator expression.
+# args.0 = 'cat' → ${{ args.0 == 'cat' && 'is-cat' || 'not-cat' }} → 'is-cat'.
+- name: expr-args-eq-expr (${{ args.0 }})
+  for: [cat]
+  run: echo "[${{ args.0 == 'cat' && 'is-cat' || 'not-cat' }}]"
+  expect:
+    stdout:
+      contains:
+      - "[is-cat]"
+
+# --- Number input into string field (R5: pure expr stringifies) ---
+
+# R5: pure `${{ inputs.seconds }}` occupying a string field now stringifies.
+# The `name:` field receives YAML string "42" (not an integer), proving R5.
+# name: ${{ inputs.seconds }} → name field = "42"
+- name: ${{ inputs.seconds }}
+  run: echo "r5-stringify-ok"
+  expect:
+    stdout:
+      contains:
+      - "r5-stringify-ok"
+
+# Interpolated form also works: "[count=42]" proves number renders faithfully.
+- name: expr-count-interp
+  run: echo "[count=${{ inputs.seconds }}]"
+  expect:
+    stdout:
+      contains:
+      - "[count=42]"
