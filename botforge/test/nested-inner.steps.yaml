@@ -1,0 +1,9 @@
+type: botforge/fragment
+steps:
+- on: guest
+  name: nested inner
+  run: |
+    echo nested-inner-ok
+  expect:
+    stdout:
+      contains: [nested-inner-ok]

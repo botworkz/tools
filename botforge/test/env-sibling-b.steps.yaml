@@ -1,0 +1,7 @@
+type: botforge/fragment
+steps:
+- on: guest
+  name: sibling B cannot see sibling A env
+  run: |
+    test -z "${SIBLING_VAR:-}"
+    test "${SIBLING_VAR:-}" != sibling-a-ok

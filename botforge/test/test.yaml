@@ -17,6 +17,9 @@ steps:
     test "$CALLER_VAR" = caller-ok
     test -z "${FRAGMENT_VAR:-}"
     test "${FRAGMENT_VAR:-}" != frag-ok
+- uses: "@://env-sibling-a.steps.yaml"
+- uses: "@://env-sibling-b.steps.yaml"
+- uses: "@://nested-outer.steps.yaml"
 - uses: "@://expressions.steps.yaml"
   with:
     str_a: hello
