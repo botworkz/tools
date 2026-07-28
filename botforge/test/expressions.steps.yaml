@@ -188,11 +188,20 @@ steps:
 
 # to_json('x') → '"x"' (JSON-quoted string); bracketed for exact-match.
 - name: expr-to-json-string-x
-  run: echo "[${{ to_json('x') }}]"
+  run: "echo '[${{ to_json('x') }}]'"
   expect:
     stdout:
       contains:
       - '["x"]'
+
+# to_json(inputs.str_a) where str_a is a declared string input ("hello")
+# must preserve JSON quotes through the same run-form as the literal case.
+- name: expr-to-json-string-var
+  run: "echo '[${{ to_json(inputs.str_a) }}]'"
+  expect:
+    stdout:
+      contains:
+      - '["hello"]'
 
 # from_json('true') → Bool(true) → truthy → 'Y'
 - name: expr-from-json-true-truthy

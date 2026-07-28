@@ -1556,6 +1556,31 @@ steps:
         }
 
         #[test]
+        fn test_to_json_string_literal_in_run_interpolation() {
+            let rendered = substitute_namespace_in_string(
+                "echo '[${{ to_json('x') }}]'",
+                "inputs",
+                &TypedInputMap::new(),
+                &BTreeMap::new(),
+            )
+            .unwrap();
+            assert_eq!(rendered, "echo '[\"x\"]'");
+        }
+
+        #[test]
+        fn test_to_json_string_var_in_run_interpolation() {
+            let tm = typed_map(&[("str_var", "hello", InputType::String)]);
+            let rendered = substitute_namespace_in_string(
+                "echo '[${{ to_json(inputs.str_var) }}]'",
+                "inputs",
+                &tm,
+                &BTreeMap::new(),
+            )
+            .unwrap();
+            assert_eq!(rendered, "echo '[\"hello\"]'");
+        }
+
+        #[test]
         fn test_from_json_function() {
             // "false" → Bool(false) → falsy → && picks right
             assert_eq!(
