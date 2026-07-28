@@ -119,9 +119,12 @@ fn sanitize_step_log_name(name: &str) -> String {
         .collect()
 }
 
-pub(super) fn step_log_path(log_dir: &Path, step_idx: usize, step_name: &str) -> PathBuf {
+pub(super) fn step_log_path(log_dir: &Path, step_display: &str, step_name: &str) -> PathBuf {
+    // Replace '.' in hierarchical indices (e.g. "3.2") with '-' so the filename
+    // stays unambiguous as a path component on all filesystems.
+    let safe_display = step_display.replace('.', "-");
     log_dir.join(format!(
-        "step-{step_idx}-{}.log",
+        "step-{safe_display}-{}.log",
         sanitize_step_log_name(step_name)
     ))
 }
@@ -140,10 +143,10 @@ fn stderr_color_enabled() -> bool {
     std::io::stderr().is_terminal()
 }
 
-fn step_title_line(step_idx: usize, name: &str, id: Option<&str>, color: bool) -> String {
+fn step_title_line(step_display: &str, name: &str, id: Option<&str>, color: bool) -> String {
     let counter = match id {
-        Some(id) => format!("{step_idx}/{id}"),
-        None => format!("{step_idx}"),
+        Some(id) => format!("{step_display}/{id}"),
+        None => step_display.to_string(),
     };
     if color {
         format!("🤖 \x1b[2m({counter})\x1b[0m \x1b[1m{name}\x1b[0m")
@@ -153,7 +156,7 @@ fn step_title_line(step_idx: usize, name: &str, id: Option<&str>, color: bool) -
 }
 
 fn step_status_marker(
-    step_idx: usize,
+    step_display: &str,
     name: &str,
     success: bool,
     id: Option<&str>,
@@ -161,8 +164,8 @@ fn step_status_marker(
     duration: Option<Duration>,
 ) -> String {
     let counter = match id {
-        Some(id) => format!("{step_idx}/{id}"),
-        None => format!("{step_idx}"),
+        Some(id) => format!("{step_display}/{id}"),
+        None => step_display.to_string(),
     };
     let duration_suffix = completion_duration_suffix(duration);
     let description = format!("{name}{duration_suffix}");
@@ -178,10 +181,10 @@ fn step_status_marker(
     }
 }
 
-pub(super) fn print_step_title(step_idx: usize, step_name: &str, step_id: Option<&str>) {
+pub(super) fn print_step_title(step_display: &str, step_name: &str, step_id: Option<&str>) {
     eprintln!(
         "{}",
-        step_title_line(step_idx, step_name, step_id, stderr_color_enabled())
+        step_title_line(step_display, step_name, step_id, stderr_color_enabled())
     );
 }
 
@@ -249,7 +252,7 @@ pub(crate) fn print_phase_status(
 }
 
 pub(super) fn print_step_status(
-    step_idx: usize,
+    step_display: &str,
     step_name: &str,
     step_id: Option<&str>,
     success: bool,
@@ -258,7 +261,7 @@ pub(super) fn print_step_status(
     eprintln!(
         "{}",
         step_status_marker(
-            step_idx,
+            step_display,
             step_name,
             success,
             step_id,
@@ -306,10 +309,10 @@ pub(crate) fn print_final_outcome(command: &str, success: bool) {
     );
 }
 
-fn step_skipped_marker(step_idx: usize, name: &str, id: Option<&str>, color: bool) -> String {
+fn step_skipped_marker(step_display: &str, name: &str, id: Option<&str>, color: bool) -> String {
     let counter = match id {
-        Some(id) => format!("{step_idx}/{id}"),
-        None => format!("{step_idx}"),
+        Some(id) => format!("{step_display}/{id}"),
+        None => step_display.to_string(),
     };
     if color {
         format!(" ⊘ \x1b[2m({counter})\x1b[0m \x1b[2m{name}\x1b[0m")
@@ -318,10 +321,10 @@ fn step_skipped_marker(step_idx: usize, name: &str, id: Option<&str>, color: boo
     }
 }
 
-pub(super) fn print_step_skipped(step_idx: usize, step_name: &str, step_id: Option<&str>) {
+pub(super) fn print_step_skipped(step_display: &str, step_name: &str, step_id: Option<&str>) {
     eprintln!(
         "{}",
-        step_skipped_marker(step_idx, step_name, step_id, stderr_color_enabled())
+        step_skipped_marker(step_display, step_name, step_id, stderr_color_enabled())
     );
 }
 
@@ -465,8 +468,16 @@ mod tests {
     #[test]
     fn test_step_log_path_sanitizes_name() {
         let log_dir = PathBuf::from("/tmp/botforge-step-logs");
-        let path = step_log_path(&log_dir, 7, "name with/slash\tand*chars");
+        let path = step_log_path(&log_dir, "7", "name with/slash\tand*chars");
         assert_eq!(path, log_dir.join("step-7-name_with_slash_and_chars.log"));
+    }
+
+    #[test]
+    fn test_step_log_path_hierarchical_index() {
+        let log_dir = PathBuf::from("/tmp/botforge-step-logs");
+        let path = step_log_path(&log_dir, "3.2", "inner-step");
+        // Dots in hierarchical index are replaced with '-' in the filename.
+        assert_eq!(path, log_dir.join("step-3-2-inner-step.log"));
     }
 
     // --- step status marker and title line ---
@@ -474,14 +485,14 @@ mod tests {
     #[test]
     fn test_step_status_marker_formats_result() {
         assert_eq!(
-            step_status_marker(4, "mcp-smoke", false, None, false, None),
+            step_status_marker("4", "mcp-smoke", false, None, false, None),
             " ✗ (4) mcp-smoke"
         );
         assert_eq!(
-            step_status_marker(4, "mcp-smoke", true, None, false, None),
+            step_status_marker("4", "mcp-smoke", true, None, false, None),
             " ✓ (4) mcp-smoke"
         );
-        let success_color = step_status_marker(4, "mcp-smoke", true, None, true, None);
+        let success_color = step_status_marker("4", "mcp-smoke", true, None, true, None);
         assert!(
             success_color.starts_with(' '),
             "success color marker should start with a space: {success_color:?}"
@@ -506,7 +517,7 @@ mod tests {
             success_color.contains("\x1b[0m"),
             "success color should reset: {success_color:?}"
         );
-        let failure_color = step_status_marker(4, "mcp-smoke", false, None, true, None);
+        let failure_color = step_status_marker("4", "mcp-smoke", false, None, true, None);
         assert!(
             failure_color.starts_with(' '),
             "failure color marker should start with a space: {failure_color:?}"
@@ -532,14 +543,14 @@ mod tests {
     #[test]
     fn test_step_status_marker_with_id() {
         assert_eq!(
-            step_status_marker(4, "mcp-smoke", true, Some("build"), false, None),
+            step_status_marker("4", "mcp-smoke", true, Some("build"), false, None),
             " ✓ (4/build) mcp-smoke"
         );
         assert_eq!(
-            step_status_marker(4, "mcp-smoke", false, Some("build"), false, None),
+            step_status_marker("4", "mcp-smoke", false, Some("build"), false, None),
             " ✗ (4/build) mcp-smoke"
         );
-        let success_color = step_status_marker(4, "mcp-smoke", true, Some("build"), true, None);
+        let success_color = step_status_marker("4", "mcp-smoke", true, Some("build"), true, None);
         assert!(
             success_color.contains("\x1b[2m(4/build)\x1b[0m"),
             "success color with id should dim counter: {success_color:?}"
@@ -556,7 +567,7 @@ mod tests {
             success_color.contains("\x1b[0m"),
             "success color with id should contain reset: {success_color:?}"
         );
-        let failure_color = step_status_marker(4, "mcp-smoke", false, Some("build"), true, None);
+        let failure_color = step_status_marker("4", "mcp-smoke", false, Some("build"), true, None);
         assert!(
             failure_color.contains("\x1b[2m(4/build)\x1b[0m"),
             "failure color with id should dim counter: {failure_color:?}"
@@ -574,10 +585,10 @@ mod tests {
     #[test]
     fn test_step_title_line_formats() {
         assert_eq!(
-            step_title_line(4, "mcp-smoke", None, false),
+            step_title_line("4", "mcp-smoke", None, false),
             "🤖 (4) mcp-smoke"
         );
-        let colored = step_title_line(4, "mcp-smoke", None, true);
+        let colored = step_title_line("4", "mcp-smoke", None, true);
         assert!(
             colored.contains("🤖 \x1b[2m(4)\x1b[0m "),
             "colored title should contain robot prefix: {colored:?}"
@@ -599,10 +610,10 @@ mod tests {
     #[test]
     fn test_step_title_line_with_id() {
         assert_eq!(
-            step_title_line(4, "mcp-smoke", Some("build"), false),
+            step_title_line("4", "mcp-smoke", Some("build"), false),
             "🤖 (4/build) mcp-smoke"
         );
-        let colored = step_title_line(4, "mcp-smoke", Some("build"), true);
+        let colored = step_title_line("4", "mcp-smoke", Some("build"), true);
         assert!(
             colored.contains("\x1b[2m(4/build)\x1b[0m"),
             "colored title with id should dim counter: {colored:?}"
@@ -624,10 +635,10 @@ mod tests {
     #[test]
     fn test_step_skipped_marker_formats() {
         assert_eq!(
-            step_skipped_marker(4, "mcp-smoke", None, false),
+            step_skipped_marker("4", "mcp-smoke", None, false),
             " ⊘ (4) mcp-smoke"
         );
-        let colored = step_skipped_marker(4, "mcp-smoke", None, true);
+        let colored = step_skipped_marker("4", "mcp-smoke", None, true);
         assert!(
             colored.contains("\x1b[2m(4)\x1b[0m"),
             "colored skipped marker should dim counter: {colored:?}"
@@ -637,10 +648,10 @@ mod tests {
             "colored skipped marker should dim name: {colored:?}"
         );
         assert_eq!(
-            step_skipped_marker(4, "mcp-smoke", Some("build"), false),
+            step_skipped_marker("4", "mcp-smoke", Some("build"), false),
             " ⊘ (4/build) mcp-smoke"
         );
-        let colored_with_id = step_skipped_marker(4, "mcp-smoke", Some("build"), true);
+        let colored_with_id = step_skipped_marker("4", "mcp-smoke", Some("build"), true);
         assert!(
             colored_with_id.contains("\x1b[2m(4/build)\x1b[0m"),
             "colored skipped marker with id should dim counter: {colored_with_id:?}"
@@ -810,12 +821,12 @@ mod tests {
     #[test]
     fn test_step_status_marker_duration_suffix_only_when_present() {
         assert_eq!(
-            step_status_marker(7, "warmup", true, None, false, None),
+            step_status_marker("7", "warmup", true, None, false, None),
             " ✓ (7) warmup"
         );
         assert_eq!(
             step_status_marker(
-                7,
+                "7",
                 "warmup",
                 true,
                 None,

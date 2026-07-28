@@ -1,0 +1,18 @@
+type: botforge/test
+name: assert-fail-dup-id
+
+# Negative-control fixture: regression guard for validate_scope_step_ids.
+# Two root-scope steps share the same id: value — botforge MUST fail to load
+# this config, proving that duplicate ids within a single scope are rejected.
+#
+# `image:` is injected by .github/workflows/_botforge.yml at CI time.
+
+steps:
+- name: first dup
+  id: dup
+  run: |
+    echo one
+- name: second dup
+  id: dup
+  run: |
+    echo two
