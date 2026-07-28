@@ -6,7 +6,8 @@ use crate::plan::files::FileEntry;
 use crate::qemu::PortSpec;
 use crate::resolver::Reference;
 use crate::step::{
-    ArchiveStep, ArchiveStepSpec, ExpectBlock, RunStep, StdioExpect, StepTarget, TestStep,
+    ArchiveStep, ArchiveStepSpec, ExpectBlock, InvokeStep, RunStep, StdioExpect, StepTarget,
+    TestStep,
 };
 use std::path::PathBuf;
 use tempfile::TempDir;
@@ -25,6 +26,13 @@ fn run_ref(step: &TestStep) -> &RunStep {
     step
 }
 
+fn invoke_ref(step: &TestStep) -> &InvokeStep {
+    let TestStep::Invoke(step) = step else {
+        panic!("expected invoke step, got {:?}", step.display_name());
+    };
+    step
+}
+
 fn make_step(target: StepTarget, name: &str) -> TestStep {
     TestStep::Run(RunStep {
         target,
@@ -36,6 +44,8 @@ fn make_step(target: StepTarget, name: &str) -> TestStep {
         id: None,
         expect: None,
         condition: None,
+        outputs: vec![],
+        captured_outputs: Default::default(),
     })
 }
 
@@ -422,11 +432,14 @@ steps:
 
         let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
 
+        // The fragment is now a single Invoke step; its inner steps hold the substituted content.
         assert_eq!(config.steps.len(), 1);
-        assert_eq!(run_ref(&config.steps[0]).name, "narrative-edge");
-        assert_eq!(run_ref(&config.steps[0]).shell.as_deref(), Some("bash"));
-        assert!(run_ref(&config.steps[0]).run.contains(r#"echo "${USER}""#));
-        assert!(run_ref(&config.steps[0]).run.contains("bash /tmp/edge.sh"));
+        let inner = &invoke_ref(&config.steps[0]).steps;
+        assert_eq!(inner.len(), 1);
+        assert_eq!(run_ref(&inner[0]).name, "narrative-edge");
+        assert_eq!(run_ref(&inner[0]).shell.as_deref(), Some("bash"));
+        assert!(run_ref(&inner[0]).run.contains(r#"echo "${USER}""#));
+        assert!(run_ref(&inner[0]).run.contains("bash /tmp/edge.sh"));
     }
 
     #[test]
@@ -458,8 +471,10 @@ steps:
         let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
 
         assert_eq!(config.steps.len(), 1);
-        assert_eq!(run_ref(&config.steps[0]).name, "frag-root-step");
-        assert_eq!(run_ref(&config.steps[0]).sudo, Some(true));
+        let inner = &invoke_ref(&config.steps[0]).steps;
+        assert_eq!(inner.len(), 1);
+        assert_eq!(run_ref(&inner[0]).name, "frag-root-step");
+        assert_eq!(run_ref(&inner[0]).sudo, Some(true));
     }
 
     #[test]
@@ -613,10 +628,14 @@ steps:
         .unwrap();
 
         let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+        // Two for:-expanded Run steps in the parent scope, plus one Invoke step.
         assert_eq!(config.steps.len(), 3);
         assert_eq!(run_ref(&config.steps[0]).name, "check-one");
         assert_eq!(run_ref(&config.steps[1]).name, "check-two");
-        assert_eq!(run_ref(&config.steps[2]).name, "frag-step");
+        // The fragment becomes an Invoke with one inner Run step.
+        let inner = &invoke_ref(&config.steps[2]).steps;
+        assert_eq!(inner.len(), 1);
+        assert_eq!(run_ref(&inner[0]).name, "frag-step");
     }
 
     #[test]
@@ -641,11 +660,14 @@ steps:
 
         let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
 
-        assert_eq!(config.steps.len(), 2);
-        assert_eq!(run_ref(&config.steps[0]).name, "frag-alpha");
-        assert_eq!(run_ref(&config.steps[0]).run, "echo alpha");
-        assert_eq!(run_ref(&config.steps[1]).name, "frag-beta");
-        assert_eq!(run_ref(&config.steps[1]).run, "echo beta");
+        // The fragment becomes one Invoke step; the for:-expanded steps are inside it.
+        assert_eq!(config.steps.len(), 1);
+        let inner = &invoke_ref(&config.steps[0]).steps;
+        assert_eq!(inner.len(), 2);
+        assert_eq!(run_ref(&inner[0]).name, "frag-alpha");
+        assert_eq!(run_ref(&inner[0]).run, "echo alpha");
+        assert_eq!(run_ref(&inner[1]).name, "frag-beta");
+        assert_eq!(run_ref(&inner[1]).run, "echo beta");
     }
 
     #[test]
@@ -672,11 +694,13 @@ steps:
 
         let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
 
-        assert_eq!(config.steps.len(), 2);
-        assert_eq!(run_ref(&config.steps[0]).name, "pair-cat");
-        assert_eq!(run_ref(&config.steps[0]).run, "echo cat /usr/bin/cat");
-        assert_eq!(run_ref(&config.steps[1]).name, "pair-ls");
-        assert_eq!(run_ref(&config.steps[1]).run, "echo ls /usr/bin/ls");
+        assert_eq!(config.steps.len(), 1);
+        let inner = &invoke_ref(&config.steps[0]).steps;
+        assert_eq!(inner.len(), 2);
+        assert_eq!(run_ref(&inner[0]).name, "pair-cat");
+        assert_eq!(run_ref(&inner[0]).run, "echo cat /usr/bin/cat");
+        assert_eq!(run_ref(&inner[1]).name, "pair-ls");
+        assert_eq!(run_ref(&inner[1]).run, "echo ls /usr/bin/ls");
     }
 
     #[test]
@@ -703,11 +727,13 @@ steps:
 
         let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
 
-        assert_eq!(config.steps.len(), 2);
-        assert_eq!(run_ref(&config.steps[0]).name, "svc-coreutils-cat");
-        assert_eq!(run_ref(&config.steps[0]).run, "echo cat");
-        assert_eq!(run_ref(&config.steps[1]).name, "svc-coreutils-ls");
-        assert_eq!(run_ref(&config.steps[1]).run, "echo ls");
+        assert_eq!(config.steps.len(), 1);
+        let inner = &invoke_ref(&config.steps[0]).steps;
+        assert_eq!(inner.len(), 2);
+        assert_eq!(run_ref(&inner[0]).name, "svc-coreutils-cat");
+        assert_eq!(run_ref(&inner[0]).run, "echo cat");
+        assert_eq!(run_ref(&inner[1]).name, "svc-coreutils-ls");
+        assert_eq!(run_ref(&inner[1]).run, "echo ls");
     }
 
     #[test]
@@ -743,11 +769,13 @@ steps:
 
         let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
 
-        assert_eq!(config.steps.len(), 2);
-        assert_eq!(run_ref(&config.steps[0]).name, "api-cp");
-        assert_eq!(run_ref(&config.steps[0]).run, "echo api cp");
-        assert_eq!(run_ref(&config.steps[1]).name, "api-ls");
-        assert_eq!(run_ref(&config.steps[1]).run, "echo api ls");
+        assert_eq!(config.steps.len(), 1);
+        let inner = &invoke_ref(&config.steps[0]).steps;
+        assert_eq!(inner.len(), 2);
+        assert_eq!(run_ref(&inner[0]).name, "api-cp");
+        assert_eq!(run_ref(&inner[0]).run, "echo api cp");
+        assert_eq!(run_ref(&inner[1]).name, "api-ls");
+        assert_eq!(run_ref(&inner[1]).run, "echo api ls");
     }
 
     #[test]
@@ -782,7 +810,9 @@ steps:
 
         let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
         assert_eq!(config.steps.len(), 1);
-        assert_eq!(run_ref(&config.steps[0]).run, "echo ");
+        let inner = &invoke_ref(&config.steps[0]).steps;
+        assert_eq!(inner.len(), 1);
+        assert_eq!(run_ref(&inner[0]).run, "echo ");
     }
 
     #[test]
@@ -836,9 +866,11 @@ steps:
 
         let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
 
-        assert_eq!(config.steps.len(), 2);
+        assert_eq!(config.steps.len(), 1);
+        let inner = &invoke_ref(&config.steps[0]).steps;
+        assert_eq!(inner.len(), 2);
         assert_eq!(
-            run_ref(&config.steps[0])
+            run_ref(&inner[0])
                 .expect
                 .as_ref()
                 .unwrap()
@@ -849,7 +881,7 @@ steps:
             vec!["alpha".to_string()]
         );
         assert_eq!(
-            run_ref(&config.steps[1])
+            run_ref(&inner[1])
                 .expect
                 .as_ref()
                 .unwrap()
@@ -1154,11 +1186,14 @@ steps:
         let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
 
         assert_eq!(config.steps.len(), 1);
-        assert_eq!(run_ref(&config.steps[0]).name, "frag-step");
+        // The fragment becomes an Invoke step; the id lives inside the inner scope.
+        let inner = &invoke_ref(&config.steps[0]).steps;
+        assert_eq!(inner.len(), 1);
+        assert_eq!(run_ref(&inner[0]).name, "frag-step");
         assert_eq!(
-            run_ref(&config.steps[0]).id.as_deref(),
+            run_ref(&inner[0]).id.as_deref(),
             Some("my-frag-id"),
-            "id should be preserved through fragment splice"
+            "id should be preserved through fragment invocation"
         );
     }
 }
@@ -1517,10 +1552,13 @@ steps:
         assert_eq!(
             config.steps.len(),
             2,
-            "same fragment included twice must expand to two steps"
+            "same fragment included twice must produce two Invoke steps"
         );
-        assert_eq!(run_ref(&config.steps[0]).name, "reused-step");
-        assert_eq!(run_ref(&config.steps[1]).name, "reused-step");
+        // Each Invoke step contains one inner Run step.
+        let inner0 = &invoke_ref(&config.steps[0]).steps;
+        let inner1 = &invoke_ref(&config.steps[1]).steps;
+        assert_eq!(run_ref(&inner0[0]).name, "reused-step");
+        assert_eq!(run_ref(&inner1[0]).name, "reused-step");
     }
 
     #[test]
@@ -2614,7 +2652,9 @@ steps: []
         );
         let cfg = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
         assert_eq!(cfg.steps.len(), 1);
-        assert_eq!(run_ref(&cfg.steps[0]).name, "still-ok");
+        let inner = &invoke_ref(&cfg.steps[0]).steps;
+        assert_eq!(inner.len(), 1);
+        assert_eq!(run_ref(&inner[0]).name, "still-ok");
     }
 
     #[test]
@@ -2954,8 +2994,10 @@ steps:
         );
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
         assert_eq!(config.steps.len(), 1);
-        assert_eq!(run_ref(&config.steps[0]).name, "frag-step");
-        assert_eq!(run_ref(&config.steps[0]).timeout, Some(42));
+        let inner = &invoke_ref(&config.steps[0]).steps;
+        assert_eq!(inner.len(), 1);
+        assert_eq!(run_ref(&inner[0]).name, "frag-step");
+        assert_eq!(run_ref(&inner[0]).timeout, Some(42));
     }
 
     #[test]
@@ -3012,11 +3054,13 @@ steps:
 
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
 
-        assert_eq!(config.steps.len(), 2);
-        assert_eq!(run_ref(&config.steps[0]).name, "build-alpha");
-        assert_eq!(run_ref(&config.steps[0]).run, "echo alpha");
-        assert_eq!(run_ref(&config.steps[1]).name, "build-beta");
-        assert_eq!(run_ref(&config.steps[1]).run, "echo beta");
+        assert_eq!(config.steps.len(), 1);
+        let inner = &invoke_ref(&config.steps[0]).steps;
+        assert_eq!(inner.len(), 2);
+        assert_eq!(run_ref(&inner[0]).name, "build-alpha");
+        assert_eq!(run_ref(&inner[0]).run, "echo alpha");
+        assert_eq!(run_ref(&inner[1]).name, "build-beta");
+        assert_eq!(run_ref(&inner[1]).run, "echo beta");
     }
 
     #[test]
@@ -3048,8 +3092,10 @@ steps:
         );
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
         assert_eq!(config.steps.len(), 1);
-        assert_eq!(run_ref(&config.steps[0]).name, "frag-step");
-        assert_eq!(run_ref(&config.steps[0]).sudo, Some(true));
+        let inner = &invoke_ref(&config.steps[0]).steps;
+        assert_eq!(inner.len(), 1);
+        assert_eq!(run_ref(&inner[0]).name, "frag-step");
+        assert_eq!(run_ref(&inner[0]).sudo, Some(true));
     }
 
     #[test]
@@ -3120,9 +3166,11 @@ steps:
         );
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
         assert_eq!(config.steps.len(), 1);
-        assert_eq!(run_ref(&config.steps[0]).name, "frag-step");
+        let inner = &invoke_ref(&config.steps[0]).steps;
+        assert_eq!(inner.len(), 1);
+        assert_eq!(run_ref(&inner[0]).name, "frag-step");
         assert_eq!(
-            run_ref(&config.steps[0]).expect,
+            run_ref(&inner[0]).expect,
             Some(ExpectBlock {
                 exit: Some(0),
                 stdout: Some(StdioExpect {
@@ -3168,7 +3216,10 @@ steps:
 "#,
         );
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
-        assert_eq!(run_ref(&config.steps[0]).timeout, Some(75));
+        assert_eq!(config.steps.len(), 1);
+        let inner = &invoke_ref(&config.steps[0]).steps;
+        assert_eq!(inner.len(), 1);
+        assert_eq!(run_ref(&inner[0]).timeout, Some(75));
     }
 
     #[test]
@@ -4316,7 +4367,10 @@ steps:
 
         let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
         use crate::step::TestStep;
-        let TestStep::Run(step) = &config.steps[0] else {
+        let TestStep::Invoke(inv) = &config.steps[0] else {
+            panic!("expected invoke step");
+        };
+        let TestStep::Run(step) = &inv.steps[0] else {
             panic!("expected run step");
         };
         assert_eq!(step.timeout, Some(42));
@@ -4371,5 +4425,149 @@ steps:
             !msg.is_empty(),
             "timeout: ${{{{ inputs.t }}}} with unset input must fail: {msg}"
         );
+    }
+}
+
+mod outputs_validation {
+    use super::*;
+    use crate::step::{OutputDecl, OutputType};
+
+    fn make_run_step_with_outputs(name: &str, outputs: Vec<OutputDecl>) -> TestStep {
+        TestStep::Run(RunStep {
+            target: StepTarget::Guest,
+            name: name.to_string(),
+            run: "echo ok".to_string(),
+            timeout: None,
+            shell: None,
+            sudo: None,
+            id: None,
+            expect: None,
+            condition: None,
+            outputs,
+            captured_outputs: Default::default(),
+        })
+    }
+
+    fn decl(name: &str, t: OutputType) -> OutputDecl {
+        OutputDecl {
+            name: name.to_string(),
+            output_type: t,
+            required: false,
+        }
+    }
+
+    // --- closed type set (parse-time) ---
+
+    #[test]
+    fn test_output_type_string_accepted() {
+        let step = make_run_step_with_outputs("s", vec![decl("x", OutputType::String)]);
+        assert!(validate_test_steps(&[step], &[]).is_ok());
+    }
+
+    #[test]
+    fn test_output_type_number_accepted() {
+        let step = make_run_step_with_outputs("s", vec![decl("n", OutputType::Number)]);
+        assert!(validate_test_steps(&[step], &[]).is_ok());
+    }
+
+    #[test]
+    fn test_output_type_bool_accepted() {
+        let step = make_run_step_with_outputs("s", vec![decl("b", OutputType::Bool)]);
+        assert!(validate_test_steps(&[step], &[]).is_ok());
+    }
+
+    #[test]
+    fn test_output_unknown_type_rejected_by_serde() {
+        // The closed type set is enforced by serde's enum deserializer.
+        let yaml =
+            "name: s\nrun: echo ok\ntarget: host\noutputs:\n  - name: x\n    type: integer\n";
+        let err = serde_yaml::from_str::<RunStep>(yaml).unwrap_err();
+        assert!(
+            !err.to_string().is_empty(),
+            "unknown type 'integer' should be rejected at parse time"
+        );
+    }
+
+    #[test]
+    fn test_output_type_list_closed_set_object_rejected() {
+        let yaml = "name: s\nrun: echo ok\ntarget: host\noutputs:\n  - name: x\n    type: object\n";
+        let err = serde_yaml::from_str::<RunStep>(yaml).unwrap_err();
+        assert!(
+            !err.to_string().is_empty(),
+            "type 'object' is not in the closed set"
+        );
+    }
+
+    // --- duplicate output names ---
+
+    #[test]
+    fn test_duplicate_output_names_rejected() {
+        let step = make_run_step_with_outputs(
+            "my-step",
+            vec![
+                decl("result", OutputType::String),
+                decl("result", OutputType::Number),
+            ],
+        );
+        let err = validate_test_steps(&[step], &[]).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("result") || msg.contains("duplicate"),
+            "error should mention the duplicate name: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_duplicate_output_names_rejected_in_build() {
+        let step = make_run_step_with_outputs(
+            "my-step",
+            vec![
+                decl("out", OutputType::Bool),
+                decl("out", OutputType::String),
+            ],
+        );
+        let err = validate_build_steps(&[step]).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("out") || msg.contains("duplicate"),
+            "error should mention the duplicate name: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_no_outputs_is_valid() {
+        let step = make_run_step_with_outputs("s", vec![]);
+        assert!(validate_test_steps(&[step], &[]).is_ok());
+    }
+
+    #[test]
+    fn test_multiple_distinct_outputs_is_valid() {
+        let step = make_run_step_with_outputs(
+            "s",
+            vec![
+                decl("name", OutputType::String),
+                decl("count", OutputType::Number),
+                decl("ready", OutputType::Bool),
+            ],
+        );
+        assert!(validate_test_steps(&[step], &[]).is_ok());
+    }
+
+    // --- required flag roundtrip via YAML ---
+
+    #[test]
+    fn test_output_required_parses_from_yaml() {
+        let yaml =
+            "name: s\nrun: echo ok\noutputs:\n  - name: x\n    type: string\n    required: true\n";
+        let step: RunStep = serde_yaml::from_str(yaml).unwrap();
+        assert!(step.outputs[0].required);
+    }
+
+    #[test]
+    fn test_output_required_false_parses_from_yaml() {
+        let yaml =
+            "name: s\nrun: echo ok\noutputs:\n  - name: x\n    type: number\n    required: false\n";
+        let step: RunStep = serde_yaml::from_str(yaml).unwrap();
+        assert!(!step.outputs[0].required);
     }
 }

@@ -1238,6 +1238,8 @@ publish:
             id: None,
             expect: None,
             condition: None,
+            outputs: vec![],
+            captured_outputs: Default::default(),
         });
 
         let config = make_publish_config_with_steps(
@@ -1284,6 +1286,8 @@ publish:
             id: None,
             expect: None,
             condition: None,
+            outputs: vec![],
+            captured_outputs: Default::default(),
         });
 
         let config = make_publish_config_with_steps(
@@ -1335,6 +1339,8 @@ publish:
             id: None,
             expect: None,
             condition: None,
+            outputs: vec![],
+            captured_outputs: Default::default(),
         });
 
         let config = make_publish_config_with_steps(
@@ -1358,13 +1364,13 @@ publish:
         let workspace = TempDir::new().unwrap();
         let context = workspace.path();
 
-        // Step 1 writes a key to BOTFORGE_ENV; step 2 reads it.
+        // Step 1 writes a key to BF_ENV; step 2 reads it.
         // If accumulation works, step 2 should see MY_KEY.
         let output_file = context.join("output.txt");
         let steps = vec![
             crate::step::TestStep::Run(crate::step::RunStep {
                 name: "set env".to_string(),
-                run: "echo MY_KEY=hello >> \"$BOTFORGE_ENV\"".to_string(),
+                run: "echo MY_KEY=hello >> \"$BF_ENV\"".to_string(),
                 target: crate::step::StepTarget::Guest,
                 shell: None,
                 timeout: None,
@@ -1372,6 +1378,8 @@ publish:
                 id: None,
                 expect: None,
                 condition: None,
+                outputs: vec![],
+                captured_outputs: Default::default(),
             }),
             crate::step::TestStep::Run(crate::step::RunStep {
                 name: "read env".to_string(),
@@ -1383,6 +1391,8 @@ publish:
                 id: None,
                 expect: None,
                 condition: None,
+                outputs: vec![],
+                captured_outputs: Default::default(),
             }),
         ];
 
@@ -1415,6 +1425,8 @@ publish:
             id: None,
             expect: None,
             condition: None,
+            outputs: vec![],
+            captured_outputs: Default::default(),
         })];
 
         crate::plan::run_local_steps(context, &steps).unwrap();
@@ -1444,6 +1456,8 @@ publish:
                 id: None,
                 expect: None,
                 condition: None,
+                outputs: vec![],
+                captured_outputs: Default::default(),
             }),
             crate::step::TestStep::Run(crate::step::RunStep {
                 name: "should not run".to_string(),
@@ -1455,6 +1469,8 @@ publish:
                 id: None,
                 expect: None,
                 condition: None,
+                outputs: vec![],
+                captured_outputs: Default::default(),
             }),
         ];
 

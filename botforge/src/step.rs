@@ -1,9 +1,242 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::de::{self, Deserializer};
 use serde::Deserialize;
 use serde_yaml::Value;
 
 use crate::config::{yaml_scalar_to_string, yaml_scalar_truthiness};
+
+/// The declared type of a step output.
+///
+/// This is a **closed** set — no other type is valid.  An unknown type is a
+/// config error at parse time (serde will return an error).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum OutputType {
+    String,
+    Number,
+    Bool,
+}
+
+impl std::fmt::Display for OutputType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OutputType::String => write!(f, "string"),
+            OutputType::Number => write!(f, "number"),
+            OutputType::Bool => write!(f, "bool"),
+        }
+    }
+}
+
+/// A single output declaration on a run step.
+///
+/// Outputs are declared on the step, typed with `type:` (closed enum:
+/// `string`, `number`, `bool`), and optionally `required: true` to enforce
+/// that the step actually emits a non-empty value.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OutputDecl {
+    /// The output name.  Must be unique within a step's `outputs:` list.
+    #[serde(deserialize_with = "deserialize_scalar_as_string")]
+    pub(crate) name: String,
+    /// The declared type.  One of `string`, `number`, `bool`.
+    #[serde(rename = "type")]
+    pub(crate) output_type: OutputType,
+    /// When `true`, the step must emit a non-empty value for this output or
+    /// the step fails at runtime.  Defaults to `false`.
+    #[serde(default)]
+    pub(crate) required: bool,
+}
+
+/// The coerced value of a captured output.
+///
+/// There is exactly **one** universal empty: `Null`.  It is used for both
+/// "not emitted" and "emitted as empty string".  `Null` is *not* a per-type
+/// zero (no `0`, no `false`, no `""`).
+///
+/// Projection behaviour of `Null`:
+/// - Into a string context (interpolation / `string`-typed field): renders as `""`.
+/// - Into a typed input: provides no value at all (treated as absent).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum OutputValue {
+    Null,
+    String(String),
+    Number(f64),
+    Bool(bool),
+}
+
+impl OutputValue {
+    /// Project the value into a string context, returning an owned `String`.
+    ///
+    /// `Null` → `""`.  All other variants → their string representation.
+    ///
+    /// Stage 2 is capture-only; this method is reserved for the downstream
+    /// resolution stage (Stage 4+) and is intentionally unused until then.
+    #[allow(dead_code)]
+    pub(crate) fn to_string_context(&self) -> String {
+        match self {
+            OutputValue::Null => String::new(),
+            OutputValue::String(s) => s.clone(),
+            OutputValue::Number(n) => {
+                if n.fract() == 0.0 && n.abs() < 1e15 {
+                    format!("{}", *n as i64)
+                } else {
+                    format!("{n}")
+                }
+            }
+            OutputValue::Bool(b) => b.to_string(),
+        }
+    }
+}
+
+/// A captured and coerced output value, as stored on the executed step node.
+///
+/// Stage 2 is capture-only; these fields are reserved for the downstream
+/// resolution stage (Stage 4+) and are intentionally unused until then.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub(crate) struct CapturedOutput {
+    /// The output name (matches a declaration in `RunStep.outputs`).
+    pub(crate) name: String,
+    /// The declared type (copied from the declaration for uniform source-agnostic access).
+    pub(crate) declared_type: OutputType,
+    /// The coerced value.
+    pub(crate) value: OutputValue,
+}
+
+/// Coerce a raw emitted string to the declared output type.
+///
+/// An empty raw string is **always** `Null`, regardless of declared type.
+/// Type only matters when there is an actual (non-empty) value to coerce.
+/// Coercion failure is a **hard failure** — there is no opt-in leniency.
+pub(crate) fn coerce_output_value(
+    name: &str,
+    raw: &str,
+    declared_type: OutputType,
+) -> Result<OutputValue> {
+    if raw.is_empty() {
+        return Ok(OutputValue::Null);
+    }
+    match declared_type {
+        OutputType::String => Ok(OutputValue::String(raw.to_string())),
+        OutputType::Number => raw.parse::<f64>().map(OutputValue::Number).map_err(|_| {
+            anyhow::anyhow!(
+                "output '{}': value {:?} cannot be coerced to number",
+                name,
+                raw
+            )
+        }),
+        OutputType::Bool => match raw {
+            "true" => Ok(OutputValue::Bool(true)),
+            "false" => Ok(OutputValue::Bool(false)),
+            other => anyhow::bail!(
+                "output '{}': value {:?} cannot be coerced to bool (expected \"true\" or \"false\")",
+                name,
+                other
+            ),
+        },
+    }
+}
+
+/// Capture and coerce all declared outputs for a step after execution.
+///
+/// `out_contents` is the contents of the BF_OUT file written by the step.
+/// The file format is identical to BF_ENV (`KEY=VALUE` or heredoc).
+///
+/// - Undeclared emissions are silently ignored.
+/// - Coercion failures are hard errors.
+/// - `required: true` outputs that are null (not emitted or emitted as empty) fail.
+pub(crate) fn capture_step_outputs(
+    step_name: &str,
+    declarations: &[OutputDecl],
+    out_contents: &str,
+) -> Result<Vec<CapturedOutput>> {
+    if declarations.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let emitted = parse_out_file(out_contents)?;
+
+    let mut captured: Vec<CapturedOutput> = Vec::with_capacity(declarations.len());
+
+    for decl in declarations {
+        let raw = emitted
+            .iter()
+            .find(|(k, _)| k == &decl.name)
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("");
+
+        let value = coerce_output_value(&decl.name, raw, decl.output_type)
+            .with_context(|| format!("step '{}' output coercion failed", step_name))?;
+
+        if decl.required && matches!(value, OutputValue::Null) {
+            anyhow::bail!(
+                "step '{}': required output '{}' was not emitted or was empty",
+                step_name,
+                decl.name
+            );
+        }
+
+        captured.push(CapturedOutput {
+            name: decl.name.clone(),
+            declared_type: decl.output_type,
+            value,
+        });
+    }
+
+    Ok(captured)
+}
+
+/// Parse a BF_OUT-format string (`KEY=VALUE` / heredoc), returning key-value pairs.
+///
+/// This is the same format as BF_ENV; blank lines and lines matching neither
+/// format are skipped.
+fn parse_out_file(contents: &str) -> Result<Vec<(String, String)>> {
+    let mut result: Vec<(String, String)> = Vec::new();
+    let lines: Vec<&str> = contents.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        if line.is_empty() {
+            i += 1;
+            continue;
+        }
+        let eq_pos = line.find('=');
+        let heredoc_pos = line.find("<<");
+        if let Some(hpos) = heredoc_pos {
+            let before_heredoc = &line[..hpos];
+            if !before_heredoc.is_empty()
+                && eq_pos.is_none_or(|ep| ep > hpos)
+                && !before_heredoc.contains('=')
+            {
+                let key = before_heredoc;
+                let delimiter = &line[hpos + 2..];
+                if !delimiter.is_empty() {
+                    i += 1;
+                    let mut value_lines: Vec<&str> = Vec::new();
+                    while i < lines.len() && lines[i] != delimiter {
+                        value_lines.push(lines[i]);
+                        i += 1;
+                    }
+                    if i >= lines.len() {
+                        anyhow::bail!("unterminated heredoc for key '{key}'");
+                    }
+                    i += 1;
+                    result.push((key.to_string(), value_lines.join("\n")));
+                    continue;
+                }
+            }
+        }
+        if let Some(eq) = eq_pos {
+            let key = &line[..eq];
+            let value = &line[eq + 1..];
+            if !key.is_empty() {
+                result.push((key.to_string(), value.to_string()));
+            }
+        }
+        i += 1;
+    }
+    Ok(result)
+}
 
 /// Where a test step executes: inside the guest (SSH) or on the harness host (local).
 #[derive(Debug, Deserialize, PartialEq, Eq, Default)]
@@ -107,6 +340,24 @@ pub(crate) struct RunStep {
         deserialize_with = "deserialize_step_condition"
     )]
     pub(crate) condition: Option<bool>,
+    /// Typed output declarations for this step.
+    ///
+    /// When the step runs, `BF_OUT` is set to a writable file; the step body
+    /// emits `NAME=value` lines to it.  After execution the executor reads the
+    /// file, coerces each emission to the declared type, enforces `required`,
+    /// and stores the results in `captured_outputs`.
+    ///
+    /// On `uses:` steps the declarations come from the fragment's `outputs:`
+    /// block instead (Stage 4+).  This field is empty for such steps.
+    #[serde(default)]
+    pub(crate) outputs: Vec<OutputDecl>,
+    /// Captured and coerced output values, populated after this step executes.
+    ///
+    /// `None` before the step runs; `Some(vec)` after.  Written by the step
+    /// executor; the slot is the substrate a later deferred-resolution pass
+    /// (Stage 4) will read from.  Not part of the YAML schema.
+    #[serde(skip)]
+    pub(crate) captured_outputs: std::cell::RefCell<Option<Vec<CapturedOutput>>>,
 }
 
 impl RunStep {
@@ -149,10 +400,28 @@ pub(crate) struct ArchiveStep {
     pub(crate) shell: Option<String>,
 }
 
+/// A scoped fragment invocation produced by a `uses:` entry.
+///
+/// The fragment's inner steps execute in their own env scope: they inherit the
+/// caller's accumulated env, but any env mutations made inside the invocation are
+/// contained within that scope and do not leak back to the caller or to later
+/// sibling steps.  `files:` and `cloud_init:` contributions from the fragment are
+/// accumulated globally at load time before this step is produced.
+#[derive(Debug)]
+pub(crate) struct InvokeStep {
+    /// The `uses:` value as written; used for display in step titles and logs.
+    pub(crate) uses: String,
+    /// The fragment's pre-resolved, pre-expanded step list.  May itself contain
+    /// further `Invoke` steps (recursive fragments).
+    pub(crate) steps: Vec<TestStep>,
+}
+
 #[derive(Debug)]
 pub(crate) enum TestStep {
     Run(RunStep),
     Archive(ArchiveStep),
+    /// A scoped fragment invocation (`uses:` entry).
+    Invoke(InvokeStep),
 }
 
 impl TestStep {
@@ -164,13 +433,14 @@ impl TestStep {
                 .name
                 .as_deref()
                 .unwrap_or(step.archive.src.as_str()),
+            Self::Invoke(step) => &step.uses,
         }
     }
 
     pub(crate) fn display_id(&self) -> Option<&str> {
         match self {
             Self::Run(step) => step.id.as_deref(),
-            Self::Archive(_) => None,
+            Self::Archive(_) | Self::Invoke(_) => None,
         }
     }
 }
@@ -754,5 +1024,387 @@ expect:
             err.to_string().contains("unknown field"),
             "deny_unknown_fields should still reject extra fields: {err}"
         );
+    }
+
+    // --- Stage 2: OutputType parse-time validation ---
+
+    mod output_type {
+        use super::super::{OutputDecl, OutputType, RunStep};
+
+        #[test]
+        fn test_output_type_string_parses() {
+            let yaml = "name: my-output\ntype: string\n";
+            let decl: OutputDecl = serde_yaml::from_str(yaml).unwrap();
+            assert_eq!(decl.output_type, OutputType::String);
+        }
+
+        #[test]
+        fn test_output_type_number_parses() {
+            let yaml = "name: count\ntype: number\n";
+            let decl: OutputDecl = serde_yaml::from_str(yaml).unwrap();
+            assert_eq!(decl.output_type, OutputType::Number);
+        }
+
+        #[test]
+        fn test_output_type_bool_parses() {
+            let yaml = "name: flag\ntype: bool\n";
+            let decl: OutputDecl = serde_yaml::from_str(yaml).unwrap();
+            assert_eq!(decl.output_type, OutputType::Bool);
+        }
+
+        #[test]
+        fn test_output_type_unknown_is_config_error() {
+            let yaml = "name: x\ntype: integer\n";
+            let err = serde_yaml::from_str::<OutputDecl>(yaml).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("integer")
+                    || msg.contains("unknown variant")
+                    || msg.contains("expected one of"),
+                "error should mention the bad type: {msg}"
+            );
+        }
+
+        #[test]
+        fn test_output_type_object_is_config_error() {
+            let yaml = "name: x\ntype: object\n";
+            let err = serde_yaml::from_str::<OutputDecl>(yaml).unwrap_err();
+            assert!(
+                !err.to_string().is_empty(),
+                "unknown type 'object' should fail"
+            );
+        }
+
+        #[test]
+        fn test_output_required_defaults_to_false() {
+            let yaml = "name: x\ntype: string\n";
+            let decl: OutputDecl = serde_yaml::from_str(yaml).unwrap();
+            assert!(!decl.required, "required defaults to false");
+        }
+
+        #[test]
+        fn test_output_required_true_parses() {
+            let yaml = "name: x\ntype: string\nrequired: true\n";
+            let decl: OutputDecl = serde_yaml::from_str(yaml).unwrap();
+            assert!(decl.required);
+        }
+
+        #[test]
+        fn test_output_unknown_field_is_error() {
+            let yaml = "name: x\ntype: string\nfoo: bar\n";
+            let err = serde_yaml::from_str::<OutputDecl>(yaml).unwrap_err();
+            assert!(
+                err.to_string().contains("unknown field") || err.to_string().contains("foo"),
+                "unknown field should be rejected: {err}"
+            );
+        }
+
+        #[test]
+        fn test_run_step_parses_outputs_list() {
+            let yaml = "name: s\nrun: echo ok\noutputs:\n  - name: result\n    type: string\n";
+            let step: RunStep = serde_yaml::from_str(yaml).unwrap();
+            assert_eq!(step.outputs.len(), 1);
+            assert_eq!(step.outputs[0].name, "result");
+            assert_eq!(step.outputs[0].output_type, OutputType::String);
+        }
+
+        #[test]
+        fn test_run_step_outputs_absent_defaults_to_empty() {
+            let yaml = "name: s\nrun: echo ok\n";
+            let step: RunStep = serde_yaml::from_str(yaml).unwrap();
+            assert!(step.outputs.is_empty());
+        }
+
+        #[test]
+        fn test_run_step_outputs_display_name() {
+            assert_eq!(OutputType::String.to_string(), "string");
+            assert_eq!(OutputType::Number.to_string(), "number");
+            assert_eq!(OutputType::Bool.to_string(), "bool");
+        }
+    }
+
+    // --- Stage 2: coerce_output_value ---
+
+    mod coercion {
+        use super::super::{coerce_output_value, OutputType, OutputValue};
+
+        // --- string coercion ---
+        #[test]
+        fn test_coerce_string_returns_string_value() {
+            let v = coerce_output_value("x", "hello", OutputType::String).unwrap();
+            assert_eq!(v, OutputValue::String("hello".to_string()));
+        }
+
+        #[test]
+        fn test_coerce_string_empty_is_null() {
+            let v = coerce_output_value("x", "", OutputType::String).unwrap();
+            assert_eq!(v, OutputValue::Null);
+        }
+
+        // --- number coercion ---
+        #[test]
+        fn test_coerce_number_integer_string() {
+            let v = coerce_output_value("n", "42", OutputType::Number).unwrap();
+            assert_eq!(v, OutputValue::Number(42.0));
+        }
+
+        #[test]
+        fn test_coerce_number_float_string() {
+            let v = coerce_output_value("n", "3.73", OutputType::Number).unwrap();
+            assert!(matches!(v, OutputValue::Number(f) if (f - 3.73).abs() < 1e-9));
+        }
+
+        #[test]
+        fn test_coerce_number_negative() {
+            let v = coerce_output_value("n", "-7", OutputType::Number).unwrap();
+            assert_eq!(v, OutputValue::Number(-7.0));
+        }
+
+        #[test]
+        fn test_coerce_number_empty_is_null() {
+            let v = coerce_output_value("n", "", OutputType::Number).unwrap();
+            assert_eq!(v, OutputValue::Null);
+        }
+
+        #[test]
+        fn test_coerce_number_non_numeric_is_hard_fail() {
+            let err = coerce_output_value("n", "hello", OutputType::Number).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("cannot be coerced to number") || msg.contains("number"),
+                "error should mention coercion failure: {msg}"
+            );
+        }
+
+        // --- bool coercion ---
+        #[test]
+        fn test_coerce_bool_true_string() {
+            let v = coerce_output_value("b", "true", OutputType::Bool).unwrap();
+            assert_eq!(v, OutputValue::Bool(true));
+        }
+
+        #[test]
+        fn test_coerce_bool_false_string() {
+            let v = coerce_output_value("b", "false", OutputType::Bool).unwrap();
+            assert_eq!(v, OutputValue::Bool(false));
+        }
+
+        #[test]
+        fn test_coerce_bool_empty_is_null() {
+            let v = coerce_output_value("b", "", OutputType::Bool).unwrap();
+            assert_eq!(v, OutputValue::Null);
+        }
+
+        #[test]
+        fn test_coerce_bool_invalid_is_hard_fail() {
+            let err = coerce_output_value("b", "yes", OutputType::Bool).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("cannot be coerced to bool") || msg.contains("bool"),
+                "error should mention coercion failure: {msg}"
+            );
+        }
+
+        #[test]
+        fn test_coerce_bool_1_is_hard_fail() {
+            // Only "true"/"false" are accepted for bool; "1"/"0" are not.
+            let err = coerce_output_value("b", "1", OutputType::Bool).unwrap_err();
+            assert!(!err.to_string().is_empty(), "1 is not a valid bool string");
+        }
+
+        #[test]
+        fn test_coerce_bool_true_is_case_sensitive() {
+            // "True" (capital T) is not valid — only lowercase "true".
+            let err = coerce_output_value("b", "True", OutputType::Bool).unwrap_err();
+            assert!(
+                !err.to_string().is_empty(),
+                "True is not a valid bool string"
+            );
+        }
+    }
+
+    // --- Stage 2: null model projection ---
+
+    mod null_model {
+        use super::super::OutputValue;
+
+        #[test]
+        fn test_null_to_string_context_is_empty_string() {
+            assert_eq!(OutputValue::Null.to_string_context(), "");
+        }
+
+        #[test]
+        fn test_string_to_string_context() {
+            let v = OutputValue::String("hello".into());
+            assert_eq!(v.to_string_context(), "hello");
+        }
+
+        #[test]
+        fn test_number_integer_to_string_context() {
+            let v = OutputValue::Number(42.0);
+            assert_eq!(v.to_string_context(), "42");
+        }
+
+        #[test]
+        fn test_number_float_to_string_context() {
+            let v = OutputValue::Number(3.5);
+            assert_eq!(v.to_string_context(), "3.5");
+        }
+
+        #[test]
+        fn test_bool_true_to_string_context() {
+            let v = OutputValue::Bool(true);
+            assert_eq!(v.to_string_context(), "true");
+        }
+
+        #[test]
+        fn test_bool_false_to_string_context() {
+            let v = OutputValue::Bool(false);
+            assert_eq!(v.to_string_context(), "false");
+        }
+
+        #[test]
+        fn test_null_is_not_zero_for_number() {
+            // Null is the universal empty — not 0.0 for numbers.
+            assert_ne!(OutputValue::Null, OutputValue::Number(0.0));
+        }
+
+        #[test]
+        fn test_null_is_not_false_for_bool() {
+            assert_ne!(OutputValue::Null, OutputValue::Bool(false));
+        }
+
+        #[test]
+        fn test_null_is_not_empty_string() {
+            // Null and String("") are different values; they only *project* the same way.
+            assert_ne!(OutputValue::Null, OutputValue::String(String::new()));
+        }
+    }
+
+    // --- Stage 2: capture_step_outputs ---
+
+    mod capture {
+        use super::super::{capture_step_outputs, OutputDecl, OutputType, OutputValue};
+
+        fn decl(name: &str, t: OutputType, required: bool) -> OutputDecl {
+            OutputDecl {
+                name: name.to_string(),
+                output_type: t,
+                required,
+            }
+        }
+
+        #[test]
+        fn test_capture_empty_declarations_returns_empty() {
+            let captured = capture_step_outputs("step", &[], "FOO=bar\n").unwrap();
+            assert!(captured.is_empty());
+        }
+
+        #[test]
+        fn test_capture_string_output() {
+            let decls = vec![decl("result", OutputType::String, false)];
+            let captured = capture_step_outputs("step", &decls, "result=hello\n").unwrap();
+            assert_eq!(captured.len(), 1);
+            assert_eq!(captured[0].name, "result");
+            assert_eq!(captured[0].value, OutputValue::String("hello".to_string()));
+        }
+
+        #[test]
+        fn test_capture_number_output() {
+            let decls = vec![decl("count", OutputType::Number, false)];
+            let captured = capture_step_outputs("step", &decls, "count=99\n").unwrap();
+            assert_eq!(captured[0].value, OutputValue::Number(99.0));
+        }
+
+        #[test]
+        fn test_capture_bool_output_true() {
+            let decls = vec![decl("ok", OutputType::Bool, false)];
+            let captured = capture_step_outputs("step", &decls, "ok=true\n").unwrap();
+            assert_eq!(captured[0].value, OutputValue::Bool(true));
+        }
+
+        #[test]
+        fn test_capture_not_emitted_becomes_null() {
+            let decls = vec![decl("missing", OutputType::String, false)];
+            let captured = capture_step_outputs("step", &decls, "").unwrap();
+            assert_eq!(captured[0].value, OutputValue::Null);
+        }
+
+        #[test]
+        fn test_capture_emitted_as_empty_becomes_null() {
+            let decls = vec![decl("empty", OutputType::Number, false)];
+            let captured = capture_step_outputs("step", &decls, "empty=\n").unwrap();
+            assert_eq!(captured[0].value, OutputValue::Null);
+        }
+
+        #[test]
+        fn test_capture_required_not_emitted_fails() {
+            let decls = vec![decl("must_have", OutputType::String, true)];
+            let err = capture_step_outputs("step", &decls, "").unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("required") && msg.contains("must_have"),
+                "error should mention required output: {msg}"
+            );
+        }
+
+        #[test]
+        fn test_capture_required_emitted_empty_fails() {
+            let decls = vec![decl("must_have", OutputType::String, true)];
+            let err = capture_step_outputs("step", &decls, "must_have=\n").unwrap_err();
+            assert!(err.to_string().contains("required"));
+        }
+
+        #[test]
+        fn test_capture_required_emitted_non_empty_succeeds() {
+            let decls = vec![decl("must_have", OutputType::String, true)];
+            let captured = capture_step_outputs("step", &decls, "must_have=present\n").unwrap();
+            assert_eq!(
+                captured[0].value,
+                OutputValue::String("present".to_string())
+            );
+        }
+
+        #[test]
+        fn test_capture_coercion_failure_is_hard_fail() {
+            let decls = vec![decl("n", OutputType::Number, false)];
+            let err = capture_step_outputs("step", &decls, "n=not-a-number\n").unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("coercion") || msg.contains("number"),
+                "error should describe coercion failure: {msg}"
+            );
+        }
+
+        #[test]
+        fn test_capture_undeclared_emissions_are_ignored() {
+            let decls = vec![decl("declared", OutputType::String, false)];
+            let captured =
+                capture_step_outputs("step", &decls, "declared=yes\nundeclared=ignored\n").unwrap();
+            assert_eq!(captured.len(), 1);
+            assert_eq!(captured[0].name, "declared");
+        }
+
+        #[test]
+        fn test_capture_declared_type_stored_on_result() {
+            let decls = vec![decl("count", OutputType::Number, false)];
+            let captured = capture_step_outputs("step", &decls, "count=5\n").unwrap();
+            assert_eq!(captured[0].declared_type, OutputType::Number);
+        }
+
+        #[test]
+        fn test_capture_multiple_outputs() {
+            let decls = vec![
+                decl("name", OutputType::String, false),
+                decl("count", OutputType::Number, false),
+                decl("ready", OutputType::Bool, false),
+            ];
+            let contents = "name=alice\ncount=7\nready=true\n";
+            let captured = capture_step_outputs("step", &decls, contents).unwrap();
+            assert_eq!(captured.len(), 3);
+            assert_eq!(captured[0].value, OutputValue::String("alice".to_string()));
+            assert_eq!(captured[1].value, OutputValue::Number(7.0));
+            assert_eq!(captured[2].value, OutputValue::Bool(true));
+        }
     }
 }

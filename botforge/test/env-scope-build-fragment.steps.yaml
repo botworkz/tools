@@ -1,0 +1,8 @@
+type: botforge/fragment
+steps:
+- name: build fragment sees caller env
+  run: |
+    test "$BUILD_CALLER_VAR" = build-caller-ok
+- name: build fragment sets env
+  run: |
+    echo "BUILD_FRAGMENT_VAR=build-frag-ok" >> "$BF_ENV"
