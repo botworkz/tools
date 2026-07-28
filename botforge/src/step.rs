@@ -149,10 +149,28 @@ pub(crate) struct ArchiveStep {
     pub(crate) shell: Option<String>,
 }
 
+/// A scoped fragment invocation produced by a `uses:` entry.
+///
+/// The fragment's inner steps execute in their own env scope: they inherit the
+/// caller's accumulated env, but any env mutations made inside the invocation are
+/// contained within that scope and do not leak back to the caller or to later
+/// sibling steps.  `files:` and `cloud_init:` contributions from the fragment are
+/// accumulated globally at load time before this step is produced.
+#[derive(Debug)]
+pub(crate) struct InvokeStep {
+    /// The `uses:` value as written; used for display in step titles and logs.
+    pub(crate) uses: String,
+    /// The fragment's pre-resolved, pre-expanded step list.  May itself contain
+    /// further `Invoke` steps (recursive fragments).
+    pub(crate) steps: Vec<TestStep>,
+}
+
 #[derive(Debug)]
 pub(crate) enum TestStep {
     Run(RunStep),
     Archive(ArchiveStep),
+    /// A scoped fragment invocation (`uses:` entry).
+    Invoke(InvokeStep),
 }
 
 impl TestStep {
@@ -164,13 +182,14 @@ impl TestStep {
                 .name
                 .as_deref()
                 .unwrap_or(step.archive.src.as_str()),
+            Self::Invoke(step) => &step.uses,
         }
     }
 
     pub(crate) fn display_id(&self) -> Option<&str> {
         match self {
             Self::Run(step) => step.id.as_deref(),
-            Self::Archive(_) => None,
+            Self::Archive(_) | Self::Invoke(_) => None,
         }
     }
 }

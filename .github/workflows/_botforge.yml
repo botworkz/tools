@@ -141,6 +141,12 @@ jobs:
         cp -a botforge/test/hello.steps.yaml testrepo/
         cp -a botforge/test/assert-fail.yaml testrepo/
         cp -a botforge/test/env-threading.steps.yaml testrepo/
+        cp -a botforge/test/env-scope-fragment.steps.yaml testrepo/
+        cp -a botforge/test/env-sibling-a.steps.yaml testrepo/
+        cp -a botforge/test/env-sibling-b.steps.yaml testrepo/
+        cp -a botforge/test/env-scope-build-fragment.steps.yaml testrepo/
+        cp -a botforge/test/nested-inner.steps.yaml testrepo/
+        cp -a botforge/test/nested-outer.steps.yaml testrepo/
         cp -a botforge/test/expressions.steps.yaml testrepo/
         cp -a botforge/test/for-fragment-build.steps.yaml testrepo/
         cp -a botforge/test/for-fragment-test.steps.yaml testrepo/
@@ -152,6 +158,7 @@ jobs:
         cp -a botforge/test/assert-fail-docker-ports.yaml testrepo/
         cp -a botforge/test/assert-fail-docker-logs.yaml testrepo/
         cp -a botforge/test/assert-fail-svc-env.yaml testrepo/
+        cp -a botforge/test/publish-fail-invoke.yaml testrepo/
     - name: Set runtime environment
       run: |
         {
@@ -580,7 +587,9 @@ jobs:
     # ── Publish acceptance ────────────────────────────────────────────────────
     # MinIO provides a local S3-compatible endpoint so the real `aws s3 cp`
     # code path is exercised in CI without any external cloud dependency.
-    - run: cp -a botforge/test/publish.yaml testrepo/
+    - run: |
+        cp -a botforge/test/publish.yaml testrepo/
+        cp -a botforge/test/publish-fail-invoke.yaml testrepo/
 
     - name: Start MinIO (S3-compatible store for publish acceptance)
       run: |
@@ -632,6 +641,17 @@ jobs:
       run: |
         . .botforge.env
         botforge publish --spec publish.yaml
+      working-directory: testrepo
+
+    - name: Negative-control — publish invoke step must fail
+      run: |
+        set -euo pipefail
+        . .botforge.env
+        if botforge publish --spec publish-fail-invoke.yaml; then
+          echo "ERROR: botforge publish should have exited non-zero for publish steps that use fragments" >&2
+          exit 1
+        fi
+        echo "Negative-control passed: botforge publish correctly rejected a publish steps fragment invoke"
       working-directory: testrepo
 
     - name: Verify publish fs output
