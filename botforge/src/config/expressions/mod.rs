@@ -34,15 +34,16 @@ pub(super) struct InputDeclaration {
     pub(super) input_type: InputType,
     #[serde(default)]
     pub(super) required: bool,
-    pub(super) default: Option<std::string::String>,
+    /// Native-typed YAML default value for this input. Must match the declared `input_type`:
+    /// `boolean` inputs require a YAML bool, `number` inputs a YAML number, `string` a string.
+    /// A string default for a `boolean`/`number` input is a hard load-time error (R2).
+    pub(super) default: Option<Value>,
 }
 
-/// Map of resolved input values together with their declared types.
-///
-/// This carries type information from `InputDeclaration` through to the expression
-/// evaluator so that `inputs.flag` (declared `boolean`) evaluates to `Bool(false)`,
-/// not the string `"false"`.
-pub(super) type TypedInputMap = BTreeMap<std::string::String, (std::string::String, InputType)>;
+/// Map of resolved input values, carrying a typed [`EvaluatedValue`] per input ready for the
+/// expression evaluator. Values are validated against their declared [`InputType`] once at
+/// resolution time; no late re-parsing occurs at evaluation time.
+pub(super) type TypedInputMap = BTreeMap<std::string::String, EvaluatedValue>;
 
 // ---------------------------------------------------------------------------
 // `for:` expansion helpers
@@ -166,22 +167,41 @@ pub(super) fn extract_fragment_input_declarations(
 }
 
 /// Resolve declared input values from a `with:` call-site map, returning a
-/// [`TypedInputMap`] that pairs each value with its declared [`InputType`].
+/// [`TypedInputMap`] that maps each input name to its fully typed [`EvaluatedValue`].
 ///
-/// Carries type information through to the expression evaluator so that boolean
-/// inputs evaluate as `Bool` (falsy/truthy correctly) rather than strings.
+/// Enforces all input-boundary rules:
+/// - R1: every input must have `default:` or `required: true`; neither is a hard error.
+/// - R2: values must be native-typed (YAML bool for `boolean`, YAML number for `number`);
+///   string values for `boolean`/`number` inputs are hard errors.
+/// - R3: `number` values must be finite (`inf`/`nan` rejected).
+/// - R4: the `__default__` sentinel string is honored for ALL input types, checked
+///   BEFORE native type-validation so it is never rejected as a wrong type.
 pub(super) fn resolve_fragment_inputs(
     path: &Path,
     declarations: &BTreeMap<std::string::String, InputDeclaration>,
-    with: &BTreeMap<std::string::String, std::string::String>,
+    with: &BTreeMap<std::string::String, Value>,
 ) -> Result<TypedInputMap> {
-    // Declaration-time validation: required: true + default: together is a contradiction.
+    // Declaration-time validation.
     for (name, decl) in declarations {
+        // R1: every input must have default: or required: true.
+        if !decl.required && decl.default.is_none() {
+            anyhow::bail!(
+                "input '{}' must set 'required: true' or provide a 'default:'",
+                name
+            );
+        }
+        // Contradiction: required: true + default: together.
         if decl.required && decl.default.is_some() {
             anyhow::bail!(
                 "input '{}' cannot set both 'required: true' and 'default'",
                 name
             );
+        }
+        // R2/R3: eagerly validate the declared default value type; a bad default is
+        // always a hard error even when a valid with: value is supplied.
+        if let Some(ref default_val) = decl.default {
+            yaml_value_to_evaluated(name, decl.input_type, default_val)
+                .map_err(|e| anyhow::anyhow!("input '{}': invalid default value: {}", name, e))?;
         }
     }
 
@@ -201,44 +221,115 @@ pub(super) fn resolve_fragment_inputs(
     for (name, decl) in declarations {
         let caller_value = with.get(name.as_str());
 
-        // Resolution pipeline:
-        //   omitted key or "__default__" sentinel → declared default (or unset if none).
-        //   any other value (including "") → take literally.
-        let effective: Option<std::string::String> =
-            match caller_value.map(std::string::String::as_str) {
-                None | Some(DEFAULT_SENTINEL) => decl.default.clone(),
-                Some(v) => Some(v.to_string()),
-            };
+        // R4: check for the __default__ sentinel FIRST, before native type-validation.
+        // `with: { flag: __default__ }` means "use declared default" for ALL input types
+        // and must NOT be rejected as "string given to boolean/number".
+        let is_sentinel = matches!(
+            caller_value,
+            Some(Value::String(s)) if s == DEFAULT_SENTINEL
+        );
 
-        // Type-validate the resolved value (sentinel is already gone at this point).
-        if let Some(ref v) = effective {
-            validate_input_type(name, decl.input_type, v)?;
-        }
+        // Resolution pipeline:
+        //   omitted key or __default__ sentinel → use declared default.
+        //   any other value → take literally with type validation.
+        let effective: Option<EvaluatedValue> = if caller_value.is_none() || is_sentinel {
+            // Use declared default (already type-validated in the declaration pass above).
+            decl.default.as_ref().map(|v| {
+                yaml_value_to_evaluated(name, decl.input_type, v)
+                    .expect("default already validated in declaration pass")
+            })
+        } else if let Some(v) = caller_value {
+            Some(
+                yaml_value_to_evaluated(name, decl.input_type, v)
+                    .map_err(|e| anyhow::anyhow!("input '{}' in 'with:' block: {}", name, e))?,
+            )
+        } else {
+            None
+        };
 
         // Required check: unset + required → error.
         if effective.is_none() && decl.required {
             anyhow::bail!("missing required input '{}'", name);
         }
 
-        if let Some(v) = effective {
-            resolved.insert(name.clone(), (v, decl.input_type));
+        if let Some(ev) = effective {
+            resolved.insert(name.clone(), ev);
         }
     }
 
     Ok(resolved)
 }
 
-fn validate_input_type(name: &str, input_type: InputType, value: &str) -> Result<()> {
+/// Convert a native YAML `Value` to a typed [`EvaluatedValue`] per the declared [`InputType`].
+///
+/// Enforces native-types-only (R2):
+/// - `boolean` inputs accept only YAML `Bool`; any string (including `"true"`/`"false"`)
+///   is a hard error — use unquoted `true`/`false` in YAML.
+/// - `number` inputs accept only YAML `Number` (finite); any string is a hard error.
+/// - `string` inputs accept only YAML `String`.
+///
+/// The `__default__` sentinel must be stripped by the caller before invoking this function.
+fn yaml_value_to_evaluated(
+    name: &str,
+    input_type: InputType,
+    value: &Value,
+) -> Result<EvaluatedValue> {
     match input_type {
-        InputType::String => Ok(()),
-        InputType::Number => value
-            .parse::<f64>()
-            .map(|_| ())
-            .map_err(|_| anyhow::anyhow!("input '{}' must be a number", name)),
-        InputType::Boolean => match value.to_ascii_lowercase().as_str() {
-            "true" | "false" => Ok(()),
-            _ => anyhow::bail!("input '{}' must be a boolean", name),
+        InputType::String => match value {
+            Value::String(s) => Ok(EvaluatedValue::String(s.clone())),
+            other => anyhow::bail!(
+                "input '{}': expected a string value, got {}",
+                name,
+                yaml_type_name(other)
+            ),
         },
+        InputType::Boolean => match value {
+            Value::Bool(b) => Ok(EvaluatedValue::Bool(*b)),
+            other => anyhow::bail!(
+                "input '{}': expected a native boolean value (true or false), got {}; \
+                 use an unquoted YAML boolean (true/false), not a quoted string",
+                name,
+                yaml_type_name(other)
+            ),
+        },
+        InputType::Number => match value {
+            Value::Number(n) => {
+                let f = n.as_f64().ok_or_else(|| {
+                    anyhow::anyhow!("input '{}': number value is out of range", name)
+                })?;
+                validate_number(name, f)?;
+                Ok(EvaluatedValue::Number(f))
+            }
+            other => anyhow::bail!(
+                "input '{}': expected a native number value, got {}; \
+                 use an unquoted YAML number, not a quoted string",
+                name,
+                yaml_type_name(other)
+            ),
+        },
+    }
+}
+
+/// Validate a `f64` number: must be finite (rejects `inf`, `-inf`, `nan`).
+///
+/// Extension point (R3): range checks (`min`/`max`) can be added here without a rewrite.
+/// Today only finiteness is checked; the name parameter is used for error context.
+fn validate_number(name: &str, value: f64) -> Result<()> {
+    if !value.is_finite() {
+        anyhow::bail!("input '{}': number must be finite, got {}", name, value);
+    }
+    Ok(())
+}
+
+fn yaml_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Sequence(_) => "sequence",
+        Value::Mapping(_) => "mapping",
+        Value::Tagged(_) => "tagged value",
     }
 }
 
@@ -255,7 +346,7 @@ pub(super) fn substitute_inputs_in_value(
     value: &mut Value,
     typed_inputs: &TypedInputMap,
 ) -> Result<()> {
-    substitute_namespace_in_value(value, "inputs", typed_inputs, &BTreeMap::new())
+    substitute_namespace_in_value(value, "inputs", typed_inputs, &BTreeMap::new(), false)
 }
 
 /// Substitute `${{ args.NAME }}` expressions in `value`.
@@ -267,25 +358,45 @@ pub(super) fn substitute_args_in_value(
     value: &mut Value,
     args: &BTreeMap<std::string::String, std::string::String>,
 ) -> Result<()> {
-    substitute_namespace_in_value(value, "args", &TypedInputMap::new(), args)
+    substitute_namespace_in_value(value, "args", &TypedInputMap::new(), args, false)
 }
 
+/// Substitute expressions in `value`, with `preserve_typed` controlling how pure
+/// `Number`/`Bool` results are emitted (R5).
+///
+/// - `preserve_typed = false` (default for all string-context fields): a pure expression
+///   yielding `Number` or `Bool` is rendered as a YAML `String` via
+///   `to_interpolated_string()`, so that string fields (`name:`, `run:`, `shell:`, etc.)
+///   accept the result without a type-mismatch deserialisation error.
+/// - `preserve_typed = true` (used for `timeout:` which needs a YAML integer): the typed
+///   `to_yaml_value()` result is kept so that integer-expecting fields deserialise correctly.
+///
+/// The `if:` field is handled separately via [`substitute_if_condition_in_value`] and is
+/// NOT affected by this parameter.
 fn substitute_namespace_in_value(
     value: &mut Value,
     active_namespace: &str,
     typed_inputs: &TypedInputMap,
     args: &BTreeMap<std::string::String, std::string::String>,
+    preserve_typed: bool,
 ) -> Result<()> {
     match value {
         Value::String(text) => {
-            // For single pure expressions (`${{ expr }}` with no surrounding text),
-            // preserve the typed result. For mixed-content strings, use string
-            // interpolation (the "interpolation into surrounding text" path).
+            // For a single pure expression (`${{ expr }}` with no surrounding text):
+            //   - `preserve_typed = true` (e.g. timeout:): emit the typed YAML scalar.
+            //   - `preserve_typed = false` (all other string-context fields): coerce
+            //     Number/Bool to a YAML String so string fields deserialise correctly (R5).
+            // For mixed-content strings (surrounding text), always use string interpolation.
             let text_clone = text.clone();
             match try_substitute_pure_expression(&text_clone, active_namespace, typed_inputs, args)?
             {
                 PureResult::Typed(ev) => {
-                    *value = ev.to_yaml_value();
+                    *value = if preserve_typed {
+                        ev.to_yaml_value()
+                    } else {
+                        // String-context fields: Number/Bool → String; String/Empty unchanged.
+                        Value::String(ev.to_interpolated_string())
+                    };
                 }
                 PureResult::Deferred => {
                     // Leave the placeholder intact for the next substitution pass.
@@ -302,19 +413,49 @@ fn substitute_namespace_in_value(
         }
         Value::Sequence(items) => {
             for item in items {
-                substitute_namespace_in_value(item, active_namespace, typed_inputs, args)?;
+                substitute_namespace_in_value(
+                    item,
+                    active_namespace,
+                    typed_inputs,
+                    args,
+                    preserve_typed,
+                )?;
             }
         }
         Value::Mapping(entries) => {
             for (key, val) in entries.iter_mut() {
-                // The `if:` field requires typed evaluation (not string interpolation):
-                // `${{ inputs.booly }}` for a declared boolean false must produce
-                // Bool(false) → falsy, not String("false") → truthy.
-                let is_if_key = key.as_str() == Some("if");
-                if is_if_key {
-                    substitute_if_condition_in_value(val, active_namespace, typed_inputs, args)?;
-                } else {
-                    substitute_namespace_in_value(val, active_namespace, typed_inputs, args)?;
+                match key.as_str() {
+                    // `if:` requires typed Bool evaluation so that a boolean-false expression
+                    // produces `Bool(false)` (falsy) rather than `String("false")` (truthy).
+                    Some("if") => {
+                        substitute_if_condition_in_value(
+                            val,
+                            active_namespace,
+                            typed_inputs,
+                            args,
+                        )?;
+                    }
+                    // `timeout:` expects a YAML integer; keep the typed scalar so
+                    // `SecondsValue::Integer` deserialises correctly.
+                    Some("timeout") => {
+                        substitute_namespace_in_value(
+                            val,
+                            active_namespace,
+                            typed_inputs,
+                            args,
+                            true,
+                        )?;
+                    }
+                    // All other fields are string-context: Number/Bool coerce to String (R5).
+                    _ => {
+                        substitute_namespace_in_value(
+                            val,
+                            active_namespace,
+                            typed_inputs,
+                            args,
+                            false,
+                        )?;
+                    }
                 }
             }
         }
@@ -487,31 +628,36 @@ mod tests {
             .collect()
     }
 
+    /// Build a `TypedInputMap` from `(key, string-repr, type)` triples.
+    /// Converts the string representation to the appropriate `EvaluatedValue`.
     fn typed_map(pairs: &[(&str, &str, InputType)]) -> TypedInputMap {
         pairs
             .iter()
-            .map(|(k, v, t)| (k.to_string(), (v.to_string(), *t)))
+            .map(|(k, v, t)| {
+                let ev = match t {
+                    InputType::Boolean => EvaluatedValue::Bool(v.eq_ignore_ascii_case("true")),
+                    InputType::Number => EvaluatedValue::Number(v.parse::<f64>().unwrap_or(0.0)),
+                    InputType::String => EvaluatedValue::String(v.to_string()),
+                };
+                (k.to_string(), ev)
+            })
             .collect()
     }
 
     /// Substitute inputs treating all as `String` type (for backward-compat tests).
     fn substitute_inputs(text: &str, pairs: &[(&str, &str)]) -> std::string::String {
-        let tm = typed_map(
-            &pairs
-                .iter()
-                .map(|(k, v)| (*k, *v, InputType::String))
-                .collect::<Vec<_>>(),
-        );
+        let tm: TypedInputMap = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), EvaluatedValue::String(v.to_string())))
+            .collect();
         substitute_namespace_in_string(text, "inputs", &tm, &BTreeMap::new()).unwrap()
     }
 
     fn substitute_inputs_err(text: &str, pairs: &[(&str, &str)]) -> std::string::String {
-        let tm = typed_map(
-            &pairs
-                .iter()
-                .map(|(k, v)| (*k, *v, InputType::String))
-                .collect::<Vec<_>>(),
-        );
+        let tm: TypedInputMap = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), EvaluatedValue::String(v.to_string())))
+            .collect();
         let err =
             substitute_namespace_in_string(text, "inputs", &tm, &BTreeMap::new()).unwrap_err();
         format!("{err:#}")
@@ -528,11 +674,17 @@ mod tests {
     mod inputs {
         use super::*;
 
-        fn decl(input_type: InputType, required: bool, default: Option<&str>) -> InputDeclaration {
+        /// Parse a YAML scalar string into a `serde_yaml::Value`.
+        /// e.g. `yaml("42")` → `Value::Number(42)`, `yaml("true")` → `Value::Bool(true)`.
+        fn yaml(s: &str) -> Value {
+            serde_yaml::from_str(s).unwrap()
+        }
+
+        fn decl(input_type: InputType, required: bool, default: Option<Value>) -> InputDeclaration {
             InputDeclaration {
                 input_type,
                 required,
-                default: default.map(str::to_string),
+                default,
             }
         }
 
@@ -540,10 +692,19 @@ mod tests {
             Path::new("fragment.yaml")
         }
 
-        fn with_map(pairs: &[(&str, &str)]) -> BTreeMap<std::string::String, std::string::String> {
+        /// Build a `with:` map with all `Value::String` values (for string inputs or sentinel).
+        fn with_map(pairs: &[(&str, &str)]) -> BTreeMap<std::string::String, Value> {
             pairs
                 .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .map(|(k, v)| (k.to_string(), Value::String(v.to_string())))
+                .collect()
+        }
+
+        /// Build a `with:` map with explicit `Value`s (for native-typed inputs).
+        fn with_val(pairs: &[(&str, Value)]) -> BTreeMap<std::string::String, Value> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
                 .collect()
         }
 
@@ -567,39 +728,80 @@ mod tests {
 
         #[test]
         fn test_resolve_inputs_declared_default_applied_when_caller_omits_key() {
-            let declarations = decl_map(&[("shell", decl(InputType::String, false, Some("bash")))]);
+            let declarations =
+                decl_map(&[("shell", decl(InputType::String, false, Some(yaml("bash"))))]);
             let with = with_map(&[]);
             let resolved = resolve_fragment_inputs(dummy_path(), &declarations, &with).unwrap();
-            assert_eq!(resolved.get("shell").map(|(v, _)| v.as_str()), Some("bash"));
+            assert_eq!(
+                resolved.get("shell"),
+                Some(&EvaluatedValue::String("bash".to_string()))
+            );
         }
 
         #[test]
         fn test_resolve_inputs_default_sentinel_resolves_to_declared_default() {
-            let declarations = decl_map(&[("shell", decl(InputType::String, false, Some("bash")))]);
+            let declarations =
+                decl_map(&[("shell", decl(InputType::String, false, Some(yaml("bash"))))]);
             let with = with_map(&[("shell", "__default__")]);
             let resolved = resolve_fragment_inputs(dummy_path(), &declarations, &with).unwrap();
-            assert_eq!(resolved.get("shell").map(|(v, _)| v.as_str()), Some("bash"));
+            assert_eq!(
+                resolved.get("shell"),
+                Some(&EvaluatedValue::String("bash".to_string()))
+            );
         }
 
+        /// R1: input with neither `default:` nor `required: true` is a hard load-time error.
         #[test]
-        fn test_resolve_inputs_default_sentinel_with_no_declared_default_yields_unset() {
+        fn test_resolve_inputs_r1_neither_default_nor_required_is_error() {
             let declarations = decl_map(&[("target", decl(InputType::String, false, None))]);
-            let with = with_map(&[("target", "__default__")]);
-            let resolved = resolve_fragment_inputs(dummy_path(), &declarations, &with).unwrap();
+            let with = with_map(&[]);
+            let err = resolve_fragment_inputs(dummy_path(), &declarations, &with).unwrap_err();
+            let msg = err.to_string();
             assert!(
-                !resolved.contains_key("target"),
-                "unset input must not appear in resolved map"
+                msg.contains("target") && (msg.contains("required") || msg.contains("default")),
+                "R1 error must name the input and mention required/default: {msg}"
+            );
+        }
+
+        /// R4: `__default__` sentinel on a `boolean` input uses the declared default without
+        /// triggering a type error ("string given to boolean").
+        #[test]
+        fn test_resolve_inputs_default_sentinel_on_boolean_input_uses_default() {
+            let declarations =
+                decl_map(&[("flag", decl(InputType::Boolean, false, Some(yaml("false"))))]);
+            // Passing the string "__default__" must use the declared Bool(false) default.
+            let with = with_map(&[("flag", "__default__")]);
+            let resolved = resolve_fragment_inputs(dummy_path(), &declarations, &with).unwrap();
+            assert_eq!(
+                resolved.get("flag"),
+                Some(&EvaluatedValue::Bool(false)),
+                "__default__ on boolean must use declared default, not fail type check"
+            );
+        }
+
+        /// R4: `__default__` sentinel on a `number` input uses the declared default.
+        #[test]
+        fn test_resolve_inputs_default_sentinel_on_number_input_uses_default() {
+            let declarations =
+                decl_map(&[("count", decl(InputType::Number, false, Some(yaml("10"))))]);
+            let with = with_map(&[("count", "__default__")]);
+            let resolved = resolve_fragment_inputs(dummy_path(), &declarations, &with).unwrap();
+            assert_eq!(
+                resolved.get("count"),
+                Some(&EvaluatedValue::Number(10.0)),
+                "__default__ on number must use declared default"
             );
         }
 
         #[test]
         fn test_resolve_inputs_empty_string_yields_empty_not_default() {
-            let declarations = decl_map(&[("shell", decl(InputType::String, false, Some("bash")))]);
+            let declarations =
+                decl_map(&[("shell", decl(InputType::String, false, Some(yaml("bash"))))]);
             let with = with_map(&[("shell", "")]);
             let resolved = resolve_fragment_inputs(dummy_path(), &declarations, &with).unwrap();
             assert_eq!(
-                resolved.get("shell").map(|(v, _)| v.as_str()),
-                Some(""),
+                resolved.get("shell"),
+                Some(&EvaluatedValue::String("".to_string())),
                 "empty string must not be replaced by the declared default"
             );
         }
@@ -614,53 +816,165 @@ mod tests {
                 "empty string must satisfy required: {result:?}"
             );
             assert_eq!(
-                result.unwrap().get("target").map(|(v, _)| v.as_str()),
-                Some("")
+                result.unwrap().get("target"),
+                Some(&EvaluatedValue::String("".to_string()))
             );
         }
 
+        /// R2: native YAML integer for `number` input → OK.
         #[test]
-        fn test_resolve_inputs_number_type_valid() {
-            let declarations = decl_map(&[("count", decl(InputType::Number, false, None))]);
-            let with = with_map(&[("count", "42")]);
-            assert!(resolve_fragment_inputs(dummy_path(), &declarations, &with).is_ok());
+        fn test_resolve_inputs_number_type_valid_native_int() {
+            let declarations = decl_map(&[("count", decl(InputType::Number, true, None))]);
+            let with = with_val(&[("count", yaml("42"))]);
+            let resolved = resolve_fragment_inputs(dummy_path(), &declarations, &with).unwrap();
+            assert_eq!(resolved.get("count"), Some(&EvaluatedValue::Number(42.0)));
         }
 
+        /// R2: native YAML float for `number` input → OK.
         #[test]
-        fn test_resolve_inputs_number_type_valid_float() {
-            let declarations = decl_map(&[("ratio", decl(InputType::Number, false, None))]);
-            let with = with_map(&[("ratio", "3.14")]);
-            assert!(resolve_fragment_inputs(dummy_path(), &declarations, &with).is_ok());
+        fn test_resolve_inputs_number_type_valid_native_float() {
+            let declarations = decl_map(&[("ratio", decl(InputType::Number, true, None))]);
+            let with = with_val(&[("ratio", yaml("3.14"))]);
+            let result = resolve_fragment_inputs(dummy_path(), &declarations, &with).unwrap();
+            let v = result.get("ratio").unwrap();
+            assert!(matches!(v, EvaluatedValue::Number(n) if (*n - 3.14).abs() < 1e-9));
         }
 
+        /// R2: negative number and zero → OK.
         #[test]
-        fn test_resolve_inputs_number_type_invalid() {
-            let declarations = decl_map(&[("count", decl(InputType::Number, false, None))]);
-            let with = with_map(&[("count", "not-a-number")]);
-            let err = resolve_fragment_inputs(dummy_path(), &declarations, &with).unwrap_err();
-            let msg = err.to_string();
-            assert!(
-                msg.contains("count") && msg.contains("number"),
-                "error must name the input and type: {msg}"
-            );
-        }
-
-        #[test]
-        fn test_resolve_inputs_boolean_type_valid() {
-            let declarations = decl_map(&[("flag", decl(InputType::Boolean, false, None))]);
-            for v in &["true", "false", "True", "FALSE"] {
-                let with = with_map(&[("flag", v)]);
+        fn test_resolve_inputs_number_type_valid_negative_and_zero() {
+            let declarations = decl_map(&[("n", decl(InputType::Number, true, None))]);
+            for v in [yaml("-3"), yaml("-3.14"), yaml("0")] {
+                let with = with_val(&[("n", v)]);
                 assert!(
                     resolve_fragment_inputs(dummy_path(), &declarations, &with).is_ok(),
-                    "expected valid boolean for '{v}'"
+                    "negative / zero number must be valid"
                 );
             }
         }
 
+        /// R2: string `"42"` for a `number` input is a hard error.
+        #[test]
+        fn test_resolve_inputs_number_string_value_is_error() {
+            let declarations = decl_map(&[("count", decl(InputType::Number, true, None))]);
+            let with = with_map(&[("count", "42")]); // Value::String("42")
+            let err = resolve_fragment_inputs(dummy_path(), &declarations, &with).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("count") && msg.contains("number"),
+                "string value for number input must be a hard error naming the input: {msg}"
+            );
+        }
+
+        /// R2: string `"42"` as the declared `default:` for a `number` input is a hard error.
+        #[test]
+        fn test_resolve_inputs_number_string_default_is_error() {
+            // default: "42" (a string) on a number input violates R2.
+            let declarations = decl_map(&[(
+                "count",
+                decl(
+                    InputType::Number,
+                    false,
+                    Some(Value::String("42".to_string())),
+                ),
+            )]);
+            let with = with_map(&[]);
+            let err = resolve_fragment_inputs(dummy_path(), &declarations, &with).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("count") && msg.contains("number"),
+                "string default for number input must be a hard error: {msg}"
+            );
+        }
+
+        /// R3: non-finite number values (`inf`, `nan`) are hard errors.
+        #[test]
+        fn test_resolve_inputs_number_non_finite_is_error() {
+            let declarations = decl_map(&[("n", decl(InputType::Number, true, None))]);
+            // Directly call validate_number (the extension seam).
+            let inf_err = validate_number("n", f64::INFINITY).unwrap_err();
+            assert!(
+                inf_err.to_string().contains("finite"),
+                "inf must be rejected: {inf_err}"
+            );
+            let nan_err = validate_number("n", f64::NAN).unwrap_err();
+            assert!(
+                nan_err.to_string().contains("finite"),
+                "nan must be rejected: {nan_err}"
+            );
+            let neg_inf_err = validate_number("n", f64::NEG_INFINITY).unwrap_err();
+            assert!(
+                neg_inf_err.to_string().contains("finite"),
+                "-inf must be rejected: {neg_inf_err}"
+            );
+            // Negative and zero are valid.
+            assert!(validate_number("n", -3.14).is_ok());
+            assert!(validate_number("n", 0.0).is_ok());
+            // via resolve_fragment_inputs: need a non-finite serde_yaml number.
+            // serde_yaml parses ".inf" as a number (YAML float special).
+            let inf_yaml: Value = serde_yaml::from_str(".inf").unwrap_or(Value::Null);
+            if matches!(inf_yaml, Value::Number(_)) {
+                let with = with_val(&[("n", inf_yaml)]);
+                assert!(
+                    resolve_fragment_inputs(dummy_path(), &declarations, &with).is_err(),
+                    ".inf must be rejected via resolve_fragment_inputs"
+                );
+            }
+        }
+
+        /// R2: native YAML bool for `boolean` input → OK.
+        #[test]
+        fn test_resolve_inputs_boolean_type_valid_native() {
+            let declarations = decl_map(&[("flag", decl(InputType::Boolean, true, None))]);
+            for v in [yaml("true"), yaml("false")] {
+                let with = with_val(&[("flag", v)]);
+                assert!(
+                    resolve_fragment_inputs(dummy_path(), &declarations, &with).is_ok(),
+                    "native YAML bool must be valid"
+                );
+            }
+        }
+
+        /// R2: string `"false"` for a `boolean` input is a hard error.
+        #[test]
+        fn test_resolve_inputs_boolean_string_value_is_error() {
+            let declarations = decl_map(&[("flag", decl(InputType::Boolean, true, None))]);
+            for v in &["true", "false", "True", "FALSE"] {
+                let with = with_map(&[("flag", v)]); // Value::String(...)
+                let err = resolve_fragment_inputs(dummy_path(), &declarations, &with).unwrap_err();
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("flag") && msg.contains("boolean"),
+                    "string value '{v}' for boolean input must be a hard error naming the input and type: {msg}"
+                );
+            }
+        }
+
+        /// R2: string `"false"` as the declared `default:` for a `boolean` input is a hard error.
+        #[test]
+        fn test_resolve_inputs_boolean_string_default_is_error() {
+            let declarations = decl_map(&[(
+                "flag",
+                decl(
+                    InputType::Boolean,
+                    false,
+                    Some(Value::String("false".to_string())),
+                ),
+            )]);
+            let with = with_map(&[]);
+            let err = resolve_fragment_inputs(dummy_path(), &declarations, &with).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("flag") && msg.contains("boolean"),
+                "string default for boolean input must be a hard error: {msg}"
+            );
+        }
+
+        /// R2: non-bool string like `"yes"` on a `boolean` input is also a hard error.
         #[test]
         fn test_resolve_inputs_boolean_type_invalid() {
-            let declarations = decl_map(&[("flag", decl(InputType::Boolean, false, None))]);
-            let with = with_map(&[("flag", "yes")]);
+            let declarations = decl_map(&[("flag", decl(InputType::Boolean, true, None))]);
+            let with = with_map(&[("flag", "yes")]); // Value::String("yes")
             let err = resolve_fragment_inputs(dummy_path(), &declarations, &with).unwrap_err();
             let msg = err.to_string();
             assert!(
@@ -669,12 +983,17 @@ mod tests {
             );
         }
 
+        /// R2: string `"not-a-number"` for a `number` input is a hard error naming the input.
         #[test]
-        fn test_resolve_inputs_default_sentinel_on_typed_input_is_not_parse_error() {
-            let declarations = decl_map(&[("count", decl(InputType::Number, false, Some("10")))]);
-            let with = with_map(&[("count", "__default__")]);
-            let resolved = resolve_fragment_inputs(dummy_path(), &declarations, &with).unwrap();
-            assert_eq!(resolved.get("count").map(|(v, _)| v.as_str()), Some("10"));
+        fn test_resolve_inputs_number_type_invalid() {
+            let declarations = decl_map(&[("count", decl(InputType::Number, true, None))]);
+            let with = with_map(&[("count", "not-a-number")]); // Value::String(...)
+            let err = resolve_fragment_inputs(dummy_path(), &declarations, &with).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("count") && msg.contains("number"),
+                "error must name the input and type: {msg}"
+            );
         }
 
         #[test]
@@ -703,7 +1022,8 @@ mod tests {
 
         #[test]
         fn test_resolve_inputs_declaration_required_and_default_contradiction() {
-            let declarations = decl_map(&[("shell", decl(InputType::String, true, Some("bash")))]);
+            let declarations =
+                decl_map(&[("shell", decl(InputType::String, true, Some(yaml("bash"))))]);
             let with = with_map(&[]);
             let err = resolve_fragment_inputs(dummy_path(), &declarations, &with).unwrap_err();
             let msg = err.to_string();
@@ -1311,13 +1631,13 @@ type: botforge/fragment
 inputs:
   flag:
     type: string
-    required: false
+    default: ""
   a:
     type: string
-    required: false
+    default: ""
   b:
     type: string
-    required: false
+    default: ""
 steps:
   - on: guest
     name: run
@@ -1384,6 +1704,9 @@ steps:
 
         /// Canonical example from the problem statement: boolean inputs must produce
         /// correctly typed values in expressions and in `if:` conditions.
+        /// - `booly: false` (native YAML bool, declared boolean) → Bool(false) → falsy → skip
+        /// - `booly_string: "false"` (quoted string, declared string) → truthy (non-empty) → run
+        /// - `from_json(inputs.booly_string)` → Bool(false) → falsy → skip
         #[test]
         fn test_if_gate_typed_boolean_input() {
             use crate::config::load_test_config;
@@ -1399,10 +1722,10 @@ type: botforge/fragment
 inputs:
   booly:
     type: boolean
-    required: false
+    default: false
   booly_string:
     type: string
-    required: false
+    default: "false"
 steps:
   - on: guest
     name: bool-false-skip
@@ -1420,9 +1743,8 @@ steps:
             )
             .unwrap();
 
-            // booly = false (declared boolean) → falsy → skip
-            // booly_string = "false" (declared string) → truthy (non-empty) → run
-            // from_json("false") → Bool(false) → falsy → skip
+            // booly: false (native YAML bool) — R2: must NOT be quoted.
+            // booly_string: "false" — valid string value.
             std::fs::write(
                 repo.path().join("test.yaml"),
                 r#"
@@ -1431,7 +1753,7 @@ name: test
 steps:
   - uses: "@://shared/frag.yaml"
     with:
-      booly: "false"
+      booly: false
       booly_string: "false"
 "#,
             )
@@ -1594,7 +1916,8 @@ steps:
 
         // --- Undefined ref: context-typed behavior (invariant C) ---
 
-        /// `name: ${{ inputs.missing }}` → `""` (undefined ref in string field, no error).
+        /// `name: ${{ inputs.name_override }}` with `default: ""` and no `with:` value
+        /// → uses default `""` → name is empty string (no error).
         #[test]
         fn test_undefined_ref_in_string_field_yields_empty_string() {
             use crate::config::load_test_config;
@@ -1610,7 +1933,7 @@ type: botforge/fragment
 inputs:
   name_override:
     type: string
-    required: false
+    default: ""
 steps:
   - on: guest
     name: ${{ inputs.name_override }}
@@ -1639,7 +1962,8 @@ steps:
             );
         }
 
-        /// `if: ${{ inputs.missing }}` → step SKIPS (undefined ref in bool context = falsy).
+        /// `if: ${{ inputs.gate }}` with `default: false` and no `with:` value
+        /// → uses default `Bool(false)` → step SKIPS.
         #[test]
         fn test_undefined_ref_in_if_is_falsy() {
             use crate::config::load_test_config;
@@ -1655,7 +1979,7 @@ type: botforge/fragment
 inputs:
   gate:
     type: boolean
-    required: false
+    default: false
 steps:
   - on: guest
     name: gated
@@ -1685,21 +2009,16 @@ steps:
             );
         }
 
-        /// Documents the current behavior of `name: ${{ inputs.count }}` where `count` is a
-        /// number input: the engine emits a typed YAML Number which serde_yaml cannot coerce
-        /// into a String field via `from_value`, producing a hard load error.
+        /// R5: `name: ${{ inputs.count }}` where `count` is a number input stringifies to `"5"`.
         ///
-        /// This is a known limitation: `to_yaml_value()` preserves the Number type, but
-        /// serde_yaml's `from_value` does not promote Number→String for struct fields.
-        /// The safe interpolated form (`name: prefix-${{ inputs.count }}`) always works
-        /// because it goes through `to_interpolated_string()` instead.
-        ///
-        /// A future engine fix (restricting typed output to typed fields, or pre-stringifying
-        /// pure expressions in string-typed fields) would make this case pass; when it does,
-        /// update this test to assert `step.name == "5"` instead.
+        /// Previously this was a load error because `to_yaml_value()` emitted a YAML integer
+        /// that serde_yaml could not coerce into a `String` field. The R5 fix makes all
+        /// non-typed fields (everything except `if:` and `timeout:`) stringify Number/Bool
+        /// via `to_interpolated_string()`, so string-context fields just work.
         #[test]
-        fn test_number_input_in_name_field_pure_expr_is_current_load_error() {
+        fn test_number_input_in_name_field_pure_expr_stringifies() {
             use crate::config::load_test_config;
+            use crate::step::TestStep;
             use tempfile::TempDir;
 
             let repo = TempDir::new().unwrap();
@@ -1711,7 +2030,7 @@ type: botforge/fragment
 inputs:
   count:
     type: number
-    default: "5"
+    default: 5
 steps:
   - on: guest
     name: ${{ inputs.count }}
@@ -1730,23 +2049,19 @@ steps:
             )
             .unwrap();
 
-            // Currently errors: YAML integer `5` cannot be deserialized into String field `name`
-            // via serde_yaml::from_value. When the engine is fixed to stringify Number in
-            // string-context fields, change this to: assert!(result.is_ok()) + assert_eq!(name, "5").
-            let result = load_test_config(repo.path(), &repo.path().join("test.yaml"));
-            assert!(
-                result.is_err(),
-                "pure number expr in string field currently errors (see doc comment); got Ok"
-            );
-            let msg = format!("{:#}", result.unwrap_err());
-            assert!(
-                msg.contains("integer") || msg.contains("string"),
-                "error should mention type mismatch: {msg}"
+            // R5: pure number expression in a string field must stringify to "5".
+            let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+            let TestStep::Run(step) = &config.steps[0] else {
+                panic!("expected run step");
+            };
+            assert_eq!(
+                step.name, "5",
+                "pure number expr in string field must coerce to string via R5"
             );
         }
 
         /// The interpolated form `name: prefix-${{ inputs.count }}` (surrounding text) always
-        /// stringifies the Number correctly via `to_interpolated_string`, even today.
+        /// stringifies the Number correctly via `to_interpolated_string`.
         #[test]
         fn test_number_input_in_name_field_interpolated_works() {
             use crate::config::load_test_config;
@@ -1762,7 +2077,7 @@ type: botforge/fragment
 inputs:
   count:
     type: number
-    default: "5"
+    default: 5
 steps:
   - on: guest
     name: step-${{ inputs.count }}
@@ -1811,6 +2126,179 @@ steps:
                 ),
                 "ok",
                 "dead branch of && must not be evaluated; || then yields 'ok'"
+            );
+        }
+
+        // --- R6: single truthiness authority ---
+        // `deserialize_step_condition` must be consistent with `EvaluatedValue::truthy()`.
+
+        /// R6: `if: false` (YAML bool) skips the step.
+        #[test]
+        fn test_r6_if_literal_false_skips() {
+            use crate::config::load_test_config;
+            use crate::step::TestStep;
+            use tempfile::TempDir;
+
+            let repo = TempDir::new().unwrap();
+            std::fs::write(
+                repo.path().join("test.yaml"),
+                r#"
+type: botforge/test
+name: test
+steps:
+  - on: guest
+    name: step
+    if: false
+    run: echo ok
+"#,
+            )
+            .unwrap();
+
+            let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+            let TestStep::Run(step) = &config.steps[0] else {
+                panic!("expected run step");
+            };
+            assert!(!step.condition_enabled(), "if: false must skip the step");
+        }
+
+        /// R6: `if: "false"` (YAML string) runs the step — non-empty string is truthy.
+        #[test]
+        fn test_r6_if_string_false_runs() {
+            use crate::config::load_test_config;
+            use crate::step::TestStep;
+            use tempfile::TempDir;
+
+            let repo = TempDir::new().unwrap();
+            std::fs::write(
+                repo.path().join("test.yaml"),
+                r#"
+type: botforge/test
+name: test
+steps:
+  - on: guest
+    name: step
+    if: "false"
+    run: echo ok
+"#,
+            )
+            .unwrap();
+
+            let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+            let TestStep::Run(step) = &config.steps[0] else {
+                panic!("expected run step");
+            };
+            assert!(
+                step.condition_enabled(),
+                "if: \"false\" (string) must run — non-empty string is truthy"
+            );
+        }
+
+        /// R6: `if: true` (YAML bool) runs the step.
+        #[test]
+        fn test_r6_if_literal_true_runs() {
+            use crate::config::load_test_config;
+            use crate::step::TestStep;
+            use tempfile::TempDir;
+
+            let repo = TempDir::new().unwrap();
+            std::fs::write(
+                repo.path().join("test.yaml"),
+                r#"
+type: botforge/test
+name: test
+steps:
+  - on: guest
+    name: step
+    if: true
+    run: echo ok
+"#,
+            )
+            .unwrap();
+
+            let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+            let TestStep::Run(step) = &config.steps[0] else {
+                panic!("expected run step");
+            };
+            assert!(step.condition_enabled(), "if: true must run the step");
+        }
+
+        /// R6: `if: 0` (YAML number) skips the step — number 0 is falsy.
+        #[test]
+        fn test_r6_if_zero_skips() {
+            use crate::config::load_test_config;
+            use crate::step::TestStep;
+            use tempfile::TempDir;
+
+            let repo = TempDir::new().unwrap();
+            std::fs::write(
+                repo.path().join("test.yaml"),
+                r#"
+type: botforge/test
+name: test
+steps:
+  - on: guest
+    name: step
+    if: 0
+    run: echo ok
+"#,
+            )
+            .unwrap();
+
+            let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+            let TestStep::Run(step) = &config.steps[0] else {
+                panic!("expected run step");
+            };
+            assert!(
+                !step.condition_enabled(),
+                "if: 0 must skip the step — number 0 is falsy"
+            );
+        }
+
+        /// R5 + timeout: `timeout: ${{ inputs.seconds }}` where seconds=42 must produce a valid
+        /// u64 timeout (not a string error). The typed-field path for `timeout:` is preserved.
+        #[test]
+        fn test_r5_timeout_number_input_stays_typed() {
+            use crate::config::load_test_config;
+            use crate::step::TestStep;
+            use tempfile::TempDir;
+
+            let repo = TempDir::new().unwrap();
+            std::fs::create_dir_all(repo.path().join("shared")).unwrap();
+            std::fs::write(
+                repo.path().join("shared/frag.yaml"),
+                r#"
+type: botforge/fragment
+inputs:
+  seconds:
+    type: number
+    default: 42
+steps:
+  - on: guest
+    name: timed
+    timeout: ${{ inputs.seconds }}
+    run: echo ok
+"#,
+            )
+            .unwrap();
+            std::fs::write(
+                repo.path().join("test.yaml"),
+                r#"
+type: botforge/test
+name: test
+steps:
+  - uses: "@://shared/frag.yaml"
+"#,
+            )
+            .unwrap();
+
+            let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+            let TestStep::Run(step) = &config.steps[0] else {
+                panic!("expected run step");
+            };
+            assert_eq!(
+                step.timeout,
+                Some(42),
+                "timeout: ${{number_input}} must be 42"
             );
         }
     }

@@ -9,13 +9,13 @@ inputs:
     default: hello
   booly:
     type: boolean
-    default: "false"
+    default: false
   booly_string:
     type: string
     default: "false"
   seconds:
     type: number
-    default: "42"
+    default: 42
   cond:
     type: string
     default: "yes"
@@ -251,13 +251,19 @@ steps:
       contains:
       - "[is-cat]"
 
-# --- Number input into string field (interpolated form) ---
+# --- Number input into string field (R5: pure expr stringifies) ---
 
-# Interpolated: "[count=42]" proves Number renders faithfully in string context.
-# Note: bare `name: ${{ inputs.seconds }}` (pure expression → YAML int → String field)
-# currently errors because serde_yaml's from_value does not coerce Number→String.
-# That coercion fix requires an engine change (out of scope for this hardening pass).
-# The interpolated form (surrounding text) is safe: Number stringifies via to_interpolated_string.
+# R5: pure `${{ inputs.seconds }}` occupying a string field now stringifies.
+# The `name:` field receives YAML string "42" (not an integer), proving R5.
+# name: ${{ inputs.seconds }} → name field = "42"
+- name: ${{ inputs.seconds }}
+  run: echo "r5-stringify-ok"
+  expect:
+    stdout:
+      contains:
+      - "r5-stringify-ok"
+
+# Interpolated form also works: "[count=42]" proves number renders faithfully.
 - name: expr-count-interp
   run: echo "[count=${{ inputs.seconds }}]"
   expect:

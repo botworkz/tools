@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 
 use super::parser::ExprNode;
 use super::value::{EvaluatedSpan, EvaluatedValue};
-use super::{InputType, TypedInputMap};
+use super::TypedInputMap;
 
 /// Evaluate a `${{ expr }}` span (the text between `${{` and `}}`).
 ///
@@ -38,12 +38,12 @@ fn evaluate_node(
         ExprNode::Reference { namespace, name } => {
             if namespace == "inputs" {
                 if active_namespace == "inputs" {
-                    // Resolve to declared type so `inputs.flag` (boolean, "false") →
-                    // `Bool(false)` (falsy), not `String("false")` (truthy).
+                    // The TypedInputMap now carries fully typed EvaluatedValues resolved
+                    // at the boundary; no re-parsing needed (resolve_typed_input removed).
                     return Ok(EvaluatedSpan::Value(
                         typed_inputs
                             .get(name)
-                            .map(|(value, input_type)| resolve_typed_input(value, *input_type))
+                            .cloned()
                             .unwrap_or(EvaluatedValue::Empty),
                     ));
                 }
@@ -213,19 +213,6 @@ fn parse_from_json(s: &str) -> Result<EvaluatedValue> {
         serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
             anyhow::bail!("from_json() does not support arrays or objects (not yet implemented)")
         }
-    }
-}
-
-/// Resolve a raw string value from the inputs map to its declared typed `EvaluatedValue`.
-///
-/// - `Boolean` input → `Bool` (parses `"true"`/`"false"` case-insensitively)
-/// - `Number` input → `Number`
-/// - `String` input → `String`
-fn resolve_typed_input(value: &str, input_type: InputType) -> EvaluatedValue {
-    match input_type {
-        InputType::Boolean => EvaluatedValue::Bool(value.eq_ignore_ascii_case("true")),
-        InputType::Number => EvaluatedValue::Number(value.parse::<f64>().unwrap_or(0.0)),
-        InputType::String => EvaluatedValue::String(value.to_string()),
     }
 }
 

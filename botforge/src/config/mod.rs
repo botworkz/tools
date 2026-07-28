@@ -306,7 +306,7 @@ impl<'de> Deserialize<'de> for RawTestStep {
 struct TestStepInclude {
     uses: String,
     #[serde(default)]
-    with: BTreeMap<String, String>,
+    with: BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1045,7 +1045,7 @@ fn expand_test_steps(
 fn load_test_steps_fragment(
     path: &Path,
     uses: &str,
-    with: &BTreeMap<String, String>,
+    with: &BTreeMap<String, Value>,
 ) -> Result<(
     Vec<RawTestStep>,
     Option<serde_yaml::Mapping>,

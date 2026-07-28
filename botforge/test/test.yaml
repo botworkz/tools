@@ -12,9 +12,9 @@ steps:
   with:
     str_a: hello
     str_b: hello
-    booly: "false"
+    booly: false
     booly_string: "false"
-    seconds: "42"
+    seconds: 42
     cond: "yes"
     empty_str: ""
 - name: Base install test

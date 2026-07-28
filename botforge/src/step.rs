@@ -222,6 +222,19 @@ where
 /// - `null` => `None` (treated as absent/run)
 /// - `false`, `0`, `""` => `Some(false)`
 /// - everything else => `Some(true)`
+///
+/// R6 — single truthiness authority: the PRIMARY path for expression-based `if:` conditions
+/// is `substitute_if_condition_in_value` in the expression engine, which pre-evaluates the
+/// expression and substitutes it back as a YAML `Bool`. This function then receives that
+/// pre-evaluated `Bool` and falls through to the `Value::Bool(flag)` arm.
+///
+/// The remaining arms handle literal YAML scalars written directly (e.g. `if: false`,
+/// `if: "false"`, `if: 0`). Their truthiness rules are consistent with `EvaluatedValue::truthy()`:
+/// - `Bool(false)` / `Number(0)` / `String("")` → falsy
+/// - non-empty strings (incl. `"false"`, `"0"`) → truthy (R6: non-empty string is ALWAYS truthy)
+/// - `Bool(true)` / non-zero numbers → truthy
+///
+/// Do NOT add implicit string→typed coercion here. `if: "false"` (string) must run.
 fn deserialize_step_condition<'de, D>(
     deserializer: D,
 ) -> std::result::Result<Option<bool>, D::Error>

@@ -3164,7 +3164,7 @@ output: "out.qcow2"
 steps:
   - uses: "@://frag.yaml"
     with:
-      seconds: "75"
+      seconds: 75
 "#,
         );
         let config = load_build_config(repo.path(), &repo.path().join("build.yaml")).unwrap();
@@ -4309,7 +4309,7 @@ name: test
 steps:
   - uses: "@://shared/frag.yaml"
     with:
-      seconds: "42"
+      seconds: 42
 "#,
         )
         .unwrap();

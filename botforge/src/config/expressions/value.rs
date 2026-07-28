@@ -8,7 +8,7 @@ use serde_yaml::Value as YamlValue;
 ///
 /// Everything else (truthiness, equality, `&&`/`||`) works on the typed value directly.
 #[derive(Clone, Debug, PartialEq)]
-pub(super) enum EvaluatedValue {
+pub(in crate::config) enum EvaluatedValue {
     String(std::string::String),
     Number(f64),
     Bool(bool),
