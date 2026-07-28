@@ -193,17 +193,10 @@ impl<'de> Deserialize<'de> for TestStep {
 #[serde(untagged)]
 enum SecondsValue {
     Integer(i64),
-    String(String),
 }
 
 fn parse_positive_seconds(value: SecondsValue) -> std::result::Result<u64, String> {
-    let parsed = match value {
-        SecondsValue::Integer(value) => value,
-        SecondsValue::String(value) => value
-            .trim()
-            .parse::<i64>()
-            .map_err(|_| format!("expected a positive integer number of seconds, got '{value}'"))?,
-    };
+    let SecondsValue::Integer(parsed) = value;
     if parsed <= 0 {
         return Err(format!(
             "expected a positive integer number of seconds, got {parsed}"

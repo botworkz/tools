@@ -69,6 +69,9 @@ pub(super) fn expand_raw_step(step: Value) -> Result<Vec<TestStep>> {
         // Even without `for:`, run the expression pass so `${{ ... }}` literals
         // (including boolean gating expressions) are evaluated consistently.
         substitute_args_in_value(&mut concrete, &BTreeMap::new())?;
+        // Invariant A: after the final (args) pass, no ${{ }} may remain.
+        check_no_residual_expressions(&concrete)
+            .with_context(|| format!("step '{step_name_template}'"))?;
         let parsed: TestStep = serde_yaml::from_value(concrete)
             .with_context(|| format!("step '{step_name_template}': invalid step definition"))?;
         return Ok(vec![parsed]);
@@ -85,6 +88,9 @@ pub(super) fn expand_raw_step(step: Value) -> Result<Vec<TestStep>> {
         let args = resolve_for_args(&item)?;
         let mut concrete = body.clone();
         substitute_args_in_value(&mut concrete, &args)?;
+        // Invariant A: after the final (args) pass, no ${{ }} may remain.
+        check_no_residual_expressions(&concrete)
+            .with_context(|| format!("step '{step_name_template}'"))?;
         // Use the post-substitution name for the error context.
         let concrete_name = if let Value::Mapping(ref m) = concrete {
             m.get(&name_key)
@@ -423,6 +429,42 @@ fn substitute_namespace_in_string(
     }
     rendered.push_str(rest);
     Ok(rendered)
+}
+
+/// Scan `value` recursively for any unresolved `${{ }}` expression.
+///
+/// # Invariant (A): No `${{ }}` may remain after the final substitution pass.
+/// After the final (`args`) substitution pass every `${{ }}` placeholder must have
+/// been evaluated to a concrete typed value. Any surviving placeholder is a hard
+/// load-time error. Typical causes:
+/// - An expression referencing an unknown namespace (usually caught earlier).
+/// - A cross-namespace expression (`${{ inputs.x || args.y }}`) where the inputs
+///   side was falsy and the args side couldn't be evaluated during the inputs pass
+///   — the two-pass deferral means it can't be resolved.
+/// - A top-level step (not from a fragment) that mistakenly uses `inputs.*` refs.
+///
+/// Callers MUST invoke this immediately after [`substitute_args_in_value`].
+fn check_no_residual_expressions(value: &Value) -> Result<()> {
+    match value {
+        Value::String(text) => {
+            if let Some(start) = text.find("${{") {
+                let snippet = match text[start..].find("}}") {
+                    Some(offset) => &text[start..start + offset + 2],
+                    None => &text[start..],
+                };
+                anyhow::bail!(
+                    "unresolved expression after final substitution pass: '{}'; \
+                     check for unknown namespaces, typos, or cross-namespace \
+                     expressions that cannot be evaluated in a single pass",
+                    snippet
+                );
+            }
+            Ok(())
+        }
+        Value::Sequence(items) => items.iter().try_for_each(check_no_residual_expressions),
+        Value::Mapping(entries) => entries.values().try_for_each(check_no_residual_expressions),
+        _ => Ok(()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1468,6 +1510,179 @@ steps:
             )
             .unwrap();
             assert_eq!(result, "This string has false in it");
+        }
+
+        // --- Residual expression errors (invariant A) ---
+
+        /// A top-level step (not from a fragment) that uses `inputs.*` references
+        /// must be a hard error: the inputs pass is never run for top-level steps,
+        /// so the placeholder survives the args pass and the residual check fires.
+        #[test]
+        fn test_residual_inputs_ref_in_top_level_step_is_error() {
+            use crate::config::load_test_config;
+            use tempfile::TempDir;
+
+            let repo = TempDir::new().unwrap();
+            std::fs::write(
+                repo.path().join("test.yaml"),
+                r#"
+type: botforge/test
+name: test
+steps:
+  - on: guest
+    name: bad-step
+    run: echo ${{ inputs.x }}
+"#,
+            )
+            .unwrap();
+
+            let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("unresolved expression"),
+                "residual inputs.* in top-level step must be a hard error: {msg}"
+            );
+        }
+
+        /// After both substitution passes, a surviving `${{ }}` placeholder is a
+        /// hard error. A cross-namespace expression `${{ inputs.x || args.0 }}` where
+        /// `inputs.x` is falsy cannot be resolved in either pass:
+        /// - inputs pass: needs `args.0` → deferred
+        /// - args pass: `inputs.x` ref → deferred again → residual!
+        #[test]
+        fn test_residual_cross_namespace_expression_is_error() {
+            use crate::config::load_test_config;
+            use tempfile::TempDir;
+
+            let repo = TempDir::new().unwrap();
+            std::fs::create_dir_all(repo.path().join("shared")).unwrap();
+            std::fs::write(
+                repo.path().join("shared/frag.yaml"),
+                r#"
+type: botforge/fragment
+inputs:
+  x:
+    type: string
+    default: ""
+steps:
+  - on: guest
+    name: cross-ns
+    run: echo ${{ inputs.x || args.0 }}
+"#,
+            )
+            .unwrap();
+            std::fs::write(
+                repo.path().join("test.yaml"),
+                r#"
+type: botforge/test
+name: test
+steps:
+  - uses: "@://shared/frag.yaml"
+    with:
+      x: ""
+"#,
+            )
+            .unwrap();
+
+            let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("unresolved expression"),
+                "residual cross-namespace expression must be a hard error: {msg}"
+            );
+        }
+
+        // --- Undefined ref: context-typed behavior (invariant C) ---
+
+        /// `name: ${{ inputs.missing }}` → `""` (undefined ref in string field, no error).
+        #[test]
+        fn test_undefined_ref_in_string_field_yields_empty_string() {
+            use crate::config::load_test_config;
+            use crate::step::TestStep;
+            use tempfile::TempDir;
+
+            let repo = TempDir::new().unwrap();
+            std::fs::create_dir_all(repo.path().join("shared")).unwrap();
+            std::fs::write(
+                repo.path().join("shared/frag.yaml"),
+                r#"
+type: botforge/fragment
+inputs:
+  name_override:
+    type: string
+    required: false
+steps:
+  - on: guest
+    name: ${{ inputs.name_override }}
+    run: echo ok
+"#,
+            )
+            .unwrap();
+            std::fs::write(
+                repo.path().join("test.yaml"),
+                r#"
+type: botforge/test
+name: test
+steps:
+  - uses: "@://shared/frag.yaml"
+"#,
+            )
+            .unwrap();
+
+            let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+            let TestStep::Run(step) = &config.steps[0] else {
+                panic!("expected run step");
+            };
+            assert_eq!(
+                step.name, "",
+                "undefined ref in string field must yield empty string"
+            );
+        }
+
+        /// `if: ${{ inputs.missing }}` → step SKIPS (undefined ref in bool context = falsy).
+        #[test]
+        fn test_undefined_ref_in_if_is_falsy() {
+            use crate::config::load_test_config;
+            use crate::step::TestStep;
+            use tempfile::TempDir;
+
+            let repo = TempDir::new().unwrap();
+            std::fs::create_dir_all(repo.path().join("shared")).unwrap();
+            std::fs::write(
+                repo.path().join("shared/frag.yaml"),
+                r#"
+type: botforge/fragment
+inputs:
+  gate:
+    type: boolean
+    required: false
+steps:
+  - on: guest
+    name: gated
+    if: ${{ inputs.gate }}
+    run: echo ok
+"#,
+            )
+            .unwrap();
+            std::fs::write(
+                repo.path().join("test.yaml"),
+                r#"
+type: botforge/test
+name: test
+steps:
+  - uses: "@://shared/frag.yaml"
+"#,
+            )
+            .unwrap();
+
+            let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+            let TestStep::Run(step) = &config.steps[0] else {
+                panic!("expected run step");
+            };
+            assert!(
+                !step.condition_enabled(),
+                "undefined ref in if: must be falsy (step skipped)"
+            );
         }
     }
 }
