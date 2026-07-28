@@ -12,7 +12,7 @@ mod parser;
 mod value;
 
 use eval::evaluate_expression_span;
-use value::{EvaluatedSpan, EvaluatedValue};
+use value::{format_number, EvaluatedSpan, EvaluatedValue};
 
 const DEFAULT_SENTINEL: &str = "__default__";
 
@@ -346,7 +346,7 @@ pub(super) fn substitute_inputs_in_value(
     value: &mut Value,
     typed_inputs: &TypedInputMap,
 ) -> Result<()> {
-    substitute_namespace_in_value(value, "inputs", typed_inputs, &BTreeMap::new(), false)
+    substitute_namespace_in_value(value, "inputs", typed_inputs, &BTreeMap::new())
 }
 
 /// Substitute `${{ args.NAME }}` expressions in `value`.
@@ -358,45 +358,38 @@ pub(super) fn substitute_args_in_value(
     value: &mut Value,
     args: &BTreeMap<std::string::String, std::string::String>,
 ) -> Result<()> {
-    substitute_namespace_in_value(value, "args", &TypedInputMap::new(), args, false)
+    substitute_namespace_in_value(value, "args", &TypedInputMap::new(), args)
 }
 
-/// Substitute expressions in `value`, with `preserve_typed` controlling how pure
-/// `Number`/`Bool` results are emitted (R5).
+/// Substitute expressions in `value`.
 ///
-/// - `preserve_typed = false` (default for all string-context fields): a pure expression
-///   yielding `Number` or `Bool` is rendered as a YAML `String` via
-///   `to_interpolated_string()`, so that string fields (`name:`, `run:`, `shell:`, etc.)
-///   accept the result without a type-mismatch deserialisation error.
-/// - `preserve_typed = true` (used for `timeout:` which needs a YAML integer): the typed
-///   `to_yaml_value()` result is kept so that integer-expecting fields deserialise correctly.
+/// For a pure `${{ expr }}` (expression spanning the entire field value), the typed
+/// `to_yaml_value()` result is always emitted. String fields accept typed YAML scalars
+/// via `deserialize_scalar_as_string` in `step.rs`; typed non-string fields (e.g.
+/// `timeout: Option<u64>`) deserialize the typed scalar directly.
 ///
-/// The `if:` field is handled separately via [`substitute_if_condition_in_value`] and is
-/// NOT affected by this parameter.
+/// The `if:` field is handled separately via [`substitute_if_condition_in_value`] and
+/// receives a pre-evaluated `Bool` result.
+///
+/// For mixed-content strings (surrounding text), always use string interpolation.
 fn substitute_namespace_in_value(
     value: &mut Value,
     active_namespace: &str,
     typed_inputs: &TypedInputMap,
     args: &BTreeMap<std::string::String, std::string::String>,
-    preserve_typed: bool,
 ) -> Result<()> {
     match value {
         Value::String(text) => {
             // For a single pure expression (`${{ expr }}` with no surrounding text):
-            //   - `preserve_typed = true` (e.g. timeout:): emit the typed YAML scalar.
-            //   - `preserve_typed = false` (all other string-context fields): coerce
-            //     Number/Bool to a YAML String so string fields deserialise correctly (R5).
+            // always emit the typed YAML scalar via `to_yaml_value()`. String fields
+            // accept typed scalars via `deserialize_scalar_as_string`; typed non-string
+            // fields (e.g. `timeout: Option<u64>`) deserialize the integer directly.
             // For mixed-content strings (surrounding text), always use string interpolation.
             let text_clone = text.clone();
             match try_substitute_pure_expression(&text_clone, active_namespace, typed_inputs, args)?
             {
                 PureResult::Typed(ev) => {
-                    *value = if preserve_typed {
-                        ev.to_yaml_value()
-                    } else {
-                        // String-context fields: Number/Bool → String; String/Empty unchanged.
-                        Value::String(ev.to_interpolated_string())
-                    };
+                    *value = ev.to_yaml_value();
                 }
                 PureResult::Deferred => {
                     // Leave the placeholder intact for the next substitution pass.
@@ -413,13 +406,7 @@ fn substitute_namespace_in_value(
         }
         Value::Sequence(items) => {
             for item in items {
-                substitute_namespace_in_value(
-                    item,
-                    active_namespace,
-                    typed_inputs,
-                    args,
-                    preserve_typed,
-                )?;
+                substitute_namespace_in_value(item, active_namespace, typed_inputs, args)?;
             }
         }
         Value::Mapping(entries) => {
@@ -435,26 +422,12 @@ fn substitute_namespace_in_value(
                             args,
                         )?;
                     }
-                    // `timeout:` expects a YAML integer; keep the typed scalar so
-                    // `SecondsValue::Integer` deserialises correctly.
-                    Some("timeout") => {
-                        substitute_namespace_in_value(
-                            val,
-                            active_namespace,
-                            typed_inputs,
-                            args,
-                            true,
-                        )?;
-                    }
-                    // All other fields are string-context: Number/Bool coerce to String (R5).
+                    // All other fields (including `timeout:`) receive the typed YAML scalar
+                    // emitted by `to_yaml_value()`. Each field's serde deserializer is
+                    // responsible for accepting the appropriate type: `timeout:` uses
+                    // `SecondsValue::Integer`, string fields use `deserialize_scalar_as_string`.
                     _ => {
-                        substitute_namespace_in_value(
-                            val,
-                            active_namespace,
-                            typed_inputs,
-                            args,
-                            false,
-                        )?;
+                        substitute_namespace_in_value(val, active_namespace, typed_inputs, args)?;
                     }
                 }
             }
@@ -466,7 +439,7 @@ fn substitute_namespace_in_value(
 
 /// Result of attempting to evaluate a value as a pure single-expression.
 enum PureResult {
-    /// A single `${{ expr }}` was fully evaluated; use `EvaluatedValue::to_yaml_value()`.
+    /// A single `${{ expr }}` was fully evaluated; emit via `EvaluatedValue::to_yaml_value()`.
     Typed(EvaluatedValue),
     /// A single `${{ expr }}` was encountered but references an inactive namespace.
     Deferred,
@@ -605,6 +578,56 @@ fn check_no_residual_expressions(value: &Value) -> Result<()> {
         Value::Sequence(items) => items.iter().try_for_each(check_no_residual_expressions),
         Value::Mapping(entries) => entries.values().try_for_each(check_no_residual_expressions),
         _ => Ok(()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Public helpers for step deserialization (single-source truthiness and
+// scalar-to-string coercion)
+// ---------------------------------------------------------------------------
+
+/// Single truthiness authority for YAML scalar values used by `if:` deserialization.
+///
+/// This is the ONE place where scalar → bool coercion is defined, delegating
+/// to `EvaluatedValue::truthy()`. Returns `None` for `Null` (absent → run).
+/// Returns `Err` for non-scalar values (mappings, sequences, tagged).
+pub(crate) fn yaml_scalar_truthiness(value: &Value) -> std::result::Result<Option<bool>, String> {
+    let ev = match value {
+        Value::Null => return Ok(None),
+        Value::Bool(b) => EvaluatedValue::Bool(*b),
+        Value::Number(n) => EvaluatedValue::Number(n.as_f64().unwrap_or(0.0)),
+        Value::String(s) => EvaluatedValue::String(s.clone()),
+        other => {
+            return Err(format!(
+                "invalid `if:` value: expected scalar (null/bool/number/string), got: {other:?}"
+            ))
+        }
+    };
+    Ok(Some(ev.truthy()))
+}
+
+/// Single string-coercion authority for YAML scalar values used by string field
+/// deserializers.
+///
+/// Renders scalars using the same rules as `EvaluatedValue::to_interpolated_string()`:
+/// - `String(s)` → `s` (as-is)
+/// - `Bool(b)` → `"true"` / `"false"`
+/// - `Number(n)` → decimal string (whole numbers without decimal point)
+///
+/// Returns `Err` for `Null` and non-scalar values.
+pub(crate) fn yaml_scalar_to_string(value: &Value) -> std::result::Result<String, String> {
+    match value {
+        Value::String(s) => Ok(s.clone()),
+        Value::Bool(b) => Ok(if *b { "true" } else { "false" }.to_string()),
+        Value::Number(n) => {
+            let f = n
+                .as_f64()
+                .ok_or_else(|| format!("number out of range: {n}"))?;
+            Ok(format_number(f))
+        }
+        other => Err(format!(
+            "expected string scalar (string/bool/number), got: {other:?}"
+        )),
     }
 }
 
@@ -2011,10 +2034,10 @@ steps:
 
         /// R5: `name: ${{ inputs.count }}` where `count` is a number input stringifies to `"5"`.
         ///
-        /// Previously this was a load error because `to_yaml_value()` emitted a YAML integer
-        /// that serde_yaml could not coerce into a `String` field. The R5 fix makes all
-        /// non-typed fields (everything except `if:` and `timeout:`) stringify Number/Bool
-        /// via `to_interpolated_string()`, so string-context fields just work.
+        /// The expression engine emits the typed YAML scalar (`YamlValue::Integer(5)`).
+        /// The `name:` field uses `deserialize_scalar_as_string` to coerce the integer to
+        /// `"5"`, making the type decision field-schema-authoritative rather than depending
+        /// on a field-name allowlist in the expression engine.
         #[test]
         fn test_number_input_in_name_field_pure_expr_stringifies() {
             use crate::config::load_test_config;
@@ -2104,6 +2127,65 @@ steps:
                 step.name, "step-5",
                 "interpolated number in string field must coerce to string via to_interpolated_string"
             );
+        }
+
+        /// Regression for Problem 2: a pure `${{ number_input }}` in a string field OTHER than
+        /// `name:` (e.g. `run:`, `shell:`, `id:`) must stringify correctly, proving the behavior
+        /// is not tied to a specific field-name allowlist in the expression engine.
+        ///
+        /// The engine emits the typed YAML scalar; each string field's `deserialize_scalar_as_string`
+        /// is the single authority for "scalar coerced into a string field".
+        #[test]
+        fn test_number_input_stringifies_in_run_shell_id_fields() {
+            use crate::config::load_test_config;
+            use crate::step::TestStep;
+            use tempfile::TempDir;
+
+            let repo = TempDir::new().unwrap();
+            std::fs::create_dir_all(repo.path().join("shared")).unwrap();
+            std::fs::write(
+                repo.path().join("shared/frag.yaml"),
+                r#"
+type: botforge/fragment
+inputs:
+  n:
+    type: number
+    default: 5
+  flag:
+    type: boolean
+    default: true
+steps:
+  - on: guest
+    name: probe
+    run: ${{ inputs.n }}
+    id: ${{ inputs.n }}
+    shell: python3 {0}
+    if: ${{ inputs.flag }}
+"#,
+            )
+            .unwrap();
+            std::fs::write(
+                repo.path().join("test.yaml"),
+                r#"
+type: botforge/test
+name: test
+steps:
+  - uses: "@://shared/frag.yaml"
+"#,
+            )
+            .unwrap();
+
+            let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+            let TestStep::Run(step) = &config.steps[0] else {
+                panic!("expected run step");
+            };
+            assert_eq!(step.run, "5", "run: ${{number}} must stringify to '5'");
+            assert_eq!(
+                step.id.as_deref(),
+                Some("5"),
+                "id: ${{number}} must stringify to '5'"
+            );
+            assert!(step.condition_enabled(), "if: ${{true}} must run");
         }
 
         /// Short-circuit must not evaluate the dead branch: `false && inputs.undefined_ref`

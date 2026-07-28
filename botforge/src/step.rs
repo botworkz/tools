@@ -3,6 +3,8 @@ use serde::de::{self, Deserializer};
 use serde::Deserialize;
 use serde_yaml::Value;
 
+use crate::config::{yaml_scalar_to_string, yaml_scalar_truthiness};
+
 /// Where a test step executes: inside the guest (SSH) or on the harness host (local).
 #[derive(Debug, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
@@ -62,7 +64,9 @@ pub(crate) struct RunStep {
     /// Where this step executes. Optional; defaults to `guest`.
     #[serde(rename = "on", default)]
     pub(crate) target: StepTarget,
+    #[serde(deserialize_with = "deserialize_scalar_as_string")]
     pub(crate) name: String,
+    #[serde(deserialize_with = "deserialize_scalar_as_string")]
     pub(crate) run: String,
     #[serde(default, deserialize_with = "deserialize_optional_positive_seconds")]
     pub(crate) timeout: Option<u64>,
@@ -72,7 +76,7 @@ pub(crate) struct RunStep {
     /// Custom template: any string containing `{0}`, e.g. `python3 -u {0}`.
     /// When absent, defaults to `bash --noprofile --norc -e -o pipefail {0}` with
     /// automatic `sh -e {0}` fallback if bash is not available.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_scalar_as_string")]
     pub(crate) shell: Option<String>,
     /// When `true`, run the step's interpreter under `sudo -E` so the entire
     /// `run:` body executes as root. Only valid on `on: guest` steps (host steps
@@ -82,7 +86,7 @@ pub(crate) struct RunStep {
     /// Optional identifier for the step. When set, it is shown in the step's
     /// title/status line as `(<index>/<id>)`. Purely a display label today — it is
     /// not required to be unique and is not addressable by other steps.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_scalar_as_string")]
     pub(crate) id: Option<String>,
     /// Declarative outcome assertions for test/build run steps.
     #[serde(default)]
@@ -120,13 +124,14 @@ impl RunStep {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ArchiveStepSpec {
+    #[serde(deserialize_with = "deserialize_scalar_as_string")]
     pub(crate) src: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_scalar_as_string")]
     pub(crate) into: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_scalar_as_string")]
     pub(crate) name: Option<String>,
     /// Guest destination path. Only valid when the step's `on:` is `guest`.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_scalar_as_string")]
     pub(crate) dest: Option<String>,
 }
 
@@ -136,11 +141,11 @@ pub(crate) struct ArchiveStep {
     pub(crate) archive: ArchiveStepSpec,
     #[serde(rename = "on", default)]
     pub(crate) target: Option<StepTarget>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_scalar_as_string")]
     pub(crate) run: Option<String>,
     #[serde(default, deserialize_with = "deserialize_optional_positive_seconds")]
     pub(crate) timeout: Option<u64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_scalar_as_string")]
     pub(crate) shell: Option<String>,
 }
 
@@ -218,15 +223,15 @@ where
         .map_err(de::Error::custom)
 }
 
-/// Deserialize the `if:` field into an `Option<bool>` using expression truthiness:
-/// - `null` => `None` (treated as absent/run)
-/// - `false`, `0`, `""` => `Some(false)`
-/// - everything else => `Some(true)`
+/// Deserialize the `if:` field into an `Option<bool>` using expression truthiness.
+///
+/// Delegates to `yaml_scalar_truthiness` (the single truthiness authority) so that
+/// this function and `EvaluatedValue::truthy()` cannot drift out of agreement.
 ///
 /// R6 — single truthiness authority: the PRIMARY path for expression-based `if:` conditions
 /// is `substitute_if_condition_in_value` in the expression engine, which pre-evaluates the
 /// expression and substitutes it back as a YAML `Bool`. This function then receives that
-/// pre-evaluated `Bool` and falls through to the `Value::Bool(flag)` arm.
+/// pre-evaluated `Bool` and falls through to the scalar case.
 ///
 /// The remaining arms handle literal YAML scalars written directly (e.g. `if: false`,
 /// `if: "false"`, `if: 0`). Their truthiness rules are consistent with `EvaluatedValue::truthy()`:
@@ -242,16 +247,40 @@ where
     D: Deserializer<'de>,
 {
     let value = Value::deserialize(deserializer)?;
-    let result = match &value {
+    yaml_scalar_truthiness(&value).map_err(de::Error::custom)
+}
+
+/// Deserialize a required string field that may receive a typed YAML scalar (Number/Bool)
+/// produced by a pure `${{ expr }}` substitution.
+///
+/// The scalar is coerced to its string representation using the same rules as
+/// `EvaluatedValue::to_interpolated_string()` via `yaml_scalar_to_string`.
+/// This is the single authority for "scalar coerced into a required string field".
+fn deserialize_scalar_as_string<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    yaml_scalar_to_string(&value).map_err(de::Error::custom)
+}
+
+/// Deserialize an optional string field that may receive a typed YAML scalar (Number/Bool)
+/// produced by a pure `${{ expr }}` substitution.
+///
+/// `null` yields `None`; all other scalars are coerced to `String` via `yaml_scalar_to_string`.
+fn deserialize_optional_scalar_as_string<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    match value {
         Value::Null => Ok(None),
-        Value::Bool(flag) => Ok(Some(*flag)),
-        Value::Number(number) => Ok(Some(number.as_f64().unwrap_or(0.0) != 0.0)),
-        Value::String(text) => Ok(Some(!text.is_empty())),
-        other => Err(de::Error::custom(format!(
-            "invalid `if:` value: expected scalar (null/bool/number/string), got: {other:?}"
-        ))),
-    }?;
-    Ok(result)
+        v => yaml_scalar_to_string(&v)
+            .map(Some)
+            .map_err(de::Error::custom),
+    }
 }
 
 /// Resolve a step's `shell:` value into an argv template with a `{0}` slot.
