@@ -1103,7 +1103,10 @@ steps:
 
             let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
             assert_eq!(config.steps.len(), 1);
-            assert_eq!(run_ref(&config.steps[0]).name, "hello");
+            let TestStep::Invoke(inv) = &config.steps[0] else {
+                panic!("expected invoke step");
+            };
+            assert_eq!(run_ref(&inv.steps[0]).name, "hello");
         }
 
         #[test]
@@ -1190,7 +1193,10 @@ steps:
             .unwrap();
 
             let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
-            assert_eq!(run_ref(&config.steps[0]).shell.as_deref(), Some("bash"));
+            let TestStep::Invoke(inv) = &config.steps[0] else {
+                panic!("expected invoke step");
+            };
+            assert_eq!(run_ref(&inv.steps[0]).shell.as_deref(), Some("bash"));
         }
 
         #[test]
@@ -1715,10 +1721,13 @@ steps:
             .unwrap();
             let enabled =
                 load_test_config(repo.path(), &repo.path().join("test-enabled.yaml")).unwrap();
-            let TestStep::Run(first) = &enabled.steps[0] else {
+            let TestStep::Invoke(inv) = &enabled.steps[0] else {
+                panic!("expected invoke step");
+            };
+            let TestStep::Run(first) = &inv.steps[0] else {
                 panic!("expected run step");
             };
-            let TestStep::Run(second) = &enabled.steps[1] else {
+            let TestStep::Run(second) = &inv.steps[1] else {
                 panic!("expected run step");
             };
             assert!(first.condition_enabled());
@@ -1740,10 +1749,13 @@ steps:
             .unwrap();
             let disabled =
                 load_test_config(repo.path(), &repo.path().join("test-disabled.yaml")).unwrap();
-            let TestStep::Run(first) = &disabled.steps[0] else {
+            let TestStep::Invoke(inv) = &disabled.steps[0] else {
+                panic!("expected invoke step");
+            };
+            let TestStep::Run(first) = &inv.steps[0] else {
                 panic!("expected run step");
             };
-            let TestStep::Run(second) = &disabled.steps[1] else {
+            let TestStep::Run(second) = &inv.steps[1] else {
                 panic!("expected run step");
             };
             assert!(!first.condition_enabled());
@@ -1807,13 +1819,16 @@ steps:
             )
             .unwrap();
             let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
-            let TestStep::Run(bool_step) = &config.steps[0] else {
+            let TestStep::Invoke(inv) = &config.steps[0] else {
+                panic!("expected invoke step");
+            };
+            let TestStep::Run(bool_step) = &inv.steps[0] else {
                 panic!("expected run step");
             };
-            let TestStep::Run(string_step) = &config.steps[1] else {
+            let TestStep::Run(string_step) = &inv.steps[1] else {
                 panic!("expected run step");
             };
-            let TestStep::Run(from_json_step) = &config.steps[2] else {
+            let TestStep::Run(from_json_step) = &inv.steps[2] else {
                 panic!("expected run step");
             };
 
@@ -2001,7 +2016,10 @@ steps:
             .unwrap();
 
             let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
-            let TestStep::Run(step) = &config.steps[0] else {
+            let TestStep::Invoke(inv) = &config.steps[0] else {
+                panic!("expected invoke step");
+            };
+            let TestStep::Run(step) = &inv.steps[0] else {
                 panic!("expected run step");
             };
             assert_eq!(
@@ -2048,7 +2066,10 @@ steps:
             .unwrap();
 
             let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
-            let TestStep::Run(step) = &config.steps[0] else {
+            let TestStep::Invoke(inv) = &config.steps[0] else {
+                panic!("expected invoke step");
+            };
+            let TestStep::Run(step) = &inv.steps[0] else {
                 panic!("expected run step");
             };
             assert!(
@@ -2099,7 +2120,10 @@ steps:
 
             // R5: pure number expression in a string field must stringify to "5".
             let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
-            let TestStep::Run(step) = &config.steps[0] else {
+            let TestStep::Invoke(inv) = &config.steps[0] else {
+                panic!("expected invoke step");
+            };
+            let TestStep::Run(step) = &inv.steps[0] else {
                 panic!("expected run step");
             };
             assert_eq!(
@@ -2145,7 +2169,10 @@ steps:
             .unwrap();
 
             let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
-            let TestStep::Run(step) = &config.steps[0] else {
+            let TestStep::Invoke(inv) = &config.steps[0] else {
+                panic!("expected invoke step");
+            };
+            let TestStep::Run(step) = &inv.steps[0] else {
                 panic!("expected run step");
             };
             assert_eq!(
@@ -2201,7 +2228,10 @@ steps:
             .unwrap();
 
             let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
-            let TestStep::Run(step) = &config.steps[0] else {
+            let TestStep::Invoke(inv) = &config.steps[0] else {
+                panic!("expected invoke step");
+            };
+            let TestStep::Run(step) = &inv.steps[0] else {
                 panic!("expected run step");
             };
             assert_eq!(step.run, "5", "run: ${{number}} must stringify to '5'");
@@ -2399,7 +2429,10 @@ steps:
             .unwrap();
 
             let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
-            let TestStep::Run(step) = &config.steps[0] else {
+            let TestStep::Invoke(inv) = &config.steps[0] else {
+                panic!("expected invoke step");
+            };
+            let TestStep::Run(step) = &inv.steps[0] else {
                 panic!("expected run step");
             };
             assert_eq!(

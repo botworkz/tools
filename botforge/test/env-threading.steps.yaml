@@ -5,19 +5,19 @@ steps:
   sudo: true
   run: |
     whoami | grep -qx root
-    echo "KEY_GUEST_ROOT=guest-root-ok" >> "$BOTFORGE_ENV"
+    echo "KEY_GUEST_ROOT=guest-root-ok" >> "$BF_ENV"
 
 - on: guest
   name: env write as ephemeral user (no sudo)
   sudo: false
   run: |
     test "$(whoami)" != root
-    echo "KEY_GUEST_USER=guest-user-ok" >> "$BOTFORGE_ENV"
+    echo "KEY_GUEST_USER=guest-user-ok" >> "$BF_ENV"
 
 - on: host
   name: env write on host
   run: |
-    echo "KEY_HOST=host-ok" >> "$BOTFORGE_ENV"
+    echo "KEY_HOST=host-ok" >> "$BF_ENV"
 
 - on: host
   name: host sees guest-written env

@@ -1,0 +1,11 @@
+type: botforge/fragment
+steps:
+- on: guest
+  name: fragment sees caller env
+  run: |
+    test "$CALLER_VAR" = caller-ok
+
+- on: guest
+  name: fragment sets env
+  run: |
+    echo "FRAGMENT_VAR=frag-ok" >> "$BF_ENV"
