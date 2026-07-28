@@ -24,7 +24,9 @@ use self::expressions::{
 pub(crate) use self::expressions::{yaml_scalar_to_string, yaml_scalar_truthiness};
 use crate::assert::{parse_assert_block, validate_assert_block, AssertBlock};
 use crate::plan::files::FileEntry;
-use crate::step::{deserialize_optional_positive_seconds, resolve_shell, StepTarget, TestStep};
+use crate::step::{
+    deserialize_optional_positive_seconds, resolve_shell, InvokeStep, StepTarget, TestStep,
+};
 
 /// Maximum number of active `uses:` includes on the call stack at any one time.
 /// Includes the root document, which is always on the stack; so this limits nesting
@@ -828,6 +830,13 @@ pub(crate) fn validate_publish_steps(steps: &[TestStep]) -> Result<()> {
                     name
                 );
             }
+            TestStep::Invoke(invoke) => {
+                anyhow::bail!(
+                    "publish step '{}': fragment invocation (`uses:`) steps are not supported \
+                     in the publish prepare phase; only `run` steps are allowed",
+                    invoke.uses
+                );
+            }
         }
     }
     Ok(())
@@ -952,6 +961,7 @@ fn run_semantic_validators(target: SemanticValidationTarget<'_>) -> Result<()> {
             }
             validate_top_level_files("build", files)
                 .with_context(|| format!("invalid build config: {}", path.display()))?;
+            validate_scope_step_ids(steps, &path.display().to_string())?;
             validate_build_steps(steps)
         }
         SemanticValidationTarget::Test {
@@ -967,6 +977,7 @@ fn run_semantic_validators(target: SemanticValidationTarget<'_>) -> Result<()> {
             }
             validate_top_level_files("test", files)
                 .with_context(|| format!("invalid test config: {}", path.display()))?;
+            validate_scope_step_ids(steps, &path.display().to_string())?;
             validate_test_steps(steps, ports)
         }
     }
@@ -1015,9 +1026,11 @@ fn expand_test_steps(
                 include_stack.push(include_path.clone());
                 let result = load_test_steps_fragment(&include_path, &include.uses, &include.with)
                     .and_then(|(steps, ci, files)| {
+                        // `files:` and `cloud_init:` contributions from the fragment are
+                        // accumulated globally (unchanged from before Stage 1).
                         files_acc.extend(files);
                         let mut ci_acc = ci;
-                        let expanded_steps = expand_test_steps(
+                        let fragment_steps = expand_test_steps(
                             repo_root,
                             &include_path,
                             steps,
@@ -1025,12 +1038,22 @@ fn expand_test_steps(
                             &mut ci_acc,
                             files_acc,
                         )?;
-                        Ok((expanded_steps, ci_acc))
+                        Ok((fragment_steps, ci_acc))
                     });
                 include_stack.pop();
                 let (fragment_steps, fragment_cloud_init) = result?;
-                expanded.extend(fragment_steps);
-                // Merge fragment's cloud_init into accumulator.
+
+                // Validate per-scope id uniqueness for this fragment's own scope.
+                validate_scope_step_ids(&fragment_steps, &include_path.display().to_string())?;
+
+                // Produce a single Invoke step instead of splicing the fragment
+                // steps flat into the parent list.
+                expanded.push(TestStep::Invoke(InvokeStep {
+                    uses: include.uses.clone(),
+                    steps: fragment_steps,
+                }));
+
+                // Merge fragment's cloud_init into accumulator (globally, as before).
                 if let Some(fci) = fragment_cloud_init {
                     *cloud_init_acc = Some(match cloud_init_acc.take() {
                         None => fci,
@@ -1372,6 +1395,47 @@ pub(crate) fn validate_test_ports(ports: &[PortSpec], ssh_port: u16) -> Result<(
     Ok(())
 }
 
+/// Recursively check whether a step list contains any `on: host` run steps.
+/// Used by `validate_test_steps` to detect host steps nested inside `Invoke` scopes.
+fn steps_have_host_step(steps: &[TestStep]) -> bool {
+    steps.iter().any(|step| match step {
+        TestStep::Run(run) => run.target == StepTarget::Host,
+        TestStep::Invoke(invoke) => steps_have_host_step(&invoke.steps),
+        TestStep::Archive(_) => false,
+    })
+}
+
+/// Validate that `id:` values are unique within a single scope.
+///
+/// A "scope" is either the root document or one fragment file body.
+/// A fragment's ids only need to be unique within that one fragment; the same
+/// id may appear in a different scope without conflict.
+///
+/// Only `TestStep::Run` steps carry an `id`; `Archive` and `Invoke` steps do not.
+/// `Invoke` steps are **not** recursed into here — they are validated when their
+/// own fragment scope is processed.
+///
+/// `scope_description` is a human-readable label (file path or `"root"`) used in
+/// the error message.
+fn validate_scope_step_ids(steps: &[TestStep], scope_description: &str) -> Result<()> {
+    let mut seen: HashSet<&str> = HashSet::new();
+    for step in steps {
+        if let TestStep::Run(run) = step {
+            if let Some(ref id) = run.id {
+                if !seen.insert(id.as_str()) {
+                    anyhow::bail!(
+                        "duplicate step id '{}' in scope '{}': \
+                         step ids must be unique within the same scope",
+                        id,
+                        scope_description
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_test_steps(steps: &[TestStep], ports: &[PortSpec]) -> Result<()> {
     for step in steps {
         match step {
@@ -1395,11 +1459,17 @@ pub(crate) fn validate_test_steps(steps: &[TestStep], ports: &[PortSpec]) -> Res
                         .unwrap_or(step.archive.src.as_str())
                 );
             }
+            TestStep::Invoke(invoke) => {
+                // Recursively validate the inner scope's steps.
+                validate_test_steps(&invoke.steps, ports)?;
+            }
         }
     }
-    let has_host_step = steps
-        .iter()
-        .any(|step| matches!(step, TestStep::Run(run) if run.target == StepTarget::Host));
+    let has_host_step = steps.iter().any(|step| match step {
+        TestStep::Run(run) => run.target == StepTarget::Host,
+        TestStep::Invoke(invoke) => steps_have_host_step(&invoke.steps),
+        TestStep::Archive(_) => false,
+    });
     if has_host_step && ports.is_empty() {
         anyhow::bail!(
             "test config has `on: host` steps but no `ports:` are declared; \
@@ -1424,6 +1494,9 @@ pub(crate) fn validate_build_steps(steps: &[TestStep]) -> Result<()> {
                 })?;
             }
             TestStep::Archive(step) => validate_archive_build_step(step)?,
+            TestStep::Invoke(invoke) => {
+                validate_build_steps(&invoke.steps)?;
+            }
         }
     }
     Ok(())
