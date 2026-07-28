@@ -1684,5 +1684,134 @@ steps:
                 "undefined ref in if: must be falsy (step skipped)"
             );
         }
+
+        /// Documents the current behavior of `name: ${{ inputs.count }}` where `count` is a
+        /// number input: the engine emits a typed YAML Number which serde_yaml cannot coerce
+        /// into a String field via `from_value`, producing a hard load error.
+        ///
+        /// This is a known limitation: `to_yaml_value()` preserves the Number type, but
+        /// serde_yaml's `from_value` does not promote Number→String for struct fields.
+        /// The safe interpolated form (`name: prefix-${{ inputs.count }}`) always works
+        /// because it goes through `to_interpolated_string()` instead.
+        ///
+        /// A future engine fix (restricting typed output to typed fields, or pre-stringifying
+        /// pure expressions in string-typed fields) would make this case pass; when it does,
+        /// update this test to assert `step.name == "5"` instead.
+        #[test]
+        fn test_number_input_in_name_field_pure_expr_is_current_load_error() {
+            use crate::config::load_test_config;
+            use tempfile::TempDir;
+
+            let repo = TempDir::new().unwrap();
+            std::fs::create_dir_all(repo.path().join("shared")).unwrap();
+            std::fs::write(
+                repo.path().join("shared/frag.yaml"),
+                r#"
+type: botforge/fragment
+inputs:
+  count:
+    type: number
+    default: "5"
+steps:
+  - on: guest
+    name: ${{ inputs.count }}
+    run: echo ok
+"#,
+            )
+            .unwrap();
+            std::fs::write(
+                repo.path().join("test.yaml"),
+                r#"
+type: botforge/test
+name: test
+steps:
+  - uses: "@://shared/frag.yaml"
+"#,
+            )
+            .unwrap();
+
+            // Currently errors: YAML integer `5` cannot be deserialized into String field `name`
+            // via serde_yaml::from_value. When the engine is fixed to stringify Number in
+            // string-context fields, change this to: assert!(result.is_ok()) + assert_eq!(name, "5").
+            let result = load_test_config(repo.path(), &repo.path().join("test.yaml"));
+            assert!(
+                result.is_err(),
+                "pure number expr in string field currently errors (see doc comment); got Ok"
+            );
+            let msg = format!("{:#}", result.unwrap_err());
+            assert!(
+                msg.contains("integer") || msg.contains("string"),
+                "error should mention type mismatch: {msg}"
+            );
+        }
+
+        /// The interpolated form `name: prefix-${{ inputs.count }}` (surrounding text) always
+        /// stringifies the Number correctly via `to_interpolated_string`, even today.
+        #[test]
+        fn test_number_input_in_name_field_interpolated_works() {
+            use crate::config::load_test_config;
+            use crate::step::TestStep;
+            use tempfile::TempDir;
+
+            let repo = TempDir::new().unwrap();
+            std::fs::create_dir_all(repo.path().join("shared")).unwrap();
+            std::fs::write(
+                repo.path().join("shared/frag.yaml"),
+                r#"
+type: botforge/fragment
+inputs:
+  count:
+    type: number
+    default: "5"
+steps:
+  - on: guest
+    name: step-${{ inputs.count }}
+    run: echo ok
+"#,
+            )
+            .unwrap();
+            std::fs::write(
+                repo.path().join("test.yaml"),
+                r#"
+type: botforge/test
+name: test
+steps:
+  - uses: "@://shared/frag.yaml"
+"#,
+            )
+            .unwrap();
+
+            let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+            let TestStep::Run(step) = &config.steps[0] else {
+                panic!("expected run step");
+            };
+            assert_eq!(
+                step.name, "step-5",
+                "interpolated number in string field must coerce to string via to_interpolated_string"
+            );
+        }
+
+        /// Short-circuit must not evaluate the dead branch: `false && inputs.undefined_ref`
+        /// returns `Bool(false)` without ever touching `inputs.undefined_ref`. A regression
+        /// that evaluates the dead branch would return an error or `Empty` instead of the
+        /// lhs falsy value.
+        #[test]
+        fn test_short_circuit_dead_branch_skips_undefined_ref() {
+            // false && inputs.undefined (dead branch, never evaluated) → Bool(false) = "false"
+            assert_eq!(
+                substitute_inputs("${{ false && inputs.undefined_key }}", &[]),
+                "false",
+                "dead branch of && must not be evaluated; lhs falsy value returned"
+            );
+            // empty_str && inputs.undefined (dead branch) → String("") = ""
+            assert_eq!(
+                substitute_inputs(
+                    "${{ inputs.empty_str && inputs.undefined_key || 'ok' }}",
+                    &[("empty_str", "")]
+                ),
+                "ok",
+                "dead branch of && must not be evaluated; || then yields 'ok'"
+            );
+        }
     }
 }

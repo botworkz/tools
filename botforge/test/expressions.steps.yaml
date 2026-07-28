@@ -130,29 +130,30 @@ steps:
 
   # --- Faithful interpolation into string context ---
 
-  # ${{ false }} → "false" (faithfully rendered, not "")
+  # ${{ false }} → "false" (faithfully rendered, not "").
+  # Bracketed so a regression to "" gives "[  ]" which fails the exact match.
   - name: expr-interp-false-literal
-    run: echo "${{ false }}"
+    run: echo "[${{ false }}]"
     expect:
       stdout:
         contains:
-        - "false"
+        - "[false]"
 
-  # ${{ 0 }} → "0" (number faithfully rendered)
+  # ${{ 0 }} → "0" (number faithfully rendered, not "").
   - name: expr-interp-zero-literal
-    run: echo "${{ 0 }}"
+    run: echo "[${{ 0 }}]"
     expect:
       stdout:
         contains:
-        - "0"
+        - "[0]"
 
-  # ${{ inputs.booly }} (boolean false) → "false" in string context
+  # ${{ inputs.booly }} (boolean false) → "false" in string context.
   - name: expr-interp-bool-input-false
-    run: echo "${{ inputs.booly }}"
+    run: echo "[${{ inputs.booly }}]"
     expect:
       stdout:
         contains:
-        - "false"
+        - "[false]"
 
   # --- Typed int field: number input into timeout ---
 
@@ -177,22 +178,21 @@ steps:
 
   # --- to_json / from_json scalars ---
 
-  # to_json(false) → "false" (bare JSON literal)
+  # to_json(false) → "false" (bare JSON literal); bracketed for exact-match.
   - name: expr-to-json-false
-    run: echo "${{ to_json(false) }}"
+    run: echo "[${{ to_json(false) }}]"
     expect:
       stdout:
         contains:
-        - "false"
+        - "[false]"
 
-  # to_json('x') → '"x"' (JSON-quoted string)
+  # to_json('x') → '"x"' (JSON-quoted string); bracketed for exact-match.
   - name: expr-to-json-string-x
-    run: |
-      echo "${{ to_json('x') }}"
+    run: echo "[${{ to_json('x') }}]"
     expect:
       stdout:
         contains:
-        - '"x"'
+        - '["x"]'
 
   # from_json('true') → Bool(true) → truthy → 'Y'
   - name: expr-from-json-true-truthy
@@ -209,3 +209,58 @@ steps:
       stdout:
         contains:
         - "N"
+
+  # --- != inequality ---
+
+  # str_a ('hello') != 'different' → true; bracketed for exact-match.
+  - name: expr-neq-true
+    run: echo "[${{ inputs.str_a != 'different' }}]"
+    expect:
+      stdout:
+        contains:
+        - "[true]"
+
+  # str_a == str_b (both 'hello') → str_a != str_b is false; bracketed.
+  - name: expr-neq-false
+    run: echo "[${{ inputs.str_a != inputs.str_b }}]"
+    expect:
+      stdout:
+        contains:
+        - "[false]"
+
+  # --- Short-circuit: dead branch not evaluated ---
+
+  # inputs.empty_str is "" (falsy) → && short-circuits before evaluating inputs.missing.
+  # The undefined ref on the dead side must NOT cause an error; || then yields 'ok'.
+  - name: expr-short-circuit-dead-branch
+    run: echo "[${{ inputs.empty_str && inputs.missing || 'ok' }}]"
+    expect:
+      stdout:
+        contains:
+        - "[ok]"
+
+  # --- args.* inside an expression (not just bare ${{ args.0 }}) ---
+
+  # Exercises typed evaluation over the args namespace with an operator expression.
+  # args.0 = 'cat' → ${{ args.0 == 'cat' && 'is-cat' || 'not-cat' }} → 'is-cat'.
+  - name: expr-args-eq-expr (${{ args.0 }})
+    for: [cat]
+    run: echo "[${{ args.0 == 'cat' && 'is-cat' || 'not-cat' }}]"
+    expect:
+      stdout:
+        contains:
+        - "[is-cat]"
+
+  # --- Number input into string field (interpolated form) ---
+
+  # Interpolated: "[count=42]" proves Number renders faithfully in string context.
+  # Note: bare `name: ${{ inputs.seconds }}` (pure expression → YAML int → String field)
+  # currently errors because serde_yaml's from_value does not coerce Number→String.
+  # That coercion fix requires an engine change (out of scope for this hardening pass).
+  # The interpolated form (surrounding text) is safe: Number stringifies via to_interpolated_string.
+  - name: expr-count-interp
+    run: echo "[count=${{ inputs.seconds }}]"
+    expect:
+      stdout:
+        contains:
+        - "[count=42]"
