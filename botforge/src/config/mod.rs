@@ -21,10 +21,16 @@ use self::expressions::{
     expand_raw_step, extract_fragment_input_declarations, resolve_fragment_inputs,
     substitute_inputs_in_value,
 };
-pub(crate) use self::expressions::{yaml_scalar_to_string, yaml_scalar_truthiness};
+pub(crate) use self::expressions::{
+    resolve_output_refs_in_string, yaml_scalar_to_string, yaml_scalar_truthiness,
+    DeferredOutputReference,
+};
 use crate::assert::{parse_assert_block, validate_assert_block, AssertBlock};
 use crate::plan::files::FileEntry;
-use crate::step::{deserialize_optional_positive_seconds, resolve_shell, StepTarget, TestStep};
+use crate::step::{
+    coerce_output_value, deserialize_optional_positive_seconds, resolve_shell, FragmentOutputDecl,
+    InvokeStep, OutputType, OutputValue, RunStep, StepTarget, TestStep,
+};
 
 /// Maximum number of active `uses:` includes on the call stack at any one time.
 /// Includes the root document, which is always on the stack; so this limits nesting
@@ -259,6 +265,38 @@ struct RawBuildDocument {
     compress: Option<CompressConfig>,
 }
 
+/// Pieces returned from loading a `type: botforge/fragment` file.
+struct LoadedFragment {
+    steps: Vec<RawTestStep>,
+    cloud_init: Option<serde_yaml::Mapping>,
+    files: Vec<FileEntry>,
+    output_decls: Vec<RawFragmentOutputDecl>,
+}
+
+/// The raw YAML form of a single fragment output declaration.
+///
+/// This is only used during loading; the validated form is [`FragmentOutputDecl`] which
+/// is what gets stored on [`InvokeStep`] after load-time cross-reference checks.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawFragmentOutputDecl {
+    name: String,
+    #[serde(rename = "type")]
+    output_type: OutputType,
+    /// The `id:` of the inner run step whose output is re-exported.
+    #[serde(rename = "from-step")]
+    from_step: String,
+    /// The output name on the referenced inner step.
+    #[serde(rename = "from-output")]
+    from_output: String,
+    /// When `true`, the inner step must emit a non-null value (after default fallback).
+    #[serde(default)]
+    required: bool,
+    /// Optional default value, expressed as a YAML scalar.  Must be coercible to the
+    /// declared `type`.  Mutually exclusive with `required: true`.
+    default: Option<Value>,
+}
+
 #[derive(Debug, Deserialize)]
 struct RawTestStepFragment {
     #[serde(default)]
@@ -269,6 +307,10 @@ struct RawTestStepFragment {
     /// Deep-merged with the parent's cloud_init under the same precedence rules.
     #[serde(default)]
     cloud_init: Option<serde_yaml::Mapping>,
+    /// Optional fragment output declarations.  Re-export inner step outputs at the
+    /// fragment boundary; validated and attached to the `InvokeStep` at load time.
+    #[serde(default)]
+    outputs: Vec<RawFragmentOutputDecl>,
 }
 
 fn deserialize_positive_seconds<'de, D>(deserializer: D) -> std::result::Result<u64, D::Error>
@@ -306,6 +348,8 @@ impl<'de> Deserialize<'de> for RawTestStep {
 #[serde(deny_unknown_fields)]
 struct TestStepInclude {
     uses: String,
+    #[serde(default)]
+    id: Option<String>,
     #[serde(default)]
     with: BTreeMap<String, Value>,
 }
@@ -828,6 +872,13 @@ pub(crate) fn validate_publish_steps(steps: &[TestStep]) -> Result<()> {
                     name
                 );
             }
+            TestStep::Invoke(invoke) => {
+                anyhow::bail!(
+                    "publish step '{}': fragment invocation (`uses:`) steps are not supported \
+                     in the publish prepare phase; only `run` steps are allowed",
+                    invoke.uses
+                );
+            }
         }
     }
     Ok(())
@@ -952,6 +1003,8 @@ fn run_semantic_validators(target: SemanticValidationTarget<'_>) -> Result<()> {
             }
             validate_top_level_files("build", files)
                 .with_context(|| format!("invalid build config: {}", path.display()))?;
+            validate_scope_step_ids(steps, &path.display().to_string())?;
+            validate_deferred_output_references(steps, &path.display().to_string())?;
             validate_build_steps(steps)
         }
         SemanticValidationTarget::Test {
@@ -967,6 +1020,8 @@ fn run_semantic_validators(target: SemanticValidationTarget<'_>) -> Result<()> {
             }
             validate_top_level_files("test", files)
                 .with_context(|| format!("invalid test config: {}", path.display()))?;
+            validate_scope_step_ids(steps, &path.display().to_string())?;
+            validate_deferred_output_references(steps, &path.display().to_string())?;
             validate_test_steps(steps, ports)
         }
     }
@@ -1014,23 +1069,45 @@ fn expand_test_steps(
                 }
                 include_stack.push(include_path.clone());
                 let result = load_test_steps_fragment(&include_path, &include.uses, &include.with)
-                    .and_then(|(steps, ci, files)| {
-                        files_acc.extend(files);
-                        let mut ci_acc = ci;
-                        let expanded_steps = expand_test_steps(
+                    .and_then(|loaded| {
+                        // `files:` and `cloud_init:` contributions from the fragment are
+                        // accumulated globally (unchanged from before Stage 1).
+                        files_acc.extend(loaded.files);
+                        let mut ci_acc = loaded.cloud_init;
+                        let fragment_steps = expand_test_steps(
                             repo_root,
                             &include_path,
-                            steps,
+                            loaded.steps,
                             include_stack,
                             &mut ci_acc,
                             files_acc,
                         )?;
-                        Ok((expanded_steps, ci_acc))
+                        Ok((fragment_steps, ci_acc, loaded.output_decls))
                     });
                 include_stack.pop();
-                let (fragment_steps, fragment_cloud_init) = result?;
-                expanded.extend(fragment_steps);
-                // Merge fragment's cloud_init into accumulator.
+                let (fragment_steps, fragment_cloud_init, raw_output_decls) = result?;
+
+                // Validate per-scope id uniqueness for this fragment's own scope.
+                validate_scope_step_ids(&fragment_steps, &include_path.display().to_string())?;
+
+                // Validate and resolve fragment output declarations against the inner steps.
+                let output_decls =
+                    validate_fragment_outputs(raw_output_decls, &fragment_steps, &include_path)
+                        .with_context(|| {
+                            format!("invalid fragment outputs: {}", include_path.display())
+                        })?;
+
+                // Produce a single Invoke step instead of splicing the fragment
+                // steps flat into the parent list.
+                expanded.push(TestStep::Invoke(InvokeStep {
+                    uses: include.uses.clone(),
+                    id: include.id.clone(),
+                    steps: fragment_steps,
+                    output_decls,
+                    captured_outputs: std::cell::RefCell::new(None),
+                }));
+
+                // Merge fragment's cloud_init into accumulator (globally, as before).
                 if let Some(fci) = fragment_cloud_init {
                     *cloud_init_acc = Some(match cloud_init_acc.take() {
                         None => fci,
@@ -1043,15 +1120,157 @@ fn expand_test_steps(
     Ok(expanded)
 }
 
+/// Validate raw fragment output declarations against the fragment's own expanded inner steps.
+///
+/// Enforces:
+/// - Unique output names within the `outputs:` block.
+/// - Required-or-default rule (mirror of inputs R1): if `required` is not `true`, a `default:`
+///   is mandatory; setting both `required: true` and `default:` together is a hard error.
+/// - The `default:` value is type-coerced against the declared `type`.
+/// - The referenced inner step `id:` (`from-step:`) must exist as a direct run step with that
+///   `id:` in the fragment's expanded step list.
+/// - The referenced output name (`from-output:`) must be declared on that step.
+/// - The fragment output's declared `type` must equal the referenced step output's declared
+///   `type` (step↔fragment type-match).
+///
+/// Returns the validated `Vec<FragmentOutputDecl>` ready to attach to the `InvokeStep`.
+fn validate_fragment_outputs(
+    raw_outputs: Vec<RawFragmentOutputDecl>,
+    inner_steps: &[TestStep],
+    path: &Path,
+) -> Result<Vec<FragmentOutputDecl>> {
+    let mut seen_names: HashSet<String> = HashSet::new();
+    let mut validated: Vec<FragmentOutputDecl> = Vec::with_capacity(raw_outputs.len());
+
+    for raw in raw_outputs {
+        // Unique name check.
+        if !seen_names.insert(raw.name.clone()) {
+            anyhow::bail!(
+                "fragment output '{}': duplicate name in outputs: block ({})",
+                raw.name,
+                path.display()
+            );
+        }
+
+        // Required-or-default rule (mirror of inputs R1).
+        if !raw.required && raw.default.is_none() {
+            anyhow::bail!(
+                "fragment output '{}' must set 'required: true' or provide a 'default:' ({})",
+                raw.name,
+                path.display()
+            );
+        }
+        // Contradiction: required: true + default: together.
+        if raw.required && raw.default.is_some() {
+            anyhow::bail!(
+                "fragment output '{}' cannot set both 'required: true' and 'default' ({})",
+                raw.name,
+                path.display()
+            );
+        }
+
+        // Validate and coerce the default value.
+        let default_value: Option<OutputValue> = if let Some(ref default_yaml) = raw.default {
+            let raw_str = yaml_scalar_to_string(default_yaml).map_err(|e| {
+                anyhow::anyhow!(
+                    "fragment output '{}': invalid default value: {} ({})",
+                    raw.name,
+                    e,
+                    path.display()
+                )
+            })?;
+            let coerced =
+                coerce_output_value(&raw.name, &raw_str, raw.output_type).map_err(|e| {
+                    anyhow::anyhow!(
+                        "fragment output '{}': default value type coercion failed: {} ({})",
+                        raw.name,
+                        e,
+                        path.display()
+                    )
+                })?;
+            Some(coerced)
+        } else {
+            None
+        };
+
+        // Look up the referenced inner step and its declared output type.
+        let step_output_type =
+            find_inner_step_output_type(inner_steps, &raw.from_step, &raw.from_output, path)?;
+
+        // Step↔fragment type-match check.
+        if step_output_type != raw.output_type {
+            anyhow::bail!(
+                "fragment output '{}': type mismatch: fragment declares '{}' but inner step \
+                 '{}' output '{}' declares '{}' ({})",
+                raw.name,
+                raw.output_type,
+                raw.from_step,
+                raw.from_output,
+                step_output_type,
+                path.display()
+            );
+        }
+
+        validated.push(FragmentOutputDecl {
+            name: raw.name,
+            output_type: raw.output_type,
+            from_step: raw.from_step,
+            from_output: raw.from_output,
+            required: raw.required,
+            default: default_value,
+        });
+    }
+
+    Ok(validated)
+}
+
+/// Find the declared [`OutputType`] of a named output on a direct inner run step.
+///
+/// Searches the **direct** children of `steps` (not recursively into nested `Invoke` steps)
+/// for a `Run` step whose `id:` equals `step_id`, then looks for an `OutputDecl` named
+/// `output_name` on that step.
+///
+/// Returns a hard error if the step id is not found, if the step does not declare the
+/// named output, or if more than one step carries the same id (should not happen after
+/// `validate_scope_step_ids`, but checked defensively).
+fn find_inner_step_output_type(
+    steps: &[TestStep],
+    step_id: &str,
+    output_name: &str,
+    path: &Path,
+) -> Result<OutputType> {
+    for step in steps {
+        if let TestStep::Run(run) = step {
+            if run.id.as_deref() == Some(step_id) {
+                // Found the step — look for the declared output.
+                return if let Some(decl) = run.outputs.iter().find(|o| o.name == output_name) {
+                    Ok(decl.output_type)
+                } else {
+                    anyhow::bail!(
+                        "fragment output references step '{}' output '{}', but step '{}' \
+                         does not declare that output ({})",
+                        step_id,
+                        output_name,
+                        step_id,
+                        path.display()
+                    )
+                };
+            }
+        }
+    }
+    anyhow::bail!(
+        "fragment output references step id '{}', but no run step with that id exists \
+         in the fragment scope ({})",
+        step_id,
+        path.display()
+    )
+}
+
 fn load_test_steps_fragment(
     path: &Path,
     uses: &str,
     with: &BTreeMap<String, Value>,
-) -> Result<(
-    Vec<RawTestStep>,
-    Option<serde_yaml::Mapping>,
-    Vec<FileEntry>,
-)> {
+) -> Result<LoadedFragment> {
     let yaml = std::fs::read_to_string(path)
         .with_context(|| format!("cannot read test step include: {}", path.display()))?;
     let mut value: Value = serde_yaml::from_str(&yaml)
@@ -1077,7 +1296,12 @@ fn load_test_steps_fragment(
     if let Some(ref ci) = fragment.cloud_init {
         validate_cloud_init_fragment(ci, path)?;
     }
-    Ok((fragment.steps, fragment.cloud_init, fragment.files))
+    Ok(LoadedFragment {
+        steps: fragment.steps,
+        cloud_init: fragment.cloud_init,
+        files: fragment.files,
+        output_decls: fragment.outputs,
+    })
 }
 
 /// Verify that a `uses:` target is a `type: botforge/fragment` document.
@@ -1372,6 +1596,210 @@ pub(crate) fn validate_test_ports(ports: &[PortSpec], ssh_port: u16) -> Result<(
     Ok(())
 }
 
+/// Recursively check whether a step list contains any `on: host` run steps.
+/// Used by `validate_test_steps` to detect host steps nested inside `Invoke` scopes.
+fn steps_have_host_step(steps: &[TestStep]) -> bool {
+    steps.iter().any(|step| match step {
+        TestStep::Run(run) => run.target == StepTarget::Host,
+        TestStep::Invoke(invoke) => steps_have_host_step(&invoke.steps),
+        TestStep::Archive(_) => false,
+    })
+}
+
+/// Validate that `id:` values are unique within a single scope.
+///
+/// A "scope" is either the root document or one fragment file body.
+/// A fragment's ids only need to be unique within that one fragment; the same
+/// id may appear in a different scope without conflict.
+///
+/// Both `TestStep::Run` steps and `TestStep::Invoke` steps can carry an `id`.
+/// `Invoke` steps are **not** recursed into here — they are validated when their
+/// own fragment scope is processed.
+///
+/// `scope_description` is a human-readable label (file path or `"root"`) used in
+/// the error message.
+fn validate_scope_step_ids(steps: &[TestStep], scope_description: &str) -> Result<()> {
+    let mut seen: HashSet<&str> = HashSet::new();
+    for step in steps {
+        let id_opt = match step {
+            TestStep::Run(run) => run.id.as_deref(),
+            TestStep::Invoke(invoke) => invoke.id.as_deref(),
+            TestStep::Archive(_) => None,
+        };
+        if let Some(id) = id_opt {
+            if !seen.insert(id) {
+                anyhow::bail!(
+                    "duplicate step id '{}' in scope '{}': \
+                     step ids must be unique within the same scope",
+                    id,
+                    scope_description
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+struct ScopeOutputContract {
+    step_kind: &'static str,
+    output_names: HashSet<String>,
+}
+
+/// Validate deferred runtime output references (`steps.*.outputs.*` / `outputs.*`)
+/// that are statically determinable at load time.
+///
+/// Runtime ordering constraints remain runtime errors: this pass validates only
+/// scope membership and declared-output existence.
+fn validate_deferred_output_references(steps: &[TestStep], scope_description: &str) -> Result<()> {
+    validate_deferred_output_references_in_scope(steps, scope_description, None)
+}
+
+fn validate_deferred_output_references_in_scope(
+    steps: &[TestStep],
+    scope_description: &str,
+    fragment_outputs: Option<&[FragmentOutputDecl]>,
+) -> Result<()> {
+    let mut scope_contracts: HashMap<String, ScopeOutputContract> = HashMap::new();
+    for step in steps {
+        match step {
+            TestStep::Run(run) => {
+                if let Some(id) = run.id.as_deref() {
+                    scope_contracts.insert(
+                        id.to_string(),
+                        ScopeOutputContract {
+                            step_kind: "run step",
+                            output_names: run.outputs.iter().map(|o| o.name.clone()).collect(),
+                        },
+                    );
+                }
+            }
+            TestStep::Invoke(invoke) => {
+                if let Some(id) = invoke.id.as_deref() {
+                    scope_contracts.insert(
+                        id.to_string(),
+                        ScopeOutputContract {
+                            step_kind: "fragment invocation",
+                            output_names: invoke
+                                .output_decls
+                                .iter()
+                                .map(|o| o.name.clone())
+                                .collect(),
+                        },
+                    );
+                }
+            }
+            TestStep::Archive(_) => {}
+        }
+    }
+
+    for step in steps {
+        match step {
+            TestStep::Run(run) => {
+                validate_run_step_deferred_output_references(
+                    run,
+                    &scope_contracts,
+                    scope_description,
+                    fragment_outputs,
+                )?;
+            }
+            TestStep::Invoke(invoke) => {
+                let child_scope = format!("{scope_description} -> {}", invoke.uses);
+                validate_deferred_output_references_in_scope(
+                    &invoke.steps,
+                    &child_scope,
+                    Some(&invoke.output_decls),
+                )?;
+            }
+            TestStep::Archive(_) => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_run_step_deferred_output_references(
+    step: &RunStep,
+    scope_contracts: &HashMap<String, ScopeOutputContract>,
+    scope_description: &str,
+    fragment_outputs: Option<&[FragmentOutputDecl]>,
+) -> Result<()> {
+    resolve_output_refs_in_string(&step.run, &mut |reference| {
+        match reference {
+            DeferredOutputReference::StepOutput {
+                step_id,
+                output_name,
+            } => {
+                let Some(contract) = scope_contracts.get(step_id.as_str()) else {
+                    anyhow::bail!(
+                        "step '{}': reference '${{{{ steps.{}.outputs.{} }}}}' is invalid: \
+                         no step with id '{}' exists in scope '{}' (inner fragment steps are private; \
+                         reference the fragment invocation id instead)",
+                        step.name,
+                        step_id,
+                        output_name,
+                        step_id,
+                        scope_description
+                    );
+                };
+                if !contract.output_names.contains(output_name.as_str()) {
+                    anyhow::bail!(
+                        "step '{}': reference '${{{{ steps.{}.outputs.{} }}}}' is invalid: \
+                         {} '{}' does not declare output '{}'",
+                        step.name,
+                        step_id,
+                        output_name,
+                        contract.step_kind,
+                        step_id,
+                        output_name
+                    );
+                }
+            }
+            DeferredOutputReference::FragmentOutput { output_name } => {
+                let Some(decls) = fragment_outputs else {
+                    anyhow::bail!(
+                        "step '{}': reference '${{{{ outputs.{} }}}}' is invalid: \
+                         outputs.* is only available inside fragment scopes",
+                        step.name,
+                        output_name
+                    );
+                };
+                if !decls.iter().any(|decl| decl.name == output_name) {
+                    anyhow::bail!(
+                        "step '{}': reference '${{{{ outputs.{} }}}}' is invalid: \
+                         fragment scope '{}' does not declare output '{}'",
+                        step.name,
+                        output_name,
+                        scope_description,
+                        output_name
+                    );
+                }
+            }
+        }
+        Ok(String::new())
+    })?;
+    Ok(())
+}
+
+/// Validate the `outputs:` declarations on a single run step.
+///
+/// Checks that:
+/// - Output names are unique within the step (duplicate = config error).
+///
+/// The `type:` field is validated implicitly by serde's enum deserialization
+/// (unknown type → error at parse time); there is nothing extra to check here.
+fn validate_run_step_outputs(step: &crate::step::RunStep) -> Result<()> {
+    let mut seen = HashSet::new();
+    for decl in &step.outputs {
+        if !seen.insert(decl.name.as_str()) {
+            anyhow::bail!(
+                "step '{}': duplicate output name '{}'; output names must be unique within a step",
+                step.name,
+                decl.name
+            );
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_test_steps(steps: &[TestStep], ports: &[PortSpec]) -> Result<()> {
     for step in steps {
         match step {
@@ -1385,6 +1813,9 @@ pub(crate) fn validate_test_steps(steps: &[TestStep], ports: &[PortSpec]) -> Res
                 resolve_shell(step.shell.as_deref()).with_context(|| {
                     format!("test step '{}': invalid `shell:` value", step.name)
                 })?;
+                validate_run_step_outputs(step).with_context(|| {
+                    format!("test step '{}': invalid outputs declaration", step.name)
+                })?;
             }
             TestStep::Archive(step) => {
                 anyhow::bail!(
@@ -1395,11 +1826,17 @@ pub(crate) fn validate_test_steps(steps: &[TestStep], ports: &[PortSpec]) -> Res
                         .unwrap_or(step.archive.src.as_str())
                 );
             }
+            TestStep::Invoke(invoke) => {
+                // Recursively validate the inner scope's steps.
+                validate_test_steps(&invoke.steps, ports)?;
+            }
         }
     }
-    let has_host_step = steps
-        .iter()
-        .any(|step| matches!(step, TestStep::Run(run) if run.target == StepTarget::Host));
+    let has_host_step = steps.iter().any(|step| match step {
+        TestStep::Run(run) => run.target == StepTarget::Host,
+        TestStep::Invoke(invoke) => steps_have_host_step(&invoke.steps),
+        TestStep::Archive(_) => false,
+    });
     if has_host_step && ports.is_empty() {
         anyhow::bail!(
             "test config has `on: host` steps but no `ports:` are declared; \
@@ -1422,8 +1859,14 @@ pub(crate) fn validate_build_steps(steps: &[TestStep]) -> Result<()> {
                 resolve_shell(step.shell.as_deref()).with_context(|| {
                     format!("build step '{}': invalid `shell:` value", step.name)
                 })?;
+                validate_run_step_outputs(step).with_context(|| {
+                    format!("build step '{}': invalid outputs declaration", step.name)
+                })?;
             }
             TestStep::Archive(step) => validate_archive_build_step(step)?,
+            TestStep::Invoke(invoke) => {
+                validate_build_steps(&invoke.steps)?;
+            }
         }
     }
     Ok(())

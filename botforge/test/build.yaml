@@ -14,6 +14,15 @@ cloud_init:
 steps:
 - uses: "@://hello.steps.yaml"
 - uses: "@://for-fragment-build.steps.yaml"
+- name: build caller sets env before fragment invoke
+  run: |
+    echo "BUILD_CALLER_VAR=build-caller-ok" >> "$BF_ENV"
+- uses: "@://env-scope-build-fragment.steps.yaml"
+- name: build caller cannot see fragment env after invoke
+  run: |
+    test "$BUILD_CALLER_VAR" = build-caller-ok
+    test -z "${BUILD_FRAGMENT_VAR:-}"
+    test "${BUILD_FRAGMENT_VAR:-}" != build-frag-ok
 - name: Base install
   run: |
     whoami | grep root

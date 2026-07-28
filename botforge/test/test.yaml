@@ -8,6 +8,61 @@ steps:
 - uses: "@://for-fragment-test.steps.yaml"
 - uses: "@://files-fragment.steps.yaml"
 - uses: "@://env-threading.steps.yaml"
+- name: caller sets env before fragment invoke
+  run: |
+    echo "CALLER_VAR=caller-ok" >> "$BF_ENV"
+- uses: "@://env-scope-fragment.steps.yaml"
+- name: caller cannot see fragment env after invoke
+  run: |
+    test "$CALLER_VAR" = caller-ok
+    test -z "${FRAGMENT_VAR:-}"
+    test "${FRAGMENT_VAR:-}" != frag-ok
+- uses: "@://env-sibling-a.steps.yaml"
+- uses: "@://env-sibling-b.steps.yaml"
+- uses: "@://nested-outer.steps.yaml"
+- uses: "@://outputs.steps.yaml"
+# --- Stage 4: general runtime output refs --------------------------------------
+# A plain run step emits typed output and a later sibling consumes it through
+# `${{ steps.<run-id>.outputs.<name> }}` in the same scope.
+- on: host
+  name: emit run-step output
+  id: host-emit
+  run: |
+    echo "count=11" >> "$BF_OUT"
+  outputs:
+  - name: count
+    type: number
+    required: true
+- on: host
+  name: consume run-step output
+  run: |
+    test "${{ steps.host-emit.outputs.count }}" = "11"
+    echo "run-step-output-consumed"
+  expect:
+    stdout:
+      contains:
+      - run-step-output-consumed
+
+# Stage 3 boundary path still works unchanged.
+# The fragment emits typed values via $BF_OUT, re-exports them through its
+# `outputs:` block, and the caller consumes them here via
+# `${{ steps.fragout.outputs.<name> }}` — proving the coerced values flow out of
+# the fragment boundary (including the `default:` fallback for a Null inner value).
+- uses: "@://fragment-outputs.steps.yaml"
+  id: fragout
+- on: host
+  name: consume fragment outputs
+  run: |
+    test "${{ steps.fragout.outputs.version }}" = "1.2.3"
+    test "${{ steps.fragout.outputs.count }}" = "7"
+    test "${{ steps.fragout.outputs.ready }}" = "true"
+    test "${{ steps.fragout.outputs.fallback }}" = "fallback-default"
+    echo "fragment-outputs-consumed"
+  expect:
+    stdout:
+      contains:
+      - fragment-outputs-consumed
+- uses: "@://fragment-self-outputs.steps.yaml"
 - uses: "@://expressions.steps.yaml"
   with:
     str_a: hello
