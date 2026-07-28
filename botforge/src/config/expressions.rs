@@ -50,7 +50,11 @@ pub(super) fn expand_raw_step(step: Value) -> Result<Vec<TestStep>> {
 
     let for_key = Value::String("for".to_string());
     let Some(items_value) = mapping.remove(&for_key) else {
-        let parsed: TestStep = serde_yaml::from_value(Value::Mapping(mapping))
+        let mut concrete = Value::Mapping(mapping);
+        // Even without `for:`, run the expression pass so `${{ ... }}` literals
+        // (including boolean gating expressions) are evaluated consistently.
+        substitute_args_in_value(&mut concrete, &BTreeMap::new())?;
+        let parsed: TestStep = serde_yaml::from_value(concrete)
             .with_context(|| format!("step '{step_name_template}': invalid step definition"))?;
         return Ok(vec![parsed]);
     };
@@ -264,38 +268,454 @@ fn substitute_namespace_in_string(
             .find("}}")
             .ok_or_else(|| anyhow::anyhow!("unterminated input expression in '{text}'"))?;
         let expr = after_open[..end].trim();
-        let prefix = format!("{namespace}.");
         let placeholder = &rest[start..start + 3 + end + 2];
-        let Some(name) = expr.strip_prefix(&prefix) else {
-            if is_deferred_namespace_expression(namespace, expr) {
-                rendered.push_str(placeholder);
-                rest = &after_open[end + 2..];
-                continue;
-            }
-            return Err(anyhow::anyhow!(
-                "unsupported expression '${{{{{expr}}}}}'; only ${{{{ {namespace}.NAME }}}} is supported"
-            ));
-        };
-        if !is_valid_namespace_name(name) {
-            anyhow::bail!("invalid input name '{name}' in '{text}'");
+        match evaluate_expression_span(expr, namespace, values)
+            .with_context(|| format!("while evaluating expression '${{{{{expr}}}}}' in '{text}'"))?
+        {
+            EvaluatedSpan::Value(value) => rendered.push_str(&value.to_interpolated_string()),
+            EvaluatedSpan::Deferred => rendered.push_str(placeholder),
         }
-        let value = values
-            .get(name)
-            .ok_or_else(|| anyhow::anyhow!("missing required input '{name}'"))?;
-        rendered.push_str(value);
         rest = &after_open[end + 2..];
     }
     rendered.push_str(rest);
     Ok(rendered)
 }
 
-fn is_deferred_namespace_expression(active_namespace: &str, expr: &str) -> bool {
-    let Some((namespace, name)) = expr.split_once('.') else {
-        return false;
+#[derive(Clone, Debug, PartialEq)]
+enum EvaluatedValue {
+    String(String),
+    Number(f64),
+    Bool(bool),
+    Empty,
+}
+
+impl EvaluatedValue {
+    fn truthy(&self) -> bool {
+        match self {
+            Self::Empty => false,
+            Self::Bool(flag) => *flag,
+            Self::Number(number) => *number != 0.0,
+            Self::String(text) => !text.is_empty(),
+        }
+    }
+
+    fn to_interpolated_string(&self) -> String {
+        if !self.truthy() {
+            return String::new();
+        }
+        match self {
+            Self::String(text) => text.clone(),
+            Self::Number(number) => number.to_string(),
+            Self::Bool(true) => "true".to_string(),
+            Self::Bool(false) | Self::Empty => String::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum EvaluatedSpan {
+    Value(EvaluatedValue),
+    Deferred,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum ExprNode {
+    String(String),
+    Number(f64),
+    Bool(bool),
+    Reference { namespace: String, name: String },
+    Not(Box<ExprNode>),
+    Equal(Box<ExprNode>, Box<ExprNode>),
+    NotEqual(Box<ExprNode>, Box<ExprNode>),
+    And(Box<ExprNode>, Box<ExprNode>),
+    Or(Box<ExprNode>, Box<ExprNode>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum Token {
+    OrOr,
+    AndAnd,
+    EqEq,
+    NotEq,
+    Bang,
+    LParen,
+    RParen,
+    Dot,
+    Identifier(String),
+    StringLiteral(String),
+    NumberLiteral(String),
+    End,
+}
+
+struct Lexer {
+    chars: Vec<char>,
+    pos: usize,
+}
+
+impl Lexer {
+    fn new(input: &str) -> Self {
+        Self {
+            chars: input.chars().collect(),
+            pos: 0,
+        }
+    }
+
+    fn next_token(&mut self) -> Result<Token> {
+        self.skip_whitespace();
+        if self.pos >= self.chars.len() {
+            return Ok(Token::End);
+        }
+
+        let ch = self.chars[self.pos];
+        match ch {
+            '|' => {
+                if self.peek_char(1) == Some('|') {
+                    self.pos += 2;
+                    Ok(Token::OrOr)
+                } else {
+                    anyhow::bail!("unexpected '|' at position {}", self.pos);
+                }
+            }
+            '&' => {
+                if self.peek_char(1) == Some('&') {
+                    self.pos += 2;
+                    Ok(Token::AndAnd)
+                } else {
+                    anyhow::bail!("unexpected '&' at position {}", self.pos);
+                }
+            }
+            '=' => {
+                if self.peek_char(1) == Some('=') {
+                    self.pos += 2;
+                    Ok(Token::EqEq)
+                } else {
+                    anyhow::bail!("unexpected '=' at position {}; use '=='", self.pos);
+                }
+            }
+            '!' => {
+                if self.peek_char(1) == Some('=') {
+                    self.pos += 2;
+                    Ok(Token::NotEq)
+                } else {
+                    self.pos += 1;
+                    Ok(Token::Bang)
+                }
+            }
+            '(' => {
+                self.pos += 1;
+                Ok(Token::LParen)
+            }
+            ')' => {
+                self.pos += 1;
+                Ok(Token::RParen)
+            }
+            '.' => {
+                self.pos += 1;
+                Ok(Token::Dot)
+            }
+            '\'' => self.read_single_quoted_string(),
+            '0'..='9' => self.read_number(),
+            _ if is_identifier_char(ch) => self.read_identifier(),
+            _ => anyhow::bail!("unexpected character '{}' at position {}", ch, self.pos),
+        }
+    }
+
+    fn read_single_quoted_string(&mut self) -> Result<Token> {
+        self.pos += 1; // opening '
+        let mut output = String::new();
+        while self.pos < self.chars.len() {
+            let ch = self.chars[self.pos];
+            self.pos += 1;
+            match ch {
+                '\'' => return Ok(Token::StringLiteral(output)),
+                '\\' => {
+                    let Some(next) = self.chars.get(self.pos).copied() else {
+                        anyhow::bail!("unterminated escape in string literal");
+                    };
+                    self.pos += 1;
+                    output.push(match next {
+                        '\'' => '\'',
+                        '\\' => '\\',
+                        'n' => '\n',
+                        'r' => '\r',
+                        't' => '\t',
+                        other => other,
+                    });
+                }
+                other => output.push(other),
+            }
+        }
+        anyhow::bail!("unterminated string literal")
+    }
+
+    fn read_number(&mut self) -> Result<Token> {
+        let start = self.pos;
+        let mut seen_dot = false;
+        while self.pos < self.chars.len() {
+            match self.chars[self.pos] {
+                '0'..='9' => self.pos += 1,
+                '.' if !seen_dot => {
+                    seen_dot = true;
+                    self.pos += 1;
+                }
+                _ => break,
+            }
+        }
+        let literal: String = self.chars[start..self.pos].iter().collect();
+        Ok(Token::NumberLiteral(literal))
+    }
+
+    fn read_identifier(&mut self) -> Result<Token> {
+        let start = self.pos;
+        while self.pos < self.chars.len() && is_identifier_char(self.chars[self.pos]) {
+            self.pos += 1;
+        }
+        let identifier: String = self.chars[start..self.pos].iter().collect();
+        if identifier.is_empty() {
+            anyhow::bail!("expected identifier at position {}", start);
+        }
+        Ok(Token::Identifier(identifier))
+    }
+
+    fn skip_whitespace(&mut self) {
+        while self.pos < self.chars.len() && self.chars[self.pos].is_whitespace() {
+            self.pos += 1;
+        }
+    }
+
+    fn peek_char(&self, offset: usize) -> Option<char> {
+        self.chars.get(self.pos + offset).copied()
+    }
+}
+
+struct Parser {
+    lexer: Lexer,
+    current: Token,
+}
+
+impl Parser {
+    fn parse(input: &str) -> Result<ExprNode> {
+        let mut parser = Self {
+            lexer: Lexer::new(input),
+            current: Token::End,
+        };
+        parser.current = parser.lexer.next_token()?;
+        let expr = parser.parse_or_expression()?;
+        if parser.current != Token::End {
+            anyhow::bail!(
+                "unexpected trailing token in expression: {:?}",
+                parser.current
+            );
+        }
+        Ok(expr)
+    }
+
+    fn parse_or_expression(&mut self) -> Result<ExprNode> {
+        let mut node = self.parse_and_expression()?;
+        while self.current == Token::OrOr {
+            self.advance()?;
+            let rhs = self.parse_and_expression()?;
+            node = ExprNode::Or(Box::new(node), Box::new(rhs));
+        }
+        Ok(node)
+    }
+
+    fn parse_and_expression(&mut self) -> Result<ExprNode> {
+        let mut node = self.parse_equality_expression()?;
+        while self.current == Token::AndAnd {
+            self.advance()?;
+            let rhs = self.parse_equality_expression()?;
+            node = ExprNode::And(Box::new(node), Box::new(rhs));
+        }
+        Ok(node)
+    }
+
+    fn parse_equality_expression(&mut self) -> Result<ExprNode> {
+        let mut node = self.parse_unary_expression()?;
+        loop {
+            let op = match self.current {
+                Token::EqEq => Some(true),
+                Token::NotEq => Some(false),
+                _ => None,
+            };
+            let Some(is_eq) = op else { break };
+            self.advance()?;
+            let rhs = self.parse_unary_expression()?;
+            node = if is_eq {
+                ExprNode::Equal(Box::new(node), Box::new(rhs))
+            } else {
+                ExprNode::NotEqual(Box::new(node), Box::new(rhs))
+            };
+        }
+        Ok(node)
+    }
+
+    fn parse_unary_expression(&mut self) -> Result<ExprNode> {
+        if self.current == Token::Bang {
+            self.advance()?;
+            return Ok(ExprNode::Not(Box::new(self.parse_unary_expression()?)));
+        }
+        self.parse_primary()
+    }
+
+    fn parse_primary(&mut self) -> Result<ExprNode> {
+        match self.current.clone() {
+            Token::StringLiteral(text) => {
+                self.advance()?;
+                Ok(ExprNode::String(text))
+            }
+            Token::NumberLiteral(number) => {
+                let parsed = number
+                    .parse::<f64>()
+                    .with_context(|| format!("invalid number literal '{number}'"))?;
+                self.advance()?;
+                Ok(ExprNode::Number(parsed))
+            }
+            Token::Identifier(identifier) => {
+                self.advance()?;
+                match identifier.as_str() {
+                    "true" => Ok(ExprNode::Bool(true)),
+                    "false" => Ok(ExprNode::Bool(false)),
+                    _ => {
+                        self.expect_token(Token::Dot)?;
+                        let name = match self.current.clone() {
+                            Token::Identifier(name) => name,
+                            Token::NumberLiteral(number) => number,
+                            _ => anyhow::bail!("expected reference name after '{}.'", identifier),
+                        };
+                        if !is_valid_namespace_name(&name) {
+                            anyhow::bail!("invalid input name '{name}'");
+                        }
+                        self.advance()?;
+                        Ok(ExprNode::Reference {
+                            namespace: identifier,
+                            name,
+                        })
+                    }
+                }
+            }
+            Token::LParen => {
+                self.advance()?;
+                let expr = self.parse_or_expression()?;
+                self.expect_token(Token::RParen)?;
+                Ok(expr)
+            }
+            other => anyhow::bail!("unexpected token in expression: {:?}", other),
+        }
+    }
+
+    fn expect_token(&mut self, expected: Token) -> Result<()> {
+        if self.current != expected {
+            anyhow::bail!("expected token {:?} but found {:?}", expected, self.current);
+        }
+        self.advance()
+    }
+
+    fn advance(&mut self) -> Result<()> {
+        self.current = self.lexer.next_token()?;
+        Ok(())
+    }
+}
+
+fn is_identifier_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'
+}
+
+fn evaluate_expression_span(
+    expr: &str,
+    active_namespace: &str,
+    values: &BTreeMap<String, String>,
+) -> Result<EvaluatedSpan> {
+    // Deliberately first increment: only literals, `inputs.NAME`/`args.NAME`,
+    // parentheses, and boolean/equality operators are supported. This Value/AST
+    // model is intentionally structured so future work can add functions
+    // (`to_json`/`from_json`), `steps.*.outputs`, indexing, and richer resolvers.
+    let parsed = Parser::parse(expr)?;
+    evaluate_node(&parsed, active_namespace, values)
+}
+
+fn evaluate_node(
+    node: &ExprNode,
+    active_namespace: &str,
+    values: &BTreeMap<String, String>,
+) -> Result<EvaluatedSpan> {
+    match node {
+        ExprNode::String(text) => Ok(EvaluatedSpan::Value(EvaluatedValue::String(text.clone()))),
+        ExprNode::Number(number) => Ok(EvaluatedSpan::Value(EvaluatedValue::Number(*number))),
+        ExprNode::Bool(flag) => Ok(EvaluatedSpan::Value(EvaluatedValue::Bool(*flag))),
+        ExprNode::Reference { namespace, name } => {
+            if namespace == active_namespace {
+                return Ok(EvaluatedSpan::Value(
+                    values
+                        .get(name)
+                        .map(|value| EvaluatedValue::String(value.clone()))
+                        .unwrap_or(EvaluatedValue::Empty),
+                ));
+            }
+            if is_deferred_namespace(active_namespace, namespace) {
+                return Ok(EvaluatedSpan::Deferred);
+            }
+            anyhow::bail!(
+                "unknown namespace '{}' in reference '{}.{}'",
+                namespace,
+                namespace,
+                name
+            );
+        }
+        ExprNode::Not(expr) => match evaluate_node(expr, active_namespace, values)? {
+            EvaluatedSpan::Deferred => Ok(EvaluatedSpan::Deferred),
+            EvaluatedSpan::Value(value) => {
+                Ok(EvaluatedSpan::Value(EvaluatedValue::Bool(!value.truthy())))
+            }
+        },
+        ExprNode::Equal(lhs, rhs) => evaluate_equality(lhs, rhs, active_namespace, values, true),
+        ExprNode::NotEqual(lhs, rhs) => {
+            evaluate_equality(lhs, rhs, active_namespace, values, false)
+        }
+        ExprNode::And(lhs, rhs) => {
+            let lhs_value = match evaluate_node(lhs, active_namespace, values)? {
+                EvaluatedSpan::Deferred => return Ok(EvaluatedSpan::Deferred),
+                EvaluatedSpan::Value(value) => value,
+            };
+            if !lhs_value.truthy() {
+                return Ok(EvaluatedSpan::Value(lhs_value));
+            }
+            evaluate_node(rhs, active_namespace, values)
+        }
+        ExprNode::Or(lhs, rhs) => {
+            let lhs_value = match evaluate_node(lhs, active_namespace, values)? {
+                EvaluatedSpan::Deferred => return Ok(EvaluatedSpan::Deferred),
+                EvaluatedSpan::Value(value) => value,
+            };
+            if lhs_value.truthy() {
+                return Ok(EvaluatedSpan::Value(lhs_value));
+            }
+            evaluate_node(rhs, active_namespace, values)
+        }
+    }
+}
+
+fn evaluate_equality(
+    lhs: &ExprNode,
+    rhs: &ExprNode,
+    active_namespace: &str,
+    values: &BTreeMap<String, String>,
+    equals: bool,
+) -> Result<EvaluatedSpan> {
+    let lhs = match evaluate_node(lhs, active_namespace, values)? {
+        EvaluatedSpan::Deferred => return Ok(EvaluatedSpan::Deferred),
+        EvaluatedSpan::Value(value) => value,
     };
-    namespace != active_namespace
-        && is_deferred_namespace(active_namespace, namespace)
-        && is_valid_namespace_name(name)
+    let rhs = match evaluate_node(rhs, active_namespace, values)? {
+        EvaluatedSpan::Deferred => return Ok(EvaluatedSpan::Deferred),
+        EvaluatedSpan::Value(value) => value,
+    };
+    let same = lhs.to_interpolated_string() == rhs.to_interpolated_string();
+    Ok(EvaluatedSpan::Value(EvaluatedValue::Bool(if equals {
+        same
+    } else {
+        !same
+    })))
 }
 
 fn is_deferred_namespace(active_namespace: &str, namespace: &str) -> bool {
@@ -683,6 +1103,305 @@ steps:
                 format!("{err:#}").contains("undeclared"),
                 "error must mention the undeclared key: {err:#}"
             );
+        }
+    }
+
+    mod expressions {
+        use super::*;
+
+        fn map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        }
+
+        fn substitute_inputs(text: &str, pairs: &[(&str, &str)]) -> String {
+            substitute_namespace_in_string(text, "inputs", &map(pairs)).unwrap()
+        }
+
+        fn substitute_inputs_err(text: &str, pairs: &[(&str, &str)]) -> String {
+            let err = substitute_namespace_in_string(text, "inputs", &map(pairs)).unwrap_err();
+            format!("{err:#}")
+        }
+
+        fn substitute_args(text: &str, pairs: &[(&str, &str)]) -> String {
+            substitute_namespace_in_string(text, "args", &map(pairs)).unwrap()
+        }
+
+        #[test]
+        fn test_back_compat_reference_and_splicing() {
+            assert_eq!(
+                substitute_inputs("${{ inputs.x }}", &[("x", "hello")]),
+                "hello"
+            );
+            assert_eq!(substitute_inputs("${{ inputs.missing }}", &[]), "");
+            assert_eq!(
+                substitute_inputs("prefix ${{ inputs.x }} suffix", &[("x", "hello")]),
+                "prefix hello suffix"
+            );
+            assert_eq!(
+                substitute_inputs(
+                    "a=${{ inputs.a }},b=${{ inputs.b }}",
+                    &[("a", "x"), ("b", "y")]
+                ),
+                "a=x,b=y"
+            );
+        }
+
+        #[test]
+        fn test_equality_and_inequality_expressions() {
+            assert_eq!(
+                substitute_inputs("${{ inputs.pov == 'admin' }}", &[("pov", "admin")]),
+                "true"
+            );
+            assert_eq!(
+                substitute_inputs("${{ inputs.pov == 'admin' }}", &[("pov", "user")]),
+                ""
+            );
+            assert_eq!(
+                substitute_inputs("${{ inputs.pov != 'admin' }}", &[("pov", "user")]),
+                "true"
+            );
+            assert_eq!(
+                substitute_inputs("${{ inputs.n == '1' }}", &[("n", "1")]),
+                "true"
+            );
+            assert_eq!(
+                substitute_inputs(
+                    "${{ inputs.a == inputs.b }}",
+                    &[("a", "same"), ("b", "same")]
+                ),
+                "true"
+            );
+        }
+
+        #[test]
+        fn test_logical_operators_return_values_and_not() {
+            assert_eq!(
+                substitute_inputs("${{ inputs.a && 'x' }}", &[("a", "yes")]),
+                "x"
+            );
+            assert_eq!(
+                substitute_inputs("${{ inputs.a && 'x' }}", &[("a", "")]),
+                ""
+            );
+            assert_eq!(
+                substitute_inputs("${{ inputs.a || 'fallback' }}", &[("a", "yes")]),
+                "yes"
+            );
+            assert_eq!(
+                substitute_inputs("${{ inputs.a || 'fallback' }}", &[("a", "")]),
+                "fallback"
+            );
+            assert_eq!(substitute_inputs("${{ !inputs.a }}", &[("a", "x")]), "");
+            assert_eq!(substitute_inputs("${{ !inputs.a }}", &[("a", "")]), "true");
+        }
+
+        #[test]
+        fn test_ternary_substitute_and_precedence_and_parens() {
+            assert_eq!(
+                substitute_inputs("${{ inputs.cond && 'x' || 'y' }}", &[("cond", "yes")]),
+                "x"
+            );
+            assert_eq!(
+                substitute_inputs("${{ inputs.cond && 'x' || 'y' }}", &[("cond", "")]),
+                "y"
+            );
+            assert_eq!(
+                substitute_inputs(
+                    "${{ inputs.a || inputs.b && inputs.c }}",
+                    &[("a", ""), ("b", "b"), ("c", "c")]
+                ),
+                "c"
+            );
+            assert_eq!(
+                substitute_inputs(
+                    "${{ (inputs.foo == inputs.bar && inputs.bar == inputs.baz) && 'x' || 'y' }}",
+                    &[("foo", "v"), ("bar", "v"), ("baz", "v")]
+                ),
+                "x"
+            );
+            assert_eq!(
+                substitute_inputs(
+                    "${{ !(inputs.a == 'x') && inputs.b }}",
+                    &[("a", "y"), ("b", "z")]
+                ),
+                "z"
+            );
+        }
+
+        #[test]
+        fn test_truthiness_and_stringification() {
+            assert_eq!(substitute_inputs("${{ '' }}", &[]), "");
+            assert_eq!(substitute_inputs("${{ false }}", &[]), "");
+            assert_eq!(substitute_inputs("${{ 0 }}", &[]), "");
+            assert_eq!(substitute_inputs("${{ inputs.missing }}", &[]), "");
+            assert_eq!(substitute_inputs("${{ true }}", &[]), "true");
+            assert_eq!(substitute_inputs("${{ 1.5 }}", &[]), "1.5");
+            assert_eq!(substitute_inputs("${{ 'false' }}", &[]), "false");
+        }
+
+        #[test]
+        fn test_short_circuit_with_unresolved_other_namespace() {
+            // args reference is on the dead branch during inputs pass; no deferral needed.
+            assert_eq!(
+                substitute_inputs("${{ inputs.a || args.x }}", &[("a", "present")]),
+                "present"
+            );
+            // args is needed here, so the expression is deferred to the args pass.
+            assert_eq!(
+                substitute_inputs("${{ inputs.a || args.x }}", &[("a", "")]),
+                "${{ inputs.a || args.x }}"
+            );
+            // When args are substituted first, dead branch inputs reference is not evaluated.
+            assert_eq!(
+                substitute_args("${{ args.a && inputs.x }}", &[("a", "")]),
+                ""
+            );
+        }
+
+        #[test]
+        fn test_syntax_and_namespace_errors_are_hard_errors() {
+            let err = substitute_inputs_err("${{ (inputs.a }}", &[("a", "x")]);
+            assert!(
+                err.contains("expected token") || err.contains("unterminated"),
+                "unexpected message: {err}"
+            );
+
+            let err = substitute_inputs_err("${{ inputs.a && }}", &[("a", "x")]);
+            assert!(
+                err.contains("unexpected token"),
+                "unexpected message: {err}"
+            );
+
+            let err = substitute_inputs_err("${{ env.PATH }}", &[]);
+            assert!(
+                err.contains("unknown namespace"),
+                "unexpected message: {err}"
+            );
+        }
+
+        #[test]
+        fn test_if_gate_expression_evaluates_via_truthiness() {
+            use crate::config::load_test_config;
+            use crate::step::TestStep;
+            use tempfile::TempDir;
+
+            let repo = TempDir::new().unwrap();
+            std::fs::create_dir_all(repo.path().join("shared")).unwrap();
+            std::fs::write(
+                repo.path().join("shared/frag.yaml"),
+                r#"
+type: botforge/fragment
+inputs:
+  flag:
+    type: string
+    required: false
+  a:
+    type: string
+    required: false
+  b:
+    type: string
+    required: false
+steps:
+  - on: guest
+    name: run
+    if: ${{ inputs.flag }}
+    run: "echo ok"
+  - on: guest
+    name: and
+    if: ${{ inputs.a == 'x' && inputs.b }}
+    run: "echo ok"
+"#,
+            )
+            .unwrap();
+
+            std::fs::write(
+                repo.path().join("test-enabled.yaml"),
+                r#"
+type: botforge/test
+name: enabled
+steps:
+  - uses: "@://shared/frag.yaml"
+    with:
+      flag: "yes"
+      a: "x"
+      b: "1"
+"#,
+            )
+            .unwrap();
+            let enabled =
+                load_test_config(repo.path(), &repo.path().join("test-enabled.yaml")).unwrap();
+            let TestStep::Run(first) = &enabled.steps[0] else {
+                panic!("expected run step");
+            };
+            let TestStep::Run(second) = &enabled.steps[1] else {
+                panic!("expected run step");
+            };
+            assert!(first.condition_enabled());
+            assert!(second.condition_enabled());
+
+            std::fs::write(
+                repo.path().join("test-disabled.yaml"),
+                r#"
+type: botforge/test
+name: disabled
+steps:
+  - uses: "@://shared/frag.yaml"
+    with:
+      flag: ""
+      a: "x"
+      b: ""
+"#,
+            )
+            .unwrap();
+            let disabled =
+                load_test_config(repo.path(), &repo.path().join("test-disabled.yaml")).unwrap();
+            let TestStep::Run(first) = &disabled.steps[0] else {
+                panic!("expected run step");
+            };
+            let TestStep::Run(second) = &disabled.steps[1] else {
+                panic!("expected run step");
+            };
+            assert!(!first.condition_enabled());
+            assert!(!second.condition_enabled());
+        }
+
+        #[test]
+        fn test_if_gate_literal_expression_without_fragment_inputs() {
+            use crate::config::load_test_config;
+            use crate::step::TestStep;
+            use tempfile::TempDir;
+
+            let repo = TempDir::new().unwrap();
+            std::fs::write(
+                repo.path().join("test.yaml"),
+                r#"
+type: botforge/test
+name: test
+steps:
+  - on: guest
+    name: run
+    if: ${{ false }}
+    run: "echo ok"
+  - on: guest
+    name: run2
+    if: ${{ true && 'x' }}
+    run: "echo ok"
+"#,
+            )
+            .unwrap();
+
+            let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+            let TestStep::Run(first) = &config.steps[0] else {
+                panic!("expected run step");
+            };
+            let TestStep::Run(second) = &config.steps[1] else {
+                panic!("expected run step");
+            };
+            assert!(!first.condition_enabled());
+            assert!(second.condition_enabled());
         }
     }
 }
