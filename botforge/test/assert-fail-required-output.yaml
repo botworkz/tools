@@ -9,8 +9,8 @@ steps:
     # Intentionally emit nothing — required: true must trigger a hard failure.
     true
   outputs:
-  - name: must_emit
-    type: string
-    required: true
+    must_emit:
+      type: string
+      required: true
 assert:
   files: {}

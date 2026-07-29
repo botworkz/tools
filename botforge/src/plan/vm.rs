@@ -28,9 +28,9 @@ use crate::config::{
     TestIsoBootstrap,
 };
 use crate::step::{
-    capture_step_outputs, resolve_shell, ArchiveStep, CapturedOutput, ExpectBlock,
-    FragmentOutputDecl, InvokeStep, OutputValue, RunStep, StdioExpect, StepCondition, StepTarget,
-    TestStep,
+    capture_step_outputs, coerce_output_value, resolve_shell, ArchiveStep, CapturedOutput,
+    ExpectBlock, FragmentOutputDecl, InvokeStep, OutputValue, RunStep, StdioExpect, StepCondition,
+    StepTarget, TestStep,
 };
 
 const TEST_SSH_READY_TIMEOUT: Duration = Duration::from_secs(300);
@@ -852,8 +852,8 @@ where
 /// Runtime references are lazy/backward-only:
 /// - `steps.<id>.outputs.<name>` resolves against earlier sibling run/invoke steps.
 /// - `outputs.<name>` (fragment-self) resolves only inside fragment scopes and maps
-///   to the fragment's declared output contract (`from-step`/`from-output`,
-///   `default`, `required`) at the current execution point.
+///   to the fragment's declared output contract (`value:` expression, `default`,
+///   `required`) at the current execution point.
 ///
 /// `inherited_step_refs` carries step-output values that were resolved at the outer
 /// invocation boundary (from `deferred_with`) and injected into this scope via input
@@ -1000,7 +1000,7 @@ fn make_boundary_consumer(uses_name: &str) -> RunStep {
         timeout: None,
         shell: None,
         sudo: None,
-        outputs: Vec::new(),
+        outputs: std::collections::BTreeMap::new(),
         expect: None,
         captured_outputs: Default::default(),
     }
@@ -1099,28 +1099,58 @@ fn resolve_fragment_output_reference(
         );
     };
 
-    let inner_value = if let Some(prior) = find_step_by_id(prior_steps, &decl.from_step) {
-        resolve_captured_output_value(consumer, &decl.from_step, &decl.from_output, prior)?
-    } else if find_step_by_id(scope_steps, &decl.from_step).is_some() {
-        anyhow::bail!(
-            "step '{}': cannot resolve ${{{{ outputs.{} }}}} — backing step '{}' \
-             has not run yet in this fragment scope",
-            consumer.name,
-            output_name,
-            decl.from_step
-        );
-    } else {
-        anyhow::bail!(
-            "step '{}': cannot resolve ${{{{ outputs.{} }}}} — backing step '{}' \
-             is not visible in this fragment scope",
-            consumer.name,
-            output_name,
-            decl.from_step
-        );
-    };
+    // Resolve the declared `value:` expression against the fragment scope at the
+    // current execution point (backward-only), then coerce to the declared type.
+    let effective = resolve_fragment_output_decl_value(decl, &mut |step_id, name| {
+        resolve_step_output_reference(consumer, scope_steps, prior_steps, step_id, name)
+    })
+    .with_context(|| {
+        format!(
+            "step '{}': cannot resolve ${{{{ outputs.{} }}}}",
+            consumer.name, output_name
+        )
+    })?;
+    Ok(output_value_to_evaluated(effective))
+}
 
-    let effective = if !matches!(inner_value, OutputValue::Null) {
-        inner_value
+/// Resolve a fragment output declaration's `value:` expression and apply the
+/// declared-type contract.
+///
+/// The `value:` expression is resolved through the expression engine via
+/// `resolve_step` (a caller-supplied `steps.<id>.outputs.<name>` lookup closure);
+/// nested `outputs.*` references inside a `value:` are a hard error.  The resolved
+/// string is then coerced and validated against the declared `type:` — a value that
+/// does not satisfy the type is a hard error naming the fragment output — and the
+/// `default`/`required` rules are applied to the resolved value.
+///
+/// Expression evaluation lives solely in config/expressions; do not parse `${{ }}` here.
+fn resolve_fragment_output_decl_value(
+    decl: &FragmentOutputDecl,
+    resolve_step: &mut dyn FnMut(&str, &str) -> Result<EvaluatedValue>,
+) -> Result<OutputValue> {
+    let resolved = resolve_deferred_refs_in_string(&decl.value, resolve_step, &mut |name| {
+        anyhow::bail!(
+            "fragment output '{}': 'value:' cannot reference ${{{{ outputs.{} }}}} — \
+             only steps.<id>.outputs.<name> references are available",
+            decl.name,
+            name
+        )
+    })?;
+
+    // Coerce + validate the resolved value against the declared type (validity,
+    // not matching): a resolved value that does not satisfy the declared type is
+    // a hard error at the boundary, naming the fragment output.
+    let value =
+        coerce_output_value(&decl.name, &resolved, decl.output_type).with_context(|| {
+            format!(
+                "fragment output '{}': resolved value does not satisfy declared type '{}'",
+                decl.name, decl.output_type
+            )
+        })?;
+
+    // Apply `default:` when the resolved value is Null, then enforce `required`.
+    let effective = if !matches!(value, OutputValue::Null) {
+        value
     } else if let Some(default) = &decl.default {
         default.clone()
     } else {
@@ -1128,63 +1158,47 @@ fn resolve_fragment_output_reference(
     };
     if decl.required && matches!(effective, OutputValue::Null) {
         anyhow::bail!(
-            "step '{}': cannot resolve ${{{{ outputs.{} }}}} — backing step '{}' output '{}' resolved to null and output is required",
-            consumer.name,
-            output_name,
-            decl.from_step,
-            decl.from_output
+            "fragment output '{}': value resolved to null and output is required",
+            decl.name
         );
     }
-    Ok(output_value_to_evaluated(effective))
+    Ok(effective)
 }
 
 /// Resolve a fragment's declared outputs onto the `InvokeStep` node.
 ///
 /// Must be called after all inner steps of the invoke have run successfully.
-/// For each declared output, reads the referenced inner step's `captured_outputs` slot,
-/// applies the declared `default` when the inner value is `Null`, enforces `required`,
-/// and stores the resulting [`Vec<CapturedOutput>`] in `invoke.captured_outputs`.
+/// For each declared output, resolves its `value:` expression through the expression
+/// engine against the fragment's executed inner steps (backward: all inner steps
+/// have run at the boundary), coerces + validates the resolved value against the
+/// declared `type:` (a hard error at the boundary when it does not satisfy the type),
+/// applies the declared `default` when the resolved value is `Null`, enforces
+/// `required`, and stores the resulting [`Vec<CapturedOutput>`] in
+/// `invoke.captured_outputs`.
 ///
 /// This makes each fragment output **observable at the `Invoke` boundary**: the caller
-/// can inspect `invoke.captured_outputs` after execution.  Downstream expression
-/// resolution (Stage 4+) will consume these values; they are not yet referenceable via
-/// `${{ ... }}` expressions in caller steps.
+/// can inspect `invoke.captured_outputs` after execution and reference the values via
+/// `${{ steps.<id>.outputs.<name> }}`.
 fn resolve_invoke_outputs(invoke: &InvokeStep) -> Result<()> {
     if invoke.output_decls.is_empty() {
         return Ok(());
     }
 
     let mut captured: Vec<CapturedOutput> = Vec::with_capacity(invoke.output_decls.len());
+    let consumer = make_boundary_consumer(&invoke.uses);
 
     for decl in &invoke.output_decls {
-        // Read the inner step's captured value.
-        let inner_value =
-            find_inner_step_captured_value(&invoke.steps, &decl.from_step, &decl.from_output);
-
-        // Apply the declared default when the inner value is `Null` or absent.
-        let effective_value = match inner_value {
-            Some(v) if !matches!(v, OutputValue::Null) => v,
-            _ => {
-                if let Some(ref default_val) = decl.default {
-                    default_val.clone()
-                } else {
-                    OutputValue::Null
-                }
-            }
-        };
-
-        // Enforce `required`.
-        if decl.required && matches!(effective_value, OutputValue::Null) {
-            anyhow::bail!(
-                "fragment '{}': required output '{}' resolved to null \
-                 (inner step '{}' output '{}' was not emitted or was empty, \
-                 and no default is configured)",
-                invoke.uses,
-                decl.name,
-                decl.from_step,
-                decl.from_output
-            );
-        }
+        // All inner steps have executed at the boundary; the whole inner step list
+        // is the "prior" scope for backward resolution.
+        let effective_value = resolve_fragment_output_decl_value(decl, &mut |step_id, name| {
+            resolve_step_output_reference(&consumer, &invoke.steps, &invoke.steps, step_id, name)
+        })
+        .with_context(|| {
+            format!(
+                "fragment '{}': failed to resolve output '{}'",
+                invoke.uses, decl.name
+            )
+        })?;
 
         captured.push(CapturedOutput {
             name: decl.name.clone(),
@@ -1195,40 +1209,6 @@ fn resolve_invoke_outputs(invoke: &InvokeStep) -> Result<()> {
 
     *invoke.captured_outputs.borrow_mut() = Some(captured);
     Ok(())
-}
-
-/// Find the captured [`OutputValue`] of a named output on a direct inner run step (by id).
-///
-/// Searches the **direct** children of `steps` for a `Run` step with the given `id:`,
-/// then returns the captured value for the named output from that step's
-/// `captured_outputs` slot.
-///
-/// Returns `None` if the step is not found, or if the step's `captured_outputs` slot has
-/// not been populated (step ran but declared no matching output — should not happen after
-/// load-time validation, but handled gracefully as `Null`).
-fn find_inner_step_captured_value(
-    steps: &[TestStep],
-    step_id: &str,
-    output_name: &str,
-) -> Option<OutputValue> {
-    for step in steps {
-        if let TestStep::Run(run) = step {
-            if run.id.as_deref() == Some(step_id) {
-                let guard = run.captured_outputs.borrow();
-                return match &*guard {
-                    Some(outputs) => outputs
-                        .iter()
-                        .find(|o| o.name == output_name)
-                        .map(|o| o.value.clone()),
-                    // Step ran but captured_outputs was never set (no declared outputs);
-                    // treat as Null — the default/required check in the caller handles it.
-                    None => Some(OutputValue::Null),
-                };
-            }
-        }
-    }
-    // Step not found — should have been caught at load time; treat as Null.
-    None
 }
 
 /// Captured stdout and stderr from a step execution, available for `expect:` matching.
@@ -3107,7 +3087,7 @@ run: echo ok
             id: None,
             expect: None,
             condition: StepCondition::Always,
-            outputs: vec![],
+            outputs: std::collections::BTreeMap::new(),
             captured_outputs: Default::default(),
         };
         assert_eq!(
@@ -3128,7 +3108,7 @@ run: echo ok
             id: None,
             expect: None,
             condition: StepCondition::Always,
-            outputs: vec![],
+            outputs: std::collections::BTreeMap::new(),
             captured_outputs: Default::default(),
         };
         assert_eq!(
@@ -3137,15 +3117,14 @@ run: echo ok
         );
     }
 
-    fn output_decl(name: &str, output_type: OutputType, required: bool) -> OutputDecl {
+    fn output_decl(output_type: OutputType, required: bool) -> OutputDecl {
         OutputDecl {
-            name: name.to_string(),
             output_type,
             required,
         }
     }
 
-    fn host_run_step_with_outputs(outputs: Vec<OutputDecl>) -> RunStep {
+    fn host_run_step_with_outputs(outputs: Vec<(&str, OutputDecl)>) -> RunStep {
         RunStep {
             target: StepTarget::Host,
             name: "capture-step".to_string(),
@@ -3156,7 +3135,10 @@ run: echo ok
             id: None,
             expect: None,
             condition: StepCondition::Always,
-            outputs,
+            outputs: outputs
+                .into_iter()
+                .map(|(name, decl)| (name.to_string(), decl))
+                .collect(),
             captured_outputs: Default::default(),
         }
     }
@@ -3164,7 +3146,7 @@ run: echo ok
     #[test]
     fn test_capture_declared_step_outputs_errors_when_read_fails() {
         let step =
-            host_run_step_with_outputs(vec![output_decl("must_emit", OutputType::String, true)]);
+            host_run_step_with_outputs(vec![("must_emit", output_decl(OutputType::String, true))]);
 
         let err = capture_declared_step_outputs(&step, || anyhow::bail!("ssh transport hiccup"))
             .unwrap_err();
@@ -3197,7 +3179,8 @@ run: echo ok
 
     #[test]
     fn test_capture_declared_step_outputs_stores_captured_values() {
-        let step = host_run_step_with_outputs(vec![output_decl("label", OutputType::String, true)]);
+        let step =
+            host_run_step_with_outputs(vec![("label", output_decl(OutputType::String, true))]);
 
         capture_declared_step_outputs(&step, || Ok("label=hello\n".to_string())).unwrap();
 
@@ -3220,7 +3203,7 @@ run: echo ok
             id: None,
             expect: None,
             condition: StepCondition::Always,
-            outputs: vec![],
+            outputs: std::collections::BTreeMap::new(),
             captured_outputs: Default::default(),
         }
     }
@@ -3247,7 +3230,7 @@ run: echo ok
             id: Some(id.to_string()),
             expect: None,
             condition: StepCondition::Always,
-            outputs: vec![],
+            outputs: std::collections::BTreeMap::new(),
             captured_outputs: std::cell::RefCell::new(Some(outputs)),
         })
     }
@@ -3728,8 +3711,7 @@ run: echo ok
             output_decls: vec![FragmentOutputDecl {
                 name: "token".to_string(),
                 output_type: OutputType::Secret,
-                from_step: "fetcher".to_string(),
-                from_output: "token".to_string(),
+                value: "${{ steps.fetcher.outputs.token }}".to_string(),
                 required: true,
                 default: None,
             }],
@@ -3787,8 +3769,7 @@ run: echo ok
             output_decls: vec![FragmentOutputDecl {
                 name: "token".to_string(),
                 output_type: OutputType::Secret,
-                from_step: "fetcher".to_string(),
-                from_output: "token".to_string(),
+                value: "${{ steps.fetcher.outputs.token }}".to_string(),
                 required: true,
                 default: None,
             }],
@@ -3901,16 +3882,14 @@ run: echo ok
             FragmentOutputDecl {
                 name: "version".to_string(),
                 output_type: OutputType::String,
-                from_step: "emit".to_string(),
-                from_output: "version".to_string(),
+                value: "${{ steps.emit.outputs.version }}".to_string(),
                 required: true,
                 default: None,
             },
             FragmentOutputDecl {
                 name: "fallback".to_string(),
                 output_type: OutputType::String,
-                from_step: "quiet".to_string(),
-                from_output: "maybe".to_string(),
+                value: "${{ steps.quiet.outputs.maybe }}".to_string(),
                 required: false,
                 default: Some(OutputValue::String("defaulted".to_string())),
             },
@@ -3944,8 +3923,7 @@ run: echo ok
         let decls = vec![FragmentOutputDecl {
             name: "version".to_string(),
             output_type: OutputType::String,
-            from_step: "emit".to_string(),
-            from_output: "version".to_string(),
+            value: "${{ steps.emit.outputs.version }}".to_string(),
             required: true,
             default: None,
         }];

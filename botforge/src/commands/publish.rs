@@ -1239,7 +1239,7 @@ publish:
             id: None,
             expect: None,
             condition: StepCondition::Always,
-            outputs: vec![],
+            outputs: std::collections::BTreeMap::new(),
             captured_outputs: Default::default(),
         });
 
@@ -1287,7 +1287,7 @@ publish:
             id: None,
             expect: None,
             condition: StepCondition::Always,
-            outputs: vec![],
+            outputs: std::collections::BTreeMap::new(),
             captured_outputs: Default::default(),
         });
 
@@ -1340,7 +1340,7 @@ publish:
             id: None,
             expect: None,
             condition: StepCondition::Always,
-            outputs: vec![],
+            outputs: std::collections::BTreeMap::new(),
             captured_outputs: Default::default(),
         });
 
@@ -1379,7 +1379,7 @@ publish:
                 id: None,
                 expect: None,
                 condition: StepCondition::Always,
-                outputs: vec![],
+                outputs: std::collections::BTreeMap::new(),
                 captured_outputs: Default::default(),
             }),
             crate::step::TestStep::Run(crate::step::RunStep {
@@ -1392,7 +1392,7 @@ publish:
                 id: None,
                 expect: None,
                 condition: StepCondition::Always,
-                outputs: vec![],
+                outputs: std::collections::BTreeMap::new(),
                 captured_outputs: Default::default(),
             }),
         ];
@@ -1426,7 +1426,7 @@ publish:
             id: None,
             expect: None,
             condition: StepCondition::Always,
-            outputs: vec![],
+            outputs: std::collections::BTreeMap::new(),
             captured_outputs: Default::default(),
         })];
 
@@ -1457,7 +1457,7 @@ publish:
                 id: None,
                 expect: None,
                 condition: StepCondition::Always,
-                outputs: vec![],
+                outputs: std::collections::BTreeMap::new(),
                 captured_outputs: Default::default(),
             }),
             crate::step::TestStep::Run(crate::step::RunStep {
@@ -1470,7 +1470,7 @@ publish:
                 id: None,
                 expect: None,
                 condition: StepCondition::Always,
-                outputs: vec![],
+                outputs: std::collections::BTreeMap::new(),
                 captured_outputs: Default::default(),
             }),
         ];

@@ -240,3 +240,18 @@ pub(super) fn is_pure_output_ref(expr: &str) -> bool {
         Ok(ExprNode::StepOutputReference { .. } | ExprNode::FragmentOutputReference { .. })
     )
 }
+
+/// If `expr` parses as a single, pure `steps.<id>.outputs.<name>` reference (no
+/// surrounding operators), return the `(step_id, output_name)` pieces.
+///
+/// Like [`is_pure_output_ref`], this is a named predicate so the AST stays an
+/// implementation detail of this module.
+pub(super) fn pure_step_output_ref(expr: &str) -> Option<(String, String)> {
+    match Parser::parse(expr) {
+        Ok(ExprNode::StepOutputReference {
+            step_id,
+            output_name,
+        }) => Some((step_id, output_name)),
+        _ => None,
+    }
+}
