@@ -155,6 +155,7 @@ jobs:
         cp -a botforge/test/outputs.steps.yaml testrepo/
         cp -a botforge/test/fragment-outputs.steps.yaml testrepo/
         cp -a botforge/test/secret-output-masking.steps.yaml testrepo/
+        cp -a botforge/test/secret-input-masking.steps.yaml testrepo/
         cp -a botforge/test/fragment-self-outputs.steps.yaml testrepo/
         cp -a botforge/test/deferred-with-admin.steps.yaml testrepo/
         cp -a botforge/test/deferred-with-user.steps.yaml testrepo/
