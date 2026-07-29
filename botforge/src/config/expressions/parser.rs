@@ -227,3 +227,16 @@ impl Parser {
 fn is_reference_name_valid(name: &str) -> bool {
     !name.is_empty() && name.chars().all(is_identifier_char)
 }
+
+/// Return `true` if `expr` parses as a single, pure runtime-output reference —
+/// `steps.<id>.outputs.<name>` or `outputs.<name>` — with no surrounding operators.
+///
+/// This is the named predicate the rest of the engine uses to classify deferred
+/// output references; the AST ([`ExprNode`]) stays an implementation detail of
+/// this module.
+pub(super) fn is_pure_output_ref(expr: &str) -> bool {
+    matches!(
+        Parser::parse(expr),
+        Ok(ExprNode::StepOutputReference { .. } | ExprNode::FragmentOutputReference { .. })
+    )
+}

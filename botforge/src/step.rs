@@ -324,20 +324,15 @@ impl ExpectBlock {
 /// - `Resolved(b)`: expression was fully evaluated at load time — skip when `false`.
 /// - `Deferred(expr)`: a pure `${{ steps.X.outputs.Y }}` or `${{ outputs.Y }}` ref
 ///   that could not be evaluated at load time; resolved lazily at execution time.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) enum StepCondition {
     /// No `if:` field (or `null`) — always run.
+    #[default]
     Always,
     /// Fully resolved at load time.
     Resolved(bool),
     /// Deferred `${{ steps.*... }}` / `${{ outputs.* }}` ref — resolved at runtime.
     Deferred(String),
-}
-
-impl Default for StepCondition {
-    fn default() -> Self {
-        StepCondition::Always
-    }
 }
 
 #[derive(Debug, Deserialize)]

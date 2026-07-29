@@ -106,7 +106,7 @@ use std::path::{Path, PathBuf};
 use crate::config::{load_publish_config, FsTarget, GithubTarget, PublishConfig, S3Target};
 use crate::plan::run_local_steps;
 use crate::resolver::{Reference, ResolveFileContext, ResolvedFile};
-use crate::step::{StepCondition, TestStep};
+use crate::step::TestStep;
 use crate::util::resolve_under_root;
 use crate::workspace::{
     discover_context, load_inline_manifest, load_plugin_entries, registry::load_committed_registry,
@@ -615,6 +615,7 @@ fn run_github_target(
 mod tests {
     use super::*;
     use crate::cli::{Cli, Commands};
+    use crate::step::StepCondition;
     use clap::Parser;
     use std::fs;
     use tempfile::TempDir;

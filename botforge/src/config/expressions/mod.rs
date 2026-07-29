@@ -1,8 +1,11 @@
 //! # Expression engine — sole evaluator of `${{ }}` expressions
 //!
 //! **Invariant**: `${{ }}` is parsed and evaluated **only here**. Nothing outside this module
-//! may parse, walk, or evaluate a `${{ }}` expression. The parser and lexer are private
-//! (`pub(super)`) and unreachable from `vm.rs`, `config/mod.rs`, or anywhere else.
+//! may parse, walk, or evaluate a `${{ }}` expression. The parser, lexer, and AST are
+//! private to this engine (`pub(super)`) and unreachable from `vm.rs`, `config/mod.rs`,
+//! or anywhere else — evaluating `${{ }}` outside the engine is a compile error. The AST
+//! (`ExprNode`) is an implementation detail of `parser.rs`; the rest of the engine consumes
+//! named predicates (e.g. `parser::is_pure_output_ref`) and typed results, never raw nodes.
 //!
 //! To add a new expression value kind: extend `ExprNode` in `parser.rs` and `eval_node` in
 //! `eval.rs` — never write a field-specific or external resolver.
@@ -611,11 +614,7 @@ fn check_no_residual_expressions_in_str(text: &str) -> Result<()> {
         let expr = after_open[..end].trim();
         // Pure steps.*/outputs.* refs are allowed to survive; they are resolved
         // lazily at execution time via resolve_deferred_refs_in_string.
-        let is_pure_runtime_output_ref = matches!(
-            parser::Parser::parse(expr),
-            Ok(parser::ExprNode::StepOutputReference { .. }
-                | parser::ExprNode::FragmentOutputReference { .. })
-        );
+        let is_pure_runtime_output_ref = parser::is_pure_output_ref(expr);
         if !is_pure_runtime_output_ref {
             anyhow::bail!(
                 "unresolved expression after final substitution pass: '{}'; \
@@ -633,11 +632,7 @@ fn check_no_residual_expressions_in_str(text: &str) -> Result<()> {
 /// `${{ outputs.NAME }}` expression (nothing outside the delimiters).
 pub(crate) fn is_pure_deferred_output_ref(text: &str) -> bool {
     if let Some(expr) = extract_pure_expression(text) {
-        matches!(
-            parser::Parser::parse(expr),
-            Ok(parser::ExprNode::StepOutputReference { .. }
-                | parser::ExprNode::FragmentOutputReference { .. })
-        )
+        parser::is_pure_output_ref(expr)
     } else {
         false
     }

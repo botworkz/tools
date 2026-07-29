@@ -414,59 +414,21 @@ fn run_steps_inner(
 
                 // Resolve deferred_with values against prior siblings in the current scope.
                 // These become the inherited step refs for the child invocation.
-                let prior_steps = &steps[..step_idx];
-                let mut child_inherited: std::collections::BTreeMap<
-                    (String, String),
-                    EvaluatedValue,
-                > = std::collections::BTreeMap::new();
-                let deferred_with_result: Result<()> = invoke
-                    .deferred_with
-                    .values()
-                    .filter_map(|v| if let Value::String(s) = v { Some(s.as_str()) } else { None })
-                    .try_for_each(|s| {
-                        resolve_deferred_refs_in_string(
-                            s,
-                            &mut |step_id: &str, output_name: &str| {
-                                // Check inherited (outer-scope) refs first.
-                                let key = (step_id.to_string(), output_name.to_string());
-                                if let Some(v) = inherited_step_refs.get(&key) {
-                                    child_inherited.insert(key, v.clone());
-                                    return Ok(v.clone());
-                                }
-                                // Then look up in the current scope's prior steps.
-                                let dummy = make_boundary_consumer(&invoke.uses);
-                                resolve_step_output_reference(
-                                    &dummy,
-                                    steps,
-                                    prior_steps,
-                                    step_id,
-                                    output_name,
-                                )
-                                .inspect(|v| {
-                                    child_inherited
-                                        .insert((step_id.to_string(), output_name.to_string()), v.clone());
-                                })
-                            },
-                            &mut |output_name: &str| {
-                                anyhow::bail!(
-                                    "'{}': outputs.* not available in outer-scope 'with:' (output: '{}')",
-                                    invoke.uses,
-                                    output_name
-                                )
-                            },
-                        )
-                        .map(|_| ())
-                    });
-                if let Err(e) = deferred_with_result {
-                    print_step_status(
-                        &display,
-                        invoke.uses.as_str(),
-                        None,
-                        false,
-                        Some(invoke_started.elapsed()),
-                    );
-                    return Err(e);
-                }
+                let deferred_with_result =
+                    resolve_invoke_deferred_with(invoke, steps, step_idx, inherited_step_refs);
+                let child_inherited = match deferred_with_result {
+                    Ok(map) => map,
+                    Err(e) => {
+                        print_step_status(
+                            &display,
+                            invoke.uses.as_str(),
+                            None,
+                            false,
+                            Some(invoke_started.elapsed()),
+                        );
+                        return Err(e);
+                    }
+                };
 
                 let invoke_result = run_steps_inner(
                     context,
@@ -958,6 +920,72 @@ fn find_step_by_id<'a>(steps: &'a [TestStep], step_id: &str) -> Option<ScopedSte
         }
     }
     None
+}
+
+/// Resolve a `uses:` step's deferred `with:` values at the invocation boundary,
+/// against already-executed siblings in the current scope (backward-only; a
+/// forward or unknown reference is a hard error).
+///
+/// Runs BEFORE the child invocation executes. The resolved `${{ steps.X.outputs.Y }}`
+/// values are returned as the child's inherited step refs, so inner steps that
+/// received the deferred ref via load-time input substitution resolve to the real
+/// captured value at runtime.
+///
+/// Expression evaluation lives solely in config/expressions; do not parse `${{ }}` here.
+fn resolve_invoke_deferred_with(
+    invoke: &InvokeStep,
+    scope_steps: &[TestStep],
+    step_idx: usize,
+    inherited_step_refs: &std::collections::BTreeMap<(String, String), EvaluatedValue>,
+) -> Result<std::collections::BTreeMap<(String, String), EvaluatedValue>> {
+    let prior_steps = &scope_steps[..step_idx];
+    let mut child_inherited: std::collections::BTreeMap<(String, String), EvaluatedValue> =
+        std::collections::BTreeMap::new();
+    invoke
+        .deferred_with
+        .values()
+        .filter_map(|v| {
+            if let Value::String(s) = v {
+                Some(s.as_str())
+            } else {
+                None
+            }
+        })
+        .try_for_each(|s| {
+            resolve_deferred_refs_in_string(
+                s,
+                &mut |step_id: &str, output_name: &str| {
+                    // Check inherited (outer-scope) refs first.
+                    let key = (step_id.to_string(), output_name.to_string());
+                    if let Some(v) = inherited_step_refs.get(&key) {
+                        child_inherited.insert(key, v.clone());
+                        return Ok(v.clone());
+                    }
+                    // Then look up in the current scope's prior steps.
+                    let dummy = make_boundary_consumer(&invoke.uses);
+                    resolve_step_output_reference(
+                        &dummy,
+                        scope_steps,
+                        prior_steps,
+                        step_id,
+                        output_name,
+                    )
+                    .inspect(|v| {
+                        child_inherited
+                            .insert((step_id.to_string(), output_name.to_string()), v.clone());
+                    })
+                },
+                &mut |output_name: &str| {
+                    anyhow::bail!(
+                        "'{}': outputs.* not available in outer-scope 'with:' (output: '{}')",
+                        invoke.uses,
+                        output_name
+                    )
+                },
+            )
+            .map(|_| ())
+        })?;
+    Ok(child_inherited)
 }
 
 /// Create a dummy `RunStep` consumer for error-message context at the invocation boundary.
@@ -2309,9 +2337,11 @@ pub(crate) fn resolve_invoke_outputs_for_test(invoke: &InvokeStep) -> anyhow::Re
 mod tests {
     use super::{
         build_guest_ssh_cmd, capture_declared_step_outputs, env_merge, guest_files_init_cmd,
-        parse_env_file, resolve_run_step_output_refs, resolve_step_timeout, run_host_step,
-        shell_single_quote, HostStepFiles, StepExecutionBudget,
+        parse_env_file, resolve_invoke_deferred_with, resolve_run_step_output_refs,
+        resolve_step_timeout, run_host_step, shell_single_quote, HostStepFiles,
+        StepExecutionBudget,
     };
+    use crate::config::EvaluatedValue;
     use crate::step::{
         resolve_shell, CapturedOutput, FragmentOutputDecl, InvokeStep, OutputDecl, OutputType,
         OutputValue, RunStep, StepCondition, StepTarget, TestStep,
@@ -3347,6 +3377,177 @@ run: echo ok
             msg.contains("has not run yet"),
             "forward reference must be a hard error: {msg}"
         );
+    }
+
+    // --- Invoke-boundary `deferred_with` resolution ----------------------------
+    // Mirrors the run-body resolution tests above: an executed sibling produces
+    // captured outputs, and a later `uses:` step's deferred `with:` values resolve
+    // against it at the invocation boundary (backward-only, hard error otherwise).
+
+    fn invoke_with_deferred_with(with: &[(&str, &str)]) -> InvokeStep {
+        InvokeStep {
+            uses: "@://user-frag.yaml".to_string(),
+            id: None,
+            steps: vec![],
+            output_decls: vec![],
+            deferred_with: with
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        k.to_string(),
+                        serde_yaml::Value::String(v.to_string()),
+                    )
+                })
+                .collect(),
+            captured_outputs: std::cell::RefCell::new(None),
+        }
+    }
+
+    #[test]
+    fn test_resolve_invoke_deferred_with_backward_sibling_resolves() {
+        // The headline OTP scenario: an executed `uses:` sibling (id: admin)
+        // produced a captured output; a later invoke consumes it via
+        // `otp: ${{ steps.admin.outputs.testuser_otp }}` in its with: block.
+        let invoke = invoke_with_deferred_with(&[("otp", "${{ steps.admin.outputs.testuser_otp }}")]);
+        let scope = vec![
+            executed_invoke(
+                "admin",
+                vec![captured(
+                    "testuser_otp",
+                    OutputType::String,
+                    OutputValue::String("otp-12345".to_string()),
+                )],
+            ),
+            TestStep::Invoke(invoke),
+        ];
+        let TestStep::Invoke(invoke) = &scope[1] else {
+            unreachable!()
+        };
+        let resolved =
+            resolve_invoke_deferred_with(invoke, &scope, 1, &std::collections::BTreeMap::new())
+                .unwrap();
+        assert_eq!(
+            resolved.get(&("admin".to_string(), "testuser_otp".to_string())),
+            Some(&EvaluatedValue::String("otp-12345".to_string())),
+            "the child must inherit the real resolved value"
+        );
+    }
+
+    #[test]
+    fn test_resolve_invoke_deferred_with_run_step_producer_resolves() {
+        let invoke = invoke_with_deferred_with(&[("count", "${{ steps.emit.outputs.count }}")]);
+        let scope = vec![
+            executed_run_with_outputs(
+                "emit",
+                vec![captured("count", OutputType::Number, OutputValue::Number(7.0))],
+            ),
+            TestStep::Invoke(invoke),
+        ];
+        let TestStep::Invoke(invoke) = &scope[1] else {
+            unreachable!()
+        };
+        let resolved =
+            resolve_invoke_deferred_with(invoke, &scope, 1, &std::collections::BTreeMap::new())
+                .unwrap();
+        assert_eq!(
+            resolved.get(&("emit".to_string(), "count".to_string())),
+            Some(&EvaluatedValue::Number(7.0))
+        );
+    }
+
+    #[test]
+    fn test_resolve_invoke_deferred_with_forward_reference_is_error() {
+        let invoke = invoke_with_deferred_with(&[("otp", "${{ steps.admin.outputs.otp }}")]);
+        let scope = vec![
+            TestStep::Invoke(invoke),
+            executed_invoke(
+                "admin",
+                vec![captured(
+                    "otp",
+                    OutputType::String,
+                    OutputValue::String("late".to_string()),
+                )],
+            ),
+        ];
+        let TestStep::Invoke(invoke) = &scope[0] else {
+            unreachable!()
+        };
+        let err =
+            resolve_invoke_deferred_with(invoke, &scope, 0, &std::collections::BTreeMap::new())
+                .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("has not run yet"),
+            "forward reference in with: must be a hard error: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_invoke_deferred_with_unknown_step_is_error() {
+        let invoke = invoke_with_deferred_with(&[("otp", "${{ steps.nope.outputs.otp }}")]);
+        let scope = vec![TestStep::Invoke(invoke)];
+        let TestStep::Invoke(invoke) = &scope[0] else {
+            unreachable!()
+        };
+        let err =
+            resolve_invoke_deferred_with(invoke, &scope, 0, &std::collections::BTreeMap::new())
+                .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("no step with id"),
+            "unknown reference in with: must be a hard error: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_invoke_deferred_with_outputs_ref_is_error() {
+        let invoke = invoke_with_deferred_with(&[("x", "${{ outputs.value }}")]);
+        let scope = vec![TestStep::Invoke(invoke)];
+        let TestStep::Invoke(invoke) = &scope[0] else {
+            unreachable!()
+        };
+        let err =
+            resolve_invoke_deferred_with(invoke, &scope, 0, &std::collections::BTreeMap::new())
+                .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("outputs.* not available"),
+            "outputs.* in outer-scope with: must be a hard error: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_invoke_deferred_with_inherited_ref_takes_precedence() {
+        // An outer-scope ref already resolved at a previous invocation boundary
+        // is forwarded to the child without a local-scope lookup.
+        let invoke = invoke_with_deferred_with(&[("otp", "${{ steps.outer.outputs.otp }}")]);
+        let scope = vec![TestStep::Invoke(invoke)];
+        let TestStep::Invoke(invoke) = &scope[0] else {
+            unreachable!()
+        };
+        let mut inherited = std::collections::BTreeMap::new();
+        inherited.insert(
+            ("outer".to_string(), "otp".to_string()),
+            EvaluatedValue::String("from-outer".to_string()),
+        );
+        let resolved = resolve_invoke_deferred_with(invoke, &scope, 0, &inherited).unwrap();
+        assert_eq!(
+            resolved.get(&("outer".to_string(), "otp".to_string())),
+            Some(&EvaluatedValue::String("from-outer".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_resolve_invoke_deferred_with_empty_yields_empty_map() {
+        let invoke = invoke_with_deferred_with(&[]);
+        let scope = vec![TestStep::Invoke(invoke)];
+        let TestStep::Invoke(invoke) = &scope[0] else {
+            unreachable!()
+        };
+        let resolved =
+            resolve_invoke_deferred_with(invoke, &scope, 0, &std::collections::BTreeMap::new())
+                .unwrap();
+        assert!(resolved.is_empty());
     }
 
     #[test]

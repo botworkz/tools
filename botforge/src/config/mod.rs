@@ -1743,7 +1743,7 @@ fn validate_deferred_output_references_in_scope(
             TestStep::Invoke(invoke) => {
                 // Validate this invoke's deferred_with values against the current (outer) scope.
                 let mut child_allowed_external_refs: HashSet<(String, String)> = HashSet::new();
-                for (_, raw_value) in &invoke.deferred_with {
+                for raw_value in invoke.deferred_with.values() {
                     if let Value::String(s) = raw_value {
                         resolve_deferred_refs_in_string(
                             s,
