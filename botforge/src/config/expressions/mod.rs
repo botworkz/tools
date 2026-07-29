@@ -1,3 +1,20 @@
+//! # Expression engine — sole evaluator of `${{ }}` expressions
+//!
+//! **Invariant**: `${{ }}` is parsed and evaluated **only here**. Nothing outside this module
+//! may parse, walk, or evaluate a `${{ }}` expression. The parser, lexer, and AST are
+//! private to this engine (`pub(super)`) and unreachable from `vm.rs`, `config/mod.rs`,
+//! or anywhere else — evaluating `${{ }}` outside the engine is a compile error. The AST
+//! (`ExprNode`) is an implementation detail of `parser.rs`; the rest of the engine consumes
+//! named predicates (e.g. `parser::is_pure_output_ref`) and typed results, never raw nodes.
+//!
+//! To add a new expression value kind: extend `ExprNode` in `parser.rs` and `eval_node` in
+//! `eval.rs` — never write a field-specific or external resolver.
+//!
+//! Public surface:
+//! - Load-time: [`substitute_inputs_in_value`], [`substitute_args_in_value`]
+//! - Runtime (deferred step-output refs): [`resolve_deferred_refs_in_string`], [`resolve_deferred_condition`]
+//! - Helpers: [`yaml_scalar_truthiness`], [`yaml_scalar_to_string`]
+
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_yaml::Value;
@@ -12,7 +29,8 @@ mod parser;
 mod value;
 
 use eval::evaluate_expression_span;
-use value::{format_number, EvaluatedSpan, EvaluatedValue};
+pub(crate) use value::EvaluatedValue;
+use value::{format_number, EvaluatedSpan};
 
 const DEFAULT_SENTINEL: &str = "__default__";
 
@@ -557,33 +575,31 @@ fn substitute_namespace_in_string(
 ///   — the two-pass deferral means it can't be resolved.
 /// - A top-level step (not from a fragment) that mistakenly uses `inputs.*` refs.
 ///
-/// # Exception: `${{ steps.<id>.outputs.<name> }}` / `${{ outputs.<name> }}` in `run:` fields
-/// A **pure** runtime-output reference (the whole span is exactly one deferred
-/// reference, no operators) is allowed to survive the load-time passes **only inside
-/// a `run:` field** — its value does not exist until execution. It is resolved lazily
-/// at execution time by [`resolve_output_refs_in_string`]. Anywhere else (or combined
-/// with operators/other references) it remains a hard load-time error.
+/// # Exception: `${{ steps.<id>.outputs.<name> }}` / `${{ outputs.<name> }}` (all fields)
+/// Pure runtime-output references (the whole span is exactly one deferred reference,
+/// no operators) are allowed to survive the load-time passes **in any field** — their
+/// values do not exist until execution. They are resolved lazily at execution time by
+/// [`resolve_deferred_refs_in_string`] / [`resolve_deferred_condition`].
 ///
 /// Callers MUST invoke this immediately after [`substitute_args_in_value`].
 fn check_no_residual_expressions(value: &Value) -> Result<()> {
-    check_no_residual_expressions_inner(value, false)
+    check_no_residual_expressions_inner(value)
 }
 
-fn check_no_residual_expressions_inner(value: &Value, in_run_field: bool) -> Result<()> {
+fn check_no_residual_expressions_inner(value: &Value) -> Result<()> {
     match value {
-        Value::String(text) => check_no_residual_expressions_in_str(text, in_run_field),
+        Value::String(text) => check_no_residual_expressions_in_str(text),
         Value::Sequence(items) => items
             .iter()
-            .try_for_each(|item| check_no_residual_expressions_inner(item, in_run_field)),
-        Value::Mapping(entries) => entries.iter().try_for_each(|(key, val)| {
-            let is_run = key.as_str() == Some("run");
-            check_no_residual_expressions_inner(val, is_run)
-        }),
+            .try_for_each(check_no_residual_expressions_inner),
+        Value::Mapping(entries) => entries
+            .iter()
+            .try_for_each(|(_, val)| check_no_residual_expressions_inner(val)),
         _ => Ok(()),
     }
 }
 
-fn check_no_residual_expressions_in_str(text: &str, in_run_field: bool) -> Result<()> {
+fn check_no_residual_expressions_in_str(text: &str) -> Result<()> {
     let mut rest = text;
     while let Some(start) = rest.find("${{") {
         let after_open = &rest[start + 3..];
@@ -596,11 +612,9 @@ fn check_no_residual_expressions_in_str(text: &str, in_run_field: bool) -> Resul
             );
         };
         let expr = after_open[..end].trim();
-        let is_pure_runtime_output_ref = matches!(
-            parser::Parser::parse(expr),
-            Ok(parser::ExprNode::StepOutputReference { .. }
-                | parser::ExprNode::FragmentOutputReference { .. })
-        );
+        // Pure steps.*/outputs.* refs are allowed to survive; they are resolved
+        // lazily at execution time via resolve_deferred_refs_in_string.
+        let is_pure_runtime_output_ref = parser::is_pure_output_ref(expr);
         if !is_pure_runtime_output_ref {
             anyhow::bail!(
                 "unresolved expression after final substitution pass: '{}'; \
@@ -609,51 +623,47 @@ fn check_no_residual_expressions_in_str(text: &str, in_run_field: bool) -> Resul
                 &rest[start..start + 3 + end + 2]
             );
         }
-        if !in_run_field {
-            anyhow::bail!(
-                "runtime output reference '{}' is only supported in 'run:' fields \
-                 (resolved at execution time)",
-                &rest[start..start + 3 + end + 2]
-            );
-        }
         rest = &after_open[end + 2..];
     }
     Ok(())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum DeferredOutputReference {
-    StepOutput {
-        step_id: String,
-        output_name: String,
-    },
-    FragmentOutput {
-        output_name: String,
-    },
+/// Return `true` if `text` is a pure `${{ steps.ID.outputs.NAME }}` or
+/// `${{ outputs.NAME }}` expression (nothing outside the delimiters).
+pub(crate) fn is_pure_deferred_output_ref(text: &str) -> bool {
+    if let Some(expr) = extract_pure_expression(text) {
+        parser::is_pure_output_ref(expr)
+    } else {
+        false
+    }
 }
 
-/// Resolve deferred runtime output references in a step's `run:` body at execution
-/// time.
+/// Resolve `${{ steps.X.outputs.Y }}` / `${{ outputs.Y }}` references in `text` at
+/// execution time using the same expression engine used for load-time substitution.
 ///
-/// This is the unified **runtime** substitution entry point for all deferred output
-/// reference kinds:
-/// - `steps.<id>.outputs.<name>`
-/// - `outputs.<name>`
+/// **Expression evaluation lives solely in `config/expressions`; do not parse
+/// `${{ }}` outside this module.**
 ///
-/// All other `${{ }}` expressions were resolved (or rejected) at load time, so any
-/// span found here must be one of the above — anything else is a hard error
-/// (defensive; load-time Invariant A already rejects it).
+/// `resolve_step(step_id, output_name)` and `resolve_output(output_name)` are
+/// caller-supplied closures that look up already-executed step outputs from the
+/// enclosing execution scope. Typed [`EvaluatedValue`] is returned from each closure;
+/// the engine handles string interpolation, truthiness, and typed projection uniformly.
 ///
-/// `resolve` maps each runtime output reference to its projected string value, or
-/// returns an error when the reference cannot be resolved.
-pub(crate) fn resolve_output_refs_in_string(
+/// Any non-output-ref `${{ }}` span is a hard error (load-time Invariant A should
+/// have already rejected it).
+pub(crate) fn resolve_deferred_refs_in_string(
     text: &str,
-    resolve: &mut dyn FnMut(DeferredOutputReference) -> Result<std::string::String>,
-) -> Result<std::string::String> {
+    resolve_step: &mut dyn FnMut(&str, &str) -> Result<EvaluatedValue>,
+    resolve_output: &mut dyn FnMut(&str) -> Result<EvaluatedValue>,
+) -> Result<String> {
     if !text.contains("${{") {
         return Ok(text.to_string());
     }
-    let mut rendered = std::string::String::with_capacity(text.len());
+    let mut resolver = eval::RuntimeResolver {
+        resolve_step,
+        resolve_output,
+    };
+    let mut rendered = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(start) = rest.find("${{") {
         rendered.push_str(&rest[..start]);
@@ -662,26 +672,35 @@ pub(crate) fn resolve_output_refs_in_string(
             .find("}}")
             .ok_or_else(|| anyhow::anyhow!("unterminated expression in '{text}'"))?;
         let expr = after_open[..end].trim();
-        match parser::Parser::parse(expr)? {
-            parser::ExprNode::StepOutputReference {
-                step_id,
-                output_name,
-            } => rendered.push_str(&resolve(DeferredOutputReference::StepOutput {
-                step_id,
-                output_name,
-            })?),
-            parser::ExprNode::FragmentOutputReference { output_name } => rendered.push_str(
-                &resolve(DeferredOutputReference::FragmentOutput { output_name })?,
-            ),
-            _ => anyhow::bail!(
-                "unexpected unresolved expression '${{{{ {expr} }}}}' at execution time; \
-                 only steps.<id>.outputs.<name> and outputs.<name> references are resolved at runtime"
-            ),
-        }
+        let value = eval::evaluate_expression_span_runtime(expr, &mut resolver)
+            .with_context(|| format!("while evaluating '${{{{ {expr} }}}}' in '{text}'"))?;
+        rendered.push_str(&value.to_interpolated_string());
         rest = &after_open[end + 2..];
     }
     rendered.push_str(rest);
     Ok(rendered)
+}
+
+/// Resolve a deferred `${{ steps.X.outputs.Y }}` / `${{ outputs.Y }}` expression that
+/// was stored as an `if:` condition and apply truthiness, returning the runtime bool.
+///
+/// The `expr_text` must be the full `${{ ... }}` placeholder string as stored in
+/// `StepCondition::Deferred`.
+pub(crate) fn resolve_deferred_condition(
+    expr_text: &str,
+    resolve_step: &mut dyn FnMut(&str, &str) -> Result<EvaluatedValue>,
+    resolve_output: &mut dyn FnMut(&str) -> Result<EvaluatedValue>,
+) -> Result<bool> {
+    let expr = extract_pure_expression(expr_text).ok_or_else(|| {
+        anyhow::anyhow!("deferred condition is not a pure expression: '{expr_text}'")
+    })?;
+    let mut resolver = eval::RuntimeResolver {
+        resolve_step,
+        resolve_output,
+    };
+    let value = eval::evaluate_expression_span_runtime(expr, &mut resolver)
+        .with_context(|| format!("while evaluating deferred condition '{expr_text}'"))?;
+    Ok(value.truthy())
 }
 
 // ---------------------------------------------------------------------------
@@ -2639,9 +2658,10 @@ steps:
             assert_eq!(step.run.trim(), "echo ${{ steps.build.outputs.version }}");
         }
 
-        /// A step-output reference outside a `run:` field is a hard load-time error.
+        /// A step-output reference in any field (not just `run:`) is now allowed — the unified
+        /// engine carries it as a deferred ref.  The step should load successfully.
         #[test]
-        fn test_steps_ref_outside_run_field_is_error() {
+        fn test_steps_ref_outside_run_field_is_allowed_deferred() {
             let repo = TempDir::new().unwrap();
             std::fs::write(
                 repo.path().join("test.yaml"),
@@ -2656,12 +2676,31 @@ steps:
             )
             .unwrap();
 
-            let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
-            let msg = format!("{err:#}");
-            assert!(
-                msg.contains("only supported in 'run:' fields"),
-                "steps ref outside run: must be a hard error: {msg}"
-            );
+            // Steps refs in name: are now deferred — load must succeed.
+            // (No step with id "build" exists, so static validation would flag it,
+            // but a name: field is not statically validated for output refs — it loads OK.)
+            // The key assertion is: no "only supported in 'run:' fields" error.
+            // Note: `on: host` without ports is a separate validation; use guest instead.
+            std::fs::write(
+                repo.path().join("test.yaml"),
+                r#"
+type: botforge/test
+name: test
+steps:
+  - name: ${{ steps.build.outputs.version }}
+    run: echo ok
+"#,
+            )
+            .unwrap();
+            // Should load without the old run:-only restriction error.
+            let result = load_test_config(repo.path(), &repo.path().join("test.yaml"));
+            if let Err(ref e) = result {
+                let msg = format!("{e:#}");
+                assert!(
+                    !msg.contains("only supported in 'run:' fields"),
+                    "steps ref should no longer be restricted to run: fields: {msg}"
+                );
+            }
         }
 
         /// A step-output reference combined with operators is not a pure reference
@@ -2967,18 +3006,14 @@ steps:
 
         #[test]
         fn test_resolve_output_refs_substitutes_step_value() {
-            let resolved = resolve_output_refs_in_string(
+            let resolved = resolve_deferred_refs_in_string(
                 "version is ${{ steps.build.outputs.version }} end",
-                &mut |reference| {
-                    assert_eq!(
-                        reference,
-                        DeferredOutputReference::StepOutput {
-                            step_id: "build".to_string(),
-                            output_name: "version".to_string(),
-                        }
-                    );
-                    Ok("1.2.3".to_string())
+                &mut |step_id, output_name| {
+                    assert_eq!(step_id, "build");
+                    assert_eq!(output_name, "version");
+                    Ok(EvaluatedValue::String("1.2.3".to_string()))
                 },
+                &mut |_| unreachable!("no outputs.* in this test"),
             )
             .unwrap();
             assert_eq!(resolved, "version is 1.2.3 end");
@@ -2986,42 +3021,52 @@ steps:
 
         #[test]
         fn test_resolve_output_refs_no_refs_is_identity() {
-            let resolved =
-                resolve_output_refs_in_string("plain text", &mut |_| unreachable!()).unwrap();
+            let resolved = resolve_deferred_refs_in_string(
+                "plain text",
+                &mut |_, _| unreachable!("no refs"),
+                &mut |_| unreachable!("no refs"),
+            )
+            .unwrap();
             assert_eq!(resolved, "plain text");
         }
 
         #[test]
         fn test_resolve_output_refs_propagates_lookup_error() {
-            let err =
-                resolve_output_refs_in_string("${{ steps.build.outputs.version }}", &mut |_| {
-                    anyhow::bail!("lookup failed")
-                })
-                .unwrap_err();
+            let err = resolve_deferred_refs_in_string(
+                "${{ steps.build.outputs.version }}",
+                &mut |_, _| anyhow::bail!("lookup failed"),
+                &mut |_| unreachable!("no outputs.* in this test"),
+            )
+            .unwrap_err();
             assert!(format!("{err:#}").contains("lookup failed"));
         }
 
         #[test]
         fn test_resolve_output_refs_substitutes_fragment_output_value() {
-            let resolved =
-                resolve_output_refs_in_string("value=${{ outputs.version }}", &mut |reference| {
-                    assert_eq!(
-                        reference,
-                        DeferredOutputReference::FragmentOutput {
-                            output_name: "version".to_string(),
-                        }
-                    );
-                    Ok("1.2.3".to_string())
-                })
-                .unwrap();
+            let resolved = resolve_deferred_refs_in_string(
+                "value=${{ outputs.version }}",
+                &mut |_, _| unreachable!("no steps.* in this test"),
+                &mut |output_name| {
+                    assert_eq!(output_name, "version");
+                    Ok(EvaluatedValue::String("1.2.3".to_string()))
+                },
+            )
+            .unwrap();
             assert_eq!(resolved, "value=1.2.3");
         }
 
         #[test]
         fn test_resolve_output_refs_rejects_non_runtime_expression() {
-            let err = resolve_output_refs_in_string("${{ inputs.x }}", &mut |_| unreachable!())
-                .unwrap_err();
-            assert!(format!("{err:#}").contains("unexpected unresolved expression"));
+            let err = resolve_deferred_refs_in_string(
+                "${{ inputs.x }}",
+                &mut |_, _| unreachable!("no steps.* in this test"),
+                &mut |_| unreachable!("no outputs.* in this test"),
+            )
+            .unwrap_err();
+            assert!(
+                format!("{err:#}").contains("load-time substitution should have resolved"),
+                "non-deferred expression should error at runtime: {err:#}"
+            );
         }
     }
 }

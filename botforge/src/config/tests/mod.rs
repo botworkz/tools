@@ -6,8 +6,8 @@ use crate::plan::files::FileEntry;
 use crate::qemu::PortSpec;
 use crate::resolver::Reference;
 use crate::step::{
-    ArchiveStep, ArchiveStepSpec, ExpectBlock, InvokeStep, RunStep, StdioExpect, StepTarget,
-    TestStep,
+    ArchiveStep, ArchiveStepSpec, ExpectBlock, InvokeStep, RunStep, StdioExpect, StepCondition,
+    StepTarget, TestStep,
 };
 use std::path::PathBuf;
 use tempfile::TempDir;
@@ -43,7 +43,7 @@ fn make_step(target: StepTarget, name: &str) -> TestStep {
         sudo: None,
         id: None,
         expect: None,
-        condition: None,
+        condition: StepCondition::Always,
         outputs: vec![],
         captured_outputs: Default::default(),
     })
@@ -4687,7 +4687,7 @@ mod outputs_validation {
             sudo: None,
             id: None,
             expect: None,
-            condition: None,
+            condition: StepCondition::Always,
             outputs,
             captured_outputs: Default::default(),
         })
@@ -5688,7 +5688,7 @@ steps:
             sudo: None,
             id: Some(inner_id.to_string()),
             expect: None,
-            condition: None,
+            condition: StepCondition::Always,
             outputs: vec![crate::step::OutputDecl {
                 name: output_name.to_string(),
                 output_type: decl.output_type,
@@ -5705,6 +5705,7 @@ steps:
             id: None,
             steps: vec![TestStep::Run(run)],
             output_decls: vec![decl],
+            deferred_with: std::collections::BTreeMap::new(),
             captured_outputs: std::cell::RefCell::new(None),
         }
     }
@@ -5815,6 +5816,7 @@ steps:
             id: None,
             steps: vec![],
             output_decls: vec![],
+            deferred_with: std::collections::BTreeMap::new(),
             captured_outputs: std::cell::RefCell::new(None),
         };
         resolve_invoke_outputs_for_test(&invoke).unwrap();

@@ -74,6 +74,19 @@ steps:
       contains:
       - secret-fragment-output-consumed
 - uses: "@://fragment-self-outputs.steps.yaml"
+# --- Deferred `with:` resolution at the invocation boundary --------------------
+# The admin fragment emits an OTP as a declared output; the user fragment
+# consumes it via `otp: ${{ steps.admin.outputs.testuser_otp }}` in its `with:`
+# block — resolved at runtime against the executed sibling, then bound to the
+# child fragment's typed `otp` input.
+- uses: "@://deferred-with-admin.steps.yaml"
+  id: admin
+  with:
+    tenant: testuser
+- uses: "@://deferred-with-user.steps.yaml"
+  with:
+    tenant: testuser
+    otp: ${{ steps.admin.outputs.testuser_otp }}
 - uses: "@://expressions.steps.yaml"
   with:
     str_a: hello

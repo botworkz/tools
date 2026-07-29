@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use serde_yaml::Value;
 use shasset::manifest::Manifest;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -23,11 +24,13 @@ use super::log::{
 };
 use crate::assert::{registry::built_in_assert_registry, AssertBlock};
 use crate::config::{
-    resolve_output_refs_in_string, DeferredOutputReference, TestConfig, TestIsoBootstrap,
+    resolve_deferred_condition, resolve_deferred_refs_in_string, EvaluatedValue, TestConfig,
+    TestIsoBootstrap,
 };
 use crate::step::{
     capture_step_outputs, resolve_shell, ArchiveStep, CapturedOutput, ExpectBlock,
-    FragmentOutputDecl, InvokeStep, OutputValue, RunStep, StdioExpect, StepTarget, TestStep,
+    FragmentOutputDecl, InvokeStep, OutputValue, RunStep, StdioExpect, StepCondition, StepTarget,
+    TestStep,
 };
 
 const TEST_SSH_READY_TIMEOUT: Duration = Duration::from_secs(300);
@@ -347,6 +350,7 @@ pub(crate) fn run_step_flow(
         None,
         &mut accumulated_env,
         &mut archive_executor,
+        &std::collections::BTreeMap::new(),
     )?;
     Ok(overall_deadline)
 }
@@ -384,6 +388,10 @@ fn run_steps_inner(
     fragment_output_decls: Option<&[FragmentOutputDecl]>,
     accumulated_env: &mut Vec<(String, String)>,
     archive_executor: &mut Option<&mut ArchiveExecutor<'_>>,
+    // Step-output values resolved at the outer invocation boundary (from deferred_with).
+    // These cover `${{ steps.X.outputs.Y }}` refs that were injected into inner steps
+    // via input substitution from the calling scope.
+    inherited_step_refs: &std::collections::BTreeMap<(String, String), EvaluatedValue>,
 ) -> Result<()> {
     for (step_idx, step) in steps.iter().enumerate() {
         ensure_overall_budget(context.overall_deadline, context.overall_timeout)?;
@@ -404,6 +412,24 @@ fn run_steps_inner(
                 let mut child_prefix = parent_indices.to_vec();
                 child_prefix.push(step_idx);
 
+                // Resolve deferred_with values against prior siblings in the current scope.
+                // These become the inherited step refs for the child invocation.
+                let deferred_with_result =
+                    resolve_invoke_deferred_with(invoke, steps, step_idx, inherited_step_refs);
+                let child_inherited = match deferred_with_result {
+                    Ok(map) => map,
+                    Err(e) => {
+                        print_step_status(
+                            &display,
+                            invoke.uses.as_str(),
+                            None,
+                            false,
+                            Some(invoke_started.elapsed()),
+                        );
+                        return Err(e);
+                    }
+                };
+
                 let invoke_result = run_steps_inner(
                     context,
                     &invoke.steps,
@@ -411,6 +437,7 @@ fn run_steps_inner(
                     Some(&invoke.output_decls),
                     &mut child_env,
                     archive_executor,
+                    &child_inherited,
                 );
                 // child_env is dropped here — env mutations do not leak back out.
 
@@ -429,7 +456,41 @@ fn run_steps_inner(
 
             TestStep::Run(run) => {
                 // Evaluate the `if:` condition before doing any work.
-                if !run.condition_enabled() {
+                // For Deferred conditions, resolve against the current scope at runtime.
+                let should_run = match &run.condition {
+                    StepCondition::Always => true,
+                    StepCondition::Resolved(b) => *b,
+                    StepCondition::Deferred(expr) => {
+                        let prior_steps = &steps[..step_idx];
+                        resolve_deferred_condition(
+                            expr,
+                            &mut |step_id: &str, output_name: &str| {
+                                let key = (step_id.to_string(), output_name.to_string());
+                                if let Some(v) = inherited_step_refs.get(&key) {
+                                    return Ok(v.clone());
+                                }
+                                resolve_step_output_reference(
+                                    run,
+                                    steps,
+                                    prior_steps,
+                                    step_id,
+                                    output_name,
+                                )
+                            },
+                            &mut |output_name: &str| {
+                                resolve_fragment_output_reference(
+                                    run,
+                                    steps,
+                                    prior_steps,
+                                    fragment_output_decls,
+                                    output_name,
+                                )
+                            },
+                        )
+                        .unwrap_or(false)
+                    }
+                };
+                if !should_run {
                     print_step_skipped(&display, step.display_name(), step.display_id());
                     continue;
                 }
@@ -442,11 +503,16 @@ fn run_steps_inner(
                 // / `${{ outputs.<name> }}` references in the run body against
                 // already-executed siblings in this scope (backward-only, hard
                 // error otherwise).
-                let step_result =
-                    resolve_run_step_output_refs(run, steps, step_idx, fragment_output_decls)
-                        .and_then(|run_body| {
-                            run_run_step(context, &display, run, &run_body, accumulated_env)
-                        });
+                let step_result = resolve_run_step_output_refs(
+                    run,
+                    steps,
+                    step_idx,
+                    fragment_output_decls,
+                    inherited_step_refs,
+                )
+                .and_then(|run_body| {
+                    run_run_step(context, &display, run, &run_body, accumulated_env)
+                });
                 print_step_status(
                     &display,
                     step.display_name(),
@@ -788,28 +854,52 @@ where
 /// - `outputs.<name>` (fragment-self) resolves only inside fragment scopes and maps
 ///   to the fragment's declared output contract (`from-step`/`from-output`,
 ///   `default`, `required`) at the current execution point.
+///
+/// `inherited_step_refs` carries step-output values that were resolved at the outer
+/// invocation boundary (from `deferred_with`) and injected into this scope via input
+/// substitution — they take precedence over local scope lookup.
+///
+/// Expression evaluation lives solely in config/expressions; do not parse `${{ }}` here.
 fn resolve_run_step_output_refs(
     step: &RunStep,
     scope_steps: &[TestStep],
     step_idx: usize,
     fragment_output_decls: Option<&[FragmentOutputDecl]>,
+    inherited_step_refs: &std::collections::BTreeMap<(String, String), EvaluatedValue>,
 ) -> Result<String> {
     let prior_steps = &scope_steps[..step_idx];
-    resolve_output_refs_in_string(&step.run, &mut |reference| match reference {
-        DeferredOutputReference::StepOutput {
-            step_id,
-            output_name,
-        } => resolve_step_output_reference(step, scope_steps, prior_steps, &step_id, &output_name),
-        DeferredOutputReference::FragmentOutput { output_name } => {
+    resolve_deferred_refs_in_string(
+        &step.run,
+        &mut |step_id: &str, output_name: &str| {
+            // Check inherited refs first (outer-scope with: substitution).
+            let key = (step_id.to_string(), output_name.to_string());
+            if let Some(value) = inherited_step_refs.get(&key) {
+                return Ok(value.clone());
+            }
+            // Then check local scope (backward-only).
+            resolve_step_output_reference(step, scope_steps, prior_steps, step_id, output_name)
+        },
+        &mut |output_name: &str| {
             resolve_fragment_output_reference(
                 step,
                 scope_steps,
                 prior_steps,
                 fragment_output_decls,
-                &output_name,
+                output_name,
             )
-        }
-    })
+        },
+    )
+}
+
+/// Convert a resolved [`OutputValue`] to an [`EvaluatedValue`] for use in the expression
+/// engine at runtime (e.g. string interpolation, typed field resolution).
+fn output_value_to_evaluated(v: OutputValue) -> EvaluatedValue {
+    match v {
+        OutputValue::String(s) => EvaluatedValue::String(s),
+        OutputValue::Number(n) => EvaluatedValue::Number(n),
+        OutputValue::Bool(b) => EvaluatedValue::Bool(b),
+        OutputValue::Null => EvaluatedValue::Empty,
+    }
 }
 
 enum ScopedStepById<'a> {
@@ -832,16 +922,100 @@ fn find_step_by_id<'a>(steps: &'a [TestStep], step_id: &str) -> Option<ScopedSte
     None
 }
 
+/// Resolve a `uses:` step's deferred `with:` values at the invocation boundary,
+/// against already-executed siblings in the current scope (backward-only; a
+/// forward or unknown reference is a hard error).
+///
+/// Runs BEFORE the child invocation executes. The resolved `${{ steps.X.outputs.Y }}`
+/// values are returned as the child's inherited step refs, so inner steps that
+/// received the deferred ref via load-time input substitution resolve to the real
+/// captured value at runtime.
+///
+/// Expression evaluation lives solely in config/expressions; do not parse `${{ }}` here.
+fn resolve_invoke_deferred_with(
+    invoke: &InvokeStep,
+    scope_steps: &[TestStep],
+    step_idx: usize,
+    inherited_step_refs: &std::collections::BTreeMap<(String, String), EvaluatedValue>,
+) -> Result<std::collections::BTreeMap<(String, String), EvaluatedValue>> {
+    let prior_steps = &scope_steps[..step_idx];
+    let mut child_inherited: std::collections::BTreeMap<(String, String), EvaluatedValue> =
+        std::collections::BTreeMap::new();
+    invoke
+        .deferred_with
+        .values()
+        .filter_map(|v| {
+            if let Value::String(s) = v {
+                Some(s.as_str())
+            } else {
+                None
+            }
+        })
+        .try_for_each(|s| {
+            resolve_deferred_refs_in_string(
+                s,
+                &mut |step_id: &str, output_name: &str| {
+                    // Check inherited (outer-scope) refs first.
+                    let key = (step_id.to_string(), output_name.to_string());
+                    if let Some(v) = inherited_step_refs.get(&key) {
+                        child_inherited.insert(key, v.clone());
+                        return Ok(v.clone());
+                    }
+                    // Then look up in the current scope's prior steps.
+                    let dummy = make_boundary_consumer(&invoke.uses);
+                    resolve_step_output_reference(
+                        &dummy,
+                        scope_steps,
+                        prior_steps,
+                        step_id,
+                        output_name,
+                    )
+                    .inspect(|v| {
+                        child_inherited
+                            .insert((step_id.to_string(), output_name.to_string()), v.clone());
+                    })
+                },
+                &mut |output_name: &str| {
+                    anyhow::bail!(
+                        "'{}': outputs.* not available in outer-scope 'with:' (output: '{}')",
+                        invoke.uses,
+                        output_name
+                    )
+                },
+            )
+            .map(|_| ())
+        })?;
+    Ok(child_inherited)
+}
+
+/// Create a dummy `RunStep` consumer for error-message context at the invocation boundary.
+/// Used when resolving `deferred_with` values outside an actual run step.
+fn make_boundary_consumer(uses_name: &str) -> RunStep {
+    RunStep {
+        name: format!("<invoke boundary: {}>", uses_name),
+        run: String::new(),
+        id: None,
+        condition: StepCondition::Always,
+        target: Default::default(),
+        timeout: None,
+        shell: None,
+        sudo: None,
+        outputs: Vec::new(),
+        expect: None,
+        captured_outputs: Default::default(),
+    }
+}
+
 fn resolve_step_output_reference(
     consumer: &RunStep,
     scope_steps: &[TestStep],
     prior_steps: &[TestStep],
     step_id: &str,
     output_name: &str,
-) -> Result<String> {
+) -> Result<EvaluatedValue> {
     if let Some(prior) = find_step_by_id(prior_steps, step_id) {
         return resolve_captured_output_value(consumer, step_id, output_name, prior)
-            .map(|value| value.to_use_string());
+            .map(output_value_to_evaluated);
     }
 
     if find_step_by_id(scope_steps, step_id).is_some() {
@@ -908,7 +1082,7 @@ fn resolve_fragment_output_reference(
     prior_steps: &[TestStep],
     fragment_output_decls: Option<&[FragmentOutputDecl]>,
     output_name: &str,
-) -> Result<String> {
+) -> Result<EvaluatedValue> {
     let Some(decls) = fragment_output_decls else {
         anyhow::bail!(
             "step '{}': cannot resolve ${{{{ outputs.{} }}}} — outputs.* is only available inside a fragment scope",
@@ -961,7 +1135,7 @@ fn resolve_fragment_output_reference(
             decl.from_output
         );
     }
-    Ok(effective.to_use_string())
+    Ok(output_value_to_evaluated(effective))
 }
 
 /// Resolve a fragment's declared outputs onto the `InvokeStep` node.
@@ -1874,62 +2048,66 @@ pub(crate) fn run_local_steps(context: &Path, steps: &[TestStep]) -> Result<()> 
                 let env_file = std::env::temp_dir().join(format!("botforge-publish-env-{suffix}"));
                 let out_file = std::env::temp_dir().join(format!("botforge-publish-out-{suffix}"));
 
-                let step_result: Result<()> =
-                    resolve_run_step_output_refs(run, steps, step_idx, None).and_then(|run_body| {
-                        if let Some(expect) = &run.expect {
-                            let (capture, actual_exit) = run_host_step_capturing(
-                                &run.name,
-                                &run_body,
-                                context,
-                                budget,
-                                &template,
-                                &accumulated_env,
-                                HostStepFiles {
-                                    env_file: &env_file,
-                                    out_file: &out_file,
-                                    log_path: &log_path,
-                                },
-                            )
-                            .with_context(|| {
-                                format!("publish step '{}' command failed", run.name)
-                            })?;
+                let step_result: Result<()> = resolve_run_step_output_refs(
+                    run,
+                    steps,
+                    step_idx,
+                    None,
+                    &std::collections::BTreeMap::new(),
+                )
+                .and_then(|run_body| {
+                    if let Some(expect) = &run.expect {
+                        let (capture, actual_exit) = run_host_step_capturing(
+                            &run.name,
+                            &run_body,
+                            context,
+                            budget,
+                            &template,
+                            &accumulated_env,
+                            HostStepFiles {
+                                env_file: &env_file,
+                                out_file: &out_file,
+                                log_path: &log_path,
+                            },
+                        )
+                        .with_context(|| format!("publish step '{}' command failed", run.name))?;
 
+                        if let Ok(contents) = std::fs::read_to_string(&env_file) {
+                            if let Ok(new_entries) = parse_env_file(&contents) {
+                                env_merge(&mut accumulated_env, new_entries);
+                            }
+                        }
+                        let _ = std::fs::remove_file(&env_file);
+                        let _ = std::fs::remove_file(&out_file);
+                        check_expect_block(&run.name, expect, &capture, actual_exit)
+                    } else {
+                        let result = run_host_step(
+                            &run.name,
+                            &run_body,
+                            context,
+                            budget,
+                            &template,
+                            &accumulated_env,
+                            HostStepFiles {
+                                env_file: &env_file,
+                                out_file: &out_file,
+                                log_path: &log_path,
+                            },
+                        )
+                        .with_context(|| format!("publish step '{}' command failed", run.name));
+
+                        if result.is_ok() {
                             if let Ok(contents) = std::fs::read_to_string(&env_file) {
                                 if let Ok(new_entries) = parse_env_file(&contents) {
                                     env_merge(&mut accumulated_env, new_entries);
                                 }
                             }
-                            let _ = std::fs::remove_file(&env_file);
-                            let _ = std::fs::remove_file(&out_file);
-                            check_expect_block(&run.name, expect, &capture, actual_exit)
-                        } else {
-                            let result = run_host_step(
-                                &run.name,
-                                &run_body,
-                                context,
-                                budget,
-                                &template,
-                                &accumulated_env,
-                                HostStepFiles {
-                                    env_file: &env_file,
-                                    out_file: &out_file,
-                                    log_path: &log_path,
-                                },
-                            )
-                            .with_context(|| format!("publish step '{}' command failed", run.name));
-
-                            if result.is_ok() {
-                                if let Ok(contents) = std::fs::read_to_string(&env_file) {
-                                    if let Ok(new_entries) = parse_env_file(&contents) {
-                                        env_merge(&mut accumulated_env, new_entries);
-                                    }
-                                }
-                            }
-                            let _ = std::fs::remove_file(&env_file);
-                            let _ = std::fs::remove_file(&out_file);
-                            result
                         }
-                    });
+                        let _ = std::fs::remove_file(&env_file);
+                        let _ = std::fs::remove_file(&out_file);
+                        result
+                    }
+                });
 
                 print_step_status(
                     &display,
@@ -2159,12 +2337,14 @@ pub(crate) fn resolve_invoke_outputs_for_test(invoke: &InvokeStep) -> anyhow::Re
 mod tests {
     use super::{
         build_guest_ssh_cmd, capture_declared_step_outputs, env_merge, guest_files_init_cmd,
-        parse_env_file, resolve_run_step_output_refs, resolve_step_timeout, run_host_step,
-        shell_single_quote, HostStepFiles, StepExecutionBudget,
+        parse_env_file, resolve_invoke_deferred_with, resolve_run_step_output_refs,
+        resolve_step_timeout, run_host_step, shell_single_quote, HostStepFiles,
+        StepExecutionBudget,
     };
+    use crate::config::EvaluatedValue;
     use crate::step::{
         resolve_shell, CapturedOutput, FragmentOutputDecl, InvokeStep, OutputDecl, OutputType,
-        OutputValue, RunStep, StepTarget, TestStep,
+        OutputValue, RunStep, StepCondition, StepTarget, TestStep,
     };
     use crate::util::unique_suffix;
     use serde::Deserialize;
@@ -2926,7 +3106,7 @@ run: echo ok
             sudo: None,
             id: None,
             expect: None,
-            condition: None,
+            condition: StepCondition::Always,
             outputs: vec![],
             captured_outputs: Default::default(),
         };
@@ -2947,7 +3127,7 @@ run: echo ok
             sudo: None,
             id: None,
             expect: None,
-            condition: None,
+            condition: StepCondition::Always,
             outputs: vec![],
             captured_outputs: Default::default(),
         };
@@ -2975,7 +3155,7 @@ run: echo ok
             sudo: None,
             id: None,
             expect: None,
-            condition: None,
+            condition: StepCondition::Always,
             outputs,
             captured_outputs: Default::default(),
         }
@@ -3039,7 +3219,7 @@ run: echo ok
             sudo: None,
             id: None,
             expect: None,
-            condition: None,
+            condition: StepCondition::Always,
             outputs: vec![],
             captured_outputs: Default::default(),
         }
@@ -3051,6 +3231,7 @@ run: echo ok
             id: Some(id.to_string()),
             steps: vec![],
             output_decls: vec![],
+            deferred_with: std::collections::BTreeMap::new(),
             captured_outputs: std::cell::RefCell::new(Some(outputs)),
         })
     }
@@ -3065,7 +3246,7 @@ run: echo ok
             sudo: None,
             id: Some(id.to_string()),
             expect: None,
-            condition: None,
+            condition: StepCondition::Always,
             outputs: vec![],
             captured_outputs: std::cell::RefCell::new(Some(outputs)),
         })
@@ -3100,7 +3281,14 @@ run: echo ok
             "echo ${{ steps.build.outputs.version }}/${{ steps.build.outputs.count }}/${{ steps.build.outputs.ready }}",
         );
 
-        let resolved = resolve_run_step_output_refs(&step, &scope, 1, None).unwrap();
+        let resolved = resolve_run_step_output_refs(
+            &step,
+            &scope,
+            1,
+            None,
+            &std::collections::BTreeMap::new(),
+        )
+        .unwrap();
         assert_eq!(resolved, "echo 1.2.3/7/true");
     }
 
@@ -3115,7 +3303,14 @@ run: echo ok
         ];
         let step = consumer_step("echo [${{ steps.build.outputs.maybe }}]");
 
-        let resolved = resolve_run_step_output_refs(&step, &scope, 1, None).unwrap();
+        let resolved = resolve_run_step_output_refs(
+            &step,
+            &scope,
+            1,
+            None,
+            &std::collections::BTreeMap::new(),
+        )
+        .unwrap();
         assert_eq!(resolved, "echo []");
     }
 
@@ -3123,7 +3318,14 @@ run: echo ok
     fn test_resolve_run_refs_no_refs_is_identity() {
         let step = consumer_step("echo plain");
         let scope = vec![TestStep::Run(consumer_step("echo noop"))];
-        let resolved = resolve_run_step_output_refs(&step, &scope, 0, None).unwrap();
+        let resolved = resolve_run_step_output_refs(
+            &step,
+            &scope,
+            0,
+            None,
+            &std::collections::BTreeMap::new(),
+        )
+        .unwrap();
         assert_eq!(resolved, "echo plain");
     }
 
@@ -3133,7 +3335,14 @@ run: echo ok
         let scope = vec![TestStep::Run(consumer_step(
             "echo ${{ steps.nope.outputs.version }}",
         ))];
-        let err = resolve_run_step_output_refs(&step, &scope, 0, None).unwrap_err();
+        let err = resolve_run_step_output_refs(
+            &step,
+            &scope,
+            0,
+            None,
+            &std::collections::BTreeMap::new(),
+        )
+        .unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("no step with id 'nope' exists in the current scope"),
@@ -3155,12 +3364,190 @@ run: echo ok
                 )],
             ),
         ];
-        let err = resolve_run_step_output_refs(&step, &scope, 0, None).unwrap_err();
+        let err = resolve_run_step_output_refs(
+            &step,
+            &scope,
+            0,
+            None,
+            &std::collections::BTreeMap::new(),
+        )
+        .unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("has not run yet"),
             "forward reference must be a hard error: {msg}"
         );
+    }
+
+    // --- Invoke-boundary `deferred_with` resolution ----------------------------
+    // Mirrors the run-body resolution tests above: an executed sibling produces
+    // captured outputs, and a later `uses:` step's deferred `with:` values resolve
+    // against it at the invocation boundary (backward-only, hard error otherwise).
+
+    fn invoke_with_deferred_with(with: &[(&str, &str)]) -> InvokeStep {
+        InvokeStep {
+            uses: "@://user-frag.yaml".to_string(),
+            id: None,
+            steps: vec![],
+            output_decls: vec![],
+            deferred_with: with
+                .iter()
+                .map(|(k, v)| (k.to_string(), serde_yaml::Value::String(v.to_string())))
+                .collect(),
+            captured_outputs: std::cell::RefCell::new(None),
+        }
+    }
+
+    #[test]
+    fn test_resolve_invoke_deferred_with_backward_sibling_resolves() {
+        // The headline OTP scenario: an executed `uses:` sibling (id: admin)
+        // produced a captured output; a later invoke consumes it via
+        // `otp: ${{ steps.admin.outputs.testuser_otp }}` in its with: block.
+        let invoke =
+            invoke_with_deferred_with(&[("otp", "${{ steps.admin.outputs.testuser_otp }}")]);
+        let scope = vec![
+            executed_invoke(
+                "admin",
+                vec![captured(
+                    "testuser_otp",
+                    OutputType::String,
+                    OutputValue::String("otp-12345".to_string()),
+                )],
+            ),
+            TestStep::Invoke(invoke),
+        ];
+        let TestStep::Invoke(invoke) = &scope[1] else {
+            unreachable!()
+        };
+        let resolved =
+            resolve_invoke_deferred_with(invoke, &scope, 1, &std::collections::BTreeMap::new())
+                .unwrap();
+        assert_eq!(
+            resolved.get(&("admin".to_string(), "testuser_otp".to_string())),
+            Some(&EvaluatedValue::String("otp-12345".to_string())),
+            "the child must inherit the real resolved value"
+        );
+    }
+
+    #[test]
+    fn test_resolve_invoke_deferred_with_run_step_producer_resolves() {
+        let invoke = invoke_with_deferred_with(&[("count", "${{ steps.emit.outputs.count }}")]);
+        let scope = vec![
+            executed_run_with_outputs(
+                "emit",
+                vec![captured(
+                    "count",
+                    OutputType::Number,
+                    OutputValue::Number(7.0),
+                )],
+            ),
+            TestStep::Invoke(invoke),
+        ];
+        let TestStep::Invoke(invoke) = &scope[1] else {
+            unreachable!()
+        };
+        let resolved =
+            resolve_invoke_deferred_with(invoke, &scope, 1, &std::collections::BTreeMap::new())
+                .unwrap();
+        assert_eq!(
+            resolved.get(&("emit".to_string(), "count".to_string())),
+            Some(&EvaluatedValue::Number(7.0))
+        );
+    }
+
+    #[test]
+    fn test_resolve_invoke_deferred_with_forward_reference_is_error() {
+        let invoke = invoke_with_deferred_with(&[("otp", "${{ steps.admin.outputs.otp }}")]);
+        let scope = vec![
+            TestStep::Invoke(invoke),
+            executed_invoke(
+                "admin",
+                vec![captured(
+                    "otp",
+                    OutputType::String,
+                    OutputValue::String("late".to_string()),
+                )],
+            ),
+        ];
+        let TestStep::Invoke(invoke) = &scope[0] else {
+            unreachable!()
+        };
+        let err =
+            resolve_invoke_deferred_with(invoke, &scope, 0, &std::collections::BTreeMap::new())
+                .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("has not run yet"),
+            "forward reference in with: must be a hard error: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_invoke_deferred_with_unknown_step_is_error() {
+        let invoke = invoke_with_deferred_with(&[("otp", "${{ steps.nope.outputs.otp }}")]);
+        let scope = vec![TestStep::Invoke(invoke)];
+        let TestStep::Invoke(invoke) = &scope[0] else {
+            unreachable!()
+        };
+        let err =
+            resolve_invoke_deferred_with(invoke, &scope, 0, &std::collections::BTreeMap::new())
+                .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("no step with id"),
+            "unknown reference in with: must be a hard error: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_invoke_deferred_with_outputs_ref_is_error() {
+        let invoke = invoke_with_deferred_with(&[("x", "${{ outputs.value }}")]);
+        let scope = vec![TestStep::Invoke(invoke)];
+        let TestStep::Invoke(invoke) = &scope[0] else {
+            unreachable!()
+        };
+        let err =
+            resolve_invoke_deferred_with(invoke, &scope, 0, &std::collections::BTreeMap::new())
+                .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("outputs.* not available"),
+            "outputs.* in outer-scope with: must be a hard error: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_invoke_deferred_with_inherited_ref_takes_precedence() {
+        // An outer-scope ref already resolved at a previous invocation boundary
+        // is forwarded to the child without a local-scope lookup.
+        let invoke = invoke_with_deferred_with(&[("otp", "${{ steps.outer.outputs.otp }}")]);
+        let scope = vec![TestStep::Invoke(invoke)];
+        let TestStep::Invoke(invoke) = &scope[0] else {
+            unreachable!()
+        };
+        let mut inherited = std::collections::BTreeMap::new();
+        inherited.insert(
+            ("outer".to_string(), "otp".to_string()),
+            EvaluatedValue::String("from-outer".to_string()),
+        );
+        let resolved = resolve_invoke_deferred_with(invoke, &scope, 0, &inherited).unwrap();
+        assert_eq!(
+            resolved.get(&("outer".to_string(), "otp".to_string())),
+            Some(&EvaluatedValue::String("from-outer".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_resolve_invoke_deferred_with_empty_yields_empty_map() {
+        let invoke = invoke_with_deferred_with(&[]);
+        let scope = vec![TestStep::Invoke(invoke)];
+        let TestStep::Invoke(invoke) = &scope[0] else {
+            unreachable!()
+        };
+        let resolved =
+            resolve_invoke_deferred_with(invoke, &scope, 0, &std::collections::BTreeMap::new())
+                .unwrap();
+        assert!(resolved.is_empty());
     }
 
     #[test]
@@ -3177,7 +3564,14 @@ run: echo ok
             TestStep::Run(consumer_step("echo noop")),
         ];
         let step = consumer_step("echo ${{ steps.build.outputs.version }}");
-        let resolved = resolve_run_step_output_refs(&step, &scope, 1, None).unwrap();
+        let resolved = resolve_run_step_output_refs(
+            &step,
+            &scope,
+            1,
+            None,
+            &std::collections::BTreeMap::new(),
+        )
+        .unwrap();
         assert_eq!(resolved, "echo 2.0.0");
     }
 
@@ -3195,7 +3589,14 @@ run: echo ok
             TestStep::Run(consumer_step("echo noop")),
         ];
         let step = consumer_step("echo ${{ steps.build.outputs.token }}");
-        let resolved = resolve_run_step_output_refs(&step, &scope, 1, None).unwrap();
+        let resolved = resolve_run_step_output_refs(
+            &step,
+            &scope,
+            1,
+            None,
+            &std::collections::BTreeMap::new(),
+        )
+        .unwrap();
         assert_eq!(resolved, "echo super-secret-token");
     }
 
@@ -3242,12 +3643,20 @@ run: echo ok
                 id: Some("fetch".to_string()),
                 steps: vec![],
                 output_decls: vec![],
+                deferred_with: std::collections::BTreeMap::new(),
                 captured_outputs: std::cell::RefCell::new(None),
             }),
             TestStep::Run(consumer_step("echo noop")),
         ];
         let step = consumer_step("echo ${{ steps.fetch.outputs.token }}");
-        let err = resolve_run_step_output_refs(&step, &scope, 1, None).unwrap_err();
+        let err = resolve_run_step_output_refs(
+            &step,
+            &scope,
+            1,
+            None,
+            &std::collections::BTreeMap::new(),
+        )
+        .unwrap_err();
         let msg = format!("{err:#}");
         // Confirm the error is about missing outputs (not a value leak).
         assert!(
@@ -3277,7 +3686,14 @@ run: echo ok
             TestStep::Run(consumer_step("echo noop")),
         ];
         let step = consumer_step("echo ${{ steps.fetch.outputs.nope }}");
-        let err = resolve_run_step_output_refs(&step, &scope, 1, None).unwrap_err();
+        let err = resolve_run_step_output_refs(
+            &step,
+            &scope,
+            1,
+            None,
+            &std::collections::BTreeMap::new(),
+        )
+        .unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("does not declare output 'nope'"),
@@ -3317,6 +3733,7 @@ run: echo ok
                 required: true,
                 default: None,
             }],
+            deferred_with: std::collections::BTreeMap::new(),
             captured_outputs: std::cell::RefCell::new(None),
         };
 
@@ -3375,6 +3792,7 @@ run: echo ok
                 required: true,
                 default: None,
             }],
+            deferred_with: std::collections::BTreeMap::new(),
             captured_outputs: std::cell::RefCell::new(None),
         };
 
@@ -3386,7 +3804,14 @@ run: echo ok
             TestStep::Run(consumer_step("echo noop")),
         ];
         let step = consumer_step("echo ${{ steps.call.outputs.token }}");
-        let resolved = resolve_run_step_output_refs(&step, &scope, 1, None).unwrap();
+        let resolved = resolve_run_step_output_refs(
+            &step,
+            &scope,
+            1,
+            None,
+            &std::collections::BTreeMap::new(),
+        )
+        .unwrap();
         // Use sink must receive the real value.
         assert_eq!(
             resolved, "echo boundary-secret",
@@ -3409,7 +3834,14 @@ run: echo ok
         ];
         let step = consumer_step("echo ${{ steps.build.outputs.nope }}");
 
-        let err = resolve_run_step_output_refs(&step, &scope, 1, None).unwrap_err();
+        let err = resolve_run_step_output_refs(
+            &step,
+            &scope,
+            1,
+            None,
+            &std::collections::BTreeMap::new(),
+        )
+        .unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("does not declare output 'nope'"),
@@ -3425,13 +3857,21 @@ run: echo ok
                 id: Some("build".to_string()),
                 steps: vec![],
                 output_decls: vec![],
+                deferred_with: std::collections::BTreeMap::new(),
                 captured_outputs: std::cell::RefCell::new(None),
             }),
             TestStep::Run(consumer_step("echo noop")),
         ];
         let step = consumer_step("echo ${{ steps.build.outputs.version }}");
 
-        let err = resolve_run_step_output_refs(&step, &scope, 1, None).unwrap_err();
+        let err = resolve_run_step_output_refs(
+            &step,
+            &scope,
+            1,
+            None,
+            &std::collections::BTreeMap::new(),
+        )
+        .unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("has no captured outputs"),
@@ -3476,7 +3916,14 @@ run: echo ok
             },
         ];
 
-        let resolved = resolve_run_step_output_refs(&step, &scope, 2, Some(&decls)).unwrap();
+        let resolved = resolve_run_step_output_refs(
+            &step,
+            &scope,
+            2,
+            Some(&decls),
+            &std::collections::BTreeMap::new(),
+        )
+        .unwrap();
         assert_eq!(resolved, "echo 1.2.3-defaulted");
     }
 
@@ -3503,7 +3950,14 @@ run: echo ok
             default: None,
         }];
 
-        let err = resolve_run_step_output_refs(&step, &scope, 0, Some(&decls)).unwrap_err();
+        let err = resolve_run_step_output_refs(
+            &step,
+            &scope,
+            0,
+            Some(&decls),
+            &std::collections::BTreeMap::new(),
+        )
+        .unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("has not run yet"),
