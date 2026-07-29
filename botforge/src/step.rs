@@ -113,6 +113,21 @@ pub(crate) struct CapturedOutput {
     pub(crate) value: OutputValue,
 }
 
+#[allow(dead_code)]
+impl CapturedOutput {
+    /// Project the captured value for human/log/error **display** sinks.
+    ///
+    /// Returns `"***"` when `declared_type` is [`OutputType::Secret`]; otherwise
+    /// returns the real string representation of the value.
+    ///
+    /// Always use this projection at display, log, and error sinks — never format
+    /// `self.value` directly.  Use `self.value.to_use_string()` **only** at use sinks
+    /// (interpolation into `run:` bodies, `$BF_ENV`, `$BF_OUT` round-trips).
+    pub(crate) fn display_value(&self) -> String {
+        self.value.to_display_string(self.declared_type)
+    }
+}
+
 /// Coerce a raw emitted string to the declared output type.
 ///
 /// An empty raw string is **always** `Null`, regardless of declared type.
@@ -1365,6 +1380,90 @@ expect:
         fn test_null_is_not_empty_string() {
             // Null and String("") are different values; they only *project* the same way.
             assert_ne!(OutputValue::Null, OutputValue::String(String::new()));
+        }
+    }
+
+    // --- Stage 5: CapturedOutput::display_value ---
+
+    mod captured_output_display {
+        use super::super::{CapturedOutput, OutputType, OutputValue};
+
+        fn captured(name: &str, t: OutputType, v: OutputValue) -> CapturedOutput {
+            CapturedOutput {
+                name: name.to_string(),
+                declared_type: t,
+                value: v,
+            }
+        }
+
+        #[test]
+        fn test_display_value_secret_masks_real_value() {
+            let c = captured(
+                "token",
+                OutputType::Secret,
+                OutputValue::String("super-secret-token".to_string()),
+            );
+            assert_eq!(
+                c.display_value(),
+                "***",
+                "secret output must render *** at display sink"
+            );
+        }
+
+        #[test]
+        fn test_display_value_secret_real_value_still_accessible_via_use_string() {
+            let c = captured(
+                "token",
+                OutputType::Secret,
+                OutputValue::String("super-secret-token".to_string()),
+            );
+            // Use sink must still get the real value.
+            assert_eq!(
+                c.value.to_use_string(),
+                "super-secret-token",
+                "use sink must receive real secret value"
+            );
+            // Display sink must mask.
+            assert_eq!(
+                c.display_value(),
+                "***",
+                "display sink must mask secret value"
+            );
+        }
+
+        #[test]
+        fn test_display_value_string_shows_real_value() {
+            let c = captured(
+                "version",
+                OutputType::String,
+                OutputValue::String("1.2.3".to_string()),
+            );
+            assert_eq!(c.display_value(), "1.2.3");
+        }
+
+        #[test]
+        fn test_display_value_number_shows_real_value() {
+            let c = captured("count", OutputType::Number, OutputValue::Number(42.0));
+            assert_eq!(c.display_value(), "42");
+        }
+
+        #[test]
+        fn test_display_value_bool_shows_real_value() {
+            let c = captured("ready", OutputType::Bool, OutputValue::Bool(true));
+            assert_eq!(c.display_value(), "true");
+        }
+
+        #[test]
+        fn test_display_value_null_secret_shows_masked() {
+            // Even a Null secret must render *** at display sinks (not "").
+            let c = captured("token", OutputType::Secret, OutputValue::Null);
+            assert_eq!(c.display_value(), "***");
+        }
+
+        #[test]
+        fn test_display_value_null_non_secret_shows_empty() {
+            let c = captured("maybe", OutputType::String, OutputValue::Null);
+            assert_eq!(c.display_value(), "");
         }
     }
 

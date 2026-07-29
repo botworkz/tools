@@ -3199,6 +3199,200 @@ run: echo ok
         assert_eq!(resolved, "echo super-secret-token");
     }
 
+    // --- Stage 5: secret masking invariant regression tests ---
+
+    #[test]
+    fn test_captured_output_display_value_secret_masks() {
+        // CapturedOutput::display_value() must mask secrets at display sinks.
+        let c = captured(
+            "token",
+            OutputType::Secret,
+            OutputValue::String("super-secret-token".to_string()),
+        );
+        assert_eq!(
+            c.display_value(),
+            "***",
+            "display_value must return *** for a secret output"
+        );
+        // Use sink still gets the real value.
+        assert_eq!(
+            c.value.to_use_string(),
+            "super-secret-token",
+            "to_use_string must return the real value at use sinks"
+        );
+    }
+
+    #[test]
+    fn test_captured_output_display_value_non_secret_shows_real() {
+        let c = captured(
+            "version",
+            OutputType::String,
+            OutputValue::String("1.2.3".to_string()),
+        );
+        assert_eq!(c.display_value(), "1.2.3");
+    }
+
+    #[test]
+    fn test_resolver_error_on_secret_output_does_not_leak_raw_value() {
+        // Resolver errors must never include the raw secret value in their message.
+        // The "no captured outputs" error path should only mention step/output names.
+        let scope = vec![
+            TestStep::Invoke(InvokeStep {
+                uses: "frag.yaml".to_string(),
+                id: Some("fetch".to_string()),
+                steps: vec![],
+                output_decls: vec![],
+                captured_outputs: std::cell::RefCell::new(None),
+            }),
+            TestStep::Run(consumer_step("echo noop")),
+        ];
+        let step = consumer_step("echo ${{ steps.fetch.outputs.token }}");
+        let err = resolve_run_step_output_refs(&step, &scope, 1, None).unwrap_err();
+        let msg = format!("{err:#}");
+        // Confirm the error is about missing outputs (not a value leak).
+        assert!(
+            msg.contains("has no captured outputs"),
+            "resolver error should describe the problem, not the value: {msg}"
+        );
+        // Confirm no raw secret value appears (defensive — the value is not even set here).
+        assert!(
+            !msg.contains("super-secret"),
+            "resolver error must not contain a raw secret value: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_resolver_error_unknown_output_does_not_leak_raw_value() {
+        // "does not declare output X" error must mention the name but not any raw secret.
+        let secret_val = "raw-secret-xyz";
+        let scope = vec![
+            executed_run_with_outputs(
+                "fetch",
+                vec![captured(
+                    "token",
+                    OutputType::Secret,
+                    OutputValue::String(secret_val.to_string()),
+                )],
+            ),
+            TestStep::Run(consumer_step("echo noop")),
+        ];
+        let step = consumer_step("echo ${{ steps.fetch.outputs.nope }}");
+        let err = resolve_run_step_output_refs(&step, &scope, 1, None).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("does not declare output 'nope'"),
+            "error must describe the problem: {msg}"
+        );
+        assert!(
+            !msg.contains(secret_val),
+            "resolver error must not contain the raw secret value: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_invoke_reexported_secret_output_is_secret_typed_and_masks_at_display() {
+        // A secret inner output re-exported through a fragment boundary must:
+        // - stay Secret-typed on invoke.captured_outputs
+        // - mask via display_value()
+        // - resolve real at the use sink
+
+        let inner_run = executed_run_with_outputs(
+            "fetcher",
+            vec![captured(
+                "token",
+                OutputType::Secret,
+                OutputValue::String("my-secret-value".to_string()),
+            )],
+        );
+
+        let invoke = InvokeStep {
+            uses: "frag.yaml".to_string(),
+            id: Some("call".to_string()),
+            steps: vec![inner_run],
+            output_decls: vec![FragmentOutputDecl {
+                name: "token".to_string(),
+                output_type: OutputType::Secret,
+                from_step: "fetcher".to_string(),
+                from_output: "token".to_string(),
+                required: true,
+                default: None,
+            }],
+            captured_outputs: std::cell::RefCell::new(None),
+        };
+
+        super::resolve_invoke_outputs_for_test(&invoke).unwrap();
+
+        let guard = invoke.captured_outputs.borrow();
+        let outputs = guard.as_ref().expect("captured_outputs must be set after resolution");
+        assert_eq!(outputs.len(), 1, "one output expected");
+        let out = &outputs[0];
+
+        // Must stay Secret-typed at the boundary.
+        assert_eq!(
+            out.declared_type,
+            OutputType::Secret,
+            "re-exported secret must remain Secret-typed at Invoke boundary"
+        );
+        // Display sink: must mask.
+        assert_eq!(
+            out.display_value(),
+            "***",
+            "re-exported secret must mask at display sinks"
+        );
+        // Use sink: must be real.
+        assert_eq!(
+            out.value.to_use_string(),
+            "my-secret-value",
+            "re-exported secret must resolve real at use sinks"
+        );
+    }
+
+    #[test]
+    fn test_invoke_reexported_secret_use_sink_resolves_real_value() {
+        // After boundary resolution, referencing the invoke's secret output via
+        // ${{ steps.call.outputs.token }} must yield the real value (use sink).
+
+        let inner_run = executed_run_with_outputs(
+            "fetcher",
+            vec![captured(
+                "token",
+                OutputType::Secret,
+                OutputValue::String("boundary-secret".to_string()),
+            )],
+        );
+
+        let invoke = InvokeStep {
+            uses: "frag.yaml".to_string(),
+            id: Some("call".to_string()),
+            steps: vec![inner_run],
+            output_decls: vec![FragmentOutputDecl {
+                name: "token".to_string(),
+                output_type: OutputType::Secret,
+                from_step: "fetcher".to_string(),
+                from_output: "token".to_string(),
+                required: true,
+                default: None,
+            }],
+            captured_outputs: std::cell::RefCell::new(None),
+        };
+
+        super::resolve_invoke_outputs_for_test(&invoke).unwrap();
+
+        // Wire the resolved invoke into a scope and resolve a use-sink reference.
+        let scope = vec![
+            TestStep::Invoke(invoke),
+            TestStep::Run(consumer_step("echo noop")),
+        ];
+        let step = consumer_step("echo ${{ steps.call.outputs.token }}");
+        let resolved = resolve_run_step_output_refs(&step, &scope, 1, None).unwrap();
+        // Use sink must receive the real value.
+        assert_eq!(
+            resolved, "echo boundary-secret",
+            "use sink reference to re-exported secret must resolve real"
+        );
+    }
+
+
     #[test]
     fn test_resolve_run_refs_unknown_output_name_is_error() {
         let scope = vec![
