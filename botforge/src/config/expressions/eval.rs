@@ -72,6 +72,13 @@ fn evaluate_node(
             )
         }
 
+        // `steps.<id>.outputs.<name>` values only exist after the referenced
+        // `uses:` step has executed; always deferred during the load-time
+        // (inputs/args) passes and resolved lazily at execution time.
+        ExprNode::StepOutputReference { .. } => Ok(EvaluatedSpan::Deferred),
+        // `outputs.<name>` values only exist at fragment execution time.
+        ExprNode::FragmentOutputReference { .. } => Ok(EvaluatedSpan::Deferred),
+
         ExprNode::FunctionCall { name, arg } => {
             evaluate_function_call(name, arg, active_namespace, typed_inputs, args)
         }

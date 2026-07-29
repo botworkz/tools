@@ -1,0 +1,44 @@
+type: botforge/fragment
+steps:
+- on: host
+  name: self-out-emit
+  id: emit
+  run: |
+    echo "version=9.9.9" >> "$BF_OUT"
+  outputs:
+  - name: version
+    type: string
+    required: true
+
+- on: host
+  name: self-out-quiet
+  id: quiet
+  run: |
+    true
+  outputs:
+  - name: maybe
+    type: string
+    required: false
+
+- on: host
+  name: consume fragment-self outputs
+  run: |
+    test "${{ outputs.version }}" = "9.9.9"
+    test "${{ outputs.fallback }}" = "self-default"
+    echo "fragment-self-outputs-consumed"
+  expect:
+    stdout:
+      contains:
+      - fragment-self-outputs-consumed
+
+outputs:
+- name: version
+  type: string
+  from-step: emit
+  from-output: version
+  required: true
+- name: fallback
+  type: string
+  from-step: quiet
+  from-output: maybe
+  default: "self-default"
