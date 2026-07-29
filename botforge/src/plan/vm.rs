@@ -563,18 +563,16 @@ fn run_run_step(
                 let expect_result = check_expect_block(&step.name, expect, &capture, actual_exit);
 
                 // Capture declared outputs on success.
-                if expect_result.is_ok() && !step.outputs.is_empty() {
-                    if let Ok(out_contents) = ssh_capture_stdout(
-                        context.ssh,
-                        &format!("cat {}", shell_single_quote(&remote_out_path)),
-                        1,
-                        Duration::from_secs(0),
-                        Duration::from_secs(10),
-                    ) {
-                        let captured =
-                            capture_step_outputs(&step.name, &step.outputs, &out_contents)?;
-                        *step.captured_outputs.borrow_mut() = Some(captured);
-                    }
+                if expect_result.is_ok() {
+                    capture_declared_step_outputs(step, || {
+                        ssh_capture_stdout(
+                            context.ssh,
+                            &format!("cat {}", shell_single_quote(&remote_out_path)),
+                            1,
+                            Duration::from_secs(0),
+                            Duration::from_secs(10),
+                        )
+                    })?;
                 }
 
                 expect_result
@@ -627,19 +625,15 @@ fn run_run_step(
                     }
 
                     // Capture declared outputs on success.
-                    if !step.outputs.is_empty() {
-                        if let Ok(out_contents) = ssh_capture_stdout(
+                    capture_declared_step_outputs(step, || {
+                        ssh_capture_stdout(
                             context.ssh,
                             &format!("cat {}", shell_single_quote(&remote_out_path)),
                             1,
                             Duration::from_secs(0),
                             Duration::from_secs(10),
-                        ) {
-                            let captured =
-                                capture_step_outputs(&step.name, &step.outputs, &out_contents)?;
-                            *step.captured_outputs.borrow_mut() = Some(captured);
-                        }
-                    }
+                        )
+                    })?;
                 }
 
                 result
@@ -747,6 +741,25 @@ fn run_run_step(
             step_result
         }
     }?;
+    Ok(())
+}
+
+fn capture_declared_step_outputs<F>(step: &RunStep, read_out: F) -> Result<()>
+where
+    F: FnOnce() -> Result<String>,
+{
+    if step.outputs.is_empty() {
+        return Ok(());
+    }
+
+    let out_contents = read_out().with_context(|| {
+        format!(
+            "step '{}': failed to read $BF_OUT to capture declared outputs",
+            step.name
+        )
+    })?;
+    let captured = capture_step_outputs(&step.name, &step.outputs, &out_contents)?;
+    *step.captured_outputs.borrow_mut() = Some(captured);
     Ok(())
 }
 
@@ -1838,10 +1851,11 @@ pub(crate) fn shutdown_build_vm(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_guest_ssh_cmd, env_merge, guest_files_init_cmd, parse_env_file, resolve_step_timeout,
-        run_host_step, shell_single_quote, HostStepFiles, StepExecutionBudget,
+        build_guest_ssh_cmd, capture_declared_step_outputs, env_merge, guest_files_init_cmd,
+        parse_env_file, resolve_step_timeout, run_host_step, shell_single_quote, HostStepFiles,
+        StepExecutionBudget,
     };
-    use crate::step::{resolve_shell, RunStep, StepTarget};
+    use crate::step::{resolve_shell, OutputDecl, OutputType, OutputValue, RunStep, StepTarget};
     use crate::util::unique_suffix;
     use serde::Deserialize;
     use std::path::{Path, PathBuf};
@@ -2631,6 +2645,76 @@ run: echo ok
             resolve_step_timeout(step.timeout, Duration::from_secs(1800)),
             Duration::from_secs(1800)
         );
+    }
+
+    fn output_decl(name: &str, output_type: OutputType, required: bool) -> OutputDecl {
+        OutputDecl {
+            name: name.to_string(),
+            output_type,
+            required,
+        }
+    }
+
+    fn host_run_step_with_outputs(outputs: Vec<OutputDecl>) -> RunStep {
+        RunStep {
+            target: StepTarget::Host,
+            name: "capture-step".to_string(),
+            run: "echo ok".to_string(),
+            timeout: None,
+            shell: None,
+            sudo: None,
+            id: None,
+            expect: None,
+            condition: None,
+            outputs,
+            captured_outputs: Default::default(),
+        }
+    }
+
+    #[test]
+    fn test_capture_declared_step_outputs_errors_when_read_fails() {
+        let step =
+            host_run_step_with_outputs(vec![output_decl("must_emit", OutputType::String, true)]);
+
+        let err = capture_declared_step_outputs(&step, || anyhow::bail!("ssh transport hiccup"))
+            .unwrap_err();
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("failed to read $BF_OUT") && msg.contains("capture-step"),
+            "expected BF_OUT read context in error: {msg}"
+        );
+        assert!(step.captured_outputs.borrow().is_none());
+    }
+
+    #[test]
+    fn test_capture_declared_step_outputs_skips_read_when_no_outputs_declared() {
+        let step = host_run_step_with_outputs(vec![]);
+        let mut read_called = false;
+
+        capture_declared_step_outputs(&step, || {
+            read_called = true;
+            anyhow::bail!("should not read")
+        })
+        .unwrap();
+
+        assert!(
+            !read_called,
+            "steps without outputs should not read $BF_OUT"
+        );
+        assert!(step.captured_outputs.borrow().is_none());
+    }
+
+    #[test]
+    fn test_capture_declared_step_outputs_stores_captured_values() {
+        let step = host_run_step_with_outputs(vec![output_decl("label", OutputType::String, true)]);
+
+        capture_declared_step_outputs(&step, || Ok("label=hello\n".to_string())).unwrap();
+
+        let captured = step.captured_outputs.borrow();
+        let captured = captured.as_ref().expect("captured outputs");
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].value, OutputValue::String("hello".to_string()));
     }
 
     // --- check_expect_block ---
