@@ -400,6 +400,30 @@ pub(crate) struct ArchiveStep {
     pub(crate) shell: Option<String>,
 }
 
+/// A validated fragment output declaration, as stored on an [`InvokeStep`].
+///
+/// Produced at load time after cross-reference validation: the referenced inner
+/// step id exists in the fragment scope, the referenced output name is declared on
+/// that step, the types match, and the required-or-default rule is satisfied.
+#[derive(Debug, Clone)]
+pub(crate) struct FragmentOutputDecl {
+    /// The fragment-level output name (unique within the fragment's `outputs:` block).
+    pub(crate) name: String,
+    /// The declared type; must equal the referenced inner step output's declared type.
+    pub(crate) output_type: OutputType,
+    /// The `id:` of the inner run step whose output is re-exported.
+    pub(crate) from_step: String,
+    /// The output name on the inner step.
+    pub(crate) from_output: String,
+    /// When `true`, the re-exported value must not be `Null` (after default fallback).
+    pub(crate) required: bool,
+    /// Pre-validated default value (coerced to the declared type at load time).
+    ///
+    /// Applied when the inner step's captured value is `Null`.  Mutually exclusive
+    /// with `required: true` — both set together is a hard load-time error.
+    pub(crate) default: Option<OutputValue>,
+}
+
 /// A scoped fragment invocation produced by a `uses:` entry.
 ///
 /// The fragment's inner steps execute in their own env scope: they inherit the
@@ -414,6 +438,20 @@ pub(crate) struct InvokeStep {
     /// The fragment's pre-resolved, pre-expanded step list.  May itself contain
     /// further `Invoke` steps (recursive fragments).
     pub(crate) steps: Vec<TestStep>,
+    /// Fragment output declarations (validated at load time).
+    ///
+    /// Each entry re-exports a value from one of this fragment's direct inner run
+    /// steps.  The executor populates `captured_outputs` after the inner steps
+    /// finish by resolving these declarations against the inner steps' own
+    /// `captured_outputs` slots.
+    pub(crate) output_decls: Vec<FragmentOutputDecl>,
+    /// Captured and coerced re-exported output values, populated after all inner
+    /// steps have executed successfully.
+    ///
+    /// `None` before execution; `Some(vec)` after.  The slot is the substrate a
+    /// later expression-resolution pass (Stage 4+) will read from — observable at
+    /// the `Invoke` boundary right after execution.  Not part of the YAML schema.
+    pub(crate) captured_outputs: std::cell::RefCell<Option<Vec<CapturedOutput>>>,
 }
 
 #[derive(Debug)]

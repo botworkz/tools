@@ -24,8 +24,8 @@ use super::log::{
 use crate::assert::{registry::built_in_assert_registry, AssertBlock};
 use crate::config::{TestConfig, TestIsoBootstrap};
 use crate::step::{
-    capture_step_outputs, resolve_shell, ArchiveStep, ExpectBlock, RunStep, StdioExpect,
-    StepTarget, TestStep,
+    capture_step_outputs, resolve_shell, ArchiveStep, CapturedOutput, ExpectBlock, InvokeStep,
+    OutputValue, RunStep, StdioExpect, StepTarget, TestStep,
 };
 
 const TEST_SSH_READY_TIMEOUT: Duration = Duration::from_secs(300);
@@ -409,6 +409,9 @@ fn run_steps_inner(
                 );
                 // child_env is dropped here — env mutations do not leak back out.
 
+                // On success, resolve the fragment's declared outputs at the boundary.
+                let invoke_result = invoke_result.and_then(|()| resolve_invoke_outputs(invoke));
+
                 print_step_status(
                     &display,
                     invoke.uses.as_str(),
@@ -761,6 +764,99 @@ where
     let captured = capture_step_outputs(&step.name, &step.outputs, &out_contents)?;
     *step.captured_outputs.borrow_mut() = Some(captured);
     Ok(())
+}
+
+/// Resolve a fragment's declared outputs onto the `InvokeStep` node.
+///
+/// Must be called after all inner steps of the invoke have run successfully.
+/// For each declared output, reads the referenced inner step's `captured_outputs` slot,
+/// applies the declared `default` when the inner value is `Null`, enforces `required`,
+/// and stores the resulting [`Vec<CapturedOutput>`] in `invoke.captured_outputs`.
+///
+/// This makes each fragment output **observable at the `Invoke` boundary**: the caller
+/// can inspect `invoke.captured_outputs` after execution.  Downstream expression
+/// resolution (Stage 4+) will consume these values; they are not yet referenceable via
+/// `${{ ... }}` expressions in caller steps.
+fn resolve_invoke_outputs(invoke: &InvokeStep) -> Result<()> {
+    if invoke.output_decls.is_empty() {
+        return Ok(());
+    }
+
+    let mut captured: Vec<CapturedOutput> = Vec::with_capacity(invoke.output_decls.len());
+
+    for decl in &invoke.output_decls {
+        // Read the inner step's captured value.
+        let inner_value =
+            find_inner_step_captured_value(&invoke.steps, &decl.from_step, &decl.from_output);
+
+        // Apply the declared default when the inner value is `Null` or absent.
+        let effective_value = match inner_value {
+            Some(v) if !matches!(v, OutputValue::Null) => v,
+            _ => {
+                if let Some(ref default_val) = decl.default {
+                    default_val.clone()
+                } else {
+                    OutputValue::Null
+                }
+            }
+        };
+
+        // Enforce `required`.
+        if decl.required && matches!(effective_value, OutputValue::Null) {
+            anyhow::bail!(
+                "fragment '{}': required output '{}' resolved to null \
+                 (inner step '{}' output '{}' was not emitted or was empty, \
+                 and no default is configured)",
+                invoke.uses,
+                decl.name,
+                decl.from_step,
+                decl.from_output
+            );
+        }
+
+        captured.push(CapturedOutput {
+            name: decl.name.clone(),
+            declared_type: decl.output_type,
+            value: effective_value,
+        });
+    }
+
+    *invoke.captured_outputs.borrow_mut() = Some(captured);
+    Ok(())
+}
+
+/// Find the captured [`OutputValue`] of a named output on a direct inner run step (by id).
+///
+/// Searches the **direct** children of `steps` for a `Run` step with the given `id:`,
+/// then returns the captured value for the named output from that step's
+/// `captured_outputs` slot.
+///
+/// Returns `None` if the step is not found, or if the step's `captured_outputs` slot has
+/// not been populated (step ran but declared no matching output — should not happen after
+/// load-time validation, but handled gracefully as `Null`).
+fn find_inner_step_captured_value(
+    steps: &[TestStep],
+    step_id: &str,
+    output_name: &str,
+) -> Option<OutputValue> {
+    for step in steps {
+        if let TestStep::Run(run) = step {
+            if run.id.as_deref() == Some(step_id) {
+                let guard = run.captured_outputs.borrow();
+                return match &*guard {
+                    Some(outputs) => outputs
+                        .iter()
+                        .find(|o| o.name == output_name)
+                        .map(|o| o.value.clone()),
+                    // Step ran but captured_outputs was never set (no declared outputs);
+                    // treat as Null — the default/required check in the caller handles it.
+                    None => Some(OutputValue::Null),
+                };
+            }
+        }
+    }
+    // Step not found — should have been caught at load time; treat as Null.
+    None
 }
 
 /// Captured stdout and stderr from a step execution, available for `expect:` matching.
@@ -1846,6 +1942,14 @@ pub(crate) fn shutdown_build_vm(
             failed_partial.display()
         )
     }
+}
+
+/// Test-only re-export of [`resolve_invoke_outputs`] so that tests in sibling modules
+/// (e.g. `config/tests`) can drive the boundary resolution logic directly without
+/// needing a live VM.
+#[cfg(test)]
+pub(crate) fn resolve_invoke_outputs_for_test(invoke: &InvokeStep) -> anyhow::Result<()> {
+    resolve_invoke_outputs(invoke)
 }
 
 #[cfg(test)]

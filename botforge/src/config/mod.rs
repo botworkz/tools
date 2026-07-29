@@ -25,7 +25,8 @@ pub(crate) use self::expressions::{yaml_scalar_to_string, yaml_scalar_truthiness
 use crate::assert::{parse_assert_block, validate_assert_block, AssertBlock};
 use crate::plan::files::FileEntry;
 use crate::step::{
-    deserialize_optional_positive_seconds, resolve_shell, InvokeStep, StepTarget, TestStep,
+    coerce_output_value, deserialize_optional_positive_seconds, resolve_shell,
+    FragmentOutputDecl, InvokeStep, OutputType, OutputValue, StepTarget, TestStep,
 };
 
 /// Maximum number of active `uses:` includes on the call stack at any one time.
@@ -261,6 +262,38 @@ struct RawBuildDocument {
     compress: Option<CompressConfig>,
 }
 
+/// Pieces returned from loading a `type: botforge/fragment` file.
+struct LoadedFragment {
+    steps: Vec<RawTestStep>,
+    cloud_init: Option<serde_yaml::Mapping>,
+    files: Vec<FileEntry>,
+    output_decls: Vec<RawFragmentOutputDecl>,
+}
+
+/// The raw YAML form of a single fragment output declaration.
+///
+/// This is only used during loading; the validated form is [`FragmentOutputDecl`] which
+/// is what gets stored on [`InvokeStep`] after load-time cross-reference checks.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawFragmentOutputDecl {
+    name: String,
+    #[serde(rename = "type")]
+    output_type: OutputType,
+    /// The `id:` of the inner run step whose output is re-exported.
+    #[serde(rename = "from-step")]
+    from_step: String,
+    /// The output name on the referenced inner step.
+    #[serde(rename = "from-output")]
+    from_output: String,
+    /// When `true`, the inner step must emit a non-null value (after default fallback).
+    #[serde(default)]
+    required: bool,
+    /// Optional default value, expressed as a YAML scalar.  Must be coercible to the
+    /// declared `type`.  Mutually exclusive with `required: true`.
+    default: Option<Value>,
+}
+
 #[derive(Debug, Deserialize)]
 struct RawTestStepFragment {
     #[serde(default)]
@@ -271,6 +304,10 @@ struct RawTestStepFragment {
     /// Deep-merged with the parent's cloud_init under the same precedence rules.
     #[serde(default)]
     cloud_init: Option<serde_yaml::Mapping>,
+    /// Optional fragment output declarations.  Re-export inner step outputs at the
+    /// fragment boundary; validated and attached to the `InvokeStep` at load time.
+    #[serde(default)]
+    outputs: Vec<RawFragmentOutputDecl>,
 }
 
 fn deserialize_positive_seconds<'de, D>(deserializer: D) -> std::result::Result<u64, D::Error>
@@ -1024,33 +1061,43 @@ fn expand_test_steps(
                     );
                 }
                 include_stack.push(include_path.clone());
-                let result = load_test_steps_fragment(&include_path, &include.uses, &include.with)
-                    .and_then(|(steps, ci, files)| {
-                        // `files:` and `cloud_init:` contributions from the fragment are
-                        // accumulated globally (unchanged from before Stage 1).
-                        files_acc.extend(files);
-                        let mut ci_acc = ci;
-                        let fragment_steps = expand_test_steps(
-                            repo_root,
-                            &include_path,
-                            steps,
-                            include_stack,
-                            &mut ci_acc,
-                            files_acc,
-                        )?;
-                        Ok((fragment_steps, ci_acc))
-                    });
+                let result =
+                    load_test_steps_fragment(&include_path, &include.uses, &include.with)
+                        .and_then(|loaded| {
+                            // `files:` and `cloud_init:` contributions from the fragment are
+                            // accumulated globally (unchanged from before Stage 1).
+                            files_acc.extend(loaded.files);
+                            let mut ci_acc = loaded.cloud_init;
+                            let fragment_steps = expand_test_steps(
+                                repo_root,
+                                &include_path,
+                                loaded.steps,
+                                include_stack,
+                                &mut ci_acc,
+                                files_acc,
+                            )?;
+                            Ok((fragment_steps, ci_acc, loaded.output_decls))
+                        });
                 include_stack.pop();
-                let (fragment_steps, fragment_cloud_init) = result?;
+                let (fragment_steps, fragment_cloud_init, raw_output_decls) = result?;
 
                 // Validate per-scope id uniqueness for this fragment's own scope.
                 validate_scope_step_ids(&fragment_steps, &include_path.display().to_string())?;
+
+                // Validate and resolve fragment output declarations against the inner steps.
+                let output_decls =
+                    validate_fragment_outputs(raw_output_decls, &fragment_steps, &include_path)
+                        .with_context(|| {
+                            format!("invalid fragment outputs: {}", include_path.display())
+                        })?;
 
                 // Produce a single Invoke step instead of splicing the fragment
                 // steps flat into the parent list.
                 expanded.push(TestStep::Invoke(InvokeStep {
                     uses: include.uses.clone(),
                     steps: fragment_steps,
+                    output_decls,
+                    captured_outputs: std::cell::RefCell::new(None),
                 }));
 
                 // Merge fragment's cloud_init into accumulator (globally, as before).
@@ -1066,15 +1113,162 @@ fn expand_test_steps(
     Ok(expanded)
 }
 
+/// Validate raw fragment output declarations against the fragment's own expanded inner steps.
+///
+/// Enforces:
+/// - Unique output names within the `outputs:` block.
+/// - Required-or-default rule (mirror of inputs R1): if `required` is not `true`, a `default:`
+///   is mandatory; setting both `required: true` and `default:` together is a hard error.
+/// - The `default:` value is type-coerced against the declared `type`.
+/// - The referenced inner step `id:` (`from-step:`) must exist as a direct run step with that
+///   `id:` in the fragment's expanded step list.
+/// - The referenced output name (`from-output:`) must be declared on that step.
+/// - The fragment output's declared `type` must equal the referenced step output's declared
+///   `type` (step↔fragment type-match).
+///
+/// Returns the validated `Vec<FragmentOutputDecl>` ready to attach to the `InvokeStep`.
+fn validate_fragment_outputs(
+    raw_outputs: Vec<RawFragmentOutputDecl>,
+    inner_steps: &[TestStep],
+    path: &Path,
+) -> Result<Vec<FragmentOutputDecl>> {
+    let mut seen_names: HashSet<String> = HashSet::new();
+    let mut validated: Vec<FragmentOutputDecl> = Vec::with_capacity(raw_outputs.len());
+
+    for raw in raw_outputs {
+        // Unique name check.
+        if !seen_names.insert(raw.name.clone()) {
+            anyhow::bail!(
+                "fragment output '{}': duplicate name in outputs: block ({})",
+                raw.name,
+                path.display()
+            );
+        }
+
+        // Required-or-default rule (mirror of inputs R1).
+        if !raw.required && raw.default.is_none() {
+            anyhow::bail!(
+                "fragment output '{}' must set 'required: true' or provide a 'default:' ({})",
+                raw.name,
+                path.display()
+            );
+        }
+        // Contradiction: required: true + default: together.
+        if raw.required && raw.default.is_some() {
+            anyhow::bail!(
+                "fragment output '{}' cannot set both 'required: true' and 'default' ({})",
+                raw.name,
+                path.display()
+            );
+        }
+
+        // Validate and coerce the default value.
+        let default_value: Option<OutputValue> = if let Some(ref default_yaml) = raw.default {
+            let raw_str = yaml_scalar_to_string(default_yaml).map_err(|e| {
+                anyhow::anyhow!(
+                    "fragment output '{}': invalid default value: {} ({})",
+                    raw.name,
+                    e,
+                    path.display()
+                )
+            })?;
+            let coerced =
+                coerce_output_value(&raw.name, &raw_str, raw.output_type).map_err(|e| {
+                    anyhow::anyhow!(
+                        "fragment output '{}': default value type coercion failed: {} ({})",
+                        raw.name,
+                        e,
+                        path.display()
+                    )
+                })?;
+            Some(coerced)
+        } else {
+            None
+        };
+
+        // Look up the referenced inner step and its declared output type.
+        let step_output_type = find_inner_step_output_type(
+            inner_steps,
+            &raw.from_step,
+            &raw.from_output,
+            path,
+        )?;
+
+        // Step↔fragment type-match check.
+        if step_output_type != raw.output_type {
+            anyhow::bail!(
+                "fragment output '{}': type mismatch: fragment declares '{}' but inner step \
+                 '{}' output '{}' declares '{}' ({})",
+                raw.name,
+                raw.output_type,
+                raw.from_step,
+                raw.from_output,
+                step_output_type,
+                path.display()
+            );
+        }
+
+        validated.push(FragmentOutputDecl {
+            name: raw.name,
+            output_type: raw.output_type,
+            from_step: raw.from_step,
+            from_output: raw.from_output,
+            required: raw.required,
+            default: default_value,
+        });
+    }
+
+    Ok(validated)
+}
+
+/// Find the declared [`OutputType`] of a named output on a direct inner run step.
+///
+/// Searches the **direct** children of `steps` (not recursively into nested `Invoke` steps)
+/// for a `Run` step whose `id:` equals `step_id`, then looks for an `OutputDecl` named
+/// `output_name` on that step.
+///
+/// Returns a hard error if the step id is not found, if the step does not declare the
+/// named output, or if more than one step carries the same id (should not happen after
+/// `validate_scope_step_ids`, but checked defensively).
+fn find_inner_step_output_type(
+    steps: &[TestStep],
+    step_id: &str,
+    output_name: &str,
+    path: &Path,
+) -> Result<OutputType> {
+    for step in steps {
+        if let TestStep::Run(run) = step {
+            if run.id.as_deref() == Some(step_id) {
+                // Found the step — look for the declared output.
+                return if let Some(decl) = run.outputs.iter().find(|o| o.name == output_name) {
+                    Ok(decl.output_type)
+                } else {
+                    anyhow::bail!(
+                        "fragment output references step '{}' output '{}', but step '{}' \
+                         does not declare that output ({})",
+                        step_id,
+                        output_name,
+                        step_id,
+                        path.display()
+                    )
+                };
+            }
+        }
+    }
+    anyhow::bail!(
+        "fragment output references step id '{}', but no run step with that id exists \
+         in the fragment scope ({})",
+        step_id,
+        path.display()
+    )
+}
+
+
 fn load_test_steps_fragment(
     path: &Path,
     uses: &str,
     with: &BTreeMap<String, Value>,
-) -> Result<(
-    Vec<RawTestStep>,
-    Option<serde_yaml::Mapping>,
-    Vec<FileEntry>,
-)> {
+) -> Result<LoadedFragment> {
     let yaml = std::fs::read_to_string(path)
         .with_context(|| format!("cannot read test step include: {}", path.display()))?;
     let mut value: Value = serde_yaml::from_str(&yaml)
@@ -1100,7 +1294,12 @@ fn load_test_steps_fragment(
     if let Some(ref ci) = fragment.cloud_init {
         validate_cloud_init_fragment(ci, path)?;
     }
-    Ok((fragment.steps, fragment.cloud_init, fragment.files))
+    Ok(LoadedFragment {
+        steps: fragment.steps,
+        cloud_init: fragment.cloud_init,
+        files: fragment.files,
+        output_decls: fragment.outputs,
+    })
 }
 
 /// Verify that a `uses:` target is a `type: botforge/fragment` document.
