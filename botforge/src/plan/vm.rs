@@ -1335,10 +1335,7 @@ fn build_guest_ssh_cmd(
         .iter()
         .map(|(k, v)| format!("{}={}", k, shell_single_quote(v)))
         .collect();
-    env_parts.push(format!(
-        "BF_ENV={}",
-        shell_single_quote(remote_env_path)
-    ));
+    env_parts.push(format!("BF_ENV={}", shell_single_quote(remote_env_path)));
     let env_prefix = format!("env {}", env_parts.join(" "));
 
     if sudo {
@@ -2323,10 +2320,7 @@ run: echo ok
         );
         assert!(cmd.contains("FOO='bar'"), "expected FOO: {cmd}");
         assert!(cmd.contains("MSG='hello world'"), "expected MSG: {cmd}");
-        assert!(
-            cmd.contains("BF_ENV='/tmp/env'"),
-            "expected BF_ENV: {cmd}"
-        );
+        assert!(cmd.contains("BF_ENV='/tmp/env'"), "expected BF_ENV: {cmd}");
         // No bash-syntax export statements in the command
         assert!(
             !cmd.contains("export "),
@@ -2353,10 +2347,7 @@ run: echo ok
             &[],
             "/tmp/botforge-env-1",
         );
-        assert!(
-            cmd.contains("BF_ENV='/tmp/botforge-env-1'"),
-            "cmd: {cmd}"
-        );
+        assert!(cmd.contains("BF_ENV='/tmp/botforge-env-1'"), "cmd: {cmd}");
         // No extra env var assignments beyond BF_ENV
         assert!(!cmd.contains("FOO="), "unexpected extra env var: {cmd}");
     }
