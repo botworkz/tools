@@ -615,6 +615,7 @@ fn run_github_target(
 mod tests {
     use super::*;
     use crate::cli::{Cli, Commands};
+    use crate::step::StepCondition;
     use clap::Parser;
     use std::fs;
     use tempfile::TempDir;
@@ -1237,7 +1238,7 @@ publish:
             sudo: None,
             id: None,
             expect: None,
-            condition: None,
+            condition: StepCondition::Always,
             outputs: vec![],
             captured_outputs: Default::default(),
         });
@@ -1285,7 +1286,7 @@ publish:
             sudo: None,
             id: None,
             expect: None,
-            condition: None,
+            condition: StepCondition::Always,
             outputs: vec![],
             captured_outputs: Default::default(),
         });
@@ -1338,7 +1339,7 @@ publish:
             sudo: None,
             id: None,
             expect: None,
-            condition: None,
+            condition: StepCondition::Always,
             outputs: vec![],
             captured_outputs: Default::default(),
         });
@@ -1377,7 +1378,7 @@ publish:
                 sudo: None,
                 id: None,
                 expect: None,
-                condition: None,
+                condition: StepCondition::Always,
                 outputs: vec![],
                 captured_outputs: Default::default(),
             }),
@@ -1390,7 +1391,7 @@ publish:
                 sudo: None,
                 id: None,
                 expect: None,
-                condition: None,
+                condition: StepCondition::Always,
                 outputs: vec![],
                 captured_outputs: Default::default(),
             }),
@@ -1424,7 +1425,7 @@ publish:
             sudo: None,
             id: None,
             expect: None,
-            condition: None,
+            condition: StepCondition::Always,
             outputs: vec![],
             captured_outputs: Default::default(),
         })];
@@ -1455,7 +1456,7 @@ publish:
                 sudo: None,
                 id: None,
                 expect: None,
-                condition: None,
+                condition: StepCondition::Always,
                 outputs: vec![],
                 captured_outputs: Default::default(),
             }),
@@ -1468,7 +1469,7 @@ publish:
                 sudo: None,
                 id: None,
                 expect: None,
-                condition: None,
+                condition: StepCondition::Always,
                 outputs: vec![],
                 captured_outputs: Default::default(),
             }),

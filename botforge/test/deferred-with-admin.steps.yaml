@@ -1,0 +1,30 @@
+type: botforge/fragment
+# Deferred `with:` acceptance (admin side): this fragment emits a typed output
+# (an OTP) via $BF_OUT and re-exports it through its `outputs:` block. The
+# caller (test.yaml) invokes it with `id: admin` and feeds the value into a
+# sibling fragment's `with:` block via
+# `otp: ${{ steps.admin.outputs.testuser_otp }}` — resolved at the invocation
+# boundary at runtime. Runs entirely on `on: host` so no VM is needed.
+
+inputs:
+  tenant:
+    type: string
+    required: true
+
+steps:
+- on: host
+  name: admin-issue-otp for ${{ inputs.tenant }}
+  id: issue
+  run: |
+    echo "testuser_otp=otp-e2e-9876" >> "$BF_OUT"
+  outputs:
+  - name: testuser_otp
+    type: string
+    required: true
+
+outputs:
+- name: testuser_otp
+  type: string
+  from-step: issue
+  from-output: testuser_otp
+  required: true

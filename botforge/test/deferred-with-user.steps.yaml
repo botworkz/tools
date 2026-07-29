@@ -1,0 +1,27 @@
+type: botforge/fragment
+# Deferred `with:` acceptance (user side): the caller passes
+# `otp: ${{ steps.admin.outputs.testuser_otp }}` in this fragment's `with:`
+# block. The reference is validated at load time against the outer scope and
+# resolved at the invocation boundary at runtime, so `${{ inputs.otp }}` below
+# must expand to the REAL value the admin fragment emitted — not the raw
+# placeholder and not an empty string.
+
+inputs:
+  tenant:
+    type: string
+    required: true
+  otp:
+    type: string
+    required: true
+
+steps:
+- on: host
+  name: user-consume-otp for ${{ inputs.tenant }}
+  run: |
+    test "${{ inputs.tenant }}" = "testuser"
+    test "${{ inputs.otp }}" = "otp-e2e-9876"
+    echo "deferred-with-otp-consumed"
+  expect:
+    stdout:
+      contains:
+      - deferred-with-otp-consumed
