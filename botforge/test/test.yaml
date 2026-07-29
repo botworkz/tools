@@ -73,6 +73,19 @@ steps:
     stdout:
       contains:
       - secret-fragment-output-consumed
+- uses: "@://secret-input-masking.steps.yaml"
+  id: secretin
+  with:
+    token: steel-toe-secret
+- on: host
+  name: consume secret input-derived output
+  run: |
+    test "${{ steps.secretin.outputs.token }}" = "steel-toe-secret"
+    echo "secret-input-output-consumed"
+  expect:
+    stdout:
+      contains:
+      - secret-input-output-consumed
 - uses: "@://fragment-self-outputs.steps.yaml"
 # --- Deferred `with:` resolution at the invocation boundary --------------------
 # The admin fragment emits an OTP as a declared output; the user fragment
