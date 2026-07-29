@@ -27,7 +27,7 @@ jobs:
     - uses: actions/checkout@v7
     - uses: docker/setup-buildx-action@v4
     - name: Reclaim runner disk space
-      uses: envoyproxy/toolshed/actions/diskspace@4cca74db6587ee660235fbadaac5a4fc2a19cfa9
+      uses: envoyproxy/toolshed/actions/diskspace@303f50e2d2bfcd0259230e3227cd08e8a95f2c69
     - name: Enable KVM via udev
       run: |
         echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
@@ -186,7 +186,7 @@ jobs:
     # preserve, so we simply transcode botforge/test/shasset.yaml straight
     # into testrepo/botforge.yaml.
     - name: Inline shasset assets into the workspace marker (botforge.yaml)
-      uses: envoyproxy/toolshed/actions/jq@4cca74db6587ee660235fbadaac5a4fc2a19cfa9
+      uses: envoyproxy/toolshed/actions/jq@303f50e2d2bfcd0259230e3227cd08e8a95f2c69
       with:
         input-format: yaml-path
         output-path: testrepo/botforge.yaml
@@ -223,7 +223,7 @@ jobs:
     # Done as a STRUCTURED jq merge into the marker (not a heredoc append) so
     # the output stays a single well-formed document.
     - name: Inject docker plugin declaration into workspace marker
-      uses: envoyproxy/toolshed/actions/jq@4cca74db6587ee660235fbadaac5a4fc2a19cfa9
+      uses: envoyproxy/toolshed/actions/jq@303f50e2d2bfcd0259230e3227cd08e8a95f2c69
       with:
         input-format: yaml-path
         output-path: testrepo/botforge.yaml
@@ -256,7 +256,7 @@ jobs:
     # YAML ("}}}plugins:" with no separator).
     - name: Inject pigz plugin declaration into workspace marker
       if: inputs.compressor == 'pigz'
-      uses: envoyproxy/toolshed/actions/jq@4cca74db6587ee660235fbadaac5a4fc2a19cfa9
+      uses: envoyproxy/toolshed/actions/jq@303f50e2d2bfcd0259230e3227cd08e8a95f2c69
       with:
         input-format: yaml-path
         output-path: testrepo/botforge.yaml
@@ -284,14 +284,14 @@ jobs:
         fi
         echo "pigz plugin declaration OK: libpigz.so present in marker"
     - name: Create build config
-      uses: envoyproxy/toolshed/actions/jq@4cca74db6587ee660235fbadaac5a4fc2a19cfa9
+      uses: envoyproxy/toolshed/actions/jq@303f50e2d2bfcd0259230e3227cd08e8a95f2c69
       id: build-config
       with:
         input-format: yaml-path
         options: -c
         input: botforge/test/build.yaml
     - name: Create build config
-      uses: envoyproxy/toolshed/actions/jq@4cca74db6587ee660235fbadaac5a4fc2a19cfa9
+      uses: envoyproxy/toolshed/actions/jq@303f50e2d2bfcd0259230e3227cd08e8a95f2c69
       with:
         input-format: yaml
         options: -c
@@ -321,7 +321,7 @@ jobs:
                  else {} end)
             )
     - name: Create test config
-      uses: envoyproxy/toolshed/actions/jq@4cca74db6587ee660235fbadaac5a4fc2a19cfa9
+      uses: envoyproxy/toolshed/actions/jq@303f50e2d2bfcd0259230e3227cd08e8a95f2c69
       id: test-config
       with:
         input-format: yaml-path
@@ -329,56 +329,56 @@ jobs:
         output-path: testrepo/test.yaml
         input: botforge/test/test.yaml
     - name: Create assert-fail-leaked config
-      uses: envoyproxy/toolshed/actions/jq@4cca74db6587ee660235fbadaac5a4fc2a19cfa9
+      uses: envoyproxy/toolshed/actions/jq@303f50e2d2bfcd0259230e3227cd08e8a95f2c69
       with:
         input-format: yaml-path
         filter: '. + {image: "@artifact://foo.qcow2"}'
         output-path: testrepo/assert-fail-leaked.yaml
         input: botforge/test/assert-fail-leaked.yaml
     - name: Create assert-fail-rootfile config
-      uses: envoyproxy/toolshed/actions/jq@4cca74db6587ee660235fbadaac5a4fc2a19cfa9
+      uses: envoyproxy/toolshed/actions/jq@303f50e2d2bfcd0259230e3227cd08e8a95f2c69
       with:
         input-format: yaml-path
         filter: '. + {image: "@artifact://foo.qcow2"}'
         output-path: testrepo/assert-fail-rootfile.yaml
         input: botforge/test/assert-fail-rootfile.yaml
     - name: Create assert-docker config
-      uses: envoyproxy/toolshed/actions/jq@4cca74db6587ee660235fbadaac5a4fc2a19cfa9
+      uses: envoyproxy/toolshed/actions/jq@303f50e2d2bfcd0259230e3227cd08e8a95f2c69
       with:
         input-format: yaml-path
         filter: '. + {image: "@artifact://foo.qcow2"}'
         output-path: testrepo/assert-docker.yaml
         input: botforge/test/assert-docker.yaml
     - name: Create assert-fail-docker-running config
-      uses: envoyproxy/toolshed/actions/jq@4cca74db6587ee660235fbadaac5a4fc2a19cfa9
+      uses: envoyproxy/toolshed/actions/jq@303f50e2d2bfcd0259230e3227cd08e8a95f2c69
       with:
         input-format: yaml-path
         filter: '. + {image: "@artifact://foo.qcow2"}'
         output-path: testrepo/assert-fail-docker-running.yaml
         input: botforge/test/assert-fail-docker-running.yaml
     - name: Create assert-fail-docker-network config
-      uses: envoyproxy/toolshed/actions/jq@4cca74db6587ee660235fbadaac5a4fc2a19cfa9
+      uses: envoyproxy/toolshed/actions/jq@303f50e2d2bfcd0259230e3227cd08e8a95f2c69
       with:
         input-format: yaml-path
         filter: '. + {image: "@artifact://foo.qcow2"}'
         output-path: testrepo/assert-fail-docker-network.yaml
         input: botforge/test/assert-fail-docker-network.yaml
     - name: Create assert-fail-docker-ports config
-      uses: envoyproxy/toolshed/actions/jq@4cca74db6587ee660235fbadaac5a4fc2a19cfa9
+      uses: envoyproxy/toolshed/actions/jq@303f50e2d2bfcd0259230e3227cd08e8a95f2c69
       with:
         input-format: yaml-path
         filter: '. + {image: "@artifact://foo.qcow2"}'
         output-path: testrepo/assert-fail-docker-ports.yaml
         input: botforge/test/assert-fail-docker-ports.yaml
     - name: Create assert-fail-docker-logs config
-      uses: envoyproxy/toolshed/actions/jq@4cca74db6587ee660235fbadaac5a4fc2a19cfa9
+      uses: envoyproxy/toolshed/actions/jq@303f50e2d2bfcd0259230e3227cd08e8a95f2c69
       with:
         input-format: yaml-path
         filter: '. + {image: "@artifact://foo.qcow2"}'
         output-path: testrepo/assert-fail-docker-logs.yaml
         input: botforge/test/assert-fail-docker-logs.yaml
     - name: Create assert-fail-svc-env config
-      uses: envoyproxy/toolshed/actions/jq@4cca74db6587ee660235fbadaac5a4fc2a19cfa9
+      uses: envoyproxy/toolshed/actions/jq@303f50e2d2bfcd0259230e3227cd08e8a95f2c69
       with:
         input-format: yaml-path
         filter: '. + {image: "@artifact://foo.qcow2"}'
@@ -428,21 +428,21 @@ jobs:
         input: botforge/test/assert-fail-secret-output-type-mismatch.yaml
 
     - name: Print marker (botforge.yaml with inline assets)
-      uses: envoyproxy/toolshed/actions/jq@4cca74db6587ee660235fbadaac5a4fc2a19cfa9
+      uses: envoyproxy/toolshed/actions/jq@303f50e2d2bfcd0259230e3227cd08e8a95f2c69
       with:
         input-format: yaml-path
         options: -C
         input: testrepo/botforge.yaml
         print-output: true
     - name: Print build config
-      uses: envoyproxy/toolshed/actions/jq@4cca74db6587ee660235fbadaac5a4fc2a19cfa9
+      uses: envoyproxy/toolshed/actions/jq@303f50e2d2bfcd0259230e3227cd08e8a95f2c69
       with:
         input-format: yaml-path
         options: -C
         input: testrepo/build.yaml
         print-output: true
     - name: Print test config
-      uses: envoyproxy/toolshed/actions/jq@4cca74db6587ee660235fbadaac5a4fc2a19cfa9
+      uses: envoyproxy/toolshed/actions/jq@303f50e2d2bfcd0259230e3227cd08e8a95f2c69
       with:
         input-format: yaml-path
         options: -C
@@ -484,7 +484,7 @@ jobs:
         echo "Sidecar guard OK: ${gz_path} was not created (correct behaviour)"
 
     - name: Create chained build config
-      uses: envoyproxy/toolshed/actions/jq@4cca74db6587ee660235fbadaac5a4fc2a19cfa9
+      uses: envoyproxy/toolshed/actions/jq@303f50e2d2bfcd0259230e3227cd08e8a95f2c69
       with:
         input-format: yaml
         output-path: testrepo/chained.yaml
