@@ -13,15 +13,15 @@ steps:
     echo "count=7" >> "$BF_OUT"
     echo "ready=true" >> "$BF_OUT"
   outputs:
-  - name: version
-    type: string
-    required: true
-  - name: count
-    type: number
-    required: true
-  - name: ready
-    type: bool
-    required: true
+    version:
+      type: string
+      required: true
+    count:
+      type: number
+      required: true
+    ready:
+      type: bool
+      required: true
 
 # Emits nothing — the fragment output re-exporting this value must fall back
 # to its declared `default:` (inner Null → default applied at the boundary).
@@ -31,28 +31,28 @@ steps:
   run: |
     true
   outputs:
-  - name: maybe
-    type: string
-    required: false
+    maybe:
+      type: string
+      required: false
 
 outputs:
-- name: version
-  type: string
-  from-step: emit
-  from-output: version
-  required: true
-- name: count
-  type: number
-  from-step: emit
-  from-output: count
-  required: true
-- name: ready
-  type: bool
-  from-step: emit
-  from-output: ready
-  required: true
-- name: fallback
-  type: string
-  from-step: silent
-  from-output: maybe
-  default: "fallback-default"
+  version:
+    type: string
+    from_step: emit
+    from_output: version
+    required: true
+  count:
+    type: number
+    from_step: emit
+    from_output: count
+    required: true
+  ready:
+    type: bool
+    from_step: emit
+    from_output: ready
+    required: true
+  fallback:
+    type: string
+    from_step: silent
+    from_output: maybe
+    default: "fallback-default"

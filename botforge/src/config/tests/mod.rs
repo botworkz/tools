@@ -44,7 +44,7 @@ fn make_step(target: StepTarget, name: &str) -> TestStep {
         id: None,
         expect: None,
         condition: StepCondition::Always,
-        outputs: vec![],
+        outputs: std::collections::BTreeMap::new(),
         captured_outputs: Default::default(),
     })
 }
@@ -4677,7 +4677,7 @@ mod outputs_validation {
     use super::*;
     use crate::step::{OutputDecl, OutputType};
 
-    fn make_run_step_with_outputs(name: &str, outputs: Vec<OutputDecl>) -> TestStep {
+    fn make_run_step_with_outputs(name: &str, outputs: Vec<(&str, OutputDecl)>) -> TestStep {
         TestStep::Run(RunStep {
             target: StepTarget::Guest,
             name: name.to_string(),
@@ -4688,14 +4688,16 @@ mod outputs_validation {
             id: None,
             expect: None,
             condition: StepCondition::Always,
-            outputs,
+            outputs: outputs
+                .into_iter()
+                .map(|(output_name, output_decl)| (output_name.to_string(), output_decl))
+                .collect(),
             captured_outputs: Default::default(),
         })
     }
 
-    fn decl(name: &str, t: OutputType) -> OutputDecl {
+    fn decl(t: OutputType) -> OutputDecl {
         OutputDecl {
-            name: name.to_string(),
             output_type: t,
             required: false,
         }
@@ -4705,25 +4707,25 @@ mod outputs_validation {
 
     #[test]
     fn test_output_type_string_accepted() {
-        let step = make_run_step_with_outputs("s", vec![decl("x", OutputType::String)]);
+        let step = make_run_step_with_outputs("s", vec![("x", decl(OutputType::String))]);
         assert!(validate_test_steps(&[step], &[]).is_ok());
     }
 
     #[test]
     fn test_output_type_number_accepted() {
-        let step = make_run_step_with_outputs("s", vec![decl("n", OutputType::Number)]);
+        let step = make_run_step_with_outputs("s", vec![("n", decl(OutputType::Number))]);
         assert!(validate_test_steps(&[step], &[]).is_ok());
     }
 
     #[test]
     fn test_output_type_secret_accepted() {
-        let step = make_run_step_with_outputs("s", vec![decl("token", OutputType::Secret)]);
+        let step = make_run_step_with_outputs("s", vec![("token", decl(OutputType::Secret))]);
         assert!(validate_test_steps(&[step], &[]).is_ok());
     }
 
     #[test]
     fn test_output_type_bool_accepted() {
-        let step = make_run_step_with_outputs("s", vec![decl("b", OutputType::Bool)]);
+        let step = make_run_step_with_outputs("s", vec![("b", decl(OutputType::Bool))]);
         assert!(validate_test_steps(&[step], &[]).is_ok());
     }
 
@@ -4749,42 +4751,6 @@ mod outputs_validation {
         );
     }
 
-    // --- duplicate output names ---
-
-    #[test]
-    fn test_duplicate_output_names_rejected() {
-        let step = make_run_step_with_outputs(
-            "my-step",
-            vec![
-                decl("result", OutputType::String),
-                decl("result", OutputType::Number),
-            ],
-        );
-        let err = validate_test_steps(&[step], &[]).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("result") || msg.contains("duplicate"),
-            "error should mention the duplicate name: {msg}"
-        );
-    }
-
-    #[test]
-    fn test_duplicate_output_names_rejected_in_build() {
-        let step = make_run_step_with_outputs(
-            "my-step",
-            vec![
-                decl("out", OutputType::Bool),
-                decl("out", OutputType::String),
-            ],
-        );
-        let err = validate_build_steps(&[step]).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("out") || msg.contains("duplicate"),
-            "error should mention the duplicate name: {msg}"
-        );
-    }
-
     #[test]
     fn test_no_outputs_is_valid() {
         let step = make_run_step_with_outputs("s", vec![]);
@@ -4796,9 +4762,9 @@ mod outputs_validation {
         let step = make_run_step_with_outputs(
             "s",
             vec![
-                decl("name", OutputType::String),
-                decl("count", OutputType::Number),
-                decl("ready", OutputType::Bool),
+                ("name", decl(OutputType::String)),
+                ("count", decl(OutputType::Number)),
+                ("ready", decl(OutputType::Bool)),
             ],
         );
         assert!(validate_test_steps(&[step], &[]).is_ok());
@@ -4809,17 +4775,28 @@ mod outputs_validation {
     #[test]
     fn test_output_required_parses_from_yaml() {
         let yaml =
-            "name: s\nrun: echo ok\noutputs:\n  - name: x\n    type: string\n    required: true\n";
+            "name: s\nrun: echo ok\noutputs:\n  x:\n    type: string\n    required: true\n";
         let step: RunStep = serde_yaml::from_str(yaml).unwrap();
-        assert!(step.outputs[0].required);
+        assert!(step.outputs["x"].required);
     }
 
     #[test]
     fn test_output_required_false_parses_from_yaml() {
         let yaml =
-            "name: s\nrun: echo ok\noutputs:\n  - name: x\n    type: number\n    required: false\n";
+            "name: s\nrun: echo ok\noutputs:\n  x:\n    type: number\n    required: false\n";
         let step: RunStep = serde_yaml::from_str(yaml).unwrap();
-        assert!(!step.outputs[0].required);
+        assert!(!step.outputs["x"].required);
+    }
+
+    #[test]
+    fn test_output_list_shape_is_rejected() {
+        let yaml =
+            "name: s\nrun: echo ok\noutputs:\n  - name: x\n    type: number\n    required: false\n";
+        let err = serde_yaml::from_str::<RunStep>(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid type"),
+            "list-shaped outputs should be rejected: {err}"
+        );
     }
 }
 
@@ -4880,14 +4857,14 @@ steps:
     name: emit
     run: echo "label=hi" >> "$BF_OUT"
     outputs:
-      - name: label
+      label:
         type: string
         required: true
 outputs:
-  - name: result
+  result:
     type: string
-    from-step: s1
-    from-output: label
+    from_step: s1
+    from_output: label
     required: true
 "#,
         )
@@ -4916,14 +4893,14 @@ steps:
     name: count
     run: echo "n=5" >> "$BF_OUT"
     outputs:
-      - name: n
+      n:
         type: number
         required: true
 outputs:
-  - name: count
+  count:
     type: number
-    from-step: counter
-    from-output: n
+    from_step: counter
+    from_output: n
     required: true
 "#,
         )
@@ -4946,14 +4923,14 @@ steps:
     name: chk
     run: echo "ok=true" >> "$BF_OUT"
     outputs:
-      - name: ok
+      ok:
         type: bool
         required: true
 outputs:
-  - name: ready
+  ready:
     type: bool
-    from-step: check
-    from-output: ok
+    from_step: check
+    from_output: ok
     required: true
 "#,
         )
@@ -4976,14 +4953,14 @@ steps:
     name: emit
     run: echo "token=s3cr3t" >> "$BF_OUT"
     outputs:
-      - name: token
+      token:
         type: secret
         required: true
 outputs:
-  - name: token
+  token:
     type: secret
-    from-step: emit
-    from-output: token
+    from_step: emit
+    from_output: token
     required: true
 "#,
         )
@@ -5006,14 +4983,14 @@ steps:
     name: s
     run: true
     outputs:
-      - name: x
+      x:
         type: string
         required: true
 outputs:
-  - name: x
+  x:
     type: integer
-    from-step: s1
-    from-output: x
+    from_step: s1
+    from_output: x
     required: true
 "#,
         )
@@ -5041,14 +5018,14 @@ steps:
     name: s
     run: true
     outputs:
-      - name: x
+      x:
         type: string
         required: true
 outputs:
-  - name: x
+  x:
     type: string
-    from-step: s1
-    from-output: x
+    from_step: s1
+    from_output: x
     required: true
     surprise: bad
 "#,
@@ -5079,14 +5056,14 @@ steps:
     name: s
     run: true
     outputs:
-      - name: x
+      x:
         type: string
         required: true
 outputs:
-  - name: x
+  x:
     type: string
-    from-step: s1
-    from-output: x
+    from_step: s1
+    from_output: x
 "#,
         )
         .unwrap();
@@ -5111,14 +5088,14 @@ steps:
     name: s
     run: true
     outputs:
-      - name: x
+      x:
         type: string
         required: true
 outputs:
-  - name: x
+  x:
     type: string
-    from-step: s1
-    from-output: x
+    from_step: s1
+    from_output: x
     required: true
 "#,
         )
@@ -5142,14 +5119,14 @@ steps:
     name: s
     run: true
     outputs:
-      - name: x
+      x:
         type: string
         required: false
 outputs:
-  - name: x
+  x:
     type: string
-    from-step: s1
-    from-output: x
+    from_step: s1
+    from_output: x
     default: fallback
 "#,
         )
@@ -5176,14 +5153,14 @@ steps:
     name: s
     run: true
     outputs:
-      - name: x
+      x:
         type: string
         required: true
 outputs:
-  - name: x
+  x:
     type: string
-    from-step: s1
-    from-output: x
+    from_step: s1
+    from_output: x
     required: true
     default: oops
 "#,
@@ -5210,14 +5187,14 @@ steps:
     name: s
     run: true
     outputs:
-      - name: n
+      n:
         type: number
         required: false
 outputs:
-  - name: count
+  count:
     type: number
-    from-step: s1
-    from-output: n
+    from_step: s1
+    from_output: n
     default: 42
 "#,
         )
@@ -5243,14 +5220,14 @@ steps:
     name: s
     run: true
     outputs:
-      - name: flag
+      flag:
         type: bool
         required: false
 outputs:
-  - name: ready
+  ready:
     type: bool
-    from-step: s1
-    from-output: flag
+    from_step: s1
+    from_output: flag
     default: false
 "#,
         )
@@ -5276,14 +5253,14 @@ steps:
     name: s
     run: true
     outputs:
-      - name: n
+      n:
         type: number
         required: false
 outputs:
-  - name: count
+  count:
     type: number
-    from-step: s1
-    from-output: n
+    from_step: s1
+    from_output: n
     default: not-a-number
 "#,
         )
@@ -5313,14 +5290,14 @@ steps:
     name: s
     run: true
     outputs:
-      - name: x
+      x:
         type: string
         required: true
 outputs:
-  - name: x
+  x:
     type: string
-    from-step: ghost-step
-    from-output: x
+    from_step: ghost-step
+    from_output: x
     required: true
 "#,
         )
@@ -5346,14 +5323,14 @@ steps:
     name: s
     run: true
     outputs:
-      - name: real-output
+      real-output:
         type: string
         required: true
 outputs:
-  - name: x
+  x:
     type: string
-    from-step: s1
-    from-output: ghost-output
+    from_step: s1
+    from_output: ghost-output
     required: true
 "#,
         )
@@ -5383,14 +5360,14 @@ steps:
     name: s
     run: echo "val=hello" >> "$BF_OUT"
     outputs:
-      - name: val
+      val:
         type: string
         required: true
 outputs:
-  - name: val
+  val:
     type: string
-    from-step: s1
-    from-output: val
+    from_step: s1
+    from_output: val
     required: true
 "#,
         )
@@ -5414,14 +5391,14 @@ steps:
     name: s
     run: true
     outputs:
-      - name: n
+      n:
         type: number
         required: true
 outputs:
-  - name: n
+  n:
     type: string
-    from-step: s1
-    from-output: n
+    from_step: s1
+    from_output: n
     required: true
 "#,
         )
@@ -5447,14 +5424,14 @@ steps:
     name: s
     run: true
     outputs:
-      - name: flag
+      flag:
         type: bool
         required: true
 outputs:
-  - name: flag
+  flag:
     type: number
-    from-step: s1
-    from-output: flag
+    from_step: s1
+    from_output: flag
     required: true
 "#,
         )
@@ -5481,14 +5458,14 @@ steps:
     name: s
     run: true
     outputs:
-      - name: token
+      token:
         type: secret
         required: true
 outputs:
-  - name: token
+  token:
     type: string
-    from-step: s1
-    from-output: token
+    from_step: s1
+    from_output: token
     required: true
 "#,
         )
@@ -5514,14 +5491,14 @@ steps:
     name: s
     run: true
     outputs:
-      - name: token
+      token:
         type: secret
         required: false
 outputs:
-  - name: token
+  token:
     type: secret
-    from-step: s1
-    from-output: token
+    from_step: s1
+    from_output: token
     default:
       leaked: super-secret-value
 "#,
@@ -5556,22 +5533,22 @@ steps:
     name: s
     run: true
     outputs:
-      - name: x
+      x:
         type: string
         required: true
-      - name: y
+      y:
         type: string
         required: true
 outputs:
-  - name: x
+  x:
     type: string
-    from-step: s1
-    from-output: x
+    from_step: s1
+    from_output: x
     required: true
-  - name: x
+  x:
     type: string
-    from-step: s1
-    from-output: y
+    from_step: s1
+    from_output: y
     required: true
 "#,
         )
@@ -5604,30 +5581,30 @@ steps:
       echo "count=7" >> "$BF_OUT"
       echo "ok=true" >> "$BF_OUT"
     outputs:
-      - name: label
+      label:
         type: string
         required: true
-      - name: count
+      count:
         type: number
         required: true
-      - name: ok
+      ok:
         type: bool
         required: true
 outputs:
-  - name: label
+  label:
     type: string
-    from-step: s1
-    from-output: label
+    from_step: s1
+    from_output: label
     required: true
-  - name: count
+  count:
     type: number
-    from-step: s1
-    from-output: count
+    from_step: s1
+    from_output: count
     required: true
-  - name: ok
+  ok:
     type: bool
-    from-step: s1
-    from-output: ok
+    from_step: s1
+    from_output: ok
     required: true
 "#,
         )
@@ -5635,12 +5612,14 @@ outputs:
         write_test_yaml(&repo, "frag.yaml");
         let invoke = load_invoke(&repo);
         assert_eq!(invoke.output_decls.len(), 3);
-        assert_eq!(invoke.output_decls[0].name, "label");
-        assert_eq!(invoke.output_decls[0].output_type, OutputType::String);
-        assert_eq!(invoke.output_decls[1].name, "count");
-        assert_eq!(invoke.output_decls[1].output_type, OutputType::Number);
-        assert_eq!(invoke.output_decls[2].name, "ok");
-        assert_eq!(invoke.output_decls[2].output_type, OutputType::Bool);
+        let by_name: std::collections::BTreeMap<&str, OutputType> = invoke
+            .output_decls
+            .iter()
+            .map(|decl| (decl.name.as_str(), decl.output_type))
+            .collect();
+        assert_eq!(by_name.get("label"), Some(&OutputType::String));
+        assert_eq!(by_name.get("count"), Some(&OutputType::Number));
+        assert_eq!(by_name.get("ok"), Some(&OutputType::Bool));
     }
 
     // ────────────────────────────────────────────────────────────────
@@ -5689,11 +5668,15 @@ steps:
             id: Some(inner_id.to_string()),
             expect: None,
             condition: StepCondition::Always,
-            outputs: vec![crate::step::OutputDecl {
-                name: output_name.to_string(),
-                output_type: decl.output_type,
-                required: true,
-            }],
+            outputs: [(
+                output_name.to_string(),
+                crate::step::OutputDecl {
+                    output_type: decl.output_type,
+                    required: true,
+                },
+            )]
+            .into_iter()
+            .collect(),
             captured_outputs: std::cell::RefCell::new(Some(vec![CapturedOutput {
                 name: output_name.to_string(),
                 declared_type: decl.output_type,
