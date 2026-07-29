@@ -4716,6 +4716,12 @@ mod outputs_validation {
     }
 
     #[test]
+    fn test_output_type_secret_accepted() {
+        let step = make_run_step_with_outputs("s", vec![decl("token", OutputType::Secret)]);
+        assert!(validate_test_steps(&[step], &[]).is_ok());
+    }
+
+    #[test]
     fn test_output_type_bool_accepted() {
         let step = make_run_step_with_outputs("s", vec![decl("b", OutputType::Bool)]);
         assert!(validate_test_steps(&[step], &[]).is_ok());
@@ -4955,6 +4961,36 @@ outputs:
         write_test_yaml(&repo, "frag.yaml");
         let invoke = load_invoke(&repo);
         assert_eq!(invoke.output_decls[0].output_type, OutputType::Bool);
+    }
+
+    #[test]
+    fn test_fragment_output_type_secret_parses() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("frag.yaml"),
+            r#"
+type: botforge/fragment
+steps:
+  - on: guest
+    id: emit
+    name: emit
+    run: echo "token=s3cr3t" >> "$BF_OUT"
+    outputs:
+      - name: token
+        type: secret
+        required: true
+outputs:
+  - name: token
+    type: secret
+    from-step: emit
+    from-output: token
+    required: true
+"#,
+        )
+        .unwrap();
+        write_test_yaml(&repo, "frag.yaml");
+        let invoke = load_invoke(&repo);
+        assert_eq!(invoke.output_decls[0].output_type, OutputType::Secret);
     }
 
     #[test]
@@ -5429,6 +5465,77 @@ outputs:
         assert!(
             err.contains("number") && err.contains("bool"),
             "type mismatch error should name both sides (bool vs number): {err}"
+        );
+    }
+
+    #[test]
+    fn test_fragment_output_secret_type_mismatch_is_error() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("frag.yaml"),
+            r#"
+type: botforge/fragment
+steps:
+  - on: guest
+    id: s1
+    name: s
+    run: true
+    outputs:
+      - name: token
+        type: secret
+        required: true
+outputs:
+  - name: token
+    type: string
+    from-step: s1
+    from-output: token
+    required: true
+"#,
+        )
+        .unwrap();
+        write_test_yaml(&repo, "frag.yaml");
+        let err = load_err(&repo);
+        assert!(
+            err.contains("mismatch") && err.contains("secret") && err.contains("string"),
+            "secret/string mismatch should fail load-time with both types named: {err}"
+        );
+    }
+
+    #[test]
+    fn test_fragment_output_secret_invalid_default_masks_raw_value() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("frag.yaml"),
+            r#"
+type: botforge/fragment
+steps:
+  - on: guest
+    id: s1
+    name: s
+    run: true
+    outputs:
+      - name: token
+        type: secret
+        required: false
+outputs:
+  - name: token
+    type: secret
+    from-step: s1
+    from-output: token
+    default:
+      leaked: super-secret-value
+"#,
+        )
+        .unwrap();
+        write_test_yaml(&repo, "frag.yaml");
+        let err = load_err(&repo);
+        assert!(
+            err.contains("invalid default value for secret output"),
+            "error should report invalid secret default: {err}"
+        );
+        assert!(
+            !err.contains("super-secret-value"),
+            "secret default value must be masked in error output: {err}"
         );
     }
 

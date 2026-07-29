@@ -841,7 +841,7 @@ fn resolve_step_output_reference(
 ) -> Result<String> {
     if let Some(prior) = find_step_by_id(prior_steps, step_id) {
         return resolve_captured_output_value(consumer, step_id, output_name, prior)
-            .map(|value| value.to_string_context());
+            .map(|value| value.to_use_string());
     }
 
     if find_step_by_id(scope_steps, step_id).is_some() {
@@ -961,7 +961,7 @@ fn resolve_fragment_output_reference(
             decl.from_output
         );
     }
-    Ok(effective.to_string_context())
+    Ok(effective.to_use_string())
 }
 
 /// Resolve a fragment's declared outputs onto the `InvokeStep` node.
@@ -3179,6 +3179,24 @@ run: echo ok
         let step = consumer_step("echo ${{ steps.build.outputs.version }}");
         let resolved = resolve_run_step_output_refs(&step, &scope, 1, None).unwrap();
         assert_eq!(resolved, "echo 2.0.0");
+    }
+
+    #[test]
+    fn test_resolve_run_refs_secret_output_uses_real_value() {
+        let scope = vec![
+            executed_run_with_outputs(
+                "build",
+                vec![captured(
+                    "token",
+                    OutputType::Secret,
+                    OutputValue::String("super-secret-token".to_string()),
+                )],
+            ),
+            TestStep::Run(consumer_step("echo noop")),
+        ];
+        let step = consumer_step("echo ${{ steps.build.outputs.token }}");
+        let resolved = resolve_run_step_output_refs(&step, &scope, 1, None).unwrap();
+        assert_eq!(resolved, "echo super-secret-token");
     }
 
     #[test]
