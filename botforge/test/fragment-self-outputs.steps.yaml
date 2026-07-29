@@ -34,11 +34,9 @@ steps:
 outputs:
   version:
     type: string
-    from_step: emit
-    from_output: version
+    value: ${{ steps.emit.outputs.version }}
     required: true
   fallback:
     type: string
-    from_step: quiet
-    from_output: maybe
+    value: ${{ steps.quiet.outputs.maybe }}
     default: "self-default"

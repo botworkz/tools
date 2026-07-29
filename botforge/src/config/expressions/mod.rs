@@ -638,6 +638,39 @@ pub(crate) fn is_pure_deferred_output_ref(text: &str) -> bool {
     }
 }
 
+/// If `text` is exactly one pure `${{ steps.ID.outputs.NAME }}` expression (nothing
+/// outside the delimiters, no operators), return the `(step_id, output_name)` pieces.
+///
+/// Used for best-effort load-time static checks on fragment output `value:` fields:
+/// only the trivially-checkable pure-ref shape is inspected; compound expressions
+/// return `None` and are validated at execution time instead.
+pub(crate) fn parse_pure_step_output_ref(text: &str) -> Option<(String, String)> {
+    extract_pure_expression(text).and_then(parser::pure_step_output_ref)
+}
+
+/// Validate that every `${{ }}` span in `text` parses as a well-formed expression.
+///
+/// Used at load time for fields whose expressions are resolved lazily at execution
+/// time (e.g. fragment output `value:`): the values are not available yet, but a
+/// malformed expression is still a hard load-time error.
+///
+/// **Expression evaluation lives solely in `config/expressions`; do not parse
+/// `${{ }}` outside this module.**
+pub(crate) fn validate_expression_spans(text: &str) -> Result<()> {
+    let mut rest = text;
+    while let Some(start) = rest.find("${{") {
+        let after_open = &rest[start + 3..];
+        let end = after_open
+            .find("}}")
+            .ok_or_else(|| anyhow::anyhow!("unterminated expression in '{text}'"))?;
+        let expr = after_open[..end].trim();
+        parser::Parser::parse(expr)
+            .with_context(|| format!("invalid expression '${{{{ {expr} }}}}' in '{text}'"))?;
+        rest = &after_open[end + 2..];
+    }
+    Ok(())
+}
+
 /// Resolve `${{ steps.X.outputs.Y }}` / `${{ outputs.Y }}` references in `text` at
 /// execution time using the same expression engine used for load-time substitution.
 ///
@@ -2838,8 +2871,7 @@ steps:
 outputs:
   defined:
     type: string
-    from_step: emit
-    from_output: version
+    value: ${{ steps.emit.outputs.version }}
     default: x
 "#,
             )
@@ -2885,8 +2917,7 @@ steps:
 outputs:
   version:
     type: string
-    from_step: inner
-    from_output: version
+    value: ${{ steps.inner.outputs.version }}
     required: true
 "#,
             )
@@ -2941,8 +2972,7 @@ steps:
 outputs:
   version:
     type: string
-    from_step: emit
-    from_output: version
+    value: ${{ steps.emit.outputs.version }}
     required: true
 "#,
             )

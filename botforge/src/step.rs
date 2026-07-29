@@ -454,19 +454,22 @@ pub(crate) struct ArchiveStep {
 
 /// A validated fragment output declaration, as stored on an [`InvokeStep`].
 ///
-/// Produced at load time after cross-reference validation: the referenced inner
-/// step id exists in the fragment scope, the referenced output name is declared on
-/// that step, the types match, and the required-or-default rule is satisfied.
+/// Produced at load time after validation: the `value:` expression is well-formed
+/// (and, for the trivially-checkable pure-ref shape, points at an inner step that
+/// exists with that output declared), and the required-or-default rule is satisfied.
+/// The `value:` expression is resolved at the fragment-output boundary — after the
+/// fragment's inner steps have executed — and the resolved value is coerced and
+/// validated against the declared `type:`.
 #[derive(Debug, Clone)]
 pub(crate) struct FragmentOutputDecl {
     /// The fragment-level output name (unique within the fragment's `outputs:` block).
     pub(crate) name: String,
-    /// The declared type; must equal the referenced inner step output's declared type.
+    /// The declared type; the resolved `value:` must coerce to it at the boundary.
     pub(crate) output_type: OutputType,
-    /// The `id:` of the inner run step whose output is re-exported.
-    pub(crate) from_step: String,
-    /// The output name on the inner step.
-    pub(crate) from_output: String,
+    /// The raw `value:` expression string (e.g. `${{ steps.emit.outputs.version }}`,
+    /// an interpolation, or a function call).  Resolved through the expression engine
+    /// at the fragment-output boundary against the fragment's executed inner steps.
+    pub(crate) value: String,
     /// When `true`, the re-exported value must not be `Null` (after default fallback).
     pub(crate) required: bool,
     /// Pre-validated default value (coerced to the declared type at load time).
@@ -496,10 +499,11 @@ pub(crate) struct InvokeStep {
     pub(crate) steps: Vec<TestStep>,
     /// Fragment output declarations (validated at load time).
     ///
-    /// Each entry re-exports a value from one of this fragment's direct inner run
-    /// steps.  The executor populates `captured_outputs` after the inner steps
-    /// finish by resolving these declarations against the inner steps' own
-    /// `captured_outputs` slots.
+    /// Each entry exports a value computed by resolving its `value:` expression
+    /// against this fragment's executed inner steps.  The executor populates
+    /// `captured_outputs` after the inner steps finish by resolving these
+    /// declarations at the fragment-output boundary and coercing the results to
+    /// their declared types.
     pub(crate) output_decls: Vec<FragmentOutputDecl>,
     /// `with:` values that contained deferred output references (`${{ steps.X.outputs.Y }}`).
     ///

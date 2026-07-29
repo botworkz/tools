@@ -38,21 +38,17 @@ steps:
 outputs:
   version:
     type: string
-    from_step: emit
-    from_output: version
+    value: ${{ steps.emit.outputs.version }}
     required: true
   count:
     type: number
-    from_step: emit
-    from_output: count
+    value: ${{ steps.emit.outputs.count }}
     required: true
   ready:
     type: bool
-    from_step: emit
-    from_output: ready
+    value: ${{ steps.emit.outputs.ready }}
     required: true
   fallback:
     type: string
-    from_step: silent
-    from_output: maybe
+    value: ${{ steps.silent.outputs.maybe }}
     default: "fallback-default"

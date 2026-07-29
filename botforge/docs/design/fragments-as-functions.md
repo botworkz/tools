@@ -149,8 +149,9 @@ fragment) is valid — ids are fragment-local.
 - A step emits values via `echo NAME=value >> $BF_OUT`.
 - At capture time, the emitted string is coerced to the declared type (hard failure
   by default; opt-in `on_type_error: empty` for leniency).
-- Fragment `outputs:` re-export step outputs with enforced step↔fragment
-  type-match.
+- Fragment `outputs:` declare a `value:` expression resolved at the fragment-output
+  boundary; the resolved value is coerced and validated against the declared
+  `type:` (validity, not matching — no static step↔fragment type-match).
 - `required:` defaults to `false`; if not `true`, a `default:` is mandatory; both
   set is a contradiction / hard load-time error (symmetric with #544 R1).
 - Declaration-level checks (required-or-default, not-both) are load-time.
@@ -227,13 +228,13 @@ graph; `matrix:` / parallelism would attach here in a later stage.
 |-------|------|--------|
 | **1** | Scoped `TestStep::Invoke` + recursive executor + hierarchical indices + per-scope id uniqueness + env isolation | **Done (this PR)** |
 | **2** | Typed step `outputs:` declaration + `$BF_OUT` capture + coercion/validation | **Done** |
-| **3** | Fragment `outputs:` wiring + step↔fragment type-match enforcement + `id:` on `uses:` + lazy `${{ steps.<id>.outputs.<name> }}` consumption at the fragment boundary | **Done** |
+| **3** | Fragment `outputs:` wiring (`value:` expression resolved at the boundary, validated against the declared `type:` — superseded the original step↔fragment type-match) + `id:` on `uses:` + lazy `${{ steps.<id>.outputs.<name> }}` consumption at the fragment boundary | **Done** |
 | **4** | General runtime output-reference namespace (`steps.<id>.outputs.<name>` for run+invoke ids in current scope, plus fragment-self `outputs.<name>`) with deferred/backward resolution | **Done** |
 | **5** | `type: secret` output masking for botforge display/error sinks while preserving real values at use sinks | **Done** |
 
 **Shipped runtime output-reference grammar (Stage 4):**
 - `${{ steps.<id>.outputs.<name> }}` — resolves in the current scope only, against already-executed sibling run/invoke steps.
-- `${{ outputs.<name> }}` — resolves only inside a fragment body, via that fragment's declared `outputs:` contract (`from_step`/`from_output`, `default`, `required`).
+- `${{ outputs.<name> }}` — resolves only inside a fragment body, via that fragment's declared `outputs:` contract (`value:` expression, `default`, `required`).
 - Both forms are deferred runtime-only references allowed in `run:` fields; all other `${{ }}` expressions remain load-time resolved/rejected.
 
 **Stage 1 explicitly does NOT include:** `$BF_OUT`, typed `outputs:`,

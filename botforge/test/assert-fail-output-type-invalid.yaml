@@ -1,0 +1,8 @@
+type: botforge/test
+name: assert-fail-output-type-invalid
+ports:
+- 80
+steps:
+- uses: "@://fragment-output-type-invalid.steps.yaml"
+assert:
+  files: {}

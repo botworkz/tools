@@ -18,6 +18,5 @@ steps:
 outputs:
   val:
     type: string
-    from_step: quiet
-    from_output: val
+    value: ${{ steps.quiet.outputs.val }}
     required: true

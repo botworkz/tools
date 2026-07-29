@@ -25,6 +25,5 @@ steps:
 outputs:
   testuser_otp:
     type: string
-    from_step: issue
-    from_output: testuser_otp
+    value: ${{ steps.issue.outputs.testuser_otp }}
     required: true

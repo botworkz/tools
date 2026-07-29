@@ -1,0 +1,21 @@
+type: botforge/fragment
+# Negative-control fixture: the fragment output's `value:` resolves to a value
+# that does not satisfy the declared `type:` (a non-numeric string declared as
+# `number`).  Boundary resolution must hard-fail after the inner steps run,
+# naming the offending fragment output.
+steps:
+- on: host
+  name: emit text
+  id: emit
+  run: |
+    echo "some_text=not-a-number" >> "$BF_OUT"
+  outputs:
+    some_text:
+      type: string
+      required: true
+
+outputs:
+  count:
+    type: number
+    value: ${{ steps.emit.outputs.some_text }}
+    required: true

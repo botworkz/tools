@@ -4863,8 +4863,7 @@ steps:
 outputs:
   result:
     type: string
-    from_step: s1
-    from_output: label
+    value: ${{ steps.s1.outputs.label }}
     required: true
 "#,
         )
@@ -4874,8 +4873,10 @@ outputs:
         assert_eq!(invoke.output_decls.len(), 1);
         assert_eq!(invoke.output_decls[0].output_type, OutputType::String);
         assert_eq!(invoke.output_decls[0].name, "result");
-        assert_eq!(invoke.output_decls[0].from_step, "s1");
-        assert_eq!(invoke.output_decls[0].from_output, "label");
+        assert_eq!(
+            invoke.output_decls[0].value,
+            "${{ steps.s1.outputs.label }}"
+        );
         assert!(invoke.output_decls[0].required);
         assert!(invoke.output_decls[0].default.is_none());
     }
@@ -4899,8 +4900,7 @@ steps:
 outputs:
   count:
     type: number
-    from_step: counter
-    from_output: n
+    value: ${{ steps.counter.outputs.n }}
     required: true
 "#,
         )
@@ -4929,8 +4929,7 @@ steps:
 outputs:
   ready:
     type: bool
-    from_step: check
-    from_output: ok
+    value: ${{ steps.check.outputs.ok }}
     required: true
 "#,
         )
@@ -4959,8 +4958,7 @@ steps:
 outputs:
   token:
     type: secret
-    from_step: emit
-    from_output: token
+    value: ${{ steps.emit.outputs.token }}
     required: true
 "#,
         )
@@ -4989,8 +4987,7 @@ steps:
 outputs:
   x:
     type: integer
-    from_step: s1
-    from_output: x
+    value: ${{ steps.s1.outputs.x }}
     required: true
 "#,
         )
@@ -5024,8 +5021,7 @@ steps:
 outputs:
   x:
     type: string
-    from_step: s1
-    from_output: x
+    value: ${{ steps.s1.outputs.x }}
     required: true
     surprise: bad
 "#,
@@ -5062,8 +5058,7 @@ steps:
 outputs:
   x:
     type: string
-    from_step: s1
-    from_output: x
+    value: ${{ steps.s1.outputs.x }}
 "#,
         )
         .unwrap();
@@ -5094,8 +5089,7 @@ steps:
 outputs:
   x:
     type: string
-    from_step: s1
-    from_output: x
+    value: ${{ steps.s1.outputs.x }}
     required: true
 "#,
         )
@@ -5125,8 +5119,7 @@ steps:
 outputs:
   x:
     type: string
-    from_step: s1
-    from_output: x
+    value: ${{ steps.s1.outputs.x }}
     default: fallback
 "#,
         )
@@ -5159,8 +5152,7 @@ steps:
 outputs:
   x:
     type: string
-    from_step: s1
-    from_output: x
+    value: ${{ steps.s1.outputs.x }}
     required: true
     default: oops
 "#,
@@ -5193,8 +5185,7 @@ steps:
 outputs:
   count:
     type: number
-    from_step: s1
-    from_output: n
+    value: ${{ steps.s1.outputs.n }}
     default: 42
 "#,
         )
@@ -5226,8 +5217,7 @@ steps:
 outputs:
   ready:
     type: bool
-    from_step: s1
-    from_output: flag
+    value: ${{ steps.s1.outputs.flag }}
     default: false
 "#,
         )
@@ -5259,8 +5249,7 @@ steps:
 outputs:
   count:
     type: number
-    from_step: s1
-    from_output: n
+    value: ${{ steps.s1.outputs.n }}
     default: not-a-number
 "#,
         )
@@ -5296,8 +5285,7 @@ steps:
 outputs:
   x:
     type: string
-    from_step: ghost-step
-    from_output: x
+    value: ${{ steps.ghost-step.outputs.x }}
     required: true
 "#,
         )
@@ -5329,8 +5317,7 @@ steps:
 outputs:
   x:
     type: string
-    from_step: s1
-    from_output: ghost-output
+    value: ${{ steps.s1.outputs.ghost-output }}
     required: true
 "#,
         )
@@ -5344,11 +5331,12 @@ outputs:
     }
 
     // ────────────────────────────────────────────────────────────────
-    // Step↔fragment type-match
+    // `value:` expression validation (validity, not matching — no static
+    // type-match against any referenced step output's declared type)
     // ────────────────────────────────────────────────────────────────
 
     #[test]
-    fn test_fragment_output_type_match_succeeds() {
+    fn test_fragment_output_pure_ref_value_loads() {
         let repo = TempDir::new().unwrap();
         std::fs::write(
             repo.path().join("frag.yaml"),
@@ -5366,8 +5354,7 @@ steps:
 outputs:
   val:
     type: string
-    from_step: s1
-    from_output: val
+    value: ${{ steps.s1.outputs.val }}
     required: true
 "#,
         )
@@ -5376,10 +5363,14 @@ outputs:
         // Should succeed without error.
         let invoke = load_invoke(&repo);
         assert_eq!(invoke.output_decls[0].output_type, OutputType::String);
+        assert_eq!(invoke.output_decls[0].value, "${{ steps.s1.outputs.val }}");
     }
 
     #[test]
-    fn test_fragment_output_type_mismatch_is_error() {
+    fn test_fragment_output_declared_type_differs_from_step_output_type_loads() {
+        // There is NO static type-match between the fragment output's declared
+        // `type:` and a referenced step output's declared type: the resolved
+        // value is validated against the declared type at the boundary instead.
         let repo = TempDir::new().unwrap();
         std::fs::write(
             repo.path().join("frag.yaml"),
@@ -5397,22 +5388,20 @@ steps:
 outputs:
   n:
     type: string
-    from_step: s1
-    from_output: n
+    value: ${{ steps.s1.outputs.n }}
     required: true
 "#,
         )
         .unwrap();
         write_test_yaml(&repo, "frag.yaml");
-        let err = load_err(&repo);
-        assert!(
-            err.contains("mismatch") || (err.contains("string") && err.contains("number")),
-            "type mismatch should be an error naming both types: {err}"
-        );
+        let invoke = load_invoke(&repo);
+        assert_eq!(invoke.output_decls[0].output_type, OutputType::String);
     }
 
     #[test]
-    fn test_fragment_output_type_mismatch_error_names_both_sides() {
+    fn test_fragment_output_compound_expression_value_loads() {
+        // Compound/function expressions must NOT be rejected at load time;
+        // they are resolved and validated at the fragment-output boundary.
         let repo = TempDir::new().unwrap();
         std::fs::write(
             repo.path().join("frag.yaml"),
@@ -5422,31 +5411,38 @@ steps:
   - on: guest
     id: s1
     name: s
-    run: true
+    run: echo "n=7" >> "$BF_OUT"
     outputs:
-      flag:
-        type: bool
+      n:
+        type: string
         required: true
 outputs:
-  flag:
+  count:
     type: number
-    from_step: s1
-    from_output: flag
+    value: ${{ from_json(steps.s1.outputs.n) }}
+    required: true
+  label:
+    type: string
+    value: "I counted ${{ steps.s1.outputs.n }} chickens"
     required: true
 "#,
         )
         .unwrap();
         write_test_yaml(&repo, "frag.yaml");
-        let err = load_err(&repo);
-        // Error should name both the fragment-declared type and the step's type.
-        assert!(
-            err.contains("number") && err.contains("bool"),
-            "type mismatch error should name both sides (bool vs number): {err}"
+        let invoke = load_invoke(&repo);
+        assert_eq!(invoke.output_decls.len(), 2);
+        assert_eq!(
+            invoke.output_decls[0].value,
+            "${{ from_json(steps.s1.outputs.n) }}"
+        );
+        assert_eq!(
+            invoke.output_decls[1].value,
+            "I counted ${{ steps.s1.outputs.n }} chickens"
         );
     }
 
     #[test]
-    fn test_fragment_output_secret_type_mismatch_is_error() {
+    fn test_fragment_output_malformed_value_expression_is_error() {
         let repo = TempDir::new().unwrap();
         std::fs::write(
             repo.path().join("frag.yaml"),
@@ -5458,14 +5454,13 @@ steps:
     name: s
     run: true
     outputs:
-      token:
-        type: secret
+      x:
+        type: string
         required: true
 outputs:
-  token:
+  x:
     type: string
-    from_step: s1
-    from_output: token
+    value: "${{ steps.s1.outputs. }}"
     required: true
 "#,
         )
@@ -5473,8 +5468,8 @@ outputs:
         write_test_yaml(&repo, "frag.yaml");
         let err = load_err(&repo);
         assert!(
-            err.contains("mismatch") && err.contains("secret") && err.contains("string"),
-            "secret/string mismatch should fail load-time with both types named: {err}"
+            err.contains("invalid") || err.contains("expression"),
+            "malformed value expression should be rejected at load time: {err}"
         );
     }
 
@@ -5497,8 +5492,7 @@ steps:
 outputs:
   token:
     type: secret
-    from_step: s1
-    from_output: token
+    value: ${{ steps.s1.outputs.token }}
     default:
       leaked: super-secret-value
 "#,
@@ -5542,13 +5536,11 @@ steps:
 outputs:
   x:
     type: string
-    from_step: s1
-    from_output: x
+    value: ${{ steps.s1.outputs.x }}
     required: true
   x:
     type: string
-    from_step: s1
-    from_output: y
+    value: ${{ steps.s1.outputs.y }}
     required: true
 "#,
         )
@@ -5593,18 +5585,15 @@ steps:
 outputs:
   label:
     type: string
-    from_step: s1
-    from_output: label
+    value: ${{ steps.s1.outputs.label }}
     required: true
   count:
     type: number
-    from_step: s1
-    from_output: count
+    value: ${{ steps.s1.outputs.count }}
     required: true
   ok:
     type: bool
-    from_step: s1
-    from_output: ok
+    value: ${{ steps.s1.outputs.ok }}
     required: true
 "#,
         )
@@ -5698,8 +5687,7 @@ steps:
         let decl = FragmentOutputDecl {
             name: "result".to_string(),
             output_type: OutputType::String,
-            from_step: "inner".to_string(),
-            from_output: "label".to_string(),
+            value: "${{ steps.inner.outputs.label }}".to_string(),
             required: true,
             default: None,
         };
@@ -5723,8 +5711,7 @@ steps:
         let decl = FragmentOutputDecl {
             name: "count".to_string(),
             output_type: OutputType::Number,
-            from_step: "inner".to_string(),
-            from_output: "n".to_string(),
+            value: "${{ steps.inner.outputs.n }}".to_string(),
             required: true,
             default: None,
         };
@@ -5740,8 +5727,7 @@ steps:
         let decl = FragmentOutputDecl {
             name: "ok".to_string(),
             output_type: OutputType::Bool,
-            from_step: "inner".to_string(),
-            from_output: "flag".to_string(),
+            value: "${{ steps.inner.outputs.flag }}".to_string(),
             required: false,
             default: Some(OutputValue::Bool(false)),
         };
@@ -5758,8 +5744,7 @@ steps:
         let decl = FragmentOutputDecl {
             name: "label".to_string(),
             output_type: OutputType::String,
-            from_step: "inner".to_string(),
-            from_output: "x".to_string(),
+            value: "${{ steps.inner.outputs.x }}".to_string(),
             required: false,
             default: Some(OutputValue::String("default-val".to_string())),
         };
@@ -5778,17 +5763,107 @@ steps:
         let decl = FragmentOutputDecl {
             name: "must-have".to_string(),
             output_type: OutputType::String,
-            from_step: "inner".to_string(),
-            from_output: "x".to_string(),
+            value: "${{ steps.inner.outputs.x }}".to_string(),
             required: true,
             default: None,
         };
         let invoke = make_invoke_with_captured_inner("inner", "x", OutputValue::Null, decl);
         let err = resolve_invoke_outputs_for_test(&invoke).unwrap_err();
-        let msg = err.to_string();
+        let msg = format!("{err:#}");
         assert!(
             msg.contains("required") && msg.contains("must-have"),
             "error should mention required output name: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_invoke_outputs_interpolated_value_resolves_to_string() {
+        let decl = FragmentOutputDecl {
+            name: "label".to_string(),
+            output_type: OutputType::String,
+            value: "I counted ${{ steps.inner.outputs.count }} chickens".to_string(),
+            required: true,
+            default: None,
+        };
+        let invoke =
+            make_invoke_with_captured_inner("inner", "count", OutputValue::Number(7.0), decl);
+        resolve_invoke_outputs_for_test(&invoke).unwrap();
+        let captured = invoke.captured_outputs.borrow();
+        let outputs = captured.as_ref().unwrap();
+        assert_eq!(
+            outputs[0].value,
+            OutputValue::String("I counted 7 chickens".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_invoke_outputs_from_json_value_coerces_to_number() {
+        let decl = FragmentOutputDecl {
+            name: "count".to_string(),
+            output_type: OutputType::Number,
+            value: "${{ from_json(steps.inner.outputs.numbery_string) }}".to_string(),
+            required: true,
+            default: None,
+        };
+        let invoke = make_invoke_with_captured_inner(
+            "inner",
+            "numbery_string",
+            OutputValue::String("7".to_string()),
+            decl,
+        );
+        resolve_invoke_outputs_for_test(&invoke).unwrap();
+        let captured = invoke.captured_outputs.borrow();
+        let outputs = captured.as_ref().unwrap();
+        assert_eq!(outputs[0].value, OutputValue::Number(7.0));
+        assert_eq!(outputs[0].declared_type, OutputType::Number);
+    }
+
+    #[test]
+    fn test_resolve_invoke_outputs_type_invalid_value_is_boundary_error() {
+        // A resolved value that does not satisfy the declared type is a hard
+        // error at the fragment-output boundary, naming the fragment output.
+        let decl = FragmentOutputDecl {
+            name: "count".to_string(),
+            output_type: OutputType::Number,
+            value: "${{ steps.inner.outputs.some_text }}".to_string(),
+            required: true,
+            default: None,
+        };
+        let invoke = make_invoke_with_captured_inner(
+            "inner",
+            "some_text",
+            OutputValue::String("not-a-number".to_string()),
+            decl,
+        );
+        let err = resolve_invoke_outputs_for_test(&invoke).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("count") && msg.contains("number"),
+            "type-invalid value must hard-fail at the boundary naming the output: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_invoke_outputs_value_cannot_reference_fragment_outputs() {
+        // `outputs.*` self-references inside a `value:` expression are a hard error.
+        let decl = FragmentOutputDecl {
+            name: "loop".to_string(),
+            output_type: OutputType::String,
+            value: "${{ outputs.loop }}".to_string(),
+            required: true,
+            default: None,
+        };
+        let invoke = make_invoke_with_captured_inner(
+            "inner",
+            "x",
+            OutputValue::String("v".to_string()),
+            decl,
+        );
+        let err = resolve_invoke_outputs_for_test(&invoke).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("cannot reference"),
+            "outputs.* inside value: must be rejected: {msg}"
         );
     }
 
@@ -5812,8 +5887,7 @@ steps:
         let decl = FragmentOutputDecl {
             name: "result".to_string(),
             output_type: OutputType::String,
-            from_step: "s1".to_string(),
-            from_output: "val".to_string(),
+            value: "${{ steps.s1.outputs.val }}".to_string(),
             required: true,
             default: None,
         };
