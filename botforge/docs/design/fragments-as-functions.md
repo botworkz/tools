@@ -1,6 +1,6 @@
 # Fragments as Functions — Design Report
 
-> **Status**: Stage 1 implemented (PR implementing issue #555).
+> **Status**: Stages 1–4 implemented.
 > This document is the authoritative spec for the fragments-as-functions redesign,
 > covering findings, the proposed model, and the staged implementation plan.
 
@@ -205,7 +205,12 @@ graph; `matrix:` / parallelism would attach here in a later stage.
 | **1** | Scoped `TestStep::Invoke` + recursive executor + hierarchical indices + per-scope id uniqueness + env isolation | **Done (this PR)** |
 | **2** | Typed step `outputs:` declaration + `$BF_OUT` capture + coercion/validation | **Done** |
 | **3** | Fragment `outputs:` wiring + step↔fragment type-match enforcement + `id:` on `uses:` + lazy `${{ steps.<id>.outputs.<name> }}` consumption at the fragment boundary | **Done** |
-| **4** | General `outputs.*` / `steps.*` engine namespace (step↔step refs, fragment-self output refs, cross-scope) | Planned |
+| **4** | General runtime output-reference namespace (`steps.<id>.outputs.<name>` for run+invoke ids in current scope, plus fragment-self `outputs.<name>`) with deferred/backward resolution | **Done** |
+
+**Shipped runtime output-reference grammar (Stage 4):**
+- `${{ steps.<id>.outputs.<name> }}` — resolves in the current scope only, against already-executed sibling run/invoke steps.
+- `${{ outputs.<name> }}` — resolves only inside a fragment body, via that fragment's declared `outputs:` contract (`from-step`/`from-output`, `default`, `required`).
+- Both forms are deferred runtime-only references allowed in `run:` fields; all other `${{ }}` expressions remain load-time resolved/rejected.
 
 **Stage 1 explicitly does NOT include:** `$BF_OUT`, typed `outputs:`,
 `steps.*` / `outputs.*` namespace, Invariant A changes, deferred/runtime

@@ -20,6 +20,11 @@ pub(super) enum ExprNode {
         step_id: String,
         output_name: String,
     },
+    /// `outputs.<name>` reference to the current fragment's declared output.
+    /// Deferred at load time and resolved lazily at execution time.
+    FragmentOutputReference {
+        output_name: String,
+    },
     /// `func(arg)` function call, e.g. `to_json(x)` or `from_json(s)`.
     FunctionCall {
         name: String,
@@ -144,8 +149,8 @@ impl Parser {
                                 anyhow::bail!("invalid input name '{name}'");
                             }
                             self.advance()?;
-                            // `steps.<id>.outputs.<name>` — fragment invocation
-                            // output reference (four dotted segments).
+                            // `steps.<id>.outputs.<name>` — step output reference
+                            // (four dotted segments).
                             if identifier == "steps" {
                                 self.expect_token(Token::Dot).map_err(|_| {
                                     anyhow::anyhow!(
@@ -183,6 +188,10 @@ impl Parser {
                                     step_id: name,
                                     output_name,
                                 });
+                            }
+                            // `outputs.<name>` — current fragment output reference.
+                            if identifier == "outputs" {
+                                return Ok(ExprNode::FragmentOutputReference { output_name: name });
                             }
                             Ok(ExprNode::Reference {
                                 namespace: identifier,

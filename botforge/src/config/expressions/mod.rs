@@ -557,13 +557,12 @@ fn substitute_namespace_in_string(
 ///   — the two-pass deferral means it can't be resolved.
 /// - A top-level step (not from a fragment) that mistakenly uses `inputs.*` refs.
 ///
-/// # Exception: `${{ steps.<id>.outputs.<name> }}` in `run:` fields
-/// A **pure** step-output reference (the whole span is exactly one
-/// `steps.<id>.outputs.<name>` reference, no operators) is allowed to survive the
-/// load-time passes **only inside a `run:` field** — its value does not exist until
-/// the referenced `uses:` step has executed, so it is resolved lazily at execution
-/// time by [`resolve_step_output_refs_in_string`]. Anywhere else (or combined with
-/// operators/other references) it remains a hard load-time error.
+/// # Exception: `${{ steps.<id>.outputs.<name> }}` / `${{ outputs.<name> }}` in `run:` fields
+/// A **pure** runtime-output reference (the whole span is exactly one deferred
+/// reference, no operators) is allowed to survive the load-time passes **only inside
+/// a `run:` field** — its value does not exist until execution. It is resolved lazily
+/// at execution time by [`resolve_output_refs_in_string`]. Anywhere else (or combined
+/// with operators/other references) it remains a hard load-time error.
 ///
 /// Callers MUST invoke this immediately after [`substitute_args_in_value`].
 fn check_no_residual_expressions(value: &Value) -> Result<()> {
@@ -597,11 +596,12 @@ fn check_no_residual_expressions_in_str(text: &str, in_run_field: bool) -> Resul
             );
         };
         let expr = after_open[..end].trim();
-        let is_pure_step_output_ref = matches!(
+        let is_pure_runtime_output_ref = matches!(
             parser::Parser::parse(expr),
-            Ok(parser::ExprNode::StepOutputReference { .. })
+            Ok(parser::ExprNode::StepOutputReference { .. }
+                | parser::ExprNode::FragmentOutputReference { .. })
         );
-        if !is_pure_step_output_ref {
+        if !is_pure_runtime_output_ref {
             anyhow::bail!(
                 "unresolved expression after final substitution pass: '{}'; \
                  check for unknown namespaces, typos, or cross-namespace \
@@ -611,7 +611,7 @@ fn check_no_residual_expressions_in_str(text: &str, in_run_field: bool) -> Resul
         }
         if !in_run_field {
             anyhow::bail!(
-                "step output reference '{}' is only supported in 'run:' fields \
+                "runtime output reference '{}' is only supported in 'run:' fields \
                  (resolved at execution time)",
                 &rest[start..start + 3 + end + 2]
             );
@@ -621,21 +621,34 @@ fn check_no_residual_expressions_in_str(text: &str, in_run_field: bool) -> Resul
     Ok(())
 }
 
-/// Resolve `${{ steps.<id>.outputs.<name> }}` references in a step's `run:` body
-/// at execution time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DeferredOutputReference {
+    StepOutput {
+        step_id: String,
+        output_name: String,
+    },
+    FragmentOutput {
+        output_name: String,
+    },
+}
+
+/// Resolve deferred runtime output references in a step's `run:` body at execution
+/// time.
 ///
-/// This is the narrow **runtime** substitution entry point for the one deferred
-/// reference kind: fragment-invocation output references. All other `${{ }}`
-/// expressions were resolved (or rejected) at load time, so any span found here
-/// must be a pure step-output reference — anything else is a hard error
+/// This is the unified **runtime** substitution entry point for all deferred output
+/// reference kinds:
+/// - `steps.<id>.outputs.<name>`
+/// - `outputs.<name>`
+///
+/// All other `${{ }}` expressions were resolved (or rejected) at load time, so any
+/// span found here must be one of the above — anything else is a hard error
 /// (defensive; load-time Invariant A already rejects it).
 ///
-/// `resolve` maps `(step_id, output_name)` to the projected string value, or
-/// returns an error when the reference cannot be resolved (unknown id, forward
-/// reference, run-step id, unknown output name).
-pub(crate) fn resolve_step_output_refs_in_string(
+/// `resolve` maps each runtime output reference to its projected string value, or
+/// returns an error when the reference cannot be resolved.
+pub(crate) fn resolve_output_refs_in_string(
     text: &str,
-    resolve: &mut dyn FnMut(&str, &str) -> Result<std::string::String>,
+    resolve: &mut dyn FnMut(DeferredOutputReference) -> Result<std::string::String>,
 ) -> Result<std::string::String> {
     if !text.contains("${{") {
         return Ok(text.to_string());
@@ -653,10 +666,16 @@ pub(crate) fn resolve_step_output_refs_in_string(
             parser::ExprNode::StepOutputReference {
                 step_id,
                 output_name,
-            } => rendered.push_str(&resolve(&step_id, &output_name)?),
+            } => rendered.push_str(&resolve(DeferredOutputReference::StepOutput {
+                step_id,
+                output_name,
+            })?),
+            parser::ExprNode::FragmentOutputReference { output_name } => rendered.push_str(
+                &resolve(DeferredOutputReference::FragmentOutput { output_name })?,
+            ),
             _ => anyhow::bail!(
                 "unexpected unresolved expression '${{{{ {expr} }}}}' at execution time; \
-                 only steps.<id>.outputs.<name> references are resolved at runtime"
+                 only steps.<id>.outputs.<name> and outputs.<name> references are resolved at runtime"
             ),
         }
         rest = &after_open[end + 2..];
@@ -2528,10 +2547,10 @@ steps:
     }
 
     // -----------------------------------------------------------------------
-    // `steps.<id>.outputs.<name>` reference tests (Stage 3 boundary consumption)
+    // Runtime output reference tests (Stage 4 namespace generalisation)
     // -----------------------------------------------------------------------
 
-    mod step_output_refs {
+    mod output_refs {
         use super::*;
         use crate::config::load_test_config;
         use crate::step::TestStep;
@@ -2551,6 +2570,14 @@ ports:
   - 80
 steps:
   - on: host
+    name: producer
+    id: build
+    run: true
+    outputs:
+      - name: version
+        type: string
+        required: false
+  - on: host
     name: consumer
     run: echo ${{ steps.build.outputs.version }}
 "#,
@@ -2558,7 +2585,7 @@ steps:
             .unwrap();
 
             let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
-            let TestStep::Run(step) = &config.steps[0] else {
+            let TestStep::Run(step) = &config.steps[1] else {
                 panic!("expected run step");
             };
             assert_eq!(step.run.trim(), "echo ${{ steps.build.outputs.version }}");
@@ -2575,6 +2602,14 @@ steps:
                 r#"
 type: botforge/fragment
 steps:
+  - on: host
+    name: producer
+    id: build
+    run: true
+    outputs:
+      - name: version
+        type: string
+        required: false
   - on: host
     name: consumer
     run: echo ${{ steps.build.outputs.version }}
@@ -2598,7 +2633,7 @@ steps:
             let TestStep::Invoke(inv) = &config.steps[0] else {
                 panic!("expected invoke step");
             };
-            let TestStep::Run(step) = &inv.steps[0] else {
+            let TestStep::Run(step) = &inv.steps[1] else {
                 panic!("expected run step");
             };
             assert_eq!(step.run.trim(), "echo ${{ steps.build.outputs.version }}");
@@ -2681,7 +2716,222 @@ steps:
             );
         }
 
-        // --- parser: steps.<id>.outputs.<name> ---
+        #[test]
+        fn test_steps_ref_unknown_id_in_scope_is_load_time_error() {
+            let repo = TempDir::new().unwrap();
+            std::fs::write(
+                repo.path().join("test.yaml"),
+                r#"
+type: botforge/test
+name: test
+ports:
+  - 80
+steps:
+  - on: host
+    name: consumer
+    run: echo ${{ steps.nope.outputs.version }}
+"#,
+            )
+            .unwrap();
+
+            let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("no step with id 'nope' exists in scope"),
+                "unknown step id should be rejected at load time: {msg}"
+            );
+        }
+
+        #[test]
+        fn test_steps_ref_unknown_output_name_is_load_time_error() {
+            let repo = TempDir::new().unwrap();
+            std::fs::write(
+                repo.path().join("test.yaml"),
+                r#"
+type: botforge/test
+name: test
+ports:
+  - 80
+steps:
+  - on: host
+    name: emit
+    id: emit
+    run: true
+    outputs:
+      - name: version
+        type: string
+        required: false
+  - on: host
+    name: consumer
+    run: echo ${{ steps.emit.outputs.nope }}
+"#,
+            )
+            .unwrap();
+
+            let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("does not declare output 'nope'"),
+                "unknown output name should be rejected at load time: {msg}"
+            );
+        }
+
+        #[test]
+        fn test_outputs_ref_undeclared_name_is_load_time_error() {
+            let repo = TempDir::new().unwrap();
+            std::fs::create_dir_all(repo.path().join("shared")).unwrap();
+            std::fs::write(
+                repo.path().join("shared/frag.yaml"),
+                r#"
+type: botforge/fragment
+steps:
+  - on: host
+    name: emit
+    id: emit
+    run: echo "version=1.2.3" >> "$BF_OUT"
+    outputs:
+      - name: version
+        type: string
+        required: true
+  - on: host
+    name: bad
+    run: echo ${{ outputs.missing }}
+outputs:
+  - name: defined
+    type: string
+    from-step: emit
+    from-output: version
+    default: x
+"#,
+            )
+            .unwrap();
+            std::fs::write(
+                repo.path().join("test.yaml"),
+                r#"
+type: botforge/test
+name: test
+ports:
+  - 80
+steps:
+  - uses: "@://shared/frag.yaml"
+"#,
+            )
+            .unwrap();
+
+            let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("does not declare output 'missing'"),
+                "undeclared outputs.* should be rejected at load time: {msg}"
+            );
+        }
+
+        #[test]
+        fn test_steps_ref_to_inner_fragment_step_is_scope_violation_load_time_error() {
+            let repo = TempDir::new().unwrap();
+            std::fs::create_dir_all(repo.path().join("shared")).unwrap();
+            std::fs::write(
+                repo.path().join("shared/frag.yaml"),
+                r#"
+type: botforge/fragment
+steps:
+  - on: host
+    name: emit
+    id: inner
+    run: echo "version=1.2.3" >> "$BF_OUT"
+    outputs:
+      - name: version
+        type: string
+        required: true
+outputs:
+  - name: version
+    type: string
+    from-step: inner
+    from-output: version
+    required: true
+"#,
+            )
+            .unwrap();
+            std::fs::write(
+                repo.path().join("test.yaml"),
+                r#"
+type: botforge/test
+name: test
+ports:
+  - 80
+steps:
+  - uses: "@://shared/frag.yaml"
+    id: frag
+  - on: host
+    name: bad
+    run: echo ${{ steps.inner.outputs.version }}
+"#,
+            )
+            .unwrap();
+
+            let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("inner fragment steps are private"),
+                "scope violation should be rejected at load time: {msg}"
+            );
+        }
+
+        /// A pure fragment-self output reference in a `run:` field survives
+        /// load-time substitution untouched (deferred to runtime).
+        #[test]
+        fn test_outputs_ref_in_fragment_run_field_survives_load() {
+            let repo = TempDir::new().unwrap();
+            std::fs::create_dir_all(repo.path().join("shared")).unwrap();
+            std::fs::write(
+                repo.path().join("shared/frag.yaml"),
+                r#"
+type: botforge/fragment
+steps:
+  - on: host
+    name: emit
+    id: emit
+    run: echo "version=1.2.3" >> "$BF_OUT"
+    outputs:
+      - name: version
+        type: string
+        required: true
+  - on: host
+    name: consume
+    run: echo ${{ outputs.version }}
+outputs:
+  - name: version
+    type: string
+    from-step: emit
+    from-output: version
+    required: true
+"#,
+            )
+            .unwrap();
+            std::fs::write(
+                repo.path().join("test.yaml"),
+                r#"
+type: botforge/test
+name: test
+ports:
+  - 80
+steps:
+  - uses: "@://shared/frag.yaml"
+"#,
+            )
+            .unwrap();
+
+            let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+            let TestStep::Invoke(inv) = &config.steps[0] else {
+                panic!("expected invoke step");
+            };
+            let TestStep::Run(step) = &inv.steps[1] else {
+                panic!("expected run step");
+            };
+            assert_eq!(step.run.trim(), "echo ${{ outputs.version }}");
+        }
+
+        // --- parser: steps.<id>.outputs.<name> / outputs.<name> ---
 
         #[test]
         fn test_parser_parses_step_output_reference() {
@@ -2702,15 +2952,31 @@ steps:
             assert!(parser::Parser::parse("steps.build.outputs").is_err());
         }
 
+        #[test]
+        fn test_parser_parses_fragment_output_reference() {
+            let node = parser::Parser::parse("outputs.version").unwrap();
+            assert_eq!(
+                node,
+                parser::ExprNode::FragmentOutputReference {
+                    output_name: "version".to_string(),
+                }
+            );
+        }
+
         // --- runtime resolution entry point ---
 
         #[test]
-        fn test_resolve_step_output_refs_substitutes_value() {
-            let resolved = resolve_step_output_refs_in_string(
+        fn test_resolve_output_refs_substitutes_step_value() {
+            let resolved = resolve_output_refs_in_string(
                 "version is ${{ steps.build.outputs.version }} end",
-                &mut |id, name| {
-                    assert_eq!(id, "build");
-                    assert_eq!(name, "version");
+                &mut |reference| {
+                    assert_eq!(
+                        reference,
+                        DeferredOutputReference::StepOutput {
+                            step_id: "build".to_string(),
+                            output_name: "version".to_string(),
+                        }
+                    );
                     Ok("1.2.3".to_string())
                 },
             )
@@ -2719,28 +2985,42 @@ steps:
         }
 
         #[test]
-        fn test_resolve_step_output_refs_no_refs_is_identity() {
+        fn test_resolve_output_refs_no_refs_is_identity() {
             let resolved =
-                resolve_step_output_refs_in_string("plain text", &mut |_, _| unreachable!())
-                    .unwrap();
+                resolve_output_refs_in_string("plain text", &mut |_| unreachable!()).unwrap();
             assert_eq!(resolved, "plain text");
         }
 
         #[test]
-        fn test_resolve_step_output_refs_propagates_lookup_error() {
-            let err = resolve_step_output_refs_in_string(
-                "${{ steps.build.outputs.version }}",
-                &mut |_, _| anyhow::bail!("lookup failed"),
-            )
-            .unwrap_err();
+        fn test_resolve_output_refs_propagates_lookup_error() {
+            let err =
+                resolve_output_refs_in_string("${{ steps.build.outputs.version }}", &mut |_| {
+                    anyhow::bail!("lookup failed")
+                })
+                .unwrap_err();
             assert!(format!("{err:#}").contains("lookup failed"));
         }
 
         #[test]
-        fn test_resolve_step_output_refs_rejects_non_steps_expression() {
-            let err =
-                resolve_step_output_refs_in_string("${{ inputs.x }}", &mut |_, _| unreachable!())
-                    .unwrap_err();
+        fn test_resolve_output_refs_substitutes_fragment_output_value() {
+            let resolved =
+                resolve_output_refs_in_string("value=${{ outputs.version }}", &mut |reference| {
+                    assert_eq!(
+                        reference,
+                        DeferredOutputReference::FragmentOutput {
+                            output_name: "version".to_string(),
+                        }
+                    );
+                    Ok("1.2.3".to_string())
+                })
+                .unwrap();
+            assert_eq!(resolved, "value=1.2.3");
+        }
+
+        #[test]
+        fn test_resolve_output_refs_rejects_non_runtime_expression() {
+            let err = resolve_output_refs_in_string("${{ inputs.x }}", &mut |_| unreachable!())
+                .unwrap_err();
             assert!(format!("{err:#}").contains("unexpected unresolved expression"));
         }
     }

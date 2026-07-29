@@ -21,7 +21,29 @@ steps:
 - uses: "@://env-sibling-b.steps.yaml"
 - uses: "@://nested-outer.steps.yaml"
 - uses: "@://outputs.steps.yaml"
-# --- Stage 3: fragment-boundary output consumption -----------------------------
+# --- Stage 4: general runtime output refs --------------------------------------
+# A plain run step emits typed output and a later sibling consumes it through
+# `${{ steps.<run-id>.outputs.<name> }}` in the same scope.
+- on: host
+  name: emit run-step output
+  id: host-emit
+  run: |
+    echo "count=11" >> "$BF_OUT"
+  outputs:
+  - name: count
+    type: number
+    required: true
+- on: host
+  name: consume run-step output
+  run: |
+    test "${{ steps.host-emit.outputs.count }}" = "11"
+    echo "run-step-output-consumed"
+  expect:
+    stdout:
+      contains:
+      - run-step-output-consumed
+
+# Stage 3 boundary path still works unchanged.
 # The fragment emits typed values via $BF_OUT, re-exports them through its
 # `outputs:` block, and the caller consumes them here via
 # `${{ steps.fragout.outputs.<name> }}` — proving the coerced values flow out of
@@ -40,6 +62,7 @@ steps:
     stdout:
       contains:
       - fragment-outputs-consumed
+- uses: "@://fragment-self-outputs.steps.yaml"
 - uses: "@://expressions.steps.yaml"
   with:
     str_a: hello

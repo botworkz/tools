@@ -22,10 +22,12 @@ use super::log::{
     StepOutputStream,
 };
 use crate::assert::{registry::built_in_assert_registry, AssertBlock};
-use crate::config::{resolve_step_output_refs_in_string, TestConfig, TestIsoBootstrap};
+use crate::config::{
+    resolve_output_refs_in_string, DeferredOutputReference, TestConfig, TestIsoBootstrap,
+};
 use crate::step::{
-    capture_step_outputs, resolve_shell, ArchiveStep, CapturedOutput, ExpectBlock, InvokeStep,
-    OutputValue, RunStep, StdioExpect, StepTarget, TestStep,
+    capture_step_outputs, resolve_shell, ArchiveStep, CapturedOutput, ExpectBlock,
+    FragmentOutputDecl, InvokeStep, OutputValue, RunStep, StdioExpect, StepTarget, TestStep,
 };
 
 const TEST_SSH_READY_TIMEOUT: Duration = Duration::from_secs(300);
@@ -342,6 +344,7 @@ pub(crate) fn run_step_flow(
         &run_context,
         plan.steps,
         &[],
+        None,
         &mut accumulated_env,
         &mut archive_executor,
     )?;
@@ -378,6 +381,7 @@ fn run_steps_inner(
     context: &RunStepContext<'_>,
     steps: &[TestStep],
     parent_indices: &[usize],
+    fragment_output_decls: Option<&[FragmentOutputDecl]>,
     accumulated_env: &mut Vec<(String, String)>,
     archive_executor: &mut Option<&mut ArchiveExecutor<'_>>,
 ) -> Result<()> {
@@ -404,6 +408,7 @@ fn run_steps_inner(
                     context,
                     &invoke.steps,
                     &child_prefix,
+                    Some(&invoke.output_decls),
                     &mut child_env,
                     archive_executor,
                 );
@@ -434,12 +439,14 @@ fn run_steps_inner(
                 print_step_title(&display, step.display_name(), step.display_id());
                 let step_started = Instant::now();
                 // Lazy resolution: substitute `${{ steps.<id>.outputs.<name> }}`
-                // references in the run body against already-executed `Invoke`
-                // siblings earlier in this scope (backward-only, hard error otherwise).
+                // / `${{ outputs.<name> }}` references in the run body against
+                // already-executed siblings in this scope (backward-only, hard
+                // error otherwise).
                 let step_result =
-                    resolve_run_step_output_refs(run, &steps[..step_idx]).and_then(|run_body| {
-                        run_run_step(context, &display, run, &run_body, accumulated_env)
-                    });
+                    resolve_run_step_output_refs(run, steps, step_idx, fragment_output_decls)
+                        .and_then(|run_body| {
+                            run_run_step(context, &display, run, &run_body, accumulated_env)
+                        });
                 print_step_status(
                     &display,
                     step.display_name(),
@@ -773,79 +780,188 @@ where
     Ok(())
 }
 
-/// Resolve `${{ steps.<id>.outputs.<name> }}` references in a run step's `run:`
-/// body against the already-executed sibling steps of the current scope.
+/// Resolve deferred runtime output references in a run step's `run:` body against
+/// the current scope's already-executed siblings.
 ///
-/// Lazy, resolve-when-you-get-there semantics: `prior_steps` is the slice of
-/// steps **before** this step in the same scope, all of which have already run.
-/// A reference is valid only when `<id>` names an `Invoke` step (`uses:` with
-/// `id:`) in that slice; its captured (boundary-resolved) outputs supply the
-/// value, projected into the string via [`OutputValue::to_string_context`]
-/// (`Null` → `""`).
-///
-/// Hard errors (clear messages, per the Stage 3 spec):
-/// - `<id>` matches no prior step (forward reference or unknown id).
-/// - `<id>` matches a prior **run** step — run-step output references are
-///   Stage 4 and out of scope here.
-/// - `<name>` is not declared as an output of the referenced fragment.
-fn resolve_run_step_output_refs(step: &RunStep, prior_steps: &[TestStep]) -> Result<String> {
-    resolve_step_output_refs_in_string(&step.run, &mut |step_id, output_name| {
-        let mut found_run_step = false;
-        for prior in prior_steps {
-            match prior {
-                TestStep::Invoke(invoke) if invoke.id.as_deref() == Some(step_id) => {
-                    let guard = invoke.captured_outputs.borrow();
-                    let Some(outputs) = &*guard else {
-                        anyhow::bail!(
-                            "step '{}': cannot resolve \
-                             ${{{{ steps.{}.outputs.{} }}}} — fragment invocation \
-                             '{}' declares no outputs",
-                            step.name,
-                            step_id,
-                            output_name,
-                            step_id
-                        );
-                    };
-                    let Some(output) = outputs.iter().find(|o| o.name == output_name) else {
-                        anyhow::bail!(
-                            "step '{}': cannot resolve \
-                             ${{{{ steps.{}.outputs.{} }}}} — fragment invocation \
-                             '{}' does not declare an output named '{}'",
-                            step.name,
-                            step_id,
-                            output_name,
-                            step_id,
-                            output_name
-                        );
-                    };
-                    return Ok(output.value.to_string_context());
-                }
-                TestStep::Run(run) if run.id.as_deref() == Some(step_id) => {
-                    found_run_step = true;
-                }
-                _ => {}
+/// Runtime references are lazy/backward-only:
+/// - `steps.<id>.outputs.<name>` resolves against earlier sibling run/invoke steps.
+/// - `outputs.<name>` (fragment-self) resolves only inside fragment scopes and maps
+///   to the fragment's declared output contract (`from-step`/`from-output`,
+///   `default`, `required`) at the current execution point.
+fn resolve_run_step_output_refs(
+    step: &RunStep,
+    scope_steps: &[TestStep],
+    step_idx: usize,
+    fragment_output_decls: Option<&[FragmentOutputDecl]>,
+) -> Result<String> {
+    let prior_steps = &scope_steps[..step_idx];
+    resolve_output_refs_in_string(&step.run, &mut |reference| match reference {
+        DeferredOutputReference::StepOutput {
+            step_id,
+            output_name,
+        } => resolve_step_output_reference(step, scope_steps, prior_steps, &step_id, &output_name),
+        DeferredOutputReference::FragmentOutput { output_name } => {
+            resolve_fragment_output_reference(
+                step,
+                scope_steps,
+                prior_steps,
+                fragment_output_decls,
+                &output_name,
+            )
+        }
+    })
+}
+
+enum ScopedStepById<'a> {
+    Run(&'a RunStep),
+    Invoke(&'a InvokeStep),
+}
+
+fn find_step_by_id<'a>(steps: &'a [TestStep], step_id: &str) -> Option<ScopedStepById<'a>> {
+    for step in steps {
+        match step {
+            TestStep::Run(run) if run.id.as_deref() == Some(step_id) => {
+                return Some(ScopedStepById::Run(run));
             }
+            TestStep::Invoke(invoke) if invoke.id.as_deref() == Some(step_id) => {
+                return Some(ScopedStepById::Invoke(invoke));
+            }
+            _ => {}
         }
-        if found_run_step {
-            anyhow::bail!(
-                "step '{}': cannot resolve ${{{{ steps.{}.outputs.{} }}}} — id '{}' \
-                 refers to a run step; only fragment invocation (`uses:`) outputs \
-                 are addressable",
-                step.name,
-                step_id,
-                output_name,
-                step_id
-            );
-        }
+    }
+    None
+}
+
+fn resolve_step_output_reference(
+    consumer: &RunStep,
+    scope_steps: &[TestStep],
+    prior_steps: &[TestStep],
+    step_id: &str,
+    output_name: &str,
+) -> Result<String> {
+    if let Some(prior) = find_step_by_id(prior_steps, step_id) {
+        return resolve_captured_output_value(consumer, step_id, output_name, prior)
+            .map(|value| value.to_string_context());
+    }
+
+    if find_step_by_id(scope_steps, step_id).is_some() {
         anyhow::bail!(
-            "step '{}': cannot resolve ${{{{ steps.{}.outputs.{} }}}} — no fragment \
-             invocation with id '{}' has run before this step in the current scope",
-            step.name,
+            "step '{}': cannot resolve ${{{{ steps.{}.outputs.{} }}}} — step '{}' exists \
+             in the current scope but has not run yet",
+            consumer.name,
             step_id,
             output_name,
             step_id
-        )
-    })
+        );
+    }
+
+    anyhow::bail!(
+        "step '{}': cannot resolve ${{{{ steps.{}.outputs.{} }}}} — no step with id '{}' \
+         exists in the current scope",
+        consumer.name,
+        step_id,
+        output_name,
+        step_id
+    );
+}
+
+fn resolve_captured_output_value(
+    consumer: &RunStep,
+    step_id: &str,
+    output_name: &str,
+    step: ScopedStepById<'_>,
+) -> Result<OutputValue> {
+    let (kind, maybe_outputs) = match step {
+        ScopedStepById::Run(run) => ("run step", run.captured_outputs.borrow().clone()),
+        ScopedStepById::Invoke(invoke) => (
+            "fragment invocation",
+            invoke.captured_outputs.borrow().clone(),
+        ),
+    };
+    let Some(outputs) = maybe_outputs else {
+        anyhow::bail!(
+            "step '{}': cannot resolve ${{{{ steps.{}.outputs.{} }}}} — {} '{}' has no captured outputs",
+            consumer.name,
+            step_id,
+            output_name,
+            kind,
+            step_id
+        );
+    };
+    let Some(output) = outputs.iter().find(|o| o.name == output_name) else {
+        anyhow::bail!(
+            "step '{}': cannot resolve ${{{{ steps.{}.outputs.{} }}}} — {} '{}' does not declare output '{}'",
+            consumer.name,
+            step_id,
+            output_name,
+            kind,
+            step_id,
+            output_name
+        );
+    };
+    Ok(output.value.clone())
+}
+
+fn resolve_fragment_output_reference(
+    consumer: &RunStep,
+    scope_steps: &[TestStep],
+    prior_steps: &[TestStep],
+    fragment_output_decls: Option<&[FragmentOutputDecl]>,
+    output_name: &str,
+) -> Result<String> {
+    let Some(decls) = fragment_output_decls else {
+        anyhow::bail!(
+            "step '{}': cannot resolve ${{{{ outputs.{} }}}} — outputs.* is only available inside a fragment scope",
+            consumer.name,
+            output_name
+        );
+    };
+    let Some(decl) = decls.iter().find(|decl| decl.name == output_name) else {
+        anyhow::bail!(
+            "step '{}': cannot resolve ${{{{ outputs.{} }}}} — fragment does not declare output '{}'",
+            consumer.name,
+            output_name,
+            output_name
+        );
+    };
+
+    let inner_value = if let Some(prior) = find_step_by_id(prior_steps, &decl.from_step) {
+        resolve_captured_output_value(consumer, &decl.from_step, &decl.from_output, prior)?
+    } else if find_step_by_id(scope_steps, &decl.from_step).is_some() {
+        anyhow::bail!(
+            "step '{}': cannot resolve ${{{{ outputs.{} }}}} — backing step '{}' \
+             has not run yet in this fragment scope",
+            consumer.name,
+            output_name,
+            decl.from_step
+        );
+    } else {
+        anyhow::bail!(
+            "step '{}': cannot resolve ${{{{ outputs.{} }}}} — backing step '{}' \
+             is not visible in this fragment scope",
+            consumer.name,
+            output_name,
+            decl.from_step
+        );
+    };
+
+    let effective = if !matches!(inner_value, OutputValue::Null) {
+        inner_value
+    } else if let Some(default) = &decl.default {
+        default.clone()
+    } else {
+        OutputValue::Null
+    };
+    if decl.required && matches!(effective, OutputValue::Null) {
+        anyhow::bail!(
+            "step '{}': cannot resolve ${{{{ outputs.{} }}}} — backing step '{}' output '{}' resolved to null and output is required",
+            consumer.name,
+            output_name,
+            decl.from_step,
+            decl.from_output
+        );
+    }
+    Ok(effective.to_string_context())
 }
 
 /// Resolve a fragment's declared outputs onto the `InvokeStep` node.
@@ -1758,8 +1874,8 @@ pub(crate) fn run_local_steps(context: &Path, steps: &[TestStep]) -> Result<()> 
                 let env_file = std::env::temp_dir().join(format!("botforge-publish-env-{suffix}"));
                 let out_file = std::env::temp_dir().join(format!("botforge-publish-out-{suffix}"));
 
-                let step_result: Result<()> = resolve_run_step_output_refs(run, &steps[..step_idx])
-                    .and_then(|run_body| {
+                let step_result: Result<()> =
+                    resolve_run_step_output_refs(run, steps, step_idx, None).and_then(|run_body| {
                         if let Some(expect) = &run.expect {
                             let (capture, actual_exit) = run_host_step_capturing(
                                 &run.name,
@@ -2047,8 +2163,8 @@ mod tests {
         shell_single_quote, HostStepFiles, StepExecutionBudget,
     };
     use crate::step::{
-        resolve_shell, CapturedOutput, InvokeStep, OutputDecl, OutputType, OutputValue, RunStep,
-        StepTarget, TestStep,
+        resolve_shell, CapturedOutput, FragmentOutputDecl, InvokeStep, OutputDecl, OutputType,
+        OutputValue, RunStep, StepTarget, TestStep,
     };
     use crate::util::unique_suffix;
     use serde::Deserialize;
@@ -2911,7 +3027,7 @@ run: echo ok
         assert_eq!(captured[0].value, OutputValue::String("hello".to_string()));
     }
 
-    // --- resolve_run_step_output_refs (lazy ${{ steps.<id>.outputs.<name> }}) ---
+    // --- resolve_run_step_output_refs (lazy steps.* / outputs.*) ---
 
     fn consumer_step(run: &str) -> RunStep {
         RunStep {
@@ -2939,6 +3055,22 @@ run: echo ok
         })
     }
 
+    fn executed_run_with_outputs(id: &str, outputs: Vec<CapturedOutput>) -> TestStep {
+        TestStep::Run(RunStep {
+            target: StepTarget::Host,
+            name: "producer".to_string(),
+            run: "true".to_string(),
+            timeout: None,
+            shell: None,
+            sudo: None,
+            id: Some(id.to_string()),
+            expect: None,
+            condition: None,
+            outputs: vec![],
+            captured_outputs: std::cell::RefCell::new(Some(outputs)),
+        })
+    }
+
     fn captured(name: &str, declared_type: OutputType, value: OutputValue) -> CapturedOutput {
         CapturedOutput {
             name: name.to_string(),
@@ -2949,120 +3081,220 @@ run: echo ok
 
     #[test]
     fn test_resolve_run_refs_backward_invoke_ref_resolves() {
-        let prior = vec![executed_invoke(
-            "build",
-            vec![
-                captured(
-                    "version",
-                    OutputType::String,
-                    OutputValue::String("1.2.3".to_string()),
-                ),
-                captured("count", OutputType::Number, OutputValue::Number(7.0)),
-                captured("ready", OutputType::Bool, OutputValue::Bool(true)),
-            ],
-        )];
+        let scope = vec![
+            executed_invoke(
+                "build",
+                vec![
+                    captured(
+                        "version",
+                        OutputType::String,
+                        OutputValue::String("1.2.3".to_string()),
+                    ),
+                    captured("count", OutputType::Number, OutputValue::Number(7.0)),
+                    captured("ready", OutputType::Bool, OutputValue::Bool(true)),
+                ],
+            ),
+            TestStep::Run(consumer_step("echo noop")),
+        ];
         let step = consumer_step(
             "echo ${{ steps.build.outputs.version }}/${{ steps.build.outputs.count }}/${{ steps.build.outputs.ready }}",
         );
 
-        let resolved = resolve_run_step_output_refs(&step, &prior).unwrap();
+        let resolved = resolve_run_step_output_refs(&step, &scope, 1, None).unwrap();
         assert_eq!(resolved, "echo 1.2.3/7/true");
     }
 
     #[test]
     fn test_resolve_run_refs_null_projects_as_empty_string() {
-        let prior = vec![executed_invoke(
-            "build",
-            vec![captured("maybe", OutputType::String, OutputValue::Null)],
-        )];
+        let scope = vec![
+            executed_invoke(
+                "build",
+                vec![captured("maybe", OutputType::String, OutputValue::Null)],
+            ),
+            TestStep::Run(consumer_step("echo noop")),
+        ];
         let step = consumer_step("echo [${{ steps.build.outputs.maybe }}]");
 
-        let resolved = resolve_run_step_output_refs(&step, &prior).unwrap();
+        let resolved = resolve_run_step_output_refs(&step, &scope, 1, None).unwrap();
         assert_eq!(resolved, "echo []");
     }
 
     #[test]
     fn test_resolve_run_refs_no_refs_is_identity() {
         let step = consumer_step("echo plain");
-        let resolved = resolve_run_step_output_refs(&step, &[]).unwrap();
+        let scope = vec![TestStep::Run(consumer_step("echo noop"))];
+        let resolved = resolve_run_step_output_refs(&step, &scope, 0, None).unwrap();
         assert_eq!(resolved, "echo plain");
     }
 
     #[test]
     fn test_resolve_run_refs_unknown_id_is_error() {
         let step = consumer_step("echo ${{ steps.nope.outputs.version }}");
-        let err = resolve_run_step_output_refs(&step, &[]).unwrap_err();
+        let scope = vec![TestStep::Run(consumer_step(
+            "echo ${{ steps.nope.outputs.version }}",
+        ))];
+        let err = resolve_run_step_output_refs(&step, &scope, 0, None).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("no fragment invocation with id 'nope' has run before this step"),
+            msg.contains("no step with id 'nope' exists in the current scope"),
             "unknown id must be a hard error: {msg}"
         );
     }
 
     #[test]
     fn test_resolve_run_refs_forward_reference_is_error() {
-        // The referenced invoke exists in the scope but AFTER the consumer, so it
-        // is not in `prior_steps` — indistinguishable from unknown id by design.
         let step = consumer_step("echo ${{ steps.later.outputs.version }}");
-        let err = resolve_run_step_output_refs(&step, &[]).unwrap_err();
+        let scope = vec![
+            TestStep::Run(consumer_step("echo ${{ steps.later.outputs.version }}")),
+            executed_invoke(
+                "later",
+                vec![captured(
+                    "version",
+                    OutputType::String,
+                    OutputValue::String("1.2.3".to_string()),
+                )],
+            ),
+        ];
+        let err = resolve_run_step_output_refs(&step, &scope, 0, None).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("has run before this step in the current scope"),
+            msg.contains("has not run yet"),
             "forward reference must be a hard error: {msg}"
         );
     }
 
     #[test]
-    fn test_resolve_run_refs_run_step_id_is_error() {
-        let mut run = consumer_step("echo emit");
-        run.id = Some("build".to_string());
-        let prior = vec![TestStep::Run(run)];
+    fn test_resolve_run_refs_run_step_id_resolves() {
+        let scope = vec![
+            executed_run_with_outputs(
+                "build",
+                vec![captured(
+                    "version",
+                    OutputType::String,
+                    OutputValue::String("2.0.0".to_string()),
+                )],
+            ),
+            TestStep::Run(consumer_step("echo noop")),
+        ];
         let step = consumer_step("echo ${{ steps.build.outputs.version }}");
-
-        let err = resolve_run_step_output_refs(&step, &prior).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("refers to a run step"),
-            "run-step id must be a hard error: {msg}"
-        );
+        let resolved = resolve_run_step_output_refs(&step, &scope, 1, None).unwrap();
+        assert_eq!(resolved, "echo 2.0.0");
     }
 
     #[test]
     fn test_resolve_run_refs_unknown_output_name_is_error() {
-        let prior = vec![executed_invoke(
-            "build",
-            vec![captured(
-                "version",
-                OutputType::String,
-                OutputValue::String("1.2.3".to_string()),
-            )],
-        )];
+        let scope = vec![
+            executed_invoke(
+                "build",
+                vec![captured(
+                    "version",
+                    OutputType::String,
+                    OutputValue::String("1.2.3".to_string()),
+                )],
+            ),
+            TestStep::Run(consumer_step("echo noop")),
+        ];
         let step = consumer_step("echo ${{ steps.build.outputs.nope }}");
 
-        let err = resolve_run_step_output_refs(&step, &prior).unwrap_err();
+        let err = resolve_run_step_output_refs(&step, &scope, 1, None).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("does not declare an output named 'nope'"),
+            msg.contains("does not declare output 'nope'"),
             "unknown output name must be a hard error: {msg}"
         );
     }
 
     #[test]
     fn test_resolve_run_refs_invoke_without_outputs_is_error() {
-        let prior = vec![TestStep::Invoke(InvokeStep {
-            uses: "frag.yaml".to_string(),
-            id: Some("build".to_string()),
-            steps: vec![],
-            output_decls: vec![],
-            captured_outputs: std::cell::RefCell::new(None),
-        })];
+        let scope = vec![
+            TestStep::Invoke(InvokeStep {
+                uses: "frag.yaml".to_string(),
+                id: Some("build".to_string()),
+                steps: vec![],
+                output_decls: vec![],
+                captured_outputs: std::cell::RefCell::new(None),
+            }),
+            TestStep::Run(consumer_step("echo noop")),
+        ];
         let step = consumer_step("echo ${{ steps.build.outputs.version }}");
 
-        let err = resolve_run_step_output_refs(&step, &prior).unwrap_err();
+        let err = resolve_run_step_output_refs(&step, &scope, 1, None).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("declares no outputs"),
+            msg.contains("has no captured outputs"),
             "invoke without outputs must be a hard error: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_run_refs_fragment_outputs_ref_resolves_with_default() {
+        let scope = vec![
+            executed_run_with_outputs(
+                "emit",
+                vec![captured(
+                    "version",
+                    OutputType::String,
+                    OutputValue::String("1.2.3".to_string()),
+                )],
+            ),
+            executed_run_with_outputs(
+                "quiet",
+                vec![captured("maybe", OutputType::String, OutputValue::Null)],
+            ),
+            TestStep::Run(consumer_step("echo noop")),
+        ];
+        let step = consumer_step("echo ${{ outputs.version }}-${{ outputs.fallback }}");
+        let decls = vec![
+            FragmentOutputDecl {
+                name: "version".to_string(),
+                output_type: OutputType::String,
+                from_step: "emit".to_string(),
+                from_output: "version".to_string(),
+                required: true,
+                default: None,
+            },
+            FragmentOutputDecl {
+                name: "fallback".to_string(),
+                output_type: OutputType::String,
+                from_step: "quiet".to_string(),
+                from_output: "maybe".to_string(),
+                required: false,
+                default: Some(OutputValue::String("defaulted".to_string())),
+            },
+        ];
+
+        let resolved = resolve_run_step_output_refs(&step, &scope, 2, Some(&decls)).unwrap();
+        assert_eq!(resolved, "echo 1.2.3-defaulted");
+    }
+
+    #[test]
+    fn test_resolve_run_refs_fragment_outputs_ref_forward_is_error() {
+        let scope = vec![
+            TestStep::Run(consumer_step("echo noop")),
+            executed_run_with_outputs(
+                "emit",
+                vec![captured(
+                    "version",
+                    OutputType::String,
+                    OutputValue::String("1.2.3".to_string()),
+                )],
+            ),
+        ];
+        let step = consumer_step("echo ${{ outputs.version }}");
+        let decls = vec![FragmentOutputDecl {
+            name: "version".to_string(),
+            output_type: OutputType::String,
+            from_step: "emit".to_string(),
+            from_output: "version".to_string(),
+            required: true,
+            default: None,
+        }];
+
+        let err = resolve_run_step_output_refs(&step, &scope, 0, Some(&decls)).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("has not run yet"),
+            "forward fragment output reference must fail: {msg}"
         );
     }
 
