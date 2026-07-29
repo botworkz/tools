@@ -203,9 +203,9 @@ graph; `matrix:` / parallelism would attach here in a later stage.
 | Stage | What | Status |
 |-------|------|--------|
 | **1** | Scoped `TestStep::Invoke` + recursive executor + hierarchical indices + per-scope id uniqueness + env isolation | **Done (this PR)** |
-| **2** | Typed step `outputs:` declaration + `$BF_OUT` capture + coercion/validation | Planned |
-| **3** | Fragment `outputs:` wiring + step↔fragment type-match enforcement | Planned |
-| **4** | `outputs.*` / `steps.*` engine namespace + deferred post-execution resolution pass | Planned |
+| **2** | Typed step `outputs:` declaration + `$BF_OUT` capture + coercion/validation | **Done** |
+| **3** | Fragment `outputs:` wiring + step↔fragment type-match enforcement + `id:` on `uses:` + lazy `${{ steps.<id>.outputs.<name> }}` consumption at the fragment boundary | **Done** |
+| **4** | General `outputs.*` / `steps.*` engine namespace (step↔step refs, fragment-self output refs, cross-scope) | Planned |
 
 **Stage 1 explicitly does NOT include:** `$BF_OUT`, typed `outputs:`,
 `steps.*` / `outputs.*` namespace, Invariant A changes, deferred/runtime

@@ -1,0 +1,23 @@
+type: botforge/fragment
+# Negative-control fixture: the fragment declares a `required: true` output
+# re-exporting an inner step value that is never emitted.  Boundary resolution
+# must hard-fail after the inner steps run (inner Null, no default).
+steps:
+- on: host
+  name: frag-required-missing-quiet
+  id: quiet
+  run: |
+    # Intentionally emit nothing — the required fragment output must trigger
+    # a hard failure at the invoke boundary.
+    true
+  outputs:
+  - name: val
+    type: string
+    required: false
+
+outputs:
+- name: val
+  type: string
+  from-step: quiet
+  from-output: val
+  required: true

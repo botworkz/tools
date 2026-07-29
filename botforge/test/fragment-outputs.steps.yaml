@@ -1,0 +1,58 @@
+type: botforge/fragment
+# Stage 3 acceptance: fragment-boundary output consumption.
+# Inner run steps emit typed values via $BF_OUT; the fragment re-exports them
+# through its `outputs:` block; the caller (test.yaml) invokes this fragment
+# with an `id:` and consumes `${{ steps.<id>.outputs.<name> }}` in a later step.
+# Runs entirely on `on: host` so no VM interaction is needed.
+steps:
+- on: host
+  name: frag-out-emit
+  id: emit
+  run: |
+    echo "version=1.2.3" >> "$BF_OUT"
+    echo "count=7" >> "$BF_OUT"
+    echo "ready=true" >> "$BF_OUT"
+  outputs:
+  - name: version
+    type: string
+    required: true
+  - name: count
+    type: number
+    required: true
+  - name: ready
+    type: bool
+    required: true
+
+# Emits nothing — the fragment output re-exporting this value must fall back
+# to its declared `default:` (inner Null → default applied at the boundary).
+- on: host
+  name: frag-out-silent
+  id: silent
+  run: |
+    true
+  outputs:
+  - name: maybe
+    type: string
+    required: false
+
+outputs:
+- name: version
+  type: string
+  from-step: emit
+  from-output: version
+  required: true
+- name: count
+  type: number
+  from-step: emit
+  from-output: count
+  required: true
+- name: ready
+  type: bool
+  from-step: emit
+  from-output: ready
+  required: true
+- name: fallback
+  type: string
+  from-step: silent
+  from-output: maybe
+  default: "fallback-default"

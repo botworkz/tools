@@ -68,10 +68,6 @@ impl OutputValue {
     /// Project the value into a string context, returning an owned `String`.
     ///
     /// `Null` → `""`.  All other variants → their string representation.
-    ///
-    /// Stage 2 is capture-only; this method is reserved for the downstream
-    /// resolution stage (Stage 4+) and is intentionally unused until then.
-    #[allow(dead_code)]
     pub(crate) fn to_string_context(&self) -> String {
         match self {
             OutputValue::Null => String::new(),
