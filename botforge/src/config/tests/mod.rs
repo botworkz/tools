@@ -36,6 +36,7 @@ fn make_step(target: StepTarget, name: &str) -> TestStep {
         id: None,
         expect: None,
         condition: None,
+        outputs: Default::default(),
     })
 }
 

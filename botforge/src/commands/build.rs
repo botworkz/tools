@@ -384,7 +384,7 @@ pub(crate) fn cmd_build(args: BuildArgs) -> Result<()> {
         vm_child.as_mut(),
     );
     let overall_deadline = match step_result {
-        Ok(overall_deadline) => overall_deadline,
+        Ok((overall_deadline, _dom)) => overall_deadline,
         Err(err) => {
             if signal::is_interrupted() {
                 return Err(handle_build_interrupt(

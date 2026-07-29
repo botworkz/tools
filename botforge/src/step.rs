@@ -2,6 +2,7 @@ use anyhow::Result;
 use serde::de::{self, Deserializer};
 use serde::Deserialize;
 use serde_yaml::Value;
+use std::collections::BTreeMap;
 
 use crate::config::{yaml_scalar_to_string, yaml_scalar_truthiness};
 
@@ -58,6 +59,124 @@ impl ExpectBlock {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Step output declaration types
+// ---------------------------------------------------------------------------
+
+/// Closed set of types an output may declare.
+///
+/// Unlike GitHub Actions (where every output is an untyped string), botforge outputs are
+/// typed. Exactly these three types are permitted — any other declared type is a config
+/// error at parse time.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum OutputType {
+    String,
+    Number,
+    Bool,
+}
+
+/// Declaration of a single named output for a step.
+///
+/// Stored on the step node (in [`RunStep::outputs`]) as parsed from the `outputs:` map.
+/// The declared type is a hard requirement: every output must have a type.
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OutputDeclaration {
+    /// Declared type of this output. Must be one of `string`, `number`, `bool`.
+    #[serde(rename = "type")]
+    pub(crate) output_type: OutputType,
+    /// Whether the output must be present (non-empty) after the step executes.
+    /// `true` → step fails if the output is absent or empty.
+    /// `false` (default) → absence/empty is acceptable; the output becomes null.
+    #[serde(default)]
+    pub(crate) required: bool,
+}
+
+/// A coerced output value captured from a step execution.
+///
+/// Represents the universal non-null case. The absent/null state is represented by
+/// `Option::None` at the capture site — there is exactly one null, not per-type zeros.
+/// Type only matters when a value is actually present; null has its own projection rules:
+/// - into a string context: renders as `""`
+/// - into a typed input: arrives as absent (not zero/false/"")
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum CapturedOutputValue {
+    String(std::string::String),
+    Number(f64),
+    Bool(bool),
+}
+
+impl CapturedOutputValue {
+    /// Project this value **into a string context** (interpolation or `string`-typed field).
+    ///
+    /// All concrete types render faithfully. Callers handling `Option<CapturedOutputValue>`
+    /// must return `""` for `None` before calling this — null maps to `""` in string context.
+    // Stage 2: capture-only; used by tests and will be called by Stage 4 interpolation.
+    #[allow(dead_code)]
+    pub(crate) fn to_string_projection(&self) -> std::string::String {
+        match self {
+            Self::String(s) => s.clone(),
+            Self::Number(n) => format_output_number(*n),
+            Self::Bool(b) => (if *b { "true" } else { "false" }).to_string(),
+        }
+    }
+}
+
+/// Format a float output value: whole numbers without a decimal point.
+// Stage 2: only used by to_string_projection, itself guarded with allow(dead_code).
+#[allow(dead_code)]
+fn format_output_number(n: f64) -> String {
+    if n.fract() == 0.0 && n.abs() < 1e15 {
+        format!("{}", n as i64)
+    } else {
+        format!("{}", n)
+    }
+}
+
+/// Coerce a raw emitted string to its declared output type.
+///
+/// The raw value is the text from the `$BOTFORGE_OUTPUT` file entry (with leading/trailing
+/// whitespace stripped). Coercion failure is a hard error — there is no opt-in escape hatch.
+///
+/// Callers must handle the absent/null case (empty or not emitted) as `None` **before**
+/// calling this function; it is only invoked when a non-empty raw value is present.
+pub(crate) fn coerce_output(
+    raw: &str,
+    output_type: OutputType,
+    output_name: &str,
+) -> Result<CapturedOutputValue> {
+    match output_type {
+        OutputType::String => Ok(CapturedOutputValue::String(raw.to_string())),
+        OutputType::Number => {
+            let f: f64 = raw.trim().parse().map_err(|_| {
+                anyhow::anyhow!(
+                    "output '{}': cannot coerce {:?} to number",
+                    output_name,
+                    raw
+                )
+            })?;
+            if !f.is_finite() {
+                anyhow::bail!(
+                    "output '{}': number must be finite, got {:?}",
+                    output_name,
+                    raw
+                );
+            }
+            Ok(CapturedOutputValue::Number(f))
+        }
+        OutputType::Bool => match raw.trim() {
+            "true" | "1" => Ok(CapturedOutputValue::Bool(true)),
+            "false" | "0" => Ok(CapturedOutputValue::Bool(false)),
+            _ => anyhow::bail!(
+                "output '{}': cannot coerce {:?} to bool (expected true/false/1/0)",
+                output_name,
+                raw
+            ),
+        },
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RunStep {
@@ -107,6 +226,13 @@ pub(crate) struct RunStep {
         deserialize_with = "deserialize_step_condition"
     )]
     pub(crate) condition: Option<bool>,
+    /// Named outputs this step may emit via `$BOTFORGE_OUTPUT`.
+    ///
+    /// Each entry declares the output's type (`string`, `number`, `bool`) and whether
+    /// it is `required`. The closed type set is enforced at parse time: an unknown type
+    /// is a config error. The declared type is stored here on the step node.
+    #[serde(default)]
+    pub(crate) outputs: BTreeMap<String, OutputDeclaration>,
 }
 
 impl RunStep {
@@ -753,6 +879,260 @@ expect:
         assert!(
             err.to_string().contains("unknown field"),
             "deny_unknown_fields should still reject extra fields: {err}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // outputs: declaration parsing tests
+    // -------------------------------------------------------------------------
+
+    use super::{coerce_output, CapturedOutputValue, OutputDeclaration, OutputType};
+
+    #[test]
+    fn test_output_type_string_parses() {
+        let decl: OutputDeclaration = serde_yaml::from_str("type: string\n").unwrap();
+        assert_eq!(decl.output_type, OutputType::String);
+        assert!(!decl.required);
+    }
+
+    #[test]
+    fn test_output_type_number_parses() {
+        let decl: OutputDeclaration = serde_yaml::from_str("type: number\n").unwrap();
+        assert_eq!(decl.output_type, OutputType::Number);
+    }
+
+    #[test]
+    fn test_output_type_bool_parses() {
+        let decl: OutputDeclaration = serde_yaml::from_str("type: bool\n").unwrap();
+        assert_eq!(decl.output_type, OutputType::Bool);
+    }
+
+    #[test]
+    fn test_output_type_unknown_is_config_error() {
+        // "object" is not in the closed set
+        let err = serde_yaml::from_str::<OutputDeclaration>("type: object\n").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown variant") || msg.contains("object"),
+            "unknown type should produce a config error: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_output_type_array_is_config_error() {
+        let err = serde_yaml::from_str::<OutputDeclaration>("type: array\n").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown variant") || msg.contains("array"),
+            "array type should be rejected: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_output_declaration_required_true() {
+        let decl: OutputDeclaration =
+            serde_yaml::from_str("type: string\nrequired: true\n").unwrap();
+        assert!(decl.required);
+    }
+
+    #[test]
+    fn test_output_declaration_required_defaults_false() {
+        let decl: OutputDeclaration = serde_yaml::from_str("type: number\n").unwrap();
+        assert!(!decl.required);
+    }
+
+    #[test]
+    fn test_output_declaration_unknown_field_rejected() {
+        let err =
+            serde_yaml::from_str::<OutputDeclaration>("type: string\nunknown: nope\n").unwrap_err();
+        assert!(
+            err.to_string().contains("unknown field"),
+            "deny_unknown_fields should apply to OutputDeclaration: {err}"
+        );
+    }
+
+    #[test]
+    fn test_run_step_parses_outputs_block() {
+        let step: RunStep = serde_yaml::from_str(
+            r#"
+name: emit-step
+run: echo "MY_VAL=42" >> "$BOTFORGE_OUTPUT"
+outputs:
+  my_val:
+    type: number
+    required: true
+  tag:
+    type: string
+"#,
+        )
+        .unwrap();
+        assert_eq!(step.outputs.len(), 2);
+        let my_val = &step.outputs["my_val"];
+        assert_eq!(my_val.output_type, OutputType::Number);
+        assert!(my_val.required);
+        let tag = &step.outputs["tag"];
+        assert_eq!(tag.output_type, OutputType::String);
+        assert!(!tag.required);
+    }
+
+    #[test]
+    fn test_run_step_absent_outputs_is_empty() {
+        let step: RunStep = serde_yaml::from_str("name: s\nrun: echo ok\n").unwrap();
+        assert!(step.outputs.is_empty());
+    }
+
+    // -------------------------------------------------------------------------
+    // coerce_output tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_coerce_string_identity() {
+        let v = coerce_output("hello world", OutputType::String, "out").unwrap();
+        assert_eq!(v, CapturedOutputValue::String("hello world".to_string()));
+    }
+
+    #[test]
+    fn test_coerce_string_empty_not_called() {
+        // Empty values are handled by callers as None, but coerce_output with empty string
+        // for string type should still work (caller responsibility to treat empty as None)
+        let v = coerce_output("", OutputType::String, "out").unwrap();
+        assert_eq!(v, CapturedOutputValue::String("".to_string()));
+    }
+
+    #[test]
+    fn test_coerce_number_integer() {
+        let v = coerce_output("42", OutputType::Number, "count").unwrap();
+        assert_eq!(v, CapturedOutputValue::Number(42.0));
+    }
+
+    #[test]
+    fn test_coerce_number_float() {
+        let v = coerce_output("3.14", OutputType::Number, "pi").unwrap();
+        assert_eq!(v, CapturedOutputValue::Number(3.14));
+    }
+
+    #[test]
+    fn test_coerce_number_negative() {
+        let v = coerce_output("-7", OutputType::Number, "neg").unwrap();
+        assert_eq!(v, CapturedOutputValue::Number(-7.0));
+    }
+
+    #[test]
+    fn test_coerce_number_whitespace_trimmed() {
+        let v = coerce_output("  99  ", OutputType::Number, "n").unwrap();
+        assert_eq!(v, CapturedOutputValue::Number(99.0));
+    }
+
+    #[test]
+    fn test_coerce_number_invalid_is_hard_fail() {
+        let err = coerce_output("not-a-number", OutputType::Number, "bad").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("bad") && msg.contains("not-a-number"),
+            "error should identify output name and value: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_coerce_number_infinity_is_hard_fail() {
+        let err = coerce_output("inf", OutputType::Number, "inf_out").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("finite"),
+            "infinity should be rejected as non-finite: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_coerce_bool_true_literal() {
+        let v = coerce_output("true", OutputType::Bool, "flag").unwrap();
+        assert_eq!(v, CapturedOutputValue::Bool(true));
+    }
+
+    #[test]
+    fn test_coerce_bool_false_literal() {
+        let v = coerce_output("false", OutputType::Bool, "flag").unwrap();
+        assert_eq!(v, CapturedOutputValue::Bool(false));
+    }
+
+    #[test]
+    fn test_coerce_bool_one_is_true() {
+        let v = coerce_output("1", OutputType::Bool, "flag").unwrap();
+        assert_eq!(v, CapturedOutputValue::Bool(true));
+    }
+
+    #[test]
+    fn test_coerce_bool_zero_is_false() {
+        let v = coerce_output("0", OutputType::Bool, "flag").unwrap();
+        assert_eq!(v, CapturedOutputValue::Bool(false));
+    }
+
+    #[test]
+    fn test_coerce_bool_invalid_is_hard_fail() {
+        let err = coerce_output("yes", OutputType::Bool, "flag").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("flag") && (msg.contains("bool") || msg.contains("true")),
+            "bool coercion error should identify output and expected values: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_coerce_bool_truecased_invalid_is_hard_fail() {
+        // Bool coercion is case-sensitive: "True" is not "true"
+        let err = coerce_output("True", OutputType::Bool, "flag").unwrap_err();
+        assert!(
+            err.to_string().contains("flag"),
+            "should fail for 'True' (not lowercased): {err}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // CapturedOutputValue::to_string_projection tests (null model)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_string_projection_of_string_value() {
+        let v = CapturedOutputValue::String("hello".to_string());
+        assert_eq!(v.to_string_projection(), "hello");
+    }
+
+    #[test]
+    fn test_string_projection_of_number_integer() {
+        let v = CapturedOutputValue::Number(7.0);
+        assert_eq!(v.to_string_projection(), "7");
+    }
+
+    #[test]
+    fn test_string_projection_of_number_float() {
+        let v = CapturedOutputValue::Number(1.5);
+        assert_eq!(v.to_string_projection(), "1.5");
+    }
+
+    #[test]
+    fn test_string_projection_of_bool_true() {
+        let v = CapturedOutputValue::Bool(true);
+        assert_eq!(v.to_string_projection(), "true");
+    }
+
+    #[test]
+    fn test_string_projection_of_bool_false() {
+        let v = CapturedOutputValue::Bool(false);
+        assert_eq!(v.to_string_projection(), "false");
+    }
+
+    #[test]
+    fn test_null_projects_to_empty_string_in_string_context() {
+        // The universal null/absent is represented as Option::None.
+        // Callers must render it as "" in string context.
+        let opt_val: Option<CapturedOutputValue> = None;
+        let rendered = opt_val
+            .as_ref()
+            .map(|v| v.to_string_projection())
+            .unwrap_or_default();
+        assert_eq!(
+            rendered, "",
+            "null must render as empty string in string context"
         );
     }
 }

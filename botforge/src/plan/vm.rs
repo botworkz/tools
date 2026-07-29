@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use shasset::manifest::Manifest;
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
@@ -24,7 +25,8 @@ use super::log::{
 use crate::assert::{registry::built_in_assert_registry, AssertBlock};
 use crate::config::{TestConfig, TestIsoBootstrap};
 use crate::step::{
-    resolve_shell, ArchiveStep, ExpectBlock, RunStep, StdioExpect, StepTarget, TestStep,
+    coerce_output, resolve_shell, ArchiveStep, CapturedOutputValue, ExpectBlock, OutputDeclaration,
+    RunStep, StdioExpect, StepTarget, TestStep,
 };
 
 const TEST_SSH_READY_TIMEOUT: Duration = Duration::from_secs(300);
@@ -34,6 +36,31 @@ const TEST_STABLE_SSH_ATTEMPTS: usize = 5;
 const TEST_STABLE_SSH_REQUIRED: usize = 2;
 type ArchiveExecutor<'a> = dyn FnMut(usize, &ArchiveStep) -> Result<()> + 'a;
 type PreStepsHook<'a> = dyn Fn(&SshOptions) -> Result<()> + 'a;
+
+// ---------------------------------------------------------------------------
+// Retained DOM: executed step nodes
+// ---------------------------------------------------------------------------
+
+/// A run step that has been executed, forming a node in the retained DOM.
+///
+/// Carries both the step's declaration (including declared output types stored on the node,
+/// per the spec) and the runtime-captured coerced output values. A later stage will use this
+/// to resolve `steps.<id>.outputs.<name>` expressions during the post-exec substitution pass.
+// Stage 2: capture-only; fields are read by tests and will be consumed by Stage 4 resolution.
+#[derive(Debug)]
+#[allow(dead_code)]
+pub(crate) struct ExecutedRunStep {
+    /// Step `id:` if declared. Future stages use this to address `steps.<id>.outputs.*`.
+    pub(crate) id: Option<String>,
+    /// Step name, for diagnostics.
+    pub(crate) name: String,
+    /// The step's declared output types, stored on the DOM node per the spec.
+    /// An output's declared type is a property of the step, not of the captured value.
+    pub(crate) output_declarations: BTreeMap<String, OutputDeclaration>,
+    /// Captured and coerced output values. One entry per declared output.
+    /// `None` = the universal null/absent state: the output was not emitted or was empty.
+    pub(crate) captured_outputs: BTreeMap<String, Option<CapturedOutputValue>>,
+}
 
 pub(crate) struct StepFlowPlan<'a> {
     pub(crate) files: &'a [FileEntry],
@@ -215,6 +242,10 @@ fn run_plugin_assert_checks(verb: &str, results_json: &str) -> Result<()> {
 /// `pre_steps` is an optional callback invoked after cloud-init/bootstraps/files
 /// staging but **before** the first step executes.  `botforge test` uses this to
 /// run the declarative `assert:` phase on the fresh-boot image state.
+///
+/// Returns `(overall_deadline, retained_dom)` on success. The retained DOM is a
+/// capture-only record of each executed run step and its coerced outputs; a later
+/// stage will use it for `steps.*` resolution.
 pub(crate) fn run_step_flow(
     context: &Path,
     plan: StepFlowPlan<'_>,
@@ -223,7 +254,7 @@ pub(crate) fn run_step_flow(
     mut archive_executor: Option<&mut ArchiveExecutor<'_>>,
     pre_steps: Option<&PreStepsHook<'_>>,
     vm_child: Option<&mut Child>,
-) -> Result<Instant> {
+) -> Result<(Instant, Vec<ExecutedRunStep>)> {
     let overall_deadline = Instant::now() + timeouts.overall_timeout;
     let step_log_dir = context.join("build").join("logs");
     std::fs::create_dir_all(&step_log_dir).with_context(|| {
@@ -322,6 +353,8 @@ pub(crate) fn run_step_flow(
 
     // Shared ordered env map threaded across all steps (both guest and host).
     let mut accumulated_env: Vec<(String, String)> = Vec::new();
+    // Retained DOM: one node per executed run step (archive steps are not in the DOM).
+    let mut dom: Vec<ExecutedRunStep> = Vec::new();
     let run_context = RunStepContext {
         context,
         ssh,
@@ -354,7 +387,9 @@ pub(crate) fn run_step_flow(
         print_step_title(step_idx, step.display_name(), step.display_id());
         let step_started = Instant::now();
         let step_result = match step {
-            TestStep::Run(step) => run_run_step(&run_context, step_idx, step, &mut accumulated_env),
+            TestStep::Run(step) => {
+                run_run_step(&run_context, step_idx, step, &mut accumulated_env, &mut dom)
+            }
             TestStep::Archive(step) => {
                 if let Some(executor) = archive_executor.as_mut() {
                     executor(step_idx, step)
@@ -381,7 +416,7 @@ pub(crate) fn run_step_flow(
         );
         step_result?;
     }
-    Ok(overall_deadline)
+    Ok((overall_deadline, dom))
 }
 
 fn run_run_step(
@@ -389,6 +424,7 @@ fn run_run_step(
     step_idx: usize,
     step: &RunStep,
     accumulated_env: &mut Vec<(String, String)>,
+    dom: &mut Vec<ExecutedRunStep>,
 ) -> Result<()> {
     let step_log_path = step_log_path(context.step_log_dir, step_idx, &step.name);
     let step_timeout = resolve_step_timeout(step.timeout, context.default_step_timeout);
@@ -398,6 +434,9 @@ fn run_run_step(
         overall_timeout: context.overall_timeout,
     };
 
+    // Raw output entries read back from the $BOTFORGE_OUTPUT file after execution.
+    let mut raw_output_entries: Vec<(String, String)> = Vec::new();
+
     match step.target {
         StepTarget::Guest => (|| -> Result<()> {
             let suffix = unique_suffix();
@@ -405,6 +444,7 @@ fn run_run_step(
                 std::env::temp_dir().join(format!("botforge-step-{step_idx}-{suffix}.sh"));
             let remote_script = format!("/tmp/botforge-step-{step_idx}-{suffix}.sh");
             let remote_env_path = format!("/tmp/botforge-env-{step_idx}-{suffix}");
+            let remote_output_path = format!("/tmp/botforge-output-{step_idx}-{suffix}");
 
             // Write only the user's script body — no interpreter-specific preamble.
             std::fs::write(&local_script, step.run.as_bytes()).with_context(|| {
@@ -427,11 +467,17 @@ fn run_run_step(
                 // Capturing path: surface stdout/stderr and exit code for assertion checking.
                 // Propagate the scp error early if upload failed.
                 scp_result?;
-                // Initialize the remote env file so the script can append to it via $BOTFORGE_ENV.
-                // Chmod world-writable so both the SSH user and root (sudo) can append.
+                // Initialize the remote env and output files.
                 let _ = ssh_with_retry(
                     context.ssh,
                     &guest_env_init_cmd(&remote_env_path),
+                    1,
+                    Duration::from_secs(0),
+                    Duration::from_secs(10),
+                );
+                let _ = ssh_with_retry(
+                    context.ssh,
+                    &guest_env_init_cmd(&remote_output_path),
                     1,
                     Duration::from_secs(0),
                     Duration::from_secs(10),
@@ -442,6 +488,7 @@ fn run_run_step(
                     step.sudo_enabled(),
                     accumulated_env,
                     &remote_env_path,
+                    &remote_output_path,
                 );
                 let (capture, actual_exit) = run_ssh_step_capturing(
                     &step.name,
@@ -468,15 +515,34 @@ fn run_run_step(
                     }
                 }
 
+                // Read back the output file (best-effort; coercion happens after step result).
+                if let Ok(output_contents) = ssh_capture_stdout(
+                    context.ssh,
+                    &format!("cat {}", shell_single_quote(&remote_output_path)),
+                    1,
+                    Duration::from_secs(0),
+                    Duration::from_secs(10),
+                ) {
+                    if let Ok(entries) = parse_env_file(&output_contents) {
+                        raw_output_entries = entries;
+                    }
+                }
+
                 check_expect_block(&step.name, expect, &capture, actual_exit)
             } else {
                 // Standard path: exit 0 required, no output capture.
                 let result = if scp_result.is_ok() {
-                    // Initialize the remote env file so the script can append to it via $BOTFORGE_ENV.
-                    // Chmod world-writable so both the SSH user and root (sudo) can append.
+                    // Initialize the remote env and output files.
                     let _ = ssh_with_retry(
                         context.ssh,
                         &guest_env_init_cmd(&remote_env_path),
+                        1,
+                        Duration::from_secs(0),
+                        Duration::from_secs(10),
+                    );
+                    let _ = ssh_with_retry(
+                        context.ssh,
+                        &guest_env_init_cmd(&remote_output_path),
                         1,
                         Duration::from_secs(0),
                         Duration::from_secs(10),
@@ -487,6 +553,7 @@ fn run_run_step(
                         step.sudo_enabled(),
                         accumulated_env,
                         &remote_env_path,
+                        &remote_output_path,
                     );
                     run_ssh_step_with_step_log(
                         &step.name,
@@ -503,7 +570,7 @@ fn run_run_step(
                     scp_result
                 };
 
-                // On success, read back the remote env file and merge into accumulated env.
+                // On success, read back the remote env and output files.
                 if result.is_ok() {
                     if let Ok(env_contents) = ssh_capture_stdout(
                         context.ssh,
@@ -516,17 +583,29 @@ fn run_run_step(
                             env_merge(accumulated_env, new_entries);
                         }
                     }
+                    if let Ok(output_contents) = ssh_capture_stdout(
+                        context.ssh,
+                        &format!("cat {}", shell_single_quote(&remote_output_path)),
+                        1,
+                        Duration::from_secs(0),
+                        Duration::from_secs(10),
+                    ) {
+                        if let Ok(entries) = parse_env_file(&output_contents) {
+                            raw_output_entries = entries;
+                        }
+                    }
                 }
 
                 result
             };
 
-            // Best-effort cleanup: remote env file, remote script, then local temp file.
+            // Best-effort cleanup: remote env file, remote output file, script, local temp file.
             let _ = ssh_with_retry(
                 context.ssh,
                 &format!(
-                    "rm -f {} {}",
+                    "rm -f {} {} {}",
                     shell_single_quote(&remote_env_path),
+                    shell_single_quote(&remote_output_path),
                     shell_single_quote(&remote_script)
                 ),
                 1,
@@ -542,6 +621,7 @@ fn run_run_step(
                 .expect("shell already validated at config load");
             let suffix = unique_suffix();
             let env_file = std::env::temp_dir().join(format!("botforge-host-env-{suffix}"));
+            let output_file = std::env::temp_dir().join(format!("botforge-host-output-{suffix}"));
 
             let step_result: Result<()> = if let Some(expect) = &step.expect {
                 // Capturing path: surface stdout/stderr and exit code for assertion checking.
@@ -554,6 +634,7 @@ fn run_run_step(
                     accumulated_env,
                     HostStepFiles {
                         env_file: &env_file,
+                        output_file: &output_file,
                         log_path: &step_log_path,
                     },
                 )
@@ -565,8 +646,15 @@ fn run_run_step(
                         env_merge(accumulated_env, new_entries);
                     }
                 }
+                // Read back the output file.
+                if let Ok(contents) = std::fs::read_to_string(&output_file) {
+                    if let Ok(entries) = parse_env_file(&contents) {
+                        raw_output_entries = entries;
+                    }
+                }
 
                 let _ = std::fs::remove_file(&env_file);
+                let _ = std::fs::remove_file(&output_file);
                 check_expect_block(&step.name, expect, &capture, actual_exit)
             } else {
                 // Standard path: exit 0 required, no output capture.
@@ -579,27 +667,44 @@ fn run_run_step(
                     accumulated_env,
                     HostStepFiles {
                         env_file: &env_file,
+                        output_file: &output_file,
                         log_path: &step_log_path,
                     },
                 )
                 .with_context(|| format!("test step '{}' command failed", step.name));
 
-                // On success, parse the local env file and merge into accumulated env.
+                // On success, parse the local env and output files.
                 if result.is_ok() {
                     if let Ok(contents) = std::fs::read_to_string(&env_file) {
                         if let Ok(new_entries) = parse_env_file(&contents) {
                             env_merge(accumulated_env, new_entries);
                         }
                     }
+                    if let Ok(contents) = std::fs::read_to_string(&output_file) {
+                        if let Ok(entries) = parse_env_file(&contents) {
+                            raw_output_entries = entries;
+                        }
+                    }
                 }
 
                 let _ = std::fs::remove_file(&env_file);
+                let _ = std::fs::remove_file(&output_file);
                 result
             };
 
             step_result
         }
     }?;
+
+    // Coerce and enforce outputs, then store the executed step node in the retained DOM.
+    let captured_outputs =
+        capture_and_coerce_outputs(&step.name, &step.outputs, raw_output_entries)?;
+    dom.push(ExecutedRunStep {
+        id: step.id.clone(),
+        name: step.name.clone(),
+        output_declarations: step.outputs.clone(),
+        captured_outputs,
+    });
     Ok(())
 }
 
@@ -713,20 +818,24 @@ fn run_host_step_capturing(
     accumulated_env: &[(String, String)],
     files: HostStepFiles<'_>,
 ) -> Result<(StepCapture, i32)> {
-    // Create/truncate the env file so `>>` always works inside the step, and make
-    // it world-writable so that both root and the non-root ephemeral identity can
-    // append via $BOTFORGE_ENV regardless of which one the step runs as.
+    // Create/truncate the env and output files so `>>` always works inside the step, and make
+    // them world-writable so that both root and the non-root ephemeral identity can append
+    // via $BOTFORGE_ENV / $BOTFORGE_OUTPUT regardless of which one the step runs as.
     std::fs::write(files.env_file, b"")
         .with_context(|| format!("failed to create env file for host step '{name}'"))?;
+    std::fs::write(files.output_file, b"")
+        .with_context(|| format!("failed to create output file for host step '{name}'"))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(files.env_file)
-            .with_context(|| format!("failed to stat env file for host step '{name}'"))?
-            .permissions();
-        perms.set_mode(0o666);
-        std::fs::set_permissions(files.env_file, perms)
-            .with_context(|| format!("failed to chmod env file for host step '{name}'"))?;
+        for (path, label) in [(files.env_file, "env"), (files.output_file, "output")] {
+            let mut perms = std::fs::metadata(path)
+                .with_context(|| format!("failed to stat {label} file for host step '{name}'"))?
+                .permissions();
+            perms.set_mode(0o666);
+            std::fs::set_permissions(path, perms)
+                .with_context(|| format!("failed to chmod {label} file for host step '{name}'"))?;
+        }
     }
 
     let script = std::env::temp_dir().join(format!("botforge-host-step-{}.sh", unique_suffix()));
@@ -750,6 +859,7 @@ fn run_host_step_capturing(
         .args(&argv[1..])
         .current_dir(context)
         .env("BOTFORGE_ENV", files.env_file)
+        .env("BOTFORGE_OUTPUT", files.output_file)
         .envs(
             accumulated_env
                 .iter()
@@ -1043,14 +1153,17 @@ fn flush_log_lines(logger: &Arc<StepLogWriter>, pending: &mut Vec<u8>, stream: S
 #[derive(Clone, Copy)]
 struct HostStepFiles<'a> {
     env_file: &'a Path,
+    /// File path for `$BOTFORGE_OUTPUT` — step appends `KEY=VALUE` lines to emit typed outputs.
+    output_file: &'a Path,
     log_path: &'a Path,
 }
 
 /// Run a step locally in the botforge container (harness) with a plain execution timeout.
 /// `run` is written to a temp file and executed via `template` (argv with `{0}` slot).
 /// The working directory is `context`. Inherits the current process environment, with
-/// `accumulated_env` injected (overriding inherited values) and `BOTFORGE_ENV` pointing at
-/// `env_file` so the step can write new key-value pairs for later steps to consume.
+/// `accumulated_env` injected (overriding inherited values), `BOTFORGE_ENV` pointing at
+/// `env_file` so the step can write new key-value pairs for later steps to consume, and
+/// `BOTFORGE_OUTPUT` pointing at `output_file` so the step can emit typed outputs.
 fn run_host_step(
     name: &str,
     run: &str,
@@ -1060,20 +1173,24 @@ fn run_host_step(
     accumulated_env: &[(String, String)],
     files: HostStepFiles<'_>,
 ) -> Result<()> {
-    // Create/truncate the env file so `>>` always works inside the step, and make
-    // it world-writable so that both root and the non-root ephemeral identity can
-    // append via $BOTFORGE_ENV regardless of which one the step runs as.
+    // Create/truncate the env and output files so `>>` always works inside the step, and make
+    // them world-writable so that both root and the non-root ephemeral identity can append
+    // via $BOTFORGE_ENV / $BOTFORGE_OUTPUT regardless of which one the step runs as.
     std::fs::write(files.env_file, b"")
         .with_context(|| format!("failed to create env file for host step '{name}'"))?;
+    std::fs::write(files.output_file, b"")
+        .with_context(|| format!("failed to create output file for host step '{name}'"))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(files.env_file)
-            .with_context(|| format!("failed to stat env file for host step '{name}'"))?
-            .permissions();
-        perms.set_mode(0o666);
-        std::fs::set_permissions(files.env_file, perms)
-            .with_context(|| format!("failed to chmod env file for host step '{name}'"))?;
+        for (path, label) in [(files.env_file, "env"), (files.output_file, "output")] {
+            let mut perms = std::fs::metadata(path)
+                .with_context(|| format!("failed to stat {label} file for host step '{name}'"))?
+                .permissions();
+            perms.set_mode(0o666);
+            std::fs::set_permissions(path, perms)
+                .with_context(|| format!("failed to chmod {label} file for host step '{name}'"))?;
+        }
     }
 
     let script = std::env::temp_dir().join(format!("botforge-host-step-{}.sh", unique_suffix()));
@@ -1097,6 +1214,7 @@ fn run_host_step(
         .args(&argv[1..])
         .current_dir(context)
         .env("BOTFORGE_ENV", files.env_file)
+        .env("BOTFORGE_OUTPUT", files.output_file)
         .envs(
             accumulated_env
                 .iter()
@@ -1225,6 +1343,7 @@ fn build_guest_ssh_cmd(
     sudo: bool,
     accumulated_env: &[(String, String)],
     remote_env_path: &str,
+    remote_output_path: &str,
 ) -> String {
     let interpreter_cmd = template
         .iter()
@@ -1238,9 +1357,8 @@ fn build_guest_ssh_cmd(
         .collect::<Vec<_>>()
         .join(" ");
 
-    // Inject accumulated env vars and BOTFORGE_ENV via a POSIX `env` prefix so that
-    // the interpreter (bash, sh, python, or any custom template) receives them as
-    // genuine environment variables rather than bash-syntax text in the script body.
+    // Inject accumulated env vars, BOTFORGE_ENV, and BOTFORGE_OUTPUT via a POSIX `env`
+    // prefix so that the interpreter receives them as genuine environment variables.
     let mut env_parts: Vec<String> = accumulated_env
         .iter()
         .map(|(k, v)| format!("{}={}", k, shell_single_quote(v)))
@@ -1248,6 +1366,10 @@ fn build_guest_ssh_cmd(
     env_parts.push(format!(
         "BOTFORGE_ENV={}",
         shell_single_quote(remote_env_path)
+    ));
+    env_parts.push(format!(
+        "BOTFORGE_OUTPUT={}",
+        shell_single_quote(remote_output_path)
     ));
     let env_prefix = format!("env {}", env_parts.join(" "));
 
@@ -1330,6 +1452,53 @@ fn env_merge(accumulated: &mut Vec<(String, String)>, new_entries: Vec<(String, 
     }
 }
 
+/// Coerce and enforce outputs declared on a step after execution.
+///
+/// Reads each declared output from the raw emitted entries (parsed from `$BOTFORGE_OUTPUT`),
+/// coerces it to the declared type, enforces `required:`, and returns a map of
+/// output name → captured value (`None` = absent/null).
+///
+/// This is the single enforcement point for both bad-type and no-emit failures:
+/// - coercion failure → hard error (there is no opt-out for this stage)
+/// - absent/empty + `required: true` → hard error
+/// - absent/empty + `required: false` → `None` (null), no error
+fn capture_and_coerce_outputs(
+    step_name: &str,
+    declared_outputs: &BTreeMap<String, OutputDeclaration>,
+    raw_entries: Vec<(String, String)>,
+) -> Result<BTreeMap<String, Option<CapturedOutputValue>>> {
+    let mut emitted: BTreeMap<String, String> = raw_entries.into_iter().collect();
+    let mut captured: BTreeMap<String, Option<CapturedOutputValue>> = BTreeMap::new();
+
+    for (name, decl) in declared_outputs {
+        let raw = emitted.remove(name.as_str()).unwrap_or_default();
+        let trimmed = raw.trim();
+
+        let value: Option<CapturedOutputValue> = if trimmed.is_empty() {
+            // Absent or empty → the universal null.
+            None
+        } else {
+            Some(
+                coerce_output(trimmed, decl.output_type, name)
+                    .with_context(|| format!("step '{step_name}': output coercion failed"))?,
+            )
+        };
+
+        // Required enforcement: null + required:true → hard fail.
+        if decl.required && value.is_none() {
+            anyhow::bail!(
+                "step '{}': required output '{}' was not emitted",
+                step_name,
+                name
+            );
+        }
+
+        captured.insert(name.clone(), value);
+    }
+
+    Ok(captured)
+}
+
 /// Execute an ordered, sequential, fail-fast prepare-phase for `botforge publish`.
 ///
 /// Steps run **locally** in the container with `cwd` at `context` (the repo/context
@@ -1343,10 +1512,14 @@ fn env_merge(accumulated: &mut Vec<(String, String)>, new_entries: Vec<(String, 
 /// - `expect:` assertion handling: supported; exit/stdout/stderr assertions apply.
 /// - `BOTFORGE_ENV` env accumulation: each step may append `KEY=VALUE` pairs; later
 ///   steps see earlier steps' exported vars (same mechanics as host steps in build/test).
+/// - `BOTFORGE_OUTPUT` output capture: each step may emit typed outputs; they are
+///   coerced and `required:` is enforced before the step is added to the returned DOM.
 /// - Fail-fast: a non-zero exit (or failed assertion) aborts the whole phase immediately.
-pub(crate) fn run_local_steps(context: &Path, steps: &[TestStep]) -> Result<()> {
+///
+/// Returns the retained DOM: one [`ExecutedRunStep`] node per executed run step.
+pub(crate) fn run_local_steps(context: &Path, steps: &[TestStep]) -> Result<Vec<ExecutedRunStep>> {
     if steps.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let step_log_dir = context.join("build").join("logs");
@@ -1366,6 +1539,7 @@ pub(crate) fn run_local_steps(context: &Path, steps: &[TestStep]) -> Result<()> 
     let default_step_timeout = Duration::from_secs(300);
 
     let mut accumulated_env: Vec<(String, String)> = Vec::new();
+    let mut dom: Vec<ExecutedRunStep> = Vec::new();
 
     for (step_idx, step) in steps.iter().enumerate() {
         let TestStep::Run(run) = step else {
@@ -1398,6 +1572,9 @@ pub(crate) fn run_local_steps(context: &Path, steps: &[TestStep]) -> Result<()> 
             resolve_shell(run.shell.as_deref()).expect("shell already validated at config load");
         let suffix = unique_suffix();
         let env_file = std::env::temp_dir().join(format!("botforge-publish-env-{suffix}"));
+        let output_file = std::env::temp_dir().join(format!("botforge-publish-output-{suffix}"));
+
+        let mut raw_output_entries: Vec<(String, String)> = Vec::new();
 
         let step_result: Result<()> = if let Some(expect) = &run.expect {
             let (capture, actual_exit) = run_host_step_capturing(
@@ -1409,6 +1586,7 @@ pub(crate) fn run_local_steps(context: &Path, steps: &[TestStep]) -> Result<()> 
                 &accumulated_env,
                 HostStepFiles {
                     env_file: &env_file,
+                    output_file: &output_file,
                     log_path: &log_path,
                 },
             )
@@ -1419,7 +1597,13 @@ pub(crate) fn run_local_steps(context: &Path, steps: &[TestStep]) -> Result<()> 
                     env_merge(&mut accumulated_env, new_entries);
                 }
             }
+            if let Ok(contents) = std::fs::read_to_string(&output_file) {
+                if let Ok(entries) = parse_env_file(&contents) {
+                    raw_output_entries = entries;
+                }
+            }
             let _ = std::fs::remove_file(&env_file);
+            let _ = std::fs::remove_file(&output_file);
             check_expect_block(&run.name, expect, &capture, actual_exit)
         } else {
             let result = run_host_step(
@@ -1431,6 +1615,7 @@ pub(crate) fn run_local_steps(context: &Path, steps: &[TestStep]) -> Result<()> 
                 &accumulated_env,
                 HostStepFiles {
                     env_file: &env_file,
+                    output_file: &output_file,
                     log_path: &log_path,
                 },
             )
@@ -1442,8 +1627,14 @@ pub(crate) fn run_local_steps(context: &Path, steps: &[TestStep]) -> Result<()> 
                         env_merge(&mut accumulated_env, new_entries);
                     }
                 }
+                if let Ok(contents) = std::fs::read_to_string(&output_file) {
+                    if let Ok(entries) = parse_env_file(&contents) {
+                        raw_output_entries = entries;
+                    }
+                }
             }
             let _ = std::fs::remove_file(&env_file);
+            let _ = std::fs::remove_file(&output_file);
             result
         };
 
@@ -1455,9 +1646,19 @@ pub(crate) fn run_local_steps(context: &Path, steps: &[TestStep]) -> Result<()> 
             Some(step_started.elapsed()),
         );
         step_result?;
+
+        // Coerce and enforce outputs, then push the executed step node to the DOM.
+        let captured_outputs =
+            capture_and_coerce_outputs(&run.name, &run.outputs, raw_output_entries)?;
+        dom.push(ExecutedRunStep {
+            id: run.id.clone(),
+            name: run.name.clone(),
+            output_declarations: run.outputs.clone(),
+            captured_outputs,
+        });
     }
 
-    Ok(())
+    Ok(dom)
 }
 
 pub(crate) fn collect_test_diagnostics(ssh: &SshOptions, units: &[String]) {
@@ -1668,6 +1869,10 @@ mod tests {
         std::env::temp_dir().join(format!("botforge-test-env-{}.env", unique_suffix()))
     }
 
+    fn tmp_output_file() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("botforge-test-output-{}.env", unique_suffix()))
+    }
+
     fn tmp_step_log(dir: &Path) -> PathBuf {
         dir.join(format!("step-{}.log", unique_suffix()))
     }
@@ -1701,6 +1906,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tmpl = resolve_shell(Some("sh")).unwrap();
         let env_file = tmp_env_file();
+        let output_file = tmp_output_file();
         let log_file = tmp_step_log(dir.path());
         let err = run_host_step(
             "fail-step",
@@ -1711,6 +1917,7 @@ mod tests {
             &[],
             HostStepFiles {
                 env_file: &env_file,
+                output_file: &output_file,
                 log_path: &log_file,
             },
         )
@@ -1727,6 +1934,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tmpl = resolve_shell(Some("sh")).unwrap();
         let env_file = tmp_env_file();
+        let output_file = tmp_output_file();
         let log_file = tmp_step_log(dir.path());
         let err = run_host_step(
             "bad",
@@ -1737,6 +1945,7 @@ mod tests {
             &[],
             HostStepFiles {
                 env_file: &env_file,
+                output_file: &output_file,
                 log_path: &log_file,
             },
         )
@@ -1755,6 +1964,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tmpl = resolve_shell(None).unwrap();
         let env_file = tmp_env_file();
+        let output_file = tmp_output_file();
         let log_file = tmp_step_log(dir.path());
         let err = run_host_step(
             "mid-fail",
@@ -1765,6 +1975,7 @@ mod tests {
             &[],
             HostStepFiles {
                 env_file: &env_file,
+                output_file: &output_file,
                 log_path: &log_file,
             },
         )
@@ -1781,6 +1992,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tmpl = resolve_shell(None).unwrap();
         let env_file = tmp_env_file();
+        let output_file = tmp_output_file();
         let log_file = tmp_step_log(dir.path());
         let result = run_host_step(
             "ok",
@@ -1791,6 +2003,7 @@ mod tests {
             &[],
             HostStepFiles {
                 env_file: &env_file,
+                output_file: &output_file,
                 log_path: &log_file,
             },
         );
@@ -1803,6 +2016,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tmpl = resolve_shell(None).unwrap();
         let env_file = tmp_env_file();
+        let output_file = tmp_output_file();
         let log_file = tmp_step_log(dir.path());
         let accumulated = vec![
             ("MY_VAR".to_string(), "hello world".to_string()),
@@ -1817,6 +2031,7 @@ mod tests {
             &accumulated,
             HostStepFiles {
                 env_file: &env_file,
+                output_file: &output_file,
                 log_path: &log_file,
             },
         );
@@ -1832,6 +2047,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tmpl = resolve_shell(None).unwrap();
         let env_file = tmp_env_file();
+        let output_file = tmp_output_file();
         let log_file = tmp_step_log(dir.path());
         let result = run_host_step(
             "write-env",
@@ -1842,6 +2058,7 @@ mod tests {
             &[],
             HostStepFiles {
                 env_file: &env_file,
+                output_file: &output_file,
                 log_path: &log_file,
             },
         );
@@ -1861,6 +2078,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tmpl = resolve_shell(None).unwrap();
         let env_file = tmp_env_file();
+        let output_file = tmp_output_file();
         let log_file = tmp_step_log(dir.path());
         let result = run_host_step(
             "mode-check",
@@ -1871,6 +2089,7 @@ mod tests {
             &[],
             HostStepFiles {
                 env_file: &env_file,
+                output_file: &output_file,
                 log_path: &log_file,
             },
         );
@@ -1893,6 +2112,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tmpl = resolve_shell(Some("sh")).unwrap();
         let env_file = tmp_env_file();
+        let output_file = tmp_output_file();
         let log_file = tmp_step_log(dir.path());
         let result = super::run_host_step_capturing(
             "mode-check-capturing",
@@ -1903,6 +2123,7 @@ mod tests {
             &[],
             HostStepFiles {
                 env_file: &env_file,
+                output_file: &output_file,
                 log_path: &log_file,
             },
         );
@@ -1923,6 +2144,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tmpl = resolve_shell(Some("sh")).unwrap();
         let env_file = tmp_env_file();
+        let output_file = tmp_output_file();
         let log_file = tmp_step_log(dir.path());
         let result = run_host_step(
             "log-lines",
@@ -1933,6 +2155,7 @@ mod tests {
             &[],
             HostStepFiles {
                 env_file: &env_file,
+                output_file: &output_file,
                 log_path: &log_file,
             },
         );
@@ -2169,10 +2392,11 @@ mod tests {
             true,
             &[],
             "/tmp/botforge-env-1",
+            "/tmp/botforge-output-1",
         );
         assert_eq!(
             cmd,
-            "sudo -E env BOTFORGE_ENV='/tmp/botforge-env-1' bash --noprofile --norc -e -o pipefail '/tmp/botforge-step.sh'"
+            "sudo -E env BOTFORGE_ENV='/tmp/botforge-env-1' BOTFORGE_OUTPUT='/tmp/botforge-output-1' bash --noprofile --norc -e -o pipefail '/tmp/botforge-step.sh'"
         );
     }
 
@@ -2185,10 +2409,11 @@ mod tests {
             false,
             &[],
             "/tmp/botforge-env-1",
+            "/tmp/botforge-output-1",
         );
         assert_eq!(
             cmd,
-            "env BOTFORGE_ENV='/tmp/botforge-env-1' sh -e '/tmp/botforge-step.sh'"
+            "env BOTFORGE_ENV='/tmp/botforge-env-1' BOTFORGE_OUTPUT='/tmp/botforge-output-1' sh -e '/tmp/botforge-step.sh'"
         );
     }
 
@@ -2208,10 +2433,11 @@ run: echo ok
             step.sudo_enabled(),
             &[],
             "/tmp/botforge-env-1",
+            "/tmp/botforge-output-1",
         );
         assert_eq!(
             cmd,
-            "sudo -E env BOTFORGE_ENV='/tmp/botforge-env-1' bash --noprofile --norc -e -o pipefail '/tmp/botforge-step.sh'"
+            "sudo -E env BOTFORGE_ENV='/tmp/botforge-env-1' BOTFORGE_OUTPUT='/tmp/botforge-output-1' bash --noprofile --norc -e -o pipefail '/tmp/botforge-step.sh'"
         );
     }
 
@@ -2222,7 +2448,14 @@ run: echo ok
             ("FOO".to_string(), "bar".to_string()),
             ("MSG".to_string(), "hello world".to_string()),
         ];
-        let cmd = build_guest_ssh_cmd(&tmpl, "/tmp/botforge-step.sh", true, &acc, "/tmp/env");
+        let cmd = build_guest_ssh_cmd(
+            &tmpl,
+            "/tmp/botforge-step.sh",
+            true,
+            &acc,
+            "/tmp/env",
+            "/tmp/output",
+        );
         assert!(
             cmd.starts_with("sudo -E env "),
             "expected sudo -E env prefix: {cmd}"
@@ -2232,6 +2465,10 @@ run: echo ok
         assert!(
             cmd.contains("BOTFORGE_ENV='/tmp/env'"),
             "expected BOTFORGE_ENV: {cmd}"
+        );
+        assert!(
+            cmd.contains("BOTFORGE_OUTPUT='/tmp/output'"),
+            "expected BOTFORGE_OUTPUT: {cmd}"
         );
         // No bash-syntax export statements in the command
         assert!(
@@ -2244,7 +2481,7 @@ run: echo ok
     fn test_build_guest_ssh_cmd_quotes_special_chars_in_env() {
         let tmpl = resolve_shell(Some("sh")).unwrap();
         let acc = vec![("VAL".to_string(), "it's a value".to_string())];
-        let cmd = build_guest_ssh_cmd(&tmpl, "/tmp/s.sh", false, &acc, "/tmp/env");
+        let cmd = build_guest_ssh_cmd(&tmpl, "/tmp/s.sh", false, &acc, "/tmp/env", "/tmp/output");
         let expected_val = format!("VAL={}", shell_single_quote("it's a value"));
         assert!(cmd.contains(&expected_val), "cmd: {cmd}");
     }
@@ -2258,12 +2495,17 @@ run: echo ok
             true,
             &[],
             "/tmp/botforge-env-1",
+            "/tmp/botforge-output-1",
         );
         assert!(
             cmd.contains("BOTFORGE_ENV='/tmp/botforge-env-1'"),
             "cmd: {cmd}"
         );
-        // No extra env var assignments beyond BOTFORGE_ENV
+        assert!(
+            cmd.contains("BOTFORGE_OUTPUT='/tmp/botforge-output-1'"),
+            "cmd: {cmd}"
+        );
+        // No extra env var assignments beyond BOTFORGE_ENV/BOTFORGE_OUTPUT
         assert!(!cmd.contains("FOO="), "unexpected extra env var: {cmd}");
     }
 
@@ -2271,7 +2513,14 @@ run: echo ok
     fn test_build_guest_ssh_cmd_python_interpreter_no_bash_syntax() {
         let tmpl = resolve_shell(Some("python")).unwrap();
         let acc = vec![("MYVAR".to_string(), "myval".to_string())];
-        let cmd = build_guest_ssh_cmd(&tmpl, "/tmp/script.py", false, &acc, "/tmp/env");
+        let cmd = build_guest_ssh_cmd(
+            &tmpl,
+            "/tmp/script.py",
+            false,
+            &acc,
+            "/tmp/env",
+            "/tmp/output",
+        );
         // No bash-specific syntax in the SSH command
         assert!(!cmd.contains("export "), "must not have bash export: {cmd}");
         assert!(
@@ -2294,6 +2543,7 @@ run: echo ok
         let dir = tempfile::tempdir().unwrap();
         let tmpl = resolve_shell(Some("sh")).unwrap();
         let env_file = tmp_env_file();
+        let output_file = tmp_output_file();
         let log_file = tmp_step_log(dir.path());
         let start = std::time::Instant::now();
         // Use `exec` so the shell replaces itself with sleep; the child we hold
@@ -2311,6 +2561,7 @@ run: echo ok
             &[],
             HostStepFiles {
                 env_file: &env_file,
+                output_file: &output_file,
                 log_path: &log_file,
             },
         )
@@ -2338,6 +2589,7 @@ run: echo ok
         let dir = tempfile::tempdir().unwrap();
         let tmpl = resolve_shell(Some("sh")).unwrap();
         let env_file = tmp_env_file();
+        let output_file = tmp_output_file();
         let log_file = tmp_step_log(dir.path());
         let overall_timeout = Duration::from_secs(1);
         let err = run_host_step(
@@ -2353,6 +2605,7 @@ run: echo ok
             &[],
             HostStepFiles {
                 env_file: &env_file,
+                output_file: &output_file,
                 log_path: &log_file,
             },
         )
@@ -2381,6 +2634,7 @@ run: echo ok
             id: None,
             expect: None,
             condition: None,
+            outputs: Default::default(),
         };
         assert_eq!(
             resolve_step_timeout(step.timeout, Duration::from_secs(300)),
@@ -2400,6 +2654,7 @@ run: echo ok
             id: None,
             expect: None,
             condition: None,
+            outputs: Default::default(),
         };
         assert_eq!(
             resolve_step_timeout(step.timeout, Duration::from_secs(1800)),
@@ -2600,6 +2855,7 @@ run: echo ok
         let dir = tempfile::tempdir().unwrap();
         let tmpl = resolve_shell(Some("sh")).unwrap();
         let env_file = tmp_env_file();
+        let output_file = tmp_output_file();
         let log_file = tmp_step_log(dir.path());
         let (cap, code) = super::run_host_step_capturing(
             "capture-test",
@@ -2610,6 +2866,7 @@ run: echo ok
             &[],
             HostStepFiles {
                 env_file: &env_file,
+                output_file: &output_file,
                 log_path: &log_file,
             },
         )
@@ -2633,6 +2890,7 @@ run: echo ok
         let dir = tempfile::tempdir().unwrap();
         let tmpl = resolve_shell(Some("sh")).unwrap();
         let env_file = tmp_env_file();
+        let output_file = tmp_output_file();
         let log_file = tmp_step_log(dir.path());
         let (cap, code) = super::run_host_step_capturing(
             "nonzero",
@@ -2643,6 +2901,7 @@ run: echo ok
             &[],
             HostStepFiles {
                 env_file: &env_file,
+                output_file: &output_file,
                 log_path: &log_file,
             },
         )

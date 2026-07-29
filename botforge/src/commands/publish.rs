@@ -176,6 +176,7 @@ fn run_publish(
             }
         } else {
             run_local_steps(context, &config.steps)
+                .map(|_| ())
                 .context("publish: prepare phase (steps) failed")?;
         }
     }
@@ -1238,6 +1239,7 @@ publish:
             id: None,
             expect: None,
             condition: None,
+            outputs: Default::default(),
         });
 
         let config = make_publish_config_with_steps(
@@ -1284,6 +1286,7 @@ publish:
             id: None,
             expect: None,
             condition: None,
+            outputs: Default::default(),
         });
 
         let config = make_publish_config_with_steps(
@@ -1335,6 +1338,7 @@ publish:
             id: None,
             expect: None,
             condition: None,
+            outputs: Default::default(),
         });
 
         let config = make_publish_config_with_steps(
@@ -1372,6 +1376,7 @@ publish:
                 id: None,
                 expect: None,
                 condition: None,
+                outputs: Default::default(),
             }),
             crate::step::TestStep::Run(crate::step::RunStep {
                 name: "read env".to_string(),
@@ -1383,6 +1388,7 @@ publish:
                 id: None,
                 expect: None,
                 condition: None,
+                outputs: Default::default(),
             }),
         ];
 
@@ -1415,6 +1421,7 @@ publish:
             id: None,
             expect: None,
             condition: None,
+            outputs: Default::default(),
         })];
 
         crate::plan::run_local_steps(context, &steps).unwrap();
@@ -1444,6 +1451,7 @@ publish:
                 id: None,
                 expect: None,
                 condition: None,
+                outputs: Default::default(),
             }),
             crate::step::TestStep::Run(crate::step::RunStep {
                 name: "should not run".to_string(),
@@ -1455,6 +1463,7 @@ publish:
                 id: None,
                 expect: None,
                 condition: None,
+                outputs: Default::default(),
             }),
         ];
 
@@ -1470,7 +1479,220 @@ publish:
         );
     }
 
-    // ── github target ─────────────────────────────────────────────────────────
+    // ── emit → capture → coerce → required-enforcement acceptance tests ───────
+
+    fn make_output_step(
+        name: &str,
+        run: &str,
+        outputs: std::collections::BTreeMap<String, crate::step::OutputDeclaration>,
+    ) -> crate::step::TestStep {
+        crate::step::TestStep::Run(crate::step::RunStep {
+            name: name.to_string(),
+            run: run.to_string(),
+            target: crate::step::StepTarget::Host,
+            shell: Some("sh".to_string()),
+            timeout: None,
+            sudo: None,
+            id: Some(name.to_string()),
+            expect: None,
+            condition: None,
+            outputs,
+        })
+    }
+
+    #[test]
+    fn run_local_steps_captures_string_output() {
+        use crate::step::{CapturedOutputValue, OutputDeclaration, OutputType};
+        let workspace = TempDir::new().unwrap();
+        let mut outputs = std::collections::BTreeMap::new();
+        outputs.insert(
+            "greeting".to_string(),
+            OutputDeclaration {
+                output_type: OutputType::String,
+                required: false,
+            },
+        );
+        let steps = vec![make_output_step(
+            "emit-step",
+            r#"echo "greeting=hello world" >> "$BOTFORGE_OUTPUT""#,
+            outputs,
+        )];
+        let dom = crate::plan::run_local_steps(workspace.path(), &steps).unwrap();
+        assert_eq!(dom.len(), 1);
+        let node = &dom[0];
+        assert_eq!(node.id.as_deref(), Some("emit-step"));
+        // Declared type must be stored on the node
+        assert!(node.output_declarations.contains_key("greeting"));
+        assert_eq!(
+            node.output_declarations["greeting"].output_type,
+            OutputType::String
+        );
+        // Captured value
+        let captured = node.captured_outputs["greeting"].as_ref().unwrap();
+        assert_eq!(
+            *captured,
+            CapturedOutputValue::String("hello world".to_string())
+        );
+    }
+
+    #[test]
+    fn run_local_steps_captures_number_output() {
+        use crate::step::{CapturedOutputValue, OutputDeclaration, OutputType};
+        let workspace = TempDir::new().unwrap();
+        let mut outputs = std::collections::BTreeMap::new();
+        outputs.insert(
+            "count".to_string(),
+            OutputDeclaration {
+                output_type: OutputType::Number,
+                required: false,
+            },
+        );
+        let steps = vec![make_output_step(
+            "count-step",
+            r#"echo "count=42" >> "$BOTFORGE_OUTPUT""#,
+            outputs,
+        )];
+        let dom = crate::plan::run_local_steps(workspace.path(), &steps).unwrap();
+        assert_eq!(dom.len(), 1);
+        let captured = dom[0].captured_outputs["count"].as_ref().unwrap();
+        assert_eq!(*captured, CapturedOutputValue::Number(42.0));
+        assert_eq!(
+            dom[0].output_declarations["count"].output_type,
+            OutputType::Number
+        );
+    }
+
+    #[test]
+    fn run_local_steps_captures_bool_output() {
+        use crate::step::{CapturedOutputValue, OutputDeclaration, OutputType};
+        let workspace = TempDir::new().unwrap();
+        let mut outputs = std::collections::BTreeMap::new();
+        outputs.insert(
+            "enabled".to_string(),
+            OutputDeclaration {
+                output_type: OutputType::Bool,
+                required: false,
+            },
+        );
+        let steps = vec![make_output_step(
+            "flag-step",
+            r#"echo "enabled=true" >> "$BOTFORGE_OUTPUT""#,
+            outputs,
+        )];
+        let dom = crate::plan::run_local_steps(workspace.path(), &steps).unwrap();
+        assert_eq!(dom.len(), 1);
+        let captured = dom[0].captured_outputs["enabled"].as_ref().unwrap();
+        assert_eq!(*captured, CapturedOutputValue::Bool(true));
+    }
+
+    #[test]
+    fn run_local_steps_number_coercion_failure_is_hard_fail() {
+        use crate::step::{OutputDeclaration, OutputType};
+        let workspace = TempDir::new().unwrap();
+        let mut outputs = std::collections::BTreeMap::new();
+        outputs.insert(
+            "count".to_string(),
+            OutputDeclaration {
+                output_type: OutputType::Number,
+                required: false,
+            },
+        );
+        let steps = vec![make_output_step(
+            "bad-number",
+            r#"echo "count=not-a-number" >> "$BOTFORGE_OUTPUT""#,
+            outputs,
+        )];
+        let err = crate::plan::run_local_steps(workspace.path(), &steps).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("count") || msg.contains("coerce") || msg.contains("number"),
+            "coercion failure should produce a clear error: {msg}"
+        );
+    }
+
+    #[test]
+    fn run_local_steps_required_output_absent_is_hard_fail() {
+        use crate::step::{OutputDeclaration, OutputType};
+        let workspace = TempDir::new().unwrap();
+        let mut outputs = std::collections::BTreeMap::new();
+        outputs.insert(
+            "must_emit".to_string(),
+            OutputDeclaration {
+                output_type: OutputType::String,
+                required: true,
+            },
+        );
+        // Step does NOT emit the required output
+        let steps = vec![make_output_step("require-step", "echo ok", outputs)];
+        let err = crate::plan::run_local_steps(workspace.path(), &steps).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("must_emit") || msg.contains("required"),
+            "missing required output should produce a clear error: {msg}"
+        );
+    }
+
+    #[test]
+    fn run_local_steps_required_false_absent_is_null() {
+        use crate::step::{OutputDeclaration, OutputType};
+        let workspace = TempDir::new().unwrap();
+        let mut outputs = std::collections::BTreeMap::new();
+        outputs.insert(
+            "optional_out".to_string(),
+            OutputDeclaration {
+                output_type: OutputType::String,
+                required: false,
+            },
+        );
+        // Step does NOT emit the optional output
+        let steps = vec![make_output_step("optional-step", "echo ok", outputs)];
+        let dom = crate::plan::run_local_steps(workspace.path(), &steps).unwrap();
+        // Null is represented as None — absent but present as a key in the map
+        assert!(dom[0].captured_outputs.contains_key("optional_out"));
+        assert!(
+            dom[0].captured_outputs["optional_out"].is_none(),
+            "absent non-required output should be null (None)"
+        );
+    }
+
+    #[test]
+    fn run_local_steps_dom_carries_declared_types_on_node() {
+        use crate::step::{OutputDeclaration, OutputType};
+        let workspace = TempDir::new().unwrap();
+        let mut outputs = std::collections::BTreeMap::new();
+        outputs.insert(
+            "x".to_string(),
+            OutputDeclaration {
+                output_type: OutputType::Bool,
+                required: true,
+            },
+        );
+        outputs.insert(
+            "y".to_string(),
+            OutputDeclaration {
+                output_type: OutputType::Number,
+                required: false,
+            },
+        );
+        let steps = vec![make_output_step(
+            "typed-step",
+            r#"printf "x=false\ny=7\n" >> "$BOTFORGE_OUTPUT""#,
+            outputs,
+        )];
+        let dom = crate::plan::run_local_steps(workspace.path(), &steps).unwrap();
+        assert_eq!(dom.len(), 1);
+        // Declared types must be stored on the DOM node (per spec: type lives on the step)
+        assert_eq!(
+            dom[0].output_declarations["x"].output_type,
+            OutputType::Bool
+        );
+        assert!(dom[0].output_declarations["x"].required);
+        assert_eq!(
+            dom[0].output_declarations["y"].output_type,
+            OutputType::Number
+        );
+        assert!(!dom[0].output_declarations["y"].required);
+    }
 
     #[test]
     fn github_target_dry_run_does_not_invoke_plugin() {
