@@ -3392,12 +3392,7 @@ run: echo ok
             output_decls: vec![],
             deferred_with: with
                 .iter()
-                .map(|(k, v)| {
-                    (
-                        k.to_string(),
-                        serde_yaml::Value::String(v.to_string()),
-                    )
-                })
+                .map(|(k, v)| (k.to_string(), serde_yaml::Value::String(v.to_string())))
                 .collect(),
             captured_outputs: std::cell::RefCell::new(None),
         }
@@ -3408,7 +3403,8 @@ run: echo ok
         // The headline OTP scenario: an executed `uses:` sibling (id: admin)
         // produced a captured output; a later invoke consumes it via
         // `otp: ${{ steps.admin.outputs.testuser_otp }}` in its with: block.
-        let invoke = invoke_with_deferred_with(&[("otp", "${{ steps.admin.outputs.testuser_otp }}")]);
+        let invoke =
+            invoke_with_deferred_with(&[("otp", "${{ steps.admin.outputs.testuser_otp }}")]);
         let scope = vec![
             executed_invoke(
                 "admin",
@@ -3439,7 +3435,11 @@ run: echo ok
         let scope = vec![
             executed_run_with_outputs(
                 "emit",
-                vec![captured("count", OutputType::Number, OutputValue::Number(7.0))],
+                vec![captured(
+                    "count",
+                    OutputType::Number,
+                    OutputValue::Number(7.0),
+                )],
             ),
             TestStep::Invoke(invoke),
         ];
