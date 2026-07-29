@@ -106,7 +106,7 @@ use std::path::{Path, PathBuf};
 use crate::config::{load_publish_config, FsTarget, GithubTarget, PublishConfig, S3Target};
 use crate::plan::run_local_steps;
 use crate::resolver::{Reference, ResolveFileContext, ResolvedFile};
-use crate::step::TestStep;
+use crate::step::{StepCondition, TestStep};
 use crate::util::resolve_under_root;
 use crate::workspace::{
     discover_context, load_inline_manifest, load_plugin_entries, registry::load_committed_registry,
@@ -1237,7 +1237,7 @@ publish:
             sudo: None,
             id: None,
             expect: None,
-            condition: None,
+            condition: StepCondition::Always,
             outputs: vec![],
             captured_outputs: Default::default(),
         });
@@ -1285,7 +1285,7 @@ publish:
             sudo: None,
             id: None,
             expect: None,
-            condition: None,
+            condition: StepCondition::Always,
             outputs: vec![],
             captured_outputs: Default::default(),
         });
@@ -1338,7 +1338,7 @@ publish:
             sudo: None,
             id: None,
             expect: None,
-            condition: None,
+            condition: StepCondition::Always,
             outputs: vec![],
             captured_outputs: Default::default(),
         });
@@ -1377,7 +1377,7 @@ publish:
                 sudo: None,
                 id: None,
                 expect: None,
-                condition: None,
+                condition: StepCondition::Always,
                 outputs: vec![],
                 captured_outputs: Default::default(),
             }),
@@ -1390,7 +1390,7 @@ publish:
                 sudo: None,
                 id: None,
                 expect: None,
-                condition: None,
+                condition: StepCondition::Always,
                 outputs: vec![],
                 captured_outputs: Default::default(),
             }),
@@ -1424,7 +1424,7 @@ publish:
             sudo: None,
             id: None,
             expect: None,
-            condition: None,
+            condition: StepCondition::Always,
             outputs: vec![],
             captured_outputs: Default::default(),
         })];
@@ -1455,7 +1455,7 @@ publish:
                 sudo: None,
                 id: None,
                 expect: None,
-                condition: None,
+                condition: StepCondition::Always,
                 outputs: vec![],
                 captured_outputs: Default::default(),
             }),
@@ -1468,7 +1468,7 @@ publish:
                 sudo: None,
                 id: None,
                 expect: None,
-                condition: None,
+                condition: StepCondition::Always,
                 outputs: vec![],
                 captured_outputs: Default::default(),
             }),
