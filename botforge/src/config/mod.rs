@@ -1436,6 +1436,27 @@ fn validate_scope_step_ids(steps: &[TestStep], scope_description: &str) -> Resul
     Ok(())
 }
 
+/// Validate the `outputs:` declarations on a single run step.
+///
+/// Checks that:
+/// - Output names are unique within the step (duplicate = config error).
+///
+/// The `type:` field is validated implicitly by serde's enum deserialization
+/// (unknown type → error at parse time); there is nothing extra to check here.
+fn validate_run_step_outputs(step: &crate::step::RunStep) -> Result<()> {
+    let mut seen = HashSet::new();
+    for decl in &step.outputs {
+        if !seen.insert(decl.name.as_str()) {
+            anyhow::bail!(
+                "step '{}': duplicate output name '{}'; output names must be unique within a step",
+                step.name,
+                decl.name
+            );
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_test_steps(steps: &[TestStep], ports: &[PortSpec]) -> Result<()> {
     for step in steps {
         match step {
@@ -1448,6 +1469,9 @@ pub(crate) fn validate_test_steps(steps: &[TestStep], ports: &[PortSpec]) -> Res
                 }
                 resolve_shell(step.shell.as_deref()).with_context(|| {
                     format!("test step '{}': invalid `shell:` value", step.name)
+                })?;
+                validate_run_step_outputs(step).with_context(|| {
+                    format!("test step '{}': invalid outputs declaration", step.name)
                 })?;
             }
             TestStep::Archive(step) => {
@@ -1491,6 +1515,9 @@ pub(crate) fn validate_build_steps(steps: &[TestStep]) -> Result<()> {
                 }
                 resolve_shell(step.shell.as_deref()).with_context(|| {
                     format!("build step '{}': invalid `shell:` value", step.name)
+                })?;
+                validate_run_step_outputs(step).with_context(|| {
+                    format!("build step '{}': invalid outputs declaration", step.name)
                 })?;
             }
             TestStep::Archive(step) => validate_archive_build_step(step)?,

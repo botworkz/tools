@@ -1,0 +1,60 @@
+type: botforge/fragment
+# Stage 2 acceptance: emit → capture → coerce → required-enforcement
+# Runs entirely on `on: host` so no VM is needed to verify BF_OUT capture.
+# Each step emits values to $BF_OUT; botforge captures, coerces, and enforces
+# required at runtime and stores the results on the step node in the retained DOM.
+# Nothing is exposed downstream yet (capture-only).
+steps:
+  - on: host
+    name: outputs-emit-string
+    run: |
+      echo "label=hello-output" >> "$BF_OUT"
+    outputs:
+      - name: label
+        type: string
+        required: true
+
+  - on: host
+    name: outputs-emit-number
+    run: |
+      echo "count=42" >> "$BF_OUT"
+    outputs:
+      - name: count
+        type: number
+        required: true
+
+  - on: host
+    name: outputs-emit-bool
+    run: |
+      echo "ready=true" >> "$BF_OUT"
+    outputs:
+      - name: ready
+        type: bool
+        required: true
+
+  - on: host
+    name: outputs-optional-not-emitted
+    run: |
+      # Intentionally emit nothing — optional output, so no failure.
+      true
+    outputs:
+      - name: optional_val
+        type: string
+        required: false
+
+  - on: host
+    name: outputs-multiple-mixed
+    run: |
+      echo "name=alice" >> "$BF_OUT"
+      echo "score=99" >> "$BF_OUT"
+      echo "active=false" >> "$BF_OUT"
+    outputs:
+      - name: name
+        type: string
+        required: true
+      - name: score
+        type: number
+        required: true
+      - name: active
+        type: bool
+        required: true
