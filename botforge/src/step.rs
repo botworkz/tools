@@ -13,6 +13,7 @@ use crate::config::{yaml_scalar_to_string, yaml_scalar_truthiness};
 #[serde(rename_all = "lowercase")]
 pub(crate) enum OutputType {
     String,
+    Secret,
     Number,
     Bool,
 }
@@ -21,6 +22,7 @@ impl std::fmt::Display for OutputType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             OutputType::String => write!(f, "string"),
+            OutputType::Secret => write!(f, "secret"),
             OutputType::Number => write!(f, "number"),
             OutputType::Bool => write!(f, "bool"),
         }
@@ -30,7 +32,7 @@ impl std::fmt::Display for OutputType {
 /// A single output declaration on a run step.
 ///
 /// Outputs are declared on the step, typed with `type:` (closed enum:
-/// `string`, `number`, `bool`), and optionally `required: true` to enforce
+/// `string`, `secret`, `number`, `bool`), and optionally `required: true` to enforce
 /// that the step actually emits a non-empty value.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -38,7 +40,7 @@ pub(crate) struct OutputDecl {
     /// The output name.  Must be unique within a step's `outputs:` list.
     #[serde(deserialize_with = "deserialize_scalar_as_string")]
     pub(crate) name: String,
-    /// The declared type.  One of `string`, `number`, `bool`.
+    /// The declared type.  One of `string`, `secret`, `number`, `bool`.
     #[serde(rename = "type")]
     pub(crate) output_type: OutputType,
     /// When `true`, the step must emit a non-empty value for this output or
@@ -65,10 +67,10 @@ pub(crate) enum OutputValue {
 }
 
 impl OutputValue {
-    /// Project the value into a string context, returning an owned `String`.
+    /// Project the value into a use sink string context, returning an owned `String`.
     ///
     /// `Null` → `""`.  All other variants → their string representation.
-    pub(crate) fn to_string_context(&self) -> String {
+    pub(crate) fn to_use_string(&self) -> String {
         match self {
             OutputValue::Null => String::new(),
             OutputValue::String(s) => s.clone(),
@@ -80,6 +82,18 @@ impl OutputValue {
                 }
             }
             OutputValue::Bool(b) => b.to_string(),
+        }
+    }
+
+    /// Project the value into a display sink string context.
+    ///
+    /// `secret` declarations always render as `"***"`; all other declarations
+    /// render exactly as [`Self::to_use_string`].
+    pub(crate) fn to_display_string(&self, declared_type: OutputType) -> String {
+        if declared_type == OutputType::Secret {
+            "***".to_string()
+        } else {
+            self.to_use_string()
         }
     }
 }
@@ -112,22 +126,23 @@ pub(crate) fn coerce_output_value(
     if raw.is_empty() {
         return Ok(OutputValue::Null);
     }
+    let display_raw = OutputValue::String(raw.to_string()).to_display_string(declared_type);
     match declared_type {
-        OutputType::String => Ok(OutputValue::String(raw.to_string())),
+        OutputType::String | OutputType::Secret => Ok(OutputValue::String(raw.to_string())),
         OutputType::Number => raw.parse::<f64>().map(OutputValue::Number).map_err(|_| {
             anyhow::anyhow!(
                 "output '{}': value {:?} cannot be coerced to number",
                 name,
-                raw
+                display_raw
             )
         }),
         OutputType::Bool => match raw {
             "true" => Ok(OutputValue::Bool(true)),
             "false" => Ok(OutputValue::Bool(false)),
-            other => anyhow::bail!(
+            _ => anyhow::bail!(
                 "output '{}': value {:?} cannot be coerced to bool (expected \"true\" or \"false\")",
                 name,
-                other
+                display_raw
             ),
         },
     }
@@ -1129,6 +1144,13 @@ expect:
         }
 
         #[test]
+        fn test_output_type_secret_parses() {
+            let yaml = "name: x\ntype: secret\nrequired: true\n";
+            let decl: OutputDecl = serde_yaml::from_str(yaml).unwrap();
+            assert_eq!(decl.output_type, OutputType::Secret);
+        }
+
+        #[test]
         fn test_output_unknown_field_is_error() {
             let yaml = "name: x\ntype: string\nfoo: bar\n";
             let err = serde_yaml::from_str::<OutputDecl>(yaml).unwrap_err();
@@ -1157,6 +1179,7 @@ expect:
         #[test]
         fn test_run_step_outputs_display_name() {
             assert_eq!(OutputType::String.to_string(), "string");
+            assert_eq!(OutputType::Secret.to_string(), "secret");
             assert_eq!(OutputType::Number.to_string(), "number");
             assert_eq!(OutputType::Bool.to_string(), "bool");
         }
@@ -1177,6 +1200,18 @@ expect:
         #[test]
         fn test_coerce_string_empty_is_null() {
             let v = coerce_output_value("x", "", OutputType::String).unwrap();
+            assert_eq!(v, OutputValue::Null);
+        }
+
+        #[test]
+        fn test_coerce_secret_returns_string_value() {
+            let v = coerce_output_value("x", "super-secret", OutputType::Secret).unwrap();
+            assert_eq!(v, OutputValue::String("super-secret".to_string()));
+        }
+
+        #[test]
+        fn test_coerce_secret_empty_is_null() {
+            let v = coerce_output_value("x", "", OutputType::Secret).unwrap();
             assert_eq!(v, OutputValue::Null);
         }
 
@@ -1265,41 +1300,54 @@ expect:
     // --- Stage 2: null model projection ---
 
     mod null_model {
-        use super::super::OutputValue;
+        use super::super::{OutputType, OutputValue};
 
         #[test]
-        fn test_null_to_string_context_is_empty_string() {
-            assert_eq!(OutputValue::Null.to_string_context(), "");
+        fn test_null_to_use_string_is_empty_string() {
+            assert_eq!(OutputValue::Null.to_use_string(), "");
         }
 
         #[test]
-        fn test_string_to_string_context() {
+        fn test_string_to_use_string() {
             let v = OutputValue::String("hello".into());
-            assert_eq!(v.to_string_context(), "hello");
+            assert_eq!(v.to_use_string(), "hello");
         }
 
         #[test]
-        fn test_number_integer_to_string_context() {
+        fn test_number_integer_to_use_string() {
             let v = OutputValue::Number(42.0);
-            assert_eq!(v.to_string_context(), "42");
+            assert_eq!(v.to_use_string(), "42");
         }
 
         #[test]
-        fn test_number_float_to_string_context() {
+        fn test_number_float_to_use_string() {
             let v = OutputValue::Number(3.5);
-            assert_eq!(v.to_string_context(), "3.5");
+            assert_eq!(v.to_use_string(), "3.5");
         }
 
         #[test]
-        fn test_bool_true_to_string_context() {
+        fn test_bool_true_to_use_string() {
             let v = OutputValue::Bool(true);
-            assert_eq!(v.to_string_context(), "true");
+            assert_eq!(v.to_use_string(), "true");
         }
 
         #[test]
-        fn test_bool_false_to_string_context() {
+        fn test_bool_false_to_use_string() {
             let v = OutputValue::Bool(false);
-            assert_eq!(v.to_string_context(), "false");
+            assert_eq!(v.to_use_string(), "false");
+        }
+
+        #[test]
+        fn test_display_projection_masks_secret_values() {
+            let v = OutputValue::String("super-secret".into());
+            assert_eq!(v.to_display_string(OutputType::Secret), "***");
+            assert_eq!(v.to_use_string(), "super-secret");
+        }
+
+        #[test]
+        fn test_display_projection_non_secret_shows_real_value() {
+            let v = OutputValue::String("plain".into());
+            assert_eq!(v.to_display_string(OutputType::String), "plain");
         }
 
         #[test]

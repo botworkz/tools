@@ -1172,21 +1172,37 @@ fn validate_fragment_outputs(
         // Validate and coerce the default value.
         let default_value: Option<OutputValue> = if let Some(ref default_yaml) = raw.default {
             let raw_str = yaml_scalar_to_string(default_yaml).map_err(|e| {
-                anyhow::anyhow!(
-                    "fragment output '{}': invalid default value: {} ({})",
-                    raw.name,
-                    e,
-                    path.display()
-                )
-            })?;
-            let coerced =
-                coerce_output_value(&raw.name, &raw_str, raw.output_type).map_err(|e| {
+                if raw.output_type == OutputType::Secret {
                     anyhow::anyhow!(
-                        "fragment output '{}': default value type coercion failed: {} ({})",
+                        "fragment output '{}': invalid default value for secret output ({})",
+                        raw.name,
+                        path.display()
+                    )
+                } else {
+                    anyhow::anyhow!(
+                        "fragment output '{}': invalid default value: {} ({})",
                         raw.name,
                         e,
                         path.display()
                     )
+                }
+            })?;
+            let coerced =
+                coerce_output_value(&raw.name, &raw_str, raw.output_type).map_err(|e| {
+                    if raw.output_type == OutputType::Secret {
+                        anyhow::anyhow!(
+                            "fragment output '{}': default value type coercion failed for secret output ({})",
+                            raw.name,
+                            path.display()
+                        )
+                    } else {
+                        anyhow::anyhow!(
+                            "fragment output '{}': default value type coercion failed: {} ({})",
+                            raw.name,
+                            e,
+                            path.display()
+                        )
+                    }
                 })?;
             Some(coerced)
         } else {

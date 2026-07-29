@@ -62,6 +62,17 @@ steps:
     stdout:
       contains:
       - fragment-outputs-consumed
+- uses: "@://secret-output-masking.steps.yaml"
+  id: secretfrag
+- on: host
+  name: consume secret fragment output
+  run: |
+    test "${{ steps.secretfrag.outputs.token }}" = "steel-toe-secret"
+    echo "secret-fragment-output-consumed"
+  expect:
+    stdout:
+      contains:
+      - secret-fragment-output-consumed
 - uses: "@://fragment-self-outputs.steps.yaml"
 - uses: "@://expressions.steps.yaml"
   with:

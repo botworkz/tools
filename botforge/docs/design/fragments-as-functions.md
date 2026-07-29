@@ -145,7 +145,7 @@ fragment) is valid — ids are fragment-local.
 
 > **Not implemented in Stage 1.** Documented here for completeness per issue #555.
 
-- Steps declare typed `outputs:` (type defaults to `string`).
+- Steps declare typed `outputs:` (`string`/`secret`/`number`/`bool`).
 - A step emits values via `echo NAME=value >> $BF_OUT`.
 - At capture time, the emitted string is coerced to the declared type (hard failure
   by default; opt-in `on_type_error: empty` for leniency).
@@ -162,10 +162,33 @@ fragment) is valid — ids are fragment-local.
 
 ## §5 Secrets Handling
 
-> To be designed in a separate stream (not in this PR).
+Stage 5 adds `type: secret` as a masked-at-display output type.
 
-Outputs/inputs carrying sensitive values (OTPs, tokens) need masking/redaction in
-logs. Not implemented in Stage 1.
+- A `secret` value is stored and propagated exactly like a normal string value.
+- Masking is **declaration-driven only** (`type: secret`), not value-taint tracking.
+- `secret` and non-secret output types are an absolute type-match at fragment
+  boundaries (no silent downgrade).
+
+### Use sinks vs display sinks
+
+- **Use sinks** see the real value:
+  - `${{ steps.<id>.outputs.<name> }}` interpolation into `run:`
+  - `$BF_ENV` writes for downstream step env propagation
+  - `$BF_OUT` capture/re-export round-trips
+- **Display sinks** show `***` for secret-declared values:
+  - value projections used for botforge-authored human-facing output
+  - error/reporting paths that would otherwise embed a secret-declared value
+
+### Steel-toe caps, not a sandbox
+
+This is accidental-leak prevention for botforge-emitted output, not a security
+boundary. A step that legitimately receives a secret can still exfiltrate it.
+
+### Optional secondary safety-net
+
+A best-effort literal scan can additionally redact exact known secret values in
+botforge-emitted lines, but this is explicitly secondary and fragile (it does
+not survive transformations such as encoding or slicing).
 
 ---
 
@@ -206,6 +229,7 @@ graph; `matrix:` / parallelism would attach here in a later stage.
 | **2** | Typed step `outputs:` declaration + `$BF_OUT` capture + coercion/validation | **Done** |
 | **3** | Fragment `outputs:` wiring + step↔fragment type-match enforcement + `id:` on `uses:` + lazy `${{ steps.<id>.outputs.<name> }}` consumption at the fragment boundary | **Done** |
 | **4** | General runtime output-reference namespace (`steps.<id>.outputs.<name>` for run+invoke ids in current scope, plus fragment-self `outputs.<name>`) with deferred/backward resolution | **Done** |
+| **5** | `type: secret` output masking for botforge display/error sinks while preserving real values at use sinks | **Done** |
 
 **Shipped runtime output-reference grammar (Stage 4):**
 - `${{ steps.<id>.outputs.<name> }}` — resolves in the current scope only, against already-executed sibling run/invoke steps.
