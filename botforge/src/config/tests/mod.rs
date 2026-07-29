@@ -44,6 +44,8 @@ fn make_step(target: StepTarget, name: &str) -> TestStep {
         id: None,
         expect: None,
         condition: None,
+        outputs: vec![],
+        captured_outputs: Default::default(),
     })
 }
 
@@ -4423,5 +4425,149 @@ steps:
             !msg.is_empty(),
             "timeout: ${{{{ inputs.t }}}} with unset input must fail: {msg}"
         );
+    }
+}
+
+mod outputs_validation {
+    use super::*;
+    use crate::step::{OutputDecl, OutputType};
+
+    fn make_run_step_with_outputs(name: &str, outputs: Vec<OutputDecl>) -> TestStep {
+        TestStep::Run(RunStep {
+            target: StepTarget::Guest,
+            name: name.to_string(),
+            run: "echo ok".to_string(),
+            timeout: None,
+            shell: None,
+            sudo: None,
+            id: None,
+            expect: None,
+            condition: None,
+            outputs,
+            captured_outputs: Default::default(),
+        })
+    }
+
+    fn decl(name: &str, t: OutputType) -> OutputDecl {
+        OutputDecl {
+            name: name.to_string(),
+            output_type: t,
+            required: false,
+        }
+    }
+
+    // --- closed type set (parse-time) ---
+
+    #[test]
+    fn test_output_type_string_accepted() {
+        let step = make_run_step_with_outputs("s", vec![decl("x", OutputType::String)]);
+        assert!(validate_test_steps(&[step], &[]).is_ok());
+    }
+
+    #[test]
+    fn test_output_type_number_accepted() {
+        let step = make_run_step_with_outputs("s", vec![decl("n", OutputType::Number)]);
+        assert!(validate_test_steps(&[step], &[]).is_ok());
+    }
+
+    #[test]
+    fn test_output_type_bool_accepted() {
+        let step = make_run_step_with_outputs("s", vec![decl("b", OutputType::Bool)]);
+        assert!(validate_test_steps(&[step], &[]).is_ok());
+    }
+
+    #[test]
+    fn test_output_unknown_type_rejected_by_serde() {
+        // The closed type set is enforced by serde's enum deserializer.
+        let yaml =
+            "name: s\nrun: echo ok\ntarget: host\noutputs:\n  - name: x\n    type: integer\n";
+        let err = serde_yaml::from_str::<RunStep>(yaml).unwrap_err();
+        assert!(
+            !err.to_string().is_empty(),
+            "unknown type 'integer' should be rejected at parse time"
+        );
+    }
+
+    #[test]
+    fn test_output_type_list_closed_set_object_rejected() {
+        let yaml = "name: s\nrun: echo ok\ntarget: host\noutputs:\n  - name: x\n    type: object\n";
+        let err = serde_yaml::from_str::<RunStep>(yaml).unwrap_err();
+        assert!(
+            !err.to_string().is_empty(),
+            "type 'object' is not in the closed set"
+        );
+    }
+
+    // --- duplicate output names ---
+
+    #[test]
+    fn test_duplicate_output_names_rejected() {
+        let step = make_run_step_with_outputs(
+            "my-step",
+            vec![
+                decl("result", OutputType::String),
+                decl("result", OutputType::Number),
+            ],
+        );
+        let err = validate_test_steps(&[step], &[]).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("result") || msg.contains("duplicate"),
+            "error should mention the duplicate name: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_duplicate_output_names_rejected_in_build() {
+        let step = make_run_step_with_outputs(
+            "my-step",
+            vec![
+                decl("out", OutputType::Bool),
+                decl("out", OutputType::String),
+            ],
+        );
+        let err = validate_build_steps(&[step]).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("out") || msg.contains("duplicate"),
+            "error should mention the duplicate name: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_no_outputs_is_valid() {
+        let step = make_run_step_with_outputs("s", vec![]);
+        assert!(validate_test_steps(&[step], &[]).is_ok());
+    }
+
+    #[test]
+    fn test_multiple_distinct_outputs_is_valid() {
+        let step = make_run_step_with_outputs(
+            "s",
+            vec![
+                decl("name", OutputType::String),
+                decl("count", OutputType::Number),
+                decl("ready", OutputType::Bool),
+            ],
+        );
+        assert!(validate_test_steps(&[step], &[]).is_ok());
+    }
+
+    // --- required flag roundtrip via YAML ---
+
+    #[test]
+    fn test_output_required_parses_from_yaml() {
+        let yaml =
+            "name: s\nrun: echo ok\noutputs:\n  - name: x\n    type: string\n    required: true\n";
+        let step: RunStep = serde_yaml::from_str(yaml).unwrap();
+        assert!(step.outputs[0].required);
+    }
+
+    #[test]
+    fn test_output_required_false_parses_from_yaml() {
+        let yaml =
+            "name: s\nrun: echo ok\noutputs:\n  - name: x\n    type: number\n    required: false\n";
+        let step: RunStep = serde_yaml::from_str(yaml).unwrap();
+        assert!(!step.outputs[0].required);
     }
 }

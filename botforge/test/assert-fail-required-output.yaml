@@ -1,0 +1,16 @@
+type: botforge/test
+name: assert-fail-required-output
+ports:
+  - 80
+steps:
+  - on: host
+    name: required-output-not-emitted
+    run: |
+      # Intentionally emit nothing — required: true must trigger a hard failure.
+      true
+    outputs:
+      - name: must_emit
+        type: string
+        required: true
+assert:
+  files: {}

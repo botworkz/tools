@@ -1238,6 +1238,8 @@ publish:
             id: None,
             expect: None,
             condition: None,
+            outputs: vec![],
+            captured_outputs: Default::default(),
         });
 
         let config = make_publish_config_with_steps(
@@ -1284,6 +1286,8 @@ publish:
             id: None,
             expect: None,
             condition: None,
+            outputs: vec![],
+            captured_outputs: Default::default(),
         });
 
         let config = make_publish_config_with_steps(
@@ -1335,6 +1339,8 @@ publish:
             id: None,
             expect: None,
             condition: None,
+            outputs: vec![],
+            captured_outputs: Default::default(),
         });
 
         let config = make_publish_config_with_steps(
@@ -1372,6 +1378,8 @@ publish:
                 id: None,
                 expect: None,
                 condition: None,
+                outputs: vec![],
+                captured_outputs: Default::default(),
             }),
             crate::step::TestStep::Run(crate::step::RunStep {
                 name: "read env".to_string(),
@@ -1383,6 +1391,8 @@ publish:
                 id: None,
                 expect: None,
                 condition: None,
+                outputs: vec![],
+                captured_outputs: Default::default(),
             }),
         ];
 
@@ -1415,6 +1425,8 @@ publish:
             id: None,
             expect: None,
             condition: None,
+            outputs: vec![],
+            captured_outputs: Default::default(),
         })];
 
         crate::plan::run_local_steps(context, &steps).unwrap();
@@ -1444,6 +1456,8 @@ publish:
                 id: None,
                 expect: None,
                 condition: None,
+                outputs: vec![],
+                captured_outputs: Default::default(),
             }),
             crate::step::TestStep::Run(crate::step::RunStep {
                 name: "should not run".to_string(),
@@ -1455,6 +1469,8 @@ publish:
                 id: None,
                 expect: None,
                 condition: None,
+                outputs: vec![],
+                captured_outputs: Default::default(),
             }),
         ];
 

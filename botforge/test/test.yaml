@@ -20,6 +20,7 @@ steps:
 - uses: "@://env-sibling-a.steps.yaml"
 - uses: "@://env-sibling-b.steps.yaml"
 - uses: "@://nested-outer.steps.yaml"
+- uses: "@://outputs.steps.yaml"
 - uses: "@://expressions.steps.yaml"
   with:
     str_a: hello
