@@ -375,6 +375,13 @@ jobs:
         filter: '. + {image: "@artifact://foo.qcow2"}'
         output-path: testrepo/assert-fail-svc-env.yaml
         input: botforge/test/assert-fail-svc-env.yaml
+    - name: Create assert-fail-dup-id config
+      uses: envoyproxy/toolshed/actions/jq@303f50e2d2bfcd0259230e3227cd08e8a95f2c69
+      with:
+        input-format: yaml-path
+        filter: '. + {image: "@artifact://foo.qcow2"}'
+        output-path: testrepo/assert-fail-dup-id.yaml
+        input: botforge/test/assert-fail-dup-id.yaml
 
     - name: Print marker (botforge.yaml with inline assets)
       uses: envoyproxy/toolshed/actions/jq@303f50e2d2bfcd0259230e3227cd08e8a95f2c69
@@ -504,6 +511,18 @@ jobs:
           exit 1
         fi
         echo "Negative-control passed: botforge correctly rejected wrong root-only file assertion"
+      working-directory: testrepo
+
+    - name: Negative-control — duplicate scope id must fail to load
+      run: |
+        set -euo pipefail
+        . .botforge.env
+        if botforge test \
+             --test-config assert-fail-dup-id.yaml; then
+          echo "ERROR: botforge should have exited non-zero for duplicate step id within a scope" >&2
+          exit 1
+        fi
+        echo "Negative-control passed: duplicate scope id correctly rejected"
       working-directory: testrepo
 
     - name: Run acceptance tests (docker assert)
