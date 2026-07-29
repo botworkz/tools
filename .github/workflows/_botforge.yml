@@ -153,6 +153,8 @@ jobs:
         cp -a botforge/test/files-fragment.steps.yaml testrepo/
         cp -a botforge/test/fragment-file-fixture.txt testrepo/
         cp -a botforge/test/outputs.steps.yaml testrepo/
+        cp -a botforge/test/fragment-outputs.steps.yaml testrepo/
+        cp -a botforge/test/fragment-outputs-required-missing.steps.yaml testrepo/
         cp -a botforge/test/assert-docker.yaml testrepo/
         cp -a botforge/test/assert-fail-docker-running.yaml testrepo/
         cp -a botforge/test/assert-fail-docker-network.yaml testrepo/
@@ -390,6 +392,13 @@ jobs:
         filter: '. + {image: "@artifact://foo.qcow2"}'
         output-path: testrepo/assert-fail-required-output.yaml
         input: botforge/test/assert-fail-required-output.yaml
+    - name: Create assert-fail-required-fragment-output config
+      uses: envoyproxy/toolshed/actions/jq@303f50e2d2bfcd0259230e3227cd08e8a95f2c69
+      with:
+        input-format: yaml-path
+        filter: '. + {image: "@artifact://foo.qcow2"}'
+        output-path: testrepo/assert-fail-required-fragment-output.yaml
+        input: botforge/test/assert-fail-required-fragment-output.yaml
 
     - name: Print marker (botforge.yaml with inline assets)
       uses: envoyproxy/toolshed/actions/jq@303f50e2d2bfcd0259230e3227cd08e8a95f2c69
@@ -543,6 +552,21 @@ jobs:
           exit 1
         fi
         echo "Negative-control passed: required output correctly enforced"
+      working-directory: testrepo
+
+    - name: Negative-control — required fragment output not emitted must fail
+      run: |
+        set -euo pipefail
+        . .botforge.env
+        # Stage 3 boundary enforcement: the fragment declares a `required: true`
+        # output whose inner step emits nothing — resolution at the invoke
+        # boundary MUST fail, proving required fragment outputs bite.
+        if botforge test \
+             --test-config assert-fail-required-fragment-output.yaml; then
+          echo "ERROR: botforge should have exited non-zero for required fragment output not emitted" >&2
+          exit 1
+        fi
+        echo "Negative-control passed: required fragment output correctly enforced"
       working-directory: testrepo
 
     - name: Run acceptance tests (docker assert)

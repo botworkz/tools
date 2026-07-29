@@ -2739,10 +2739,8 @@ steps:
         #[test]
         fn test_resolve_step_output_refs_rejects_non_steps_expression() {
             let err =
-                resolve_step_output_refs_in_string("${{ inputs.x }}", &mut |_, _| {
-                    unreachable!()
-                })
-                .unwrap_err();
+                resolve_step_output_refs_in_string("${{ inputs.x }}", &mut |_, _| unreachable!())
+                    .unwrap_err();
             assert!(format!("{err:#}").contains("unexpected unresolved expression"));
         }
     }

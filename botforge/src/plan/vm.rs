@@ -436,8 +436,10 @@ fn run_steps_inner(
                 // Lazy resolution: substitute `${{ steps.<id>.outputs.<name> }}`
                 // references in the run body against already-executed `Invoke`
                 // siblings earlier in this scope (backward-only, hard error otherwise).
-                let step_result = resolve_run_step_output_refs(run, &steps[..step_idx])
-                    .and_then(|run_body| run_run_step(context, &display, run, &run_body, accumulated_env));
+                let step_result =
+                    resolve_run_step_output_refs(run, &steps[..step_idx]).and_then(|run_body| {
+                        run_run_step(context, &display, run, &run_body, accumulated_env)
+                    });
                 print_step_status(
                     &display,
                     step.display_name(),
@@ -1756,67 +1758,62 @@ pub(crate) fn run_local_steps(context: &Path, steps: &[TestStep]) -> Result<()> 
                 let env_file = std::env::temp_dir().join(format!("botforge-publish-env-{suffix}"));
                 let out_file = std::env::temp_dir().join(format!("botforge-publish-out-{suffix}"));
 
-                let step_result: Result<()> = resolve_run_step_output_refs(
-                    run,
-                    &steps[..step_idx],
-                )
-                .and_then(|run_body| {
-                    if let Some(expect) = &run.expect {
-                        let (capture, actual_exit) = run_host_step_capturing(
-                            &run.name,
-                            &run_body,
-                            context,
-                            budget,
-                            &template,
-                            &accumulated_env,
-                            HostStepFiles {
-                                env_file: &env_file,
-                                out_file: &out_file,
-                                log_path: &log_path,
-                            },
-                        )
-                        .with_context(|| {
-                            format!("publish step '{}' command failed", run.name)
-                        })?;
+                let step_result: Result<()> = resolve_run_step_output_refs(run, &steps[..step_idx])
+                    .and_then(|run_body| {
+                        if let Some(expect) = &run.expect {
+                            let (capture, actual_exit) = run_host_step_capturing(
+                                &run.name,
+                                &run_body,
+                                context,
+                                budget,
+                                &template,
+                                &accumulated_env,
+                                HostStepFiles {
+                                    env_file: &env_file,
+                                    out_file: &out_file,
+                                    log_path: &log_path,
+                                },
+                            )
+                            .with_context(|| {
+                                format!("publish step '{}' command failed", run.name)
+                            })?;
 
-                        if let Ok(contents) = std::fs::read_to_string(&env_file) {
-                            if let Ok(new_entries) = parse_env_file(&contents) {
-                                env_merge(&mut accumulated_env, new_entries);
-                            }
-                        }
-                        let _ = std::fs::remove_file(&env_file);
-                        let _ = std::fs::remove_file(&out_file);
-                        check_expect_block(&run.name, expect, &capture, actual_exit)
-                    } else {
-                        let result = run_host_step(
-                            &run.name,
-                            &run_body,
-                            context,
-                            budget,
-                            &template,
-                            &accumulated_env,
-                            HostStepFiles {
-                                env_file: &env_file,
-                                out_file: &out_file,
-                                log_path: &log_path,
-                            },
-                        )
-                        .with_context(|| {
-                            format!("publish step '{}' command failed", run.name)
-                        });
-
-                        if result.is_ok() {
                             if let Ok(contents) = std::fs::read_to_string(&env_file) {
                                 if let Ok(new_entries) = parse_env_file(&contents) {
                                     env_merge(&mut accumulated_env, new_entries);
                                 }
                             }
+                            let _ = std::fs::remove_file(&env_file);
+                            let _ = std::fs::remove_file(&out_file);
+                            check_expect_block(&run.name, expect, &capture, actual_exit)
+                        } else {
+                            let result = run_host_step(
+                                &run.name,
+                                &run_body,
+                                context,
+                                budget,
+                                &template,
+                                &accumulated_env,
+                                HostStepFiles {
+                                    env_file: &env_file,
+                                    out_file: &out_file,
+                                    log_path: &log_path,
+                                },
+                            )
+                            .with_context(|| format!("publish step '{}' command failed", run.name));
+
+                            if result.is_ok() {
+                                if let Ok(contents) = std::fs::read_to_string(&env_file) {
+                                    if let Ok(new_entries) = parse_env_file(&contents) {
+                                        env_merge(&mut accumulated_env, new_entries);
+                                    }
+                                }
+                            }
+                            let _ = std::fs::remove_file(&env_file);
+                            let _ = std::fs::remove_file(&out_file);
+                            result
                         }
-                        let _ = std::fs::remove_file(&env_file);
-                        let _ = std::fs::remove_file(&out_file);
-                        result
-                    }
-                });
+                    });
 
                 print_step_status(
                     &display,
