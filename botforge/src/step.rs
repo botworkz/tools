@@ -2,8 +2,9 @@ use anyhow::{Context, Result};
 use serde::de::{self, Deserializer};
 use serde::Deserialize;
 use serde_yaml::Value;
+use std::collections::BTreeMap;
 
-use crate::config::{yaml_scalar_to_string, yaml_scalar_truthiness};
+use crate::config::{is_pure_deferred_output_ref, yaml_scalar_to_string, yaml_scalar_truthiness};
 
 /// The declared type of a step output.
 ///
@@ -317,6 +318,28 @@ impl ExpectBlock {
     }
 }
 
+/// Runtime condition for a step's `if:` field.
+///
+/// - `Always`: `if:` was absent or evaluated to `null` — run unconditionally.
+/// - `Resolved(b)`: expression was fully evaluated at load time — skip when `false`.
+/// - `Deferred(expr)`: a pure `${{ steps.X.outputs.Y }}` or `${{ outputs.Y }}` ref
+///   that could not be evaluated at load time; resolved lazily at execution time.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum StepCondition {
+    /// No `if:` field (or `null`) — always run.
+    Always,
+    /// Fully resolved at load time.
+    Resolved(bool),
+    /// Deferred `${{ steps.*... }}` / `${{ outputs.* }}` ref — resolved at runtime.
+    Deferred(String),
+}
+
+impl Default for StepCondition {
+    fn default() -> Self {
+        StepCondition::Always
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RunStep {
@@ -360,12 +383,14 @@ pub(crate) struct RunStep {
     ///
     /// Expression syntax (`${{ ... }}`) is evaluated before deserialization; this
     /// field receives the resulting scalar and applies the same truthiness coercion.
+    /// A pure `${{ steps.X.outputs.Y }}` or `${{ outputs.Y }}` ref that survives the
+    /// load-time passes is stored as `StepCondition::Deferred` and resolved at runtime.
     #[serde(
         rename = "if",
         default,
         deserialize_with = "deserialize_step_condition"
     )]
-    pub(crate) condition: Option<bool>,
+    pub(crate) condition: StepCondition,
     /// Typed output declarations for this step.
     ///
     /// When the step runs, `BF_OUT` is set to a writable file; the step body
@@ -392,9 +417,14 @@ impl RunStep {
     }
 
     /// Returns `true` when the step should run, `false` when it should be skipped.
-    /// Absent `if:` (stored as `None`) is treated as truthy — run as normal.
+    ///
+    /// `Always` and `Deferred` are both optimistically truthy at this point —
+    /// `Deferred` is resolved properly at runtime by the executor.
     pub(crate) fn condition_enabled(&self) -> bool {
-        self.condition.unwrap_or(true)
+        match &self.condition {
+            StepCondition::Always | StepCondition::Deferred(_) => true,
+            StepCondition::Resolved(b) => *b,
+        }
     }
 }
 
@@ -475,6 +505,18 @@ pub(crate) struct InvokeStep {
     /// finish by resolving these declarations against the inner steps' own
     /// `captured_outputs` slots.
     pub(crate) output_decls: Vec<FragmentOutputDecl>,
+    /// `with:` values that contained deferred output references (`${{ steps.X.outputs.Y }}`).
+    ///
+    /// At load time these raw expression strings were substituted into the fragment YAML as
+    /// the literal input values (so `${{ inputs.otp }}` became `${{ steps.admin.outputs.otp }}`
+    /// inside the fragment body). At runtime the executor resolves these expressions against
+    /// already-executed sibling steps in the calling scope BEFORE the fragment's inner steps
+    /// run, and passes the resolved values as inherited step-output refs into the child
+    /// execution context.
+    ///
+    /// Key: the fragment input name. Value: the raw `with:` YAML value (a string containing
+    /// a `${{ steps.* }}` or `${{ outputs.* }}` expression).
+    pub(crate) deferred_with: BTreeMap<String, Value>,
     /// Captured and coerced re-exported output values, populated after all inner
     /// steps have executed successfully.
     ///
@@ -578,15 +620,29 @@ where
 /// - non-empty strings (incl. `"false"`, `"0"`) → truthy (R6: non-empty string is ALWAYS truthy)
 /// - `Bool(true)` / non-zero numbers → truthy
 ///
+/// A pure `${{ steps.X.outputs.Y }}` or `${{ outputs.Y }}` expression that survived the
+/// load-time passes is stored as `StepCondition::Deferred` and resolved at runtime.
+///
 /// Do NOT add implicit string→typed coercion here. `if: "false"` (string) must run.
 fn deserialize_step_condition<'de, D>(
     deserializer: D,
-) -> std::result::Result<Option<bool>, D::Error>
+) -> std::result::Result<StepCondition, D::Error>
 where
     D: Deserializer<'de>,
 {
     let value = Value::deserialize(deserializer)?;
-    yaml_scalar_truthiness(&value).map_err(de::Error::custom)
+    // A surviving pure `${{ steps.*/outputs.* }}` ref: store as Deferred for runtime resolution.
+    if let Value::String(ref s) = value {
+        if is_pure_deferred_output_ref(s) {
+            return Ok(StepCondition::Deferred(s.clone()));
+        }
+    }
+    yaml_scalar_truthiness(&value)
+        .map_err(de::Error::custom)
+        .map(|opt_bool| match opt_bool {
+            None => StepCondition::Always,
+            Some(b) => StepCondition::Resolved(b),
+        })
 }
 
 /// Deserialize a required string field that may receive a typed YAML scalar (Number/Bool)
@@ -668,7 +724,7 @@ pub(crate) fn resolve_shell(shell: Option<&str>) -> Result<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_shell, RunStep, StepTarget};
+    use super::{resolve_shell, RunStep, StepCondition, StepTarget};
 
     #[test]
     fn test_resolve_shell_absent_returns_bash_template() {
@@ -1004,7 +1060,7 @@ expect:
     #[test]
     fn test_if_absent_is_none() {
         let step: RunStep = serde_yaml::from_str("name: s\nrun: echo ok\n").unwrap();
-        assert_eq!(step.condition, None);
+        assert_eq!(step.condition, StepCondition::Always);
         assert!(
             step.condition_enabled(),
             "absent if: should default to enabled"
@@ -1014,14 +1070,14 @@ expect:
     #[test]
     fn test_if_bool_true_is_some_true() {
         let step: RunStep = serde_yaml::from_str("name: s\nrun: echo ok\nif: true\n").unwrap();
-        assert_eq!(step.condition, Some(true));
+        assert_eq!(step.condition, StepCondition::Resolved(true));
         assert!(step.condition_enabled());
     }
 
     #[test]
     fn test_if_bool_false_is_some_false() {
         let step: RunStep = serde_yaml::from_str("name: s\nrun: echo ok\nif: false\n").unwrap();
-        assert_eq!(step.condition, Some(false));
+        assert_eq!(step.condition, StepCondition::Resolved(false));
         assert!(!step.condition_enabled());
     }
 
@@ -1033,7 +1089,7 @@ expect:
                 .unwrap_or_else(|e| panic!("should parse if: {value} as truthy: {e}"));
             assert_eq!(
                 step.condition,
-                Some(true),
+                StepCondition::Resolved(true),
                 "if: {value} should be Some(true)"
             );
             assert!(step.condition_enabled(), "if: {value} should be enabled");
@@ -1048,7 +1104,7 @@ expect:
             .unwrap_or_else(|e| panic!("should parse if: {value} as falsy: {e}"));
         assert_eq!(
             step.condition,
-            Some(false),
+            StepCondition::Resolved(false),
             "if: {value} should be Some(false)"
         );
         assert!(!step.condition_enabled(), "if: {value} should be disabled");
@@ -1061,7 +1117,11 @@ expect:
             let yaml = format!("name: s\nrun: echo ok\nif: {value}\n");
             let step: RunStep = serde_yaml::from_str(&yaml)
                 .unwrap_or_else(|e| panic!("should accept if: {value}: {e}"));
-            assert_eq!(step.condition, Some(true), "if: {value} should be truthy");
+            assert_eq!(
+                step.condition,
+                StepCondition::Resolved(true),
+                "if: {value} should be truthy"
+            );
         }
     }
 
@@ -1069,18 +1129,18 @@ expect:
     fn test_if_expression_placeholder_is_truthy_string_when_unresolved() {
         let step: RunStep =
             serde_yaml::from_str("name: s\nrun: echo ok\nif: \"${{ inputs.flag }}\"\n").unwrap();
-        assert_eq!(step.condition, Some(true));
+        assert_eq!(step.condition, StepCondition::Resolved(true));
         assert!(step.condition_enabled());
     }
 
     #[test]
     fn test_if_number_truthiness() {
         let step: RunStep = serde_yaml::from_str("name: s\nrun: echo ok\nif: 2\n").unwrap();
-        assert_eq!(step.condition, Some(true));
+        assert_eq!(step.condition, StepCondition::Resolved(true));
         assert!(step.condition_enabled());
 
         let step: RunStep = serde_yaml::from_str("name: s\nrun: echo ok\nif: 0\n").unwrap();
-        assert_eq!(step.condition, Some(false));
+        assert_eq!(step.condition, StepCondition::Resolved(false));
         assert!(!step.condition_enabled());
     }
 

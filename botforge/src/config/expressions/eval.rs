@@ -235,3 +235,115 @@ fn is_deferred_namespace(active_namespace: &str, namespace: &str) -> bool {
             ("inputs", "args") | ("args", "inputs")
         )
 }
+
+// ---------------------------------------------------------------------------
+// Runtime resolution (second pass: steps.* / outputs.*)
+// ---------------------------------------------------------------------------
+
+/// Resolver closures supplied by the executor for runtime deferred-ref resolution.
+///
+/// Passed to [`evaluate_expression_span_runtime`]; the closures look up already-executed
+/// step outputs from the enclosing execution scope.
+pub(super) struct RuntimeResolver<'a> {
+    pub(super) resolve_step: &'a mut dyn FnMut(&str, &str) -> anyhow::Result<EvaluatedValue>,
+    pub(super) resolve_output: &'a mut dyn FnMut(&str) -> anyhow::Result<EvaluatedValue>,
+}
+
+/// Evaluate a `${{ expr }}` span at runtime, resolving `steps.*` / `outputs.*` refs via `resolver`.
+///
+/// Unlike the load-time [`evaluate_expression_span`], this function:
+/// - Resolves `StepOutputReference` / `FragmentOutputReference` through the provided closures.
+/// - Returns a fully typed [`EvaluatedValue`] (never `Deferred`).
+/// - Treats any surviving `inputs.*` / `args.*` reference as a hard error (they must have been
+///   resolved at load time).
+pub(super) fn evaluate_expression_span_runtime(
+    expr: &str,
+    resolver: &mut RuntimeResolver<'_>,
+) -> anyhow::Result<EvaluatedValue> {
+    let parsed = super::parser::Parser::parse(expr)?;
+    evaluate_node_runtime(&parsed, resolver)
+}
+
+fn evaluate_node_runtime(
+    node: &ExprNode,
+    resolver: &mut RuntimeResolver<'_>,
+) -> anyhow::Result<EvaluatedValue> {
+    match node {
+        ExprNode::String(text) => Ok(EvaluatedValue::String(text.clone())),
+        ExprNode::Number(n) => Ok(EvaluatedValue::Number(*n)),
+        ExprNode::Bool(b) => Ok(EvaluatedValue::Bool(*b)),
+
+        ExprNode::Reference { namespace, name } => anyhow::bail!(
+            "unexpected '${{{{{namespace}.{name}}}}}' at execution time; \
+             load-time substitution should have resolved this reference"
+        ),
+
+        ExprNode::StepOutputReference {
+            step_id,
+            output_name,
+        } => (resolver.resolve_step)(step_id, output_name),
+
+        ExprNode::FragmentOutputReference { output_name } => (resolver.resolve_output)(output_name),
+
+        ExprNode::FunctionCall { name, arg } => {
+            let val = evaluate_node_runtime(arg, resolver)?;
+            match name.as_str() {
+                "to_json" => Ok(EvaluatedValue::String(val.to_json_string())),
+                "from_json" => {
+                    let json_str = match val {
+                        EvaluatedValue::String(s) => s,
+                        other => {
+                            anyhow::bail!("from_json() requires a string argument, got {:?}", other)
+                        }
+                    };
+                    parse_from_json(&json_str)
+                }
+                unknown => anyhow::bail!(
+                    "unknown function '{}'; supported functions: to_json, from_json",
+                    unknown
+                ),
+            }
+        }
+
+        ExprNode::Not(expr) => Ok(EvaluatedValue::Bool(
+            !evaluate_node_runtime(expr, resolver)?.truthy(),
+        )),
+
+        ExprNode::Equal(lhs, rhs) => {
+            let lhs = evaluate_node_runtime(lhs, resolver)?;
+            let rhs = evaluate_node_runtime(rhs, resolver)?;
+            Ok(EvaluatedValue::Bool(runtime_values_equal(&lhs, &rhs)))
+        }
+        ExprNode::NotEqual(lhs, rhs) => {
+            let lhs = evaluate_node_runtime(lhs, resolver)?;
+            let rhs = evaluate_node_runtime(rhs, resolver)?;
+            Ok(EvaluatedValue::Bool(!runtime_values_equal(&lhs, &rhs)))
+        }
+
+        ExprNode::And(lhs, rhs) => {
+            let lhs_val = evaluate_node_runtime(lhs, resolver)?;
+            if !lhs_val.truthy() {
+                return Ok(lhs_val);
+            }
+            evaluate_node_runtime(rhs, resolver)
+        }
+
+        ExprNode::Or(lhs, rhs) => {
+            let lhs_val = evaluate_node_runtime(lhs, resolver)?;
+            if lhs_val.truthy() {
+                return Ok(lhs_val);
+            }
+            evaluate_node_runtime(rhs, resolver)
+        }
+    }
+}
+
+fn runtime_values_equal(lhs: &EvaluatedValue, rhs: &EvaluatedValue) -> bool {
+    match (lhs, rhs) {
+        (EvaluatedValue::String(a), EvaluatedValue::String(b)) => a == b,
+        (EvaluatedValue::Number(a), EvaluatedValue::Number(b)) => a == b,
+        (EvaluatedValue::Bool(a), EvaluatedValue::Bool(b)) => a == b,
+        (EvaluatedValue::Empty, EvaluatedValue::Empty) => true,
+        _ => false,
+    }
+}

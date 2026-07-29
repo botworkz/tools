@@ -22,8 +22,8 @@ use self::expressions::{
     substitute_inputs_in_value,
 };
 pub(crate) use self::expressions::{
-    resolve_output_refs_in_string, yaml_scalar_to_string, yaml_scalar_truthiness,
-    DeferredOutputReference,
+    is_pure_deferred_output_ref, resolve_deferred_condition, resolve_deferred_refs_in_string,
+    yaml_scalar_to_string, yaml_scalar_truthiness, EvaluatedValue,
 };
 use crate::assert::{parse_assert_block, validate_assert_block, AssertBlock};
 use crate::plan::files::FileEntry;
@@ -1087,6 +1087,22 @@ fn expand_test_steps(
                 include_stack.pop();
                 let (fragment_steps, fragment_cloud_init, raw_output_decls) = result?;
 
+                // Collect any `with:` values that contain deferred output references.
+                // These are validated against the outer scope at semantic-validation time,
+                // and resolved against the outer scope's prior steps at runtime.
+                let deferred_with: BTreeMap<String, Value> = include
+                    .with
+                    .iter()
+                    .filter(|(_, v)| {
+                        if let Value::String(s) = v {
+                            s.contains("${{")
+                        } else {
+                            false
+                        }
+                    })
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+
                 // Validate per-scope id uniqueness for this fragment's own scope.
                 validate_scope_step_ids(&fragment_steps, &include_path.display().to_string())?;
 
@@ -1104,6 +1120,7 @@ fn expand_test_steps(
                     id: include.id.clone(),
                     steps: fragment_steps,
                     output_decls,
+                    deferred_with,
                     captured_outputs: std::cell::RefCell::new(None),
                 }));
 
@@ -1667,13 +1684,17 @@ struct ScopeOutputContract {
 /// Runtime ordering constraints remain runtime errors: this pass validates only
 /// scope membership and declared-output existence.
 fn validate_deferred_output_references(steps: &[TestStep], scope_description: &str) -> Result<()> {
-    validate_deferred_output_references_in_scope(steps, scope_description, None)
+    validate_deferred_output_references_in_scope(steps, scope_description, None, &HashSet::new())
 }
 
 fn validate_deferred_output_references_in_scope(
     steps: &[TestStep],
     scope_description: &str,
     fragment_outputs: Option<&[FragmentOutputDecl]>,
+    // Step-output ref pairs (step_id, output_name) that were injected into this scope via
+    // deferred `with:` input substitution from the calling scope.  These are validated
+    // against the calling scope's contracts and must NOT be re-validated here.
+    allowed_external_refs: &HashSet<(String, String)>,
 ) -> Result<()> {
     let mut scope_contracts: HashMap<String, ScopeOutputContract> = HashMap::new();
     for step in steps {
@@ -1716,18 +1737,96 @@ fn validate_deferred_output_references_in_scope(
                     &scope_contracts,
                     scope_description,
                     fragment_outputs,
+                    allowed_external_refs,
                 )?;
             }
             TestStep::Invoke(invoke) => {
+                // Validate this invoke's deferred_with values against the current (outer) scope.
+                let mut child_allowed_external_refs: HashSet<(String, String)> = HashSet::new();
+                for (_, raw_value) in &invoke.deferred_with {
+                    if let Value::String(s) = raw_value {
+                        resolve_deferred_refs_in_string(
+                            s,
+                            &mut |step_id: &str, output_name: &str| {
+                                // Validate against OUTER scope contracts.
+                                validate_deferred_step_ref(
+                                    &invoke.uses,
+                                    &scope_contracts,
+                                    scope_description,
+                                    step_id,
+                                    output_name,
+                                )?;
+                                // Record this ref as allowed in the inner scope.
+                                child_allowed_external_refs
+                                    .insert((step_id.to_string(), output_name.to_string()));
+                                Ok(EvaluatedValue::Empty)
+                            },
+                            &mut |output_name: &str| {
+                                // outputs.* is not valid in outer-scope with: values.
+                                anyhow::bail!(
+                                    "fragment '{}': '${{{{ outputs.{} }}}}' is not valid in \
+                                     a 'with:' call-site value (outputs.* is only available \
+                                     inside a fragment's own steps, not at the call site)",
+                                    invoke.uses,
+                                    output_name
+                                )
+                            },
+                        )
+                        .with_context(|| {
+                            format!(
+                                "invalid deferred 'with:' value in '{}' (scope: {})",
+                                invoke.uses, scope_description
+                            )
+                        })?;
+                    }
+                }
+                // Recurse into the inner scope, passing the refs that were injected via with:
+                // as allowed external refs (they were already validated against the outer scope).
                 let child_scope = format!("{scope_description} -> {}", invoke.uses);
                 validate_deferred_output_references_in_scope(
                     &invoke.steps,
                     &child_scope,
                     Some(&invoke.output_decls),
+                    &child_allowed_external_refs,
                 )?;
             }
             TestStep::Archive(_) => {}
         }
+    }
+    Ok(())
+}
+
+/// Validate a `steps.STEP_ID.outputs.OUTPUT_NAME` reference against `scope_contracts`.
+fn validate_deferred_step_ref(
+    step_name: &str,
+    scope_contracts: &HashMap<String, ScopeOutputContract>,
+    scope_description: &str,
+    step_id: &str,
+    output_name: &str,
+) -> Result<()> {
+    let Some(contract) = scope_contracts.get(step_id) else {
+        anyhow::bail!(
+            "step '{}': reference '${{{{ steps.{}.outputs.{} }}}}' is invalid: \
+             no step with id '{}' exists in scope '{}' (inner fragment steps are private; \
+             reference the fragment invocation id instead)",
+            step_name,
+            step_id,
+            output_name,
+            step_id,
+            scope_description
+        );
+    };
+    if !contract.output_names.contains(output_name) {
+        anyhow::bail!(
+            "step '{}': reference '${{{{ steps.{}.outputs.{} }}}}' is invalid: \
+             {} '{}' does not declare output '{}'",
+            step_name,
+            step_id,
+            output_name,
+            contract.step_kind,
+            step_id,
+            output_name
+        );
     }
     Ok(())
 }
@@ -1737,62 +1836,47 @@ fn validate_run_step_deferred_output_references(
     scope_contracts: &HashMap<String, ScopeOutputContract>,
     scope_description: &str,
     fragment_outputs: Option<&[FragmentOutputDecl]>,
+    allowed_external_refs: &HashSet<(String, String)>,
 ) -> Result<()> {
-    resolve_output_refs_in_string(&step.run, &mut |reference| {
-        match reference {
-            DeferredOutputReference::StepOutput {
+    resolve_deferred_refs_in_string(
+        &step.run,
+        &mut |step_id: &str, output_name: &str| {
+            // Skip refs that were injected from the outer scope via with: input substitution.
+            if allowed_external_refs.contains(&(step_id.to_string(), output_name.to_string())) {
+                return Ok(EvaluatedValue::Empty);
+            }
+            validate_deferred_step_ref(
+                &step.name,
+                scope_contracts,
+                scope_description,
                 step_id,
                 output_name,
-            } => {
-                let Some(contract) = scope_contracts.get(step_id.as_str()) else {
-                    anyhow::bail!(
-                        "step '{}': reference '${{{{ steps.{}.outputs.{} }}}}' is invalid: \
-                         no step with id '{}' exists in scope '{}' (inner fragment steps are private; \
-                         reference the fragment invocation id instead)",
-                        step.name,
-                        step_id,
-                        output_name,
-                        step_id,
-                        scope_description
-                    );
-                };
-                if !contract.output_names.contains(output_name.as_str()) {
-                    anyhow::bail!(
-                        "step '{}': reference '${{{{ steps.{}.outputs.{} }}}}' is invalid: \
-                         {} '{}' does not declare output '{}'",
-                        step.name,
-                        step_id,
-                        output_name,
-                        contract.step_kind,
-                        step_id,
-                        output_name
-                    );
-                }
+            )?;
+            Ok(EvaluatedValue::Empty)
+        },
+        &mut |output_name: &str| {
+            let Some(decls) = fragment_outputs else {
+                anyhow::bail!(
+                    "step '{}': reference '${{{{ outputs.{} }}}}' is invalid: \
+                     outputs.* is only available inside fragment scopes",
+                    step.name,
+                    output_name
+                );
+            };
+            if !decls.iter().any(|decl| decl.name == output_name) {
+                anyhow::bail!(
+                    "step '{}': reference '${{{{ outputs.{} }}}}' is invalid: \
+                     fragment scope '{}' does not declare output '{}'",
+                    step.name,
+                    output_name,
+                    scope_description,
+                    output_name
+                );
             }
-            DeferredOutputReference::FragmentOutput { output_name } => {
-                let Some(decls) = fragment_outputs else {
-                    anyhow::bail!(
-                        "step '{}': reference '${{{{ outputs.{} }}}}' is invalid: \
-                         outputs.* is only available inside fragment scopes",
-                        step.name,
-                        output_name
-                    );
-                };
-                if !decls.iter().any(|decl| decl.name == output_name) {
-                    anyhow::bail!(
-                        "step '{}': reference '${{{{ outputs.{} }}}}' is invalid: \
-                         fragment scope '{}' does not declare output '{}'",
-                        step.name,
-                        output_name,
-                        scope_description,
-                        output_name
-                    );
-                }
-            }
-        }
-        Ok(String::new())
-    })?;
-    Ok(())
+            Ok(EvaluatedValue::Empty)
+        },
+    )
+    .map(|_| ())
 }
 
 /// Validate the `outputs:` declarations on a single run step.
