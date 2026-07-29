@@ -557,28 +557,112 @@ fn substitute_namespace_in_string(
 ///   — the two-pass deferral means it can't be resolved.
 /// - A top-level step (not from a fragment) that mistakenly uses `inputs.*` refs.
 ///
+/// # Exception: `${{ steps.<id>.outputs.<name> }}` in `run:` fields
+/// A **pure** step-output reference (the whole span is exactly one
+/// `steps.<id>.outputs.<name>` reference, no operators) is allowed to survive the
+/// load-time passes **only inside a `run:` field** — its value does not exist until
+/// the referenced `uses:` step has executed, so it is resolved lazily at execution
+/// time by [`resolve_step_output_refs_in_string`]. Anywhere else (or combined with
+/// operators/other references) it remains a hard load-time error.
+///
 /// Callers MUST invoke this immediately after [`substitute_args_in_value`].
 fn check_no_residual_expressions(value: &Value) -> Result<()> {
+    check_no_residual_expressions_inner(value, false)
+}
+
+fn check_no_residual_expressions_inner(value: &Value, in_run_field: bool) -> Result<()> {
     match value {
-        Value::String(text) => {
-            if let Some(start) = text.find("${{") {
-                let snippet = match text[start..].find("}}") {
-                    Some(offset) => &text[start..start + offset + 2],
-                    None => &text[start..],
-                };
-                anyhow::bail!(
-                    "unresolved expression after final substitution pass: '{}'; \
-                     check for unknown namespaces, typos, or cross-namespace \
-                     expressions that cannot be evaluated in a single pass",
-                    snippet
-                );
-            }
-            Ok(())
-        }
-        Value::Sequence(items) => items.iter().try_for_each(check_no_residual_expressions),
-        Value::Mapping(entries) => entries.values().try_for_each(check_no_residual_expressions),
+        Value::String(text) => check_no_residual_expressions_in_str(text, in_run_field),
+        Value::Sequence(items) => items
+            .iter()
+            .try_for_each(|item| check_no_residual_expressions_inner(item, in_run_field)),
+        Value::Mapping(entries) => entries.iter().try_for_each(|(key, val)| {
+            let is_run = key.as_str() == Some("run");
+            check_no_residual_expressions_inner(val, is_run)
+        }),
         _ => Ok(()),
     }
+}
+
+fn check_no_residual_expressions_in_str(text: &str, in_run_field: bool) -> Result<()> {
+    let mut rest = text;
+    while let Some(start) = rest.find("${{") {
+        let after_open = &rest[start + 3..];
+        let Some(end) = after_open.find("}}") else {
+            anyhow::bail!(
+                "unresolved expression after final substitution pass: '{}'; \
+                 check for unknown namespaces, typos, or cross-namespace \
+                 expressions that cannot be evaluated in a single pass",
+                &rest[start..]
+            );
+        };
+        let expr = after_open[..end].trim();
+        let is_pure_step_output_ref = matches!(
+            parser::Parser::parse(expr),
+            Ok(parser::ExprNode::StepOutputReference { .. })
+        );
+        if !is_pure_step_output_ref {
+            anyhow::bail!(
+                "unresolved expression after final substitution pass: '{}'; \
+                 check for unknown namespaces, typos, or cross-namespace \
+                 expressions that cannot be evaluated in a single pass",
+                &rest[start..start + 3 + end + 2]
+            );
+        }
+        if !in_run_field {
+            anyhow::bail!(
+                "step output reference '{}' is only supported in 'run:' fields \
+                 (resolved at execution time)",
+                &rest[start..start + 3 + end + 2]
+            );
+        }
+        rest = &after_open[end + 2..];
+    }
+    Ok(())
+}
+
+/// Resolve `${{ steps.<id>.outputs.<name> }}` references in a step's `run:` body
+/// at execution time.
+///
+/// This is the narrow **runtime** substitution entry point for the one deferred
+/// reference kind: fragment-invocation output references. All other `${{ }}`
+/// expressions were resolved (or rejected) at load time, so any span found here
+/// must be a pure step-output reference — anything else is a hard error
+/// (defensive; load-time Invariant A already rejects it).
+///
+/// `resolve` maps `(step_id, output_name)` to the projected string value, or
+/// returns an error when the reference cannot be resolved (unknown id, forward
+/// reference, run-step id, unknown output name).
+pub(crate) fn resolve_step_output_refs_in_string(
+    text: &str,
+    resolve: &mut dyn FnMut(&str, &str) -> Result<std::string::String>,
+) -> Result<std::string::String> {
+    if !text.contains("${{") {
+        return Ok(text.to_string());
+    }
+    let mut rendered = std::string::String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("${{") {
+        rendered.push_str(&rest[..start]);
+        let after_open = &rest[start + 3..];
+        let end = after_open
+            .find("}}")
+            .ok_or_else(|| anyhow::anyhow!("unterminated expression in '{text}'"))?;
+        let expr = after_open[..end].trim();
+        match parser::Parser::parse(expr)? {
+            parser::ExprNode::StepOutputReference {
+                step_id,
+                output_name,
+            } => rendered.push_str(&resolve(&step_id, &output_name)?),
+            _ => anyhow::bail!(
+                "unexpected unresolved expression '${{{{ {expr} }}}}' at execution time; \
+                 only steps.<id>.outputs.<name> references are resolved at runtime"
+            ),
+        }
+        rest = &after_open[end + 2..];
+    }
+    rendered.push_str(rest);
+    Ok(rendered)
 }
 
 // ---------------------------------------------------------------------------
@@ -2440,6 +2524,226 @@ steps:
                 Some(42),
                 "timeout: ${{number_input}} must be 42"
             );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // `steps.<id>.outputs.<name>` reference tests (Stage 3 boundary consumption)
+    // -----------------------------------------------------------------------
+
+    mod step_output_refs {
+        use super::*;
+        use crate::config::load_test_config;
+        use crate::step::TestStep;
+        use tempfile::TempDir;
+
+        /// A pure step-output reference in a `run:` field survives load-time
+        /// substitution untouched (deferred to runtime).
+        #[test]
+        fn test_steps_ref_in_run_field_survives_load() {
+            let repo = TempDir::new().unwrap();
+            std::fs::write(
+                repo.path().join("test.yaml"),
+                r#"
+type: botforge/test
+name: test
+ports:
+  - 80
+steps:
+  - on: host
+    name: consumer
+    run: echo ${{ steps.build.outputs.version }}
+"#,
+            )
+            .unwrap();
+
+            let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+            let TestStep::Run(step) = &config.steps[0] else {
+                panic!("expected run step");
+            };
+            assert_eq!(step.run.trim(), "echo ${{ steps.build.outputs.version }}");
+        }
+
+        /// A step-output reference inside a fragment's `run:` also survives both
+        /// load-time passes (inputs + args) untouched.
+        #[test]
+        fn test_steps_ref_in_fragment_run_field_survives_load() {
+            let repo = TempDir::new().unwrap();
+            std::fs::create_dir_all(repo.path().join("shared")).unwrap();
+            std::fs::write(
+                repo.path().join("shared/frag.yaml"),
+                r#"
+type: botforge/fragment
+steps:
+  - on: host
+    name: consumer
+    run: echo ${{ steps.build.outputs.version }}
+"#,
+            )
+            .unwrap();
+            std::fs::write(
+                repo.path().join("test.yaml"),
+                r#"
+type: botforge/test
+name: test
+ports:
+  - 80
+steps:
+  - uses: "@://shared/frag.yaml"
+"#,
+            )
+            .unwrap();
+
+            let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+            let TestStep::Invoke(inv) = &config.steps[0] else {
+                panic!("expected invoke step");
+            };
+            let TestStep::Run(step) = &inv.steps[0] else {
+                panic!("expected run step");
+            };
+            assert_eq!(step.run.trim(), "echo ${{ steps.build.outputs.version }}");
+        }
+
+        /// A step-output reference outside a `run:` field is a hard load-time error.
+        #[test]
+        fn test_steps_ref_outside_run_field_is_error() {
+            let repo = TempDir::new().unwrap();
+            std::fs::write(
+                repo.path().join("test.yaml"),
+                r#"
+type: botforge/test
+name: test
+steps:
+  - on: host
+    name: ${{ steps.build.outputs.version }}
+    run: echo ok
+"#,
+            )
+            .unwrap();
+
+            let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("only supported in 'run:' fields"),
+                "steps ref outside run: must be a hard error: {msg}"
+            );
+        }
+
+        /// A step-output reference combined with operators is not a pure reference
+        /// and remains a hard load-time error (Invariant A).
+        #[test]
+        fn test_steps_ref_in_compound_expression_is_error() {
+            let repo = TempDir::new().unwrap();
+            std::fs::write(
+                repo.path().join("test.yaml"),
+                r#"
+type: botforge/test
+name: test
+steps:
+  - on: host
+    name: consumer
+    run: echo ${{ steps.build.outputs.version || 'fallback' }}
+"#,
+            )
+            .unwrap();
+
+            let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("unresolved expression"),
+                "compound expression with steps ref must be a hard error: {msg}"
+            );
+        }
+
+        /// A malformed `steps.` reference (missing the `.outputs.<name>` tail) is a
+        /// hard load-time error.
+        #[test]
+        fn test_steps_ref_without_outputs_segment_is_error() {
+            let repo = TempDir::new().unwrap();
+            std::fs::write(
+                repo.path().join("test.yaml"),
+                r#"
+type: botforge/test
+name: test
+steps:
+  - on: host
+    name: consumer
+    run: echo ${{ steps.build.version }}
+"#,
+            )
+            .unwrap();
+
+            let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("unresolved expression") || msg.contains("steps"),
+                "malformed steps ref must be a hard error: {msg}"
+            );
+        }
+
+        // --- parser: steps.<id>.outputs.<name> ---
+
+        #[test]
+        fn test_parser_parses_step_output_reference() {
+            let node = parser::Parser::parse("steps.build.outputs.version").unwrap();
+            assert_eq!(
+                node,
+                parser::ExprNode::StepOutputReference {
+                    step_id: "build".to_string(),
+                    output_name: "version".to_string(),
+                }
+            );
+        }
+
+        #[test]
+        fn test_parser_rejects_steps_ref_missing_outputs() {
+            assert!(parser::Parser::parse("steps.build.version").is_err());
+            assert!(parser::Parser::parse("steps.build").is_err());
+            assert!(parser::Parser::parse("steps.build.outputs").is_err());
+        }
+
+        // --- runtime resolution entry point ---
+
+        #[test]
+        fn test_resolve_step_output_refs_substitutes_value() {
+            let resolved = resolve_step_output_refs_in_string(
+                "version is ${{ steps.build.outputs.version }} end",
+                &mut |id, name| {
+                    assert_eq!(id, "build");
+                    assert_eq!(name, "version");
+                    Ok("1.2.3".to_string())
+                },
+            )
+            .unwrap();
+            assert_eq!(resolved, "version is 1.2.3 end");
+        }
+
+        #[test]
+        fn test_resolve_step_output_refs_no_refs_is_identity() {
+            let resolved =
+                resolve_step_output_refs_in_string("plain text", &mut |_, _| unreachable!())
+                    .unwrap();
+            assert_eq!(resolved, "plain text");
+        }
+
+        #[test]
+        fn test_resolve_step_output_refs_propagates_lookup_error() {
+            let err = resolve_step_output_refs_in_string(
+                "${{ steps.build.outputs.version }}",
+                &mut |_, _| anyhow::bail!("lookup failed"),
+            )
+            .unwrap_err();
+            assert!(format!("{err:#}").contains("lookup failed"));
+        }
+
+        #[test]
+        fn test_resolve_step_output_refs_rejects_non_steps_expression() {
+            let err =
+                resolve_step_output_refs_in_string("${{ inputs.x }}", &mut |_, _| {
+                    unreachable!()
+                })
+                .unwrap_err();
+            assert!(format!("{err:#}").contains("unexpected unresolved expression"));
         }
     }
 }

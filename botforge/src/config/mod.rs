@@ -21,7 +21,9 @@ use self::expressions::{
     expand_raw_step, extract_fragment_input_declarations, resolve_fragment_inputs,
     substitute_inputs_in_value,
 };
-pub(crate) use self::expressions::{yaml_scalar_to_string, yaml_scalar_truthiness};
+pub(crate) use self::expressions::{
+    resolve_step_output_refs_in_string, yaml_scalar_to_string, yaml_scalar_truthiness,
+};
 use crate::assert::{parse_assert_block, validate_assert_block, AssertBlock};
 use crate::plan::files::FileEntry;
 use crate::step::{
