@@ -229,7 +229,7 @@ jobs:
 
     - name: Publish container images
       if: steps.version.outputs.is_release == 'true'
-      uses: envoyproxy/toolshed/actions/oci/collector@303f50e2d2bfcd0259230e3227cd08e8a95f2c69
+      uses: envoyproxy/toolshed/actions/oci/collector@4cca74db6587ee660235fbadaac5a4fc2a19cfa9
       with:
         artifacts-pattern: oci-amd64-*
         manifest-config: |
