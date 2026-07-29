@@ -3,4 +3,4 @@ steps:
 - on: guest
   name: sibling A sets env
   run: |
-    echo "SIBLING_VAR=sibling-a-ok" >> "$BOTFORGE_ENV"
+    echo "SIBLING_VAR=sibling-a-ok" >> "$BF_ENV"

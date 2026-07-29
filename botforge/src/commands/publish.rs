@@ -1358,13 +1358,13 @@ publish:
         let workspace = TempDir::new().unwrap();
         let context = workspace.path();
 
-        // Step 1 writes a key to BOTFORGE_ENV; step 2 reads it.
+        // Step 1 writes a key to BF_ENV; step 2 reads it.
         // If accumulation works, step 2 should see MY_KEY.
         let output_file = context.join("output.txt");
         let steps = vec![
             crate::step::TestStep::Run(crate::step::RunStep {
                 name: "set env".to_string(),
-                run: "echo MY_KEY=hello >> \"$BOTFORGE_ENV\"".to_string(),
+                run: "echo MY_KEY=hello >> \"$BF_ENV\"".to_string(),
                 target: crate::step::StepTarget::Guest,
                 shell: None,
                 timeout: None,

@@ -8,4 +8,4 @@ steps:
 - on: guest
   name: fragment sets env
   run: |
-    echo "FRAGMENT_VAR=frag-ok" >> "$BOTFORGE_ENV"
+    echo "FRAGMENT_VAR=frag-ok" >> "$BF_ENV"

@@ -146,7 +146,7 @@ fragment) is valid — ids are fragment-local.
 > **Not implemented in Stage 1.** Documented here for completeness per issue #555.
 
 - Steps declare typed `outputs:` (type defaults to `string`).
-- A step emits values via `echo NAME=value >> $BOTFORGE_OUTPUT`.
+- A step emits values via `echo NAME=value >> $BF_OUT`.
 - At capture time, the emitted string is coerced to the declared type (hard failure
   by default; opt-in `on_type_error: empty` for leniency).
 - Fragment `outputs:` re-export step outputs with enforced step↔fragment
@@ -203,11 +203,11 @@ graph; `matrix:` / parallelism would attach here in a later stage.
 | Stage | What | Status |
 |-------|------|--------|
 | **1** | Scoped `TestStep::Invoke` + recursive executor + hierarchical indices + per-scope id uniqueness + env isolation | **Done (this PR)** |
-| **2** | Typed step `outputs:` declaration + `$BOTFORGE_OUTPUT` capture + coercion/validation | Planned |
+| **2** | Typed step `outputs:` declaration + `$BF_OUT` capture + coercion/validation | Planned |
 | **3** | Fragment `outputs:` wiring + step↔fragment type-match enforcement | Planned |
 | **4** | `outputs.*` / `steps.*` engine namespace + deferred post-execution resolution pass | Planned |
 
-**Stage 1 explicitly does NOT include:** `$BOTFORGE_OUTPUT`, typed `outputs:`,
+**Stage 1 explicitly does NOT include:** `$BF_OUT`, typed `outputs:`,
 `steps.*` / `outputs.*` namespace, Invariant A changes, deferred/runtime
 substitution pass, or secret masking.
 

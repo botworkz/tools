@@ -517,7 +517,7 @@ fn run_run_step(
                 // Capturing path: surface stdout/stderr and exit code for assertion checking.
                 // Propagate the scp error early if upload failed.
                 scp_result?;
-                // Initialize the remote env file so the script can append to it via $BOTFORGE_ENV.
+                // Initialize the remote env file so the script can append to it via $BF_ENV.
                 // Chmod world-writable so both the SSH user and root (sudo) can append.
                 let _ = ssh_with_retry(
                     context.ssh,
@@ -562,7 +562,7 @@ fn run_run_step(
             } else {
                 // Standard path: exit 0 required, no output capture.
                 let result = if scp_result.is_ok() {
-                    // Initialize the remote env file so the script can append to it via $BOTFORGE_ENV.
+                    // Initialize the remote env file so the script can append to it via $BF_ENV.
                     // Chmod world-writable so both the SSH user and root (sudo) can append.
                     let _ = ssh_with_retry(
                         context.ssh,
@@ -805,7 +805,7 @@ fn run_host_step_capturing(
 ) -> Result<(StepCapture, i32)> {
     // Create/truncate the env file so `>>` always works inside the step, and make
     // it world-writable so that both root and the non-root ephemeral identity can
-    // append via $BOTFORGE_ENV regardless of which one the step runs as.
+    // append via $BF_ENV regardless of which one the step runs as.
     std::fs::write(files.env_file, b"")
         .with_context(|| format!("failed to create env file for host step '{name}'"))?;
     #[cfg(unix)]
@@ -839,7 +839,7 @@ fn run_host_step_capturing(
     command
         .args(&argv[1..])
         .current_dir(context)
-        .env("BOTFORGE_ENV", files.env_file)
+        .env("BF_ENV", files.env_file)
         .envs(
             accumulated_env
                 .iter()
@@ -1139,7 +1139,7 @@ struct HostStepFiles<'a> {
 /// Run a step locally in the botforge container (harness) with a plain execution timeout.
 /// `run` is written to a temp file and executed via `template` (argv with `{0}` slot).
 /// The working directory is `context`. Inherits the current process environment, with
-/// `accumulated_env` injected (overriding inherited values) and `BOTFORGE_ENV` pointing at
+/// `accumulated_env` injected (overriding inherited values) and `BF_ENV` pointing at
 /// `env_file` so the step can write new key-value pairs for later steps to consume.
 fn run_host_step(
     name: &str,
@@ -1152,7 +1152,7 @@ fn run_host_step(
 ) -> Result<()> {
     // Create/truncate the env file so `>>` always works inside the step, and make
     // it world-writable so that both root and the non-root ephemeral identity can
-    // append via $BOTFORGE_ENV regardless of which one the step runs as.
+    // append via $BF_ENV regardless of which one the step runs as.
     std::fs::write(files.env_file, b"")
         .with_context(|| format!("failed to create env file for host step '{name}'"))?;
     #[cfg(unix)]
@@ -1186,7 +1186,7 @@ fn run_host_step(
     command
         .args(&argv[1..])
         .current_dir(context)
-        .env("BOTFORGE_ENV", files.env_file)
+        .env("BF_ENV", files.env_file)
         .envs(
             accumulated_env
                 .iter()
@@ -1328,7 +1328,7 @@ fn build_guest_ssh_cmd(
         .collect::<Vec<_>>()
         .join(" ");
 
-    // Inject accumulated env vars and BOTFORGE_ENV via a POSIX `env` prefix so that
+    // Inject accumulated env vars and BF_ENV via a POSIX `env` prefix so that
     // the interpreter (bash, sh, python, or any custom template) receives them as
     // genuine environment variables rather than bash-syntax text in the script body.
     let mut env_parts: Vec<String> = accumulated_env
@@ -1336,7 +1336,7 @@ fn build_guest_ssh_cmd(
         .map(|(k, v)| format!("{}={}", k, shell_single_quote(v)))
         .collect();
     env_parts.push(format!(
-        "BOTFORGE_ENV={}",
+        "BF_ENV={}",
         shell_single_quote(remote_env_path)
     ));
     let env_prefix = format!("env {}", env_parts.join(" "));
@@ -1431,7 +1431,7 @@ fn env_merge(accumulated: &mut Vec<(String, String)>, new_entries: Vec<(String, 
 ///   steps reach this function they are already fully expanded.
 /// - `if:` condition checking: a step with `if: false` is skipped (logged).
 /// - `expect:` assertion handling: supported; exit/stdout/stderr assertions apply.
-/// - `BOTFORGE_ENV` env accumulation: each step may append `KEY=VALUE` pairs; later
+/// - `BF_ENV` env accumulation: each step may append `KEY=VALUE` pairs; later
 ///   steps see earlier steps' exported vars (same mechanics as host steps in build/test).
 /// - Fail-fast: a non-zero exit (or failed assertion) aborts the whole phase immediately.
 pub(crate) fn run_local_steps(context: &Path, steps: &[TestStep]) -> Result<()> {
@@ -1929,7 +1929,7 @@ mod tests {
         let log_file = tmp_step_log(dir.path());
         let result = run_host_step(
             "write-env",
-            r#"echo "WRITTEN=yes" >> "$BOTFORGE_ENV""#,
+            r#"echo "WRITTEN=yes" >> "$BF_ENV""#,
             dir.path(),
             test_budget(),
             &tmpl,
@@ -2266,7 +2266,7 @@ mod tests {
         );
         assert_eq!(
             cmd,
-            "sudo -E env BOTFORGE_ENV='/tmp/botforge-env-1' bash --noprofile --norc -e -o pipefail '/tmp/botforge-step.sh'"
+            "sudo -E env BF_ENV='/tmp/botforge-env-1' bash --noprofile --norc -e -o pipefail '/tmp/botforge-step.sh'"
         );
     }
 
@@ -2282,7 +2282,7 @@ mod tests {
         );
         assert_eq!(
             cmd,
-            "env BOTFORGE_ENV='/tmp/botforge-env-1' sh -e '/tmp/botforge-step.sh'"
+            "env BF_ENV='/tmp/botforge-env-1' sh -e '/tmp/botforge-step.sh'"
         );
     }
 
@@ -2305,7 +2305,7 @@ run: echo ok
         );
         assert_eq!(
             cmd,
-            "sudo -E env BOTFORGE_ENV='/tmp/botforge-env-1' bash --noprofile --norc -e -o pipefail '/tmp/botforge-step.sh'"
+            "sudo -E env BF_ENV='/tmp/botforge-env-1' bash --noprofile --norc -e -o pipefail '/tmp/botforge-step.sh'"
         );
     }
 
@@ -2324,8 +2324,8 @@ run: echo ok
         assert!(cmd.contains("FOO='bar'"), "expected FOO: {cmd}");
         assert!(cmd.contains("MSG='hello world'"), "expected MSG: {cmd}");
         assert!(
-            cmd.contains("BOTFORGE_ENV='/tmp/env'"),
-            "expected BOTFORGE_ENV: {cmd}"
+            cmd.contains("BF_ENV='/tmp/env'"),
+            "expected BF_ENV: {cmd}"
         );
         // No bash-syntax export statements in the command
         assert!(
@@ -2354,10 +2354,10 @@ run: echo ok
             "/tmp/botforge-env-1",
         );
         assert!(
-            cmd.contains("BOTFORGE_ENV='/tmp/botforge-env-1'"),
+            cmd.contains("BF_ENV='/tmp/botforge-env-1'"),
             "cmd: {cmd}"
         );
-        // No extra env var assignments beyond BOTFORGE_ENV
+        // No extra env var assignments beyond BF_ENV
         assert!(!cmd.contains("FOO="), "unexpected extra env var: {cmd}");
     }
 

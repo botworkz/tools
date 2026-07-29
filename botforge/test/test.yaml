@@ -10,7 +10,7 @@ steps:
 - uses: "@://env-threading.steps.yaml"
 - name: caller sets env before fragment invoke
   run: |
-    echo "CALLER_VAR=caller-ok" >> "$BOTFORGE_ENV"
+    echo "CALLER_VAR=caller-ok" >> "$BF_ENV"
 - uses: "@://env-scope-fragment.steps.yaml"
 - name: caller cannot see fragment env after invoke
   run: |
