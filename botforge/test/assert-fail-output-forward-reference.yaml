@@ -11,8 +11,8 @@ steps:
   id: producer
   run: echo "value=ok" >> "$BF_OUT"
   outputs:
-  - name: value
-    type: string
-    required: true
+    value:
+      type: string
+      required: true
 assert:
   files: {}

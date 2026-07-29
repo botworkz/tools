@@ -2593,7 +2593,7 @@ steps:
     id: build
     run: true
     outputs:
-      - name: version
+      version:
         type: string
         required: false
   - on: host
@@ -2626,7 +2626,7 @@ steps:
     id: build
     run: true
     outputs:
-      - name: version
+      version:
         type: string
         required: false
   - on: host
@@ -2797,7 +2797,7 @@ steps:
     id: emit
     run: true
     outputs:
-      - name: version
+      version:
         type: string
         required: false
   - on: host
@@ -2829,17 +2829,17 @@ steps:
     id: emit
     run: echo "version=1.2.3" >> "$BF_OUT"
     outputs:
-      - name: version
+      version:
         type: string
         required: true
   - on: host
     name: bad
     run: echo ${{ outputs.missing }}
 outputs:
-  - name: defined
+  defined:
     type: string
-    from-step: emit
-    from-output: version
+    from_step: emit
+    from_output: version
     default: x
 "#,
             )
@@ -2879,14 +2879,14 @@ steps:
     id: inner
     run: echo "version=1.2.3" >> "$BF_OUT"
     outputs:
-      - name: version
+      version:
         type: string
         required: true
 outputs:
-  - name: version
+  version:
     type: string
-    from-step: inner
-    from-output: version
+    from_step: inner
+    from_output: version
     required: true
 "#,
             )
@@ -2932,17 +2932,17 @@ steps:
     id: emit
     run: echo "version=1.2.3" >> "$BF_OUT"
     outputs:
-      - name: version
+      version:
         type: string
         required: true
   - on: host
     name: consume
     run: echo ${{ outputs.version }}
 outputs:
-  - name: version
+  version:
     type: string
-    from-step: emit
-    from-output: version
+    from_step: emit
+    from_output: version
     required: true
 "#,
             )

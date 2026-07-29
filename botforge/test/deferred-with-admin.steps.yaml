@@ -18,13 +18,13 @@ steps:
   run: |
     echo "testuser_otp=otp-e2e-9876" >> "$BF_OUT"
   outputs:
-  - name: testuser_otp
-    type: string
-    required: true
+    testuser_otp:
+      type: string
+      required: true
 
 outputs:
-- name: testuser_otp
-  type: string
-  from-step: issue
-  from-output: testuser_otp
-  required: true
+  testuser_otp:
+    type: string
+    from_step: issue
+    from_output: testuser_otp
+    required: true

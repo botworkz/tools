@@ -270,7 +270,7 @@ struct LoadedFragment {
     steps: Vec<RawTestStep>,
     cloud_init: Option<serde_yaml::Mapping>,
     files: Vec<FileEntry>,
-    output_decls: Vec<RawFragmentOutputDecl>,
+    output_decls: BTreeMap<String, RawFragmentOutputDecl>,
 }
 
 /// The raw YAML form of a single fragment output declaration.
@@ -280,14 +280,11 @@ struct LoadedFragment {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawFragmentOutputDecl {
-    name: String,
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default = "default_output_type")]
     output_type: OutputType,
     /// The `id:` of the inner run step whose output is re-exported.
-    #[serde(rename = "from-step")]
     from_step: String,
     /// The output name on the referenced inner step.
-    #[serde(rename = "from-output")]
     from_output: String,
     /// When `true`, the inner step must emit a non-null value (after default fallback).
     #[serde(default)]
@@ -310,7 +307,11 @@ struct RawTestStepFragment {
     /// Optional fragment output declarations.  Re-export inner step outputs at the
     /// fragment boundary; validated and attached to the `InvokeStep` at load time.
     #[serde(default)]
-    outputs: Vec<RawFragmentOutputDecl>,
+    outputs: BTreeMap<String, RawFragmentOutputDecl>,
+}
+
+fn default_output_type() -> OutputType {
+    OutputType::String
 }
 
 fn deserialize_positive_seconds<'de, D>(deserializer: D) -> std::result::Result<u64, D::Error>
@@ -1140,40 +1141,29 @@ fn expand_test_steps(
 /// Validate raw fragment output declarations against the fragment's own expanded inner steps.
 ///
 /// Enforces:
-/// - Unique output names within the `outputs:` block.
 /// - Required-or-default rule (mirror of inputs R1): if `required` is not `true`, a `default:`
 ///   is mandatory; setting both `required: true` and `default:` together is a hard error.
 /// - The `default:` value is type-coerced against the declared `type`.
-/// - The referenced inner step `id:` (`from-step:`) must exist as a direct run step with that
+/// - The referenced inner step `id:` (`from_step:`) must exist as a direct run step with that
 ///   `id:` in the fragment's expanded step list.
-/// - The referenced output name (`from-output:`) must be declared on that step.
+/// - The referenced output name (`from_output:`) must be declared on that step.
 /// - The fragment output's declared `type` must equal the referenced step output's declared
 ///   `type` (step↔fragment type-match).
 ///
 /// Returns the validated `Vec<FragmentOutputDecl>` ready to attach to the `InvokeStep`.
 fn validate_fragment_outputs(
-    raw_outputs: Vec<RawFragmentOutputDecl>,
+    raw_outputs: BTreeMap<String, RawFragmentOutputDecl>,
     inner_steps: &[TestStep],
     path: &Path,
 ) -> Result<Vec<FragmentOutputDecl>> {
-    let mut seen_names: HashSet<String> = HashSet::new();
     let mut validated: Vec<FragmentOutputDecl> = Vec::with_capacity(raw_outputs.len());
 
-    for raw in raw_outputs {
-        // Unique name check.
-        if !seen_names.insert(raw.name.clone()) {
-            anyhow::bail!(
-                "fragment output '{}': duplicate name in outputs: block ({})",
-                raw.name,
-                path.display()
-            );
-        }
-
+    for (name, raw) in raw_outputs {
         // Required-or-default rule (mirror of inputs R1).
         if !raw.required && raw.default.is_none() {
             anyhow::bail!(
                 "fragment output '{}' must set 'required: true' or provide a 'default:' ({})",
-                raw.name,
+                name,
                 path.display()
             );
         }
@@ -1181,7 +1171,7 @@ fn validate_fragment_outputs(
         if raw.required && raw.default.is_some() {
             anyhow::bail!(
                 "fragment output '{}' cannot set both 'required: true' and 'default' ({})",
-                raw.name,
+                name,
                 path.display()
             );
         }
@@ -1192,30 +1182,30 @@ fn validate_fragment_outputs(
                 if raw.output_type == OutputType::Secret {
                     anyhow::anyhow!(
                         "fragment output '{}': invalid default value for secret output ({})",
-                        raw.name,
+                        name,
                         path.display()
                     )
                 } else {
                     anyhow::anyhow!(
                         "fragment output '{}': invalid default value: {} ({})",
-                        raw.name,
+                        name,
                         e,
                         path.display()
                     )
                 }
             })?;
             let coerced =
-                coerce_output_value(&raw.name, &raw_str, raw.output_type).map_err(|e| {
+                coerce_output_value(&name, &raw_str, raw.output_type).map_err(|e| {
                     if raw.output_type == OutputType::Secret {
                         anyhow::anyhow!(
                             "fragment output '{}': default value type coercion failed for secret output ({})",
-                            raw.name,
+                            name,
                             path.display()
                         )
                     } else {
                         anyhow::anyhow!(
                             "fragment output '{}': default value type coercion failed: {} ({})",
-                            raw.name,
+                            name,
                             e,
                             path.display()
                         )
@@ -1235,7 +1225,7 @@ fn validate_fragment_outputs(
             anyhow::bail!(
                 "fragment output '{}': type mismatch: fragment declares '{}' but inner step \
                  '{}' output '{}' declares '{}' ({})",
-                raw.name,
+                name,
                 raw.output_type,
                 raw.from_step,
                 raw.from_output,
@@ -1245,7 +1235,7 @@ fn validate_fragment_outputs(
         }
 
         validated.push(FragmentOutputDecl {
-            name: raw.name,
+            name,
             output_type: raw.output_type,
             from_step: raw.from_step,
             from_output: raw.from_output,
@@ -1276,7 +1266,7 @@ fn find_inner_step_output_type(
         if let TestStep::Run(run) = step {
             if run.id.as_deref() == Some(step_id) {
                 // Found the step — look for the declared output.
-                return if let Some(decl) = run.outputs.iter().find(|o| o.name == output_name) {
+                return if let Some(decl) = run.outputs.get(output_name) {
                     Ok(decl.output_type)
                 } else {
                     anyhow::bail!(
@@ -1705,7 +1695,7 @@ fn validate_deferred_output_references_in_scope(
                         id.to_string(),
                         ScopeOutputContract {
                             step_kind: "run step",
-                            output_names: run.outputs.iter().map(|o| o.name.clone()).collect(),
+                            output_names: run.outputs.keys().cloned().collect(),
                         },
                     );
                 }
@@ -1881,22 +1871,10 @@ fn validate_run_step_deferred_output_references(
 
 /// Validate the `outputs:` declarations on a single run step.
 ///
-/// Checks that:
-/// - Output names are unique within the step (duplicate = config error).
-///
-/// The `type:` field is validated implicitly by serde's enum deserialization
-/// (unknown type → error at parse time); there is nothing extra to check here.
+/// Output names are structural map keys, so duplicate-name validation is handled
+/// by the map shape itself.
 fn validate_run_step_outputs(step: &crate::step::RunStep) -> Result<()> {
-    let mut seen = HashSet::new();
-    for decl in &step.outputs {
-        if !seen.insert(decl.name.as_str()) {
-            anyhow::bail!(
-                "step '{}': duplicate output name '{}'; output names must be unique within a step",
-                step.name,
-                decl.name
-            );
-        }
-    }
+    let _ = step;
     Ok(())
 }
 

@@ -852,7 +852,7 @@ where
 /// Runtime references are lazy/backward-only:
 /// - `steps.<id>.outputs.<name>` resolves against earlier sibling run/invoke steps.
 /// - `outputs.<name>` (fragment-self) resolves only inside fragment scopes and maps
-///   to the fragment's declared output contract (`from-step`/`from-output`,
+///   to the fragment's declared output contract (`from_step`/`from_output`,
 ///   `default`, `required`) at the current execution point.
 ///
 /// `inherited_step_refs` carries step-output values that were resolved at the outer
@@ -1000,7 +1000,7 @@ fn make_boundary_consumer(uses_name: &str) -> RunStep {
         timeout: None,
         shell: None,
         sudo: None,
-        outputs: Vec::new(),
+        outputs: std::collections::BTreeMap::new(),
         expect: None,
         captured_outputs: Default::default(),
     }
@@ -3107,7 +3107,7 @@ run: echo ok
             id: None,
             expect: None,
             condition: StepCondition::Always,
-            outputs: vec![],
+            outputs: std::collections::BTreeMap::new(),
             captured_outputs: Default::default(),
         };
         assert_eq!(
@@ -3128,7 +3128,7 @@ run: echo ok
             id: None,
             expect: None,
             condition: StepCondition::Always,
-            outputs: vec![],
+            outputs: std::collections::BTreeMap::new(),
             captured_outputs: Default::default(),
         };
         assert_eq!(
@@ -3137,15 +3137,14 @@ run: echo ok
         );
     }
 
-    fn output_decl(name: &str, output_type: OutputType, required: bool) -> OutputDecl {
+    fn output_decl(output_type: OutputType, required: bool) -> OutputDecl {
         OutputDecl {
-            name: name.to_string(),
             output_type,
             required,
         }
     }
 
-    fn host_run_step_with_outputs(outputs: Vec<OutputDecl>) -> RunStep {
+    fn host_run_step_with_outputs(outputs: Vec<(&str, OutputDecl)>) -> RunStep {
         RunStep {
             target: StepTarget::Host,
             name: "capture-step".to_string(),
@@ -3156,7 +3155,10 @@ run: echo ok
             id: None,
             expect: None,
             condition: StepCondition::Always,
-            outputs,
+            outputs: outputs
+                .into_iter()
+                .map(|(name, decl)| (name.to_string(), decl))
+                .collect(),
             captured_outputs: Default::default(),
         }
     }
@@ -3164,7 +3166,7 @@ run: echo ok
     #[test]
     fn test_capture_declared_step_outputs_errors_when_read_fails() {
         let step =
-            host_run_step_with_outputs(vec![output_decl("must_emit", OutputType::String, true)]);
+            host_run_step_with_outputs(vec![("must_emit", output_decl(OutputType::String, true))]);
 
         let err = capture_declared_step_outputs(&step, || anyhow::bail!("ssh transport hiccup"))
             .unwrap_err();
@@ -3197,7 +3199,7 @@ run: echo ok
 
     #[test]
     fn test_capture_declared_step_outputs_stores_captured_values() {
-        let step = host_run_step_with_outputs(vec![output_decl("label", OutputType::String, true)]);
+        let step = host_run_step_with_outputs(vec![("label", output_decl(OutputType::String, true))]);
 
         capture_declared_step_outputs(&step, || Ok("label=hello\n".to_string())).unwrap();
 
@@ -3220,7 +3222,7 @@ run: echo ok
             id: None,
             expect: None,
             condition: StepCondition::Always,
-            outputs: vec![],
+            outputs: std::collections::BTreeMap::new(),
             captured_outputs: Default::default(),
         }
     }
@@ -3247,7 +3249,7 @@ run: echo ok
             id: Some(id.to_string()),
             expect: None,
             condition: StepCondition::Always,
-            outputs: vec![],
+            outputs: std::collections::BTreeMap::new(),
             captured_outputs: std::cell::RefCell::new(Some(outputs)),
         })
     }

@@ -11,13 +11,13 @@ steps:
     # a hard failure at the invoke boundary.
     true
   outputs:
-  - name: val
-    type: string
-    required: false
+    val:
+      type: string
+      required: false
 
 outputs:
-- name: val
-  type: string
-  from-step: quiet
-  from-output: val
-  required: true
+  val:
+    type: string
+    from_step: quiet
+    from_output: val
+    required: true

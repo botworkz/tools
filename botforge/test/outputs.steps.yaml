@@ -10,27 +10,27 @@ steps:
   run: |
     echo "label=hello-output" >> "$BF_OUT"
   outputs:
-  - name: label
-    type: string
-    required: true
+    label:
+      type: string
+      required: true
 
 - on: host
   name: outputs-emit-number
   run: |
     echo "count=42" >> "$BF_OUT"
   outputs:
-  - name: count
-    type: number
-    required: true
+    count:
+      type: number
+      required: true
 
 - on: host
   name: outputs-emit-bool
   run: |
     echo "ready=true" >> "$BF_OUT"
   outputs:
-  - name: ready
-    type: bool
-    required: true
+    ready:
+      type: bool
+      required: true
 
 - on: host
   name: outputs-optional-not-emitted
@@ -38,9 +38,9 @@ steps:
     # Intentionally emit nothing — optional output, so no failure.
     true
   outputs:
-  - name: optional_val
-    type: string
-    required: false
+    optional_val:
+      type: string
+      required: false
 
 - on: host
   name: outputs-multiple-mixed
@@ -49,12 +49,12 @@ steps:
     echo "score=99" >> "$BF_OUT"
     echo "active=false" >> "$BF_OUT"
   outputs:
-  - name: name
-    type: string
-    required: true
-  - name: score
-    type: number
-    required: true
-  - name: active
-    type: bool
-    required: true
+    name:
+      type: string
+      required: true
+    score:
+      type: number
+      required: true
+    active:
+      type: bool
+      required: true

@@ -233,7 +233,7 @@ graph; `matrix:` / parallelism would attach here in a later stage.
 
 **Shipped runtime output-reference grammar (Stage 4):**
 - `${{ steps.<id>.outputs.<name> }}` — resolves in the current scope only, against already-executed sibling run/invoke steps.
-- `${{ outputs.<name> }}` — resolves only inside a fragment body, via that fragment's declared `outputs:` contract (`from-step`/`from-output`, `default`, `required`).
+- `${{ outputs.<name> }}` — resolves only inside a fragment body, via that fragment's declared `outputs:` contract (`from_step`/`from_output`, `default`, `required`).
 - Both forms are deferred runtime-only references allowed in `run:` fields; all other `${{ }}` expressions remain load-time resolved/rejected.
 
 **Stage 1 explicitly does NOT include:** `$BF_OUT`, typed `outputs:`,
