@@ -25,8 +25,8 @@ pub(crate) use self::expressions::{yaml_scalar_to_string, yaml_scalar_truthiness
 use crate::assert::{parse_assert_block, validate_assert_block, AssertBlock};
 use crate::plan::files::FileEntry;
 use crate::step::{
-    coerce_output_value, deserialize_optional_positive_seconds, resolve_shell,
-    FragmentOutputDecl, InvokeStep, OutputType, OutputValue, StepTarget, TestStep,
+    coerce_output_value, deserialize_optional_positive_seconds, resolve_shell, FragmentOutputDecl,
+    InvokeStep, OutputType, OutputValue, StepTarget, TestStep,
 };
 
 /// Maximum number of active `uses:` includes on the call stack at any one time.
@@ -345,6 +345,8 @@ impl<'de> Deserialize<'de> for RawTestStep {
 #[serde(deny_unknown_fields)]
 struct TestStepInclude {
     uses: String,
+    #[serde(default)]
+    id: Option<String>,
     #[serde(default)]
     with: BTreeMap<String, Value>,
 }
@@ -1061,23 +1063,22 @@ fn expand_test_steps(
                     );
                 }
                 include_stack.push(include_path.clone());
-                let result =
-                    load_test_steps_fragment(&include_path, &include.uses, &include.with)
-                        .and_then(|loaded| {
-                            // `files:` and `cloud_init:` contributions from the fragment are
-                            // accumulated globally (unchanged from before Stage 1).
-                            files_acc.extend(loaded.files);
-                            let mut ci_acc = loaded.cloud_init;
-                            let fragment_steps = expand_test_steps(
-                                repo_root,
-                                &include_path,
-                                loaded.steps,
-                                include_stack,
-                                &mut ci_acc,
-                                files_acc,
-                            )?;
-                            Ok((fragment_steps, ci_acc, loaded.output_decls))
-                        });
+                let result = load_test_steps_fragment(&include_path, &include.uses, &include.with)
+                    .and_then(|loaded| {
+                        // `files:` and `cloud_init:` contributions from the fragment are
+                        // accumulated globally (unchanged from before Stage 1).
+                        files_acc.extend(loaded.files);
+                        let mut ci_acc = loaded.cloud_init;
+                        let fragment_steps = expand_test_steps(
+                            repo_root,
+                            &include_path,
+                            loaded.steps,
+                            include_stack,
+                            &mut ci_acc,
+                            files_acc,
+                        )?;
+                        Ok((fragment_steps, ci_acc, loaded.output_decls))
+                    });
                 include_stack.pop();
                 let (fragment_steps, fragment_cloud_init, raw_output_decls) = result?;
 
@@ -1095,6 +1096,7 @@ fn expand_test_steps(
                 // steps flat into the parent list.
                 expanded.push(TestStep::Invoke(InvokeStep {
                     uses: include.uses.clone(),
+                    id: include.id.clone(),
                     steps: fragment_steps,
                     output_decls,
                     captured_outputs: std::cell::RefCell::new(None),
@@ -1187,12 +1189,8 @@ fn validate_fragment_outputs(
         };
 
         // Look up the referenced inner step and its declared output type.
-        let step_output_type = find_inner_step_output_type(
-            inner_steps,
-            &raw.from_step,
-            &raw.from_output,
-            path,
-        )?;
+        let step_output_type =
+            find_inner_step_output_type(inner_steps, &raw.from_step, &raw.from_output, path)?;
 
         // Step↔fragment type-match check.
         if step_output_type != raw.output_type {
@@ -1262,7 +1260,6 @@ fn find_inner_step_output_type(
         path.display()
     )
 }
-
 
 fn load_test_steps_fragment(
     path: &Path,
@@ -1610,7 +1607,7 @@ fn steps_have_host_step(steps: &[TestStep]) -> bool {
 /// A fragment's ids only need to be unique within that one fragment; the same
 /// id may appear in a different scope without conflict.
 ///
-/// Only `TestStep::Run` steps carry an `id`; `Archive` and `Invoke` steps do not.
+/// Both `TestStep::Run` steps and `TestStep::Invoke` steps can carry an `id`.
 /// `Invoke` steps are **not** recursed into here — they are validated when their
 /// own fragment scope is processed.
 ///
@@ -1619,16 +1616,19 @@ fn steps_have_host_step(steps: &[TestStep]) -> bool {
 fn validate_scope_step_ids(steps: &[TestStep], scope_description: &str) -> Result<()> {
     let mut seen: HashSet<&str> = HashSet::new();
     for step in steps {
-        if let TestStep::Run(run) = step {
-            if let Some(ref id) = run.id {
-                if !seen.insert(id.as_str()) {
-                    anyhow::bail!(
-                        "duplicate step id '{}' in scope '{}': \
-                         step ids must be unique within the same scope",
-                        id,
-                        scope_description
-                    );
-                }
+        let id_opt = match step {
+            TestStep::Run(run) => run.id.as_deref(),
+            TestStep::Invoke(invoke) => invoke.id.as_deref(),
+            TestStep::Archive(_) => None,
+        };
+        if let Some(id) = id_opt {
+            if !seen.insert(id) {
+                anyhow::bail!(
+                    "duplicate step id '{}' in scope '{}': \
+                     step ids must be unique within the same scope",
+                    id,
+                    scope_description
+                );
             }
         }
     }

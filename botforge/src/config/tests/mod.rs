@@ -1196,6 +1196,251 @@ steps:
             "id should be preserved through fragment invocation"
         );
     }
+
+    // --- id: on uses: steps ---
+
+    #[test]
+    fn test_invoke_step_id_parses_and_is_stored() {
+        let repo = TempDir::new().unwrap();
+        std::fs::create_dir_all(repo.path().join("shared")).unwrap();
+        std::fs::write(
+            repo.path().join("shared/frag.yaml"),
+            r#"
+type: botforge/fragment
+steps:
+  - on: guest
+    name: inner-step
+    run: echo hello
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            r#"
+type: botforge/test
+name: test
+steps:
+  - uses: "@://shared/frag.yaml"
+    id: my-invoke-id
+"#,
+        )
+        .unwrap();
+
+        let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+
+        assert_eq!(config.steps.len(), 1);
+        let invoke = invoke_ref(&config.steps[0]);
+        assert_eq!(
+            invoke.id.as_deref(),
+            Some("my-invoke-id"),
+            "id on uses: step should be stored on InvokeStep"
+        );
+        assert_eq!(
+            config.steps[0].display_id(),
+            Some("my-invoke-id"),
+            "display_id() must return the invoke id"
+        );
+    }
+
+    #[test]
+    fn test_invoke_step_without_id_yields_none() {
+        let repo = TempDir::new().unwrap();
+        std::fs::create_dir_all(repo.path().join("shared")).unwrap();
+        std::fs::write(
+            repo.path().join("shared/frag.yaml"),
+            r#"
+type: botforge/fragment
+steps:
+  - on: guest
+    name: inner-step
+    run: echo hello
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            r#"
+type: botforge/test
+name: test
+steps:
+  - uses: "@://shared/frag.yaml"
+"#,
+        )
+        .unwrap();
+
+        let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+
+        assert_eq!(config.steps.len(), 1);
+        let invoke = invoke_ref(&config.steps[0]);
+        assert!(
+            invoke.id.is_none(),
+            "uses: step without id: should have None id"
+        );
+        assert!(
+            config.steps[0].display_id().is_none(),
+            "display_id() must return None when no invoke id"
+        );
+    }
+
+    #[test]
+    fn test_duplicate_invoke_ids_in_same_scope_rejected() {
+        let repo = TempDir::new().unwrap();
+        std::fs::create_dir_all(repo.path().join("shared")).unwrap();
+        std::fs::write(
+            repo.path().join("shared/frag.yaml"),
+            r#"
+type: botforge/fragment
+steps:
+  - on: guest
+    name: inner-step
+    run: echo hello
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            r#"
+type: botforge/test
+name: test
+steps:
+  - uses: "@://shared/frag.yaml"
+    id: same-id
+  - uses: "@://shared/frag.yaml"
+    id: same-id
+"#,
+        )
+        .unwrap();
+
+        let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("duplicate step id") && msg.contains("same-id"),
+            "error should mention the duplicate id: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_duplicate_id_between_invoke_and_run_step_rejected() {
+        let repo = TempDir::new().unwrap();
+        std::fs::create_dir_all(repo.path().join("shared")).unwrap();
+        std::fs::write(
+            repo.path().join("shared/frag.yaml"),
+            r#"
+type: botforge/fragment
+steps:
+  - on: guest
+    name: inner-step
+    run: echo hello
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            r#"
+type: botforge/test
+name: test
+steps:
+  - on: guest
+    name: run-step
+    id: shared-id
+    run: echo a
+  - uses: "@://shared/frag.yaml"
+    id: shared-id
+"#,
+        )
+        .unwrap();
+
+        let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("duplicate step id") && msg.contains("shared-id"),
+            "run↔invoke id collision must be rejected: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_same_id_in_different_scopes_allowed() {
+        let repo = TempDir::new().unwrap();
+        std::fs::create_dir_all(repo.path().join("shared")).unwrap();
+        // The fragment uses id "reused-id" in its inner scope.
+        std::fs::write(
+            repo.path().join("shared/frag.yaml"),
+            r#"
+type: botforge/fragment
+steps:
+  - on: guest
+    name: inner-step
+    id: reused-id
+    run: echo hello
+"#,
+        )
+        .unwrap();
+        // The parent scope also uses id "reused-id" as the invoke id.
+        // These are different scopes so there must be no conflict.
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            r#"
+type: botforge/test
+name: test
+steps:
+  - uses: "@://shared/frag.yaml"
+    id: reused-id
+"#,
+        )
+        .unwrap();
+
+        let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+        assert_eq!(config.steps.len(), 1);
+        assert_eq!(
+            invoke_ref(&config.steps[0]).id.as_deref(),
+            Some("reused-id"),
+            "invoke id in parent scope should be allowed even if same id is used in fragment scope"
+        );
+    }
+
+    #[test]
+    fn test_duplicate_run_ids_in_same_scope_still_rejected() {
+        let config_result = serde_yaml::from_str::<TestConfig>(
+            r#"
+steps:
+  - on: guest
+    name: step-a
+    id: dup-run-id
+    run: echo a
+  - on: guest
+    name: step-b
+    id: dup-run-id
+    run: echo b
+"#,
+        );
+        // serde parsing succeeds; the duplicate is caught at validate time.
+        // Use load_test_config path via a temp file.
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            r#"
+type: botforge/test
+name: test
+steps:
+  - on: guest
+    name: step-a
+    id: dup-run-id
+    run: echo a
+  - on: guest
+    name: step-b
+    id: dup-run-id
+    run: echo b
+"#,
+        )
+        .unwrap();
+        let _ = config_result; // just to use the binding
+        let err = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("duplicate step id") && msg.contains("dup-run-id"),
+            "run↔run id collision must still be rejected: {msg}"
+        );
+    }
 }
 
 mod fragments {
@@ -4589,17 +4834,14 @@ mod fragment_outputs {
     fn write_test_yaml(repo: &TempDir, frag_name: &str) {
         std::fs::write(
             repo.path().join("test.yaml"),
-            format!(
-                "type: botforge/test\nname: test\nsteps:\n  - uses: \"@://{frag_name}\"\n"
-            ),
+            format!("type: botforge/test\nname: test\nsteps:\n  - uses: \"@://{frag_name}\"\n"),
         )
         .unwrap();
     }
 
     /// Load the config and return the single `InvokeStep`.
     fn load_invoke(repo: &TempDir) -> InvokeStep {
-        let config =
-            load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+        let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
         assert_eq!(config.steps.len(), 1, "expected exactly one top-level step");
         let TestStep::Invoke(invoke) = config.steps.into_iter().next().unwrap() else {
             panic!("expected Invoke step");
@@ -4743,7 +4985,9 @@ outputs:
         write_test_yaml(&repo, "frag.yaml");
         let err = load_err(&repo);
         assert!(
-            err.contains("integer") || err.contains("unknown variant") || err.contains("expected one of"),
+            err.contains("integer")
+                || err.contains("unknown variant")
+                || err.contains("expected one of"),
             "error should mention the bad type: {err}"
         );
     }
@@ -4944,7 +5188,10 @@ outputs:
         .unwrap();
         write_test_yaml(&repo, "frag.yaml");
         let invoke = load_invoke(&repo);
-        assert_eq!(invoke.output_decls[0].default, Some(OutputValue::Number(42.0)));
+        assert_eq!(
+            invoke.output_decls[0].default,
+            Some(OutputValue::Number(42.0))
+        );
     }
 
     #[test]
@@ -4974,7 +5221,10 @@ outputs:
         .unwrap();
         write_test_yaml(&repo, "frag.yaml");
         let invoke = load_invoke(&repo);
-        assert_eq!(invoke.output_decls[0].default, Some(OutputValue::Bool(false)));
+        assert_eq!(
+            invoke.output_decls[0].default,
+            Some(OutputValue::Bool(false))
+        );
     }
 
     #[test]
@@ -5345,6 +5595,7 @@ steps:
         };
         InvokeStep {
             uses: "@://test-frag.yaml".to_string(),
+            id: None,
             steps: vec![TestStep::Run(run)],
             output_decls: vec![decl],
             captured_outputs: std::cell::RefCell::new(None),
@@ -5386,8 +5637,7 @@ steps:
             required: true,
             default: None,
         };
-        let invoke =
-            make_invoke_with_captured_inner("inner", "n", OutputValue::Number(99.0), decl);
+        let invoke = make_invoke_with_captured_inner("inner", "n", OutputValue::Number(99.0), decl);
         resolve_invoke_outputs_for_test(&invoke).unwrap();
         let captured = invoke.captured_outputs.borrow();
         let outputs = captured.as_ref().unwrap();
@@ -5422,8 +5672,7 @@ steps:
             required: false,
             default: Some(OutputValue::String("default-val".to_string())),
         };
-        let invoke =
-            make_invoke_with_captured_inner("inner", "x", OutputValue::Null, decl);
+        let invoke = make_invoke_with_captured_inner("inner", "x", OutputValue::Null, decl);
         resolve_invoke_outputs_for_test(&invoke).unwrap();
         let captured = invoke.captured_outputs.borrow();
         let outputs = captured.as_ref().unwrap();
@@ -5443,8 +5692,7 @@ steps:
             required: true,
             default: None,
         };
-        let invoke =
-            make_invoke_with_captured_inner("inner", "x", OutputValue::Null, decl);
+        let invoke = make_invoke_with_captured_inner("inner", "x", OutputValue::Null, decl);
         let err = resolve_invoke_outputs_for_test(&invoke).unwrap_err();
         let msg = err.to_string();
         assert!(
@@ -5457,6 +5705,7 @@ steps:
     fn test_resolve_invoke_outputs_no_decls_leaves_captured_as_none() {
         let invoke = InvokeStep {
             uses: "@://empty-frag.yaml".to_string(),
+            id: None,
             steps: vec![],
             output_decls: vec![],
             captured_outputs: std::cell::RefCell::new(None),

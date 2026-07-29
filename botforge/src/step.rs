@@ -435,6 +435,10 @@ pub(crate) struct FragmentOutputDecl {
 pub(crate) struct InvokeStep {
     /// The `uses:` value as written; used for display in step titles and logs.
     pub(crate) uses: String,
+    /// Optional caller-assigned id for this invocation.  When set, makes the fragment
+    /// boundary addressable (e.g. `steps.<id>.outputs.<name>`).  Unique within the
+    /// enclosing scope; validated by `validate_scope_step_ids`.
+    pub(crate) id: Option<String>,
     /// The fragment's pre-resolved, pre-expanded step list.  May itself contain
     /// further `Invoke` steps (recursive fragments).
     pub(crate) steps: Vec<TestStep>,
@@ -478,7 +482,8 @@ impl TestStep {
     pub(crate) fn display_id(&self) -> Option<&str> {
         match self {
             Self::Run(step) => step.id.as_deref(),
-            Self::Archive(_) | Self::Invoke(_) => None,
+            Self::Archive(_) => None,
+            Self::Invoke(step) => step.id.as_deref(),
         }
     }
 }
