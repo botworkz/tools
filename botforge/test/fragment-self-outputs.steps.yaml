@@ -6,9 +6,9 @@ steps:
   run: |
     echo "version=9.9.9" >> "$BF_OUT"
   outputs:
-  - name: version
-    type: string
-    required: true
+    version:
+      type: string
+      required: true
 
 - on: host
   name: self-out-quiet
@@ -16,9 +16,9 @@ steps:
   run: |
     true
   outputs:
-  - name: maybe
-    type: string
-    required: false
+    maybe:
+      type: string
+      required: false
 
 - on: host
   name: consume fragment-self outputs
@@ -32,13 +32,11 @@ steps:
       - fragment-self-outputs-consumed
 
 outputs:
-- name: version
-  type: string
-  from-step: emit
-  from-output: version
-  required: true
-- name: fallback
-  type: string
-  from-step: quiet
-  from-output: maybe
-  default: "self-default"
+  version:
+    type: string
+    value: ${{ steps.emit.outputs.version }}
+    required: true
+  fallback:
+    type: string
+    value: ${{ steps.quiet.outputs.maybe }}
+    default: "self-default"

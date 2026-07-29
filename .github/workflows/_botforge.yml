@@ -159,10 +159,10 @@ jobs:
         cp -a botforge/test/deferred-with-admin.steps.yaml testrepo/
         cp -a botforge/test/deferred-with-user.steps.yaml testrepo/
         cp -a botforge/test/fragment-outputs-required-missing.steps.yaml testrepo/
-        cp -a botforge/test/fragment-secret-output-mismatch.steps.yaml testrepo/
+        cp -a botforge/test/fragment-output-type-invalid.steps.yaml testrepo/
         cp -a botforge/test/assert-fail-output-scope-violation.yaml testrepo/
         cp -a botforge/test/assert-fail-output-forward-reference.yaml testrepo/
-        cp -a botforge/test/assert-fail-secret-output-type-mismatch.yaml testrepo/
+        cp -a botforge/test/assert-fail-output-type-invalid.yaml testrepo/
         cp -a botforge/test/assert-docker.yaml testrepo/
         cp -a botforge/test/assert-fail-docker-running.yaml testrepo/
         cp -a botforge/test/assert-fail-docker-network.yaml testrepo/
@@ -421,13 +421,13 @@ jobs:
         filter: '. + {image: "@artifact://foo.qcow2"}'
         output-path: testrepo/assert-fail-output-forward-reference.yaml
         input: botforge/test/assert-fail-output-forward-reference.yaml
-    - name: Create assert-fail-secret-output-type-mismatch config
+    - name: Create assert-fail-output-type-invalid config
       uses: envoyproxy/toolshed/actions/jq@303f50e2d2bfcd0259230e3227cd08e8a95f2c69
       with:
         input-format: yaml-path
         filter: '. + {image: "@artifact://foo.qcow2"}'
-        output-path: testrepo/assert-fail-secret-output-type-mismatch.yaml
-        input: botforge/test/assert-fail-secret-output-type-mismatch.yaml
+        output-path: testrepo/assert-fail-output-type-invalid.yaml
+        input: botforge/test/assert-fail-output-type-invalid.yaml
 
     - name: Print marker (botforge.yaml with inline assets)
       uses: envoyproxy/toolshed/actions/jq@303f50e2d2bfcd0259230e3227cd08e8a95f2c69
@@ -622,16 +622,16 @@ jobs:
         echo "Negative-control passed: forward output reference correctly rejected"
       working-directory: testrepo
 
-    - name: Negative-control — secret/non-secret output type mismatch must fail to load
+    - name: Negative-control — type-invalid fragment output value must fail at the boundary
       run: |
         set -euo pipefail
         . .botforge.env
         if botforge test \
-             --test-config assert-fail-secret-output-type-mismatch.yaml; then
-          echo "ERROR: botforge should have exited non-zero for secret/non-secret output type mismatch" >&2
+             --test-config assert-fail-output-type-invalid.yaml; then
+          echo "ERROR: botforge should have exited non-zero for type-invalid fragment output value" >&2
           exit 1
         fi
-        echo "Negative-control passed: secret/non-secret output type mismatch correctly rejected"
+        echo "Negative-control passed: type-invalid fragment output value correctly rejected"
       working-directory: testrepo
 
     - name: Run acceptance tests (docker assert)

@@ -38,16 +38,17 @@ impl std::fmt::Display for OutputType {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct OutputDecl {
-    /// The output name.  Must be unique within a step's `outputs:` list.
-    #[serde(deserialize_with = "deserialize_scalar_as_string")]
-    pub(crate) name: String,
     /// The declared type.  One of `string`, `secret`, `number`, `bool`.
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default = "default_output_type")]
     pub(crate) output_type: OutputType,
     /// When `true`, the step must emit a non-empty value for this output or
     /// the step fails at runtime.  Defaults to `false`.
     #[serde(default)]
     pub(crate) required: bool,
+}
+
+fn default_output_type() -> OutputType {
+    OutputType::String
 }
 
 /// The coerced value of a captured output.
@@ -174,7 +175,7 @@ pub(crate) fn coerce_output_value(
 /// - `required: true` outputs that are null (not emitted or emitted as empty) fail.
 pub(crate) fn capture_step_outputs(
     step_name: &str,
-    declarations: &[OutputDecl],
+    declarations: &BTreeMap<String, OutputDecl>,
     out_contents: &str,
 ) -> Result<Vec<CapturedOutput>> {
     if declarations.is_empty() {
@@ -185,26 +186,26 @@ pub(crate) fn capture_step_outputs(
 
     let mut captured: Vec<CapturedOutput> = Vec::with_capacity(declarations.len());
 
-    for decl in declarations {
+    for (name, decl) in declarations {
         let raw = emitted
             .iter()
-            .find(|(k, _)| k == &decl.name)
+            .find(|(k, _)| k == name)
             .map(|(_, v)| v.as_str())
             .unwrap_or("");
 
-        let value = coerce_output_value(&decl.name, raw, decl.output_type)
+        let value = coerce_output_value(name, raw, decl.output_type)
             .with_context(|| format!("step '{}' output coercion failed", step_name))?;
 
         if decl.required && matches!(value, OutputValue::Null) {
             anyhow::bail!(
                 "step '{}': required output '{}' was not emitted or was empty",
                 step_name,
-                decl.name
+                name
             );
         }
 
         captured.push(CapturedOutput {
-            name: decl.name.clone(),
+            name: name.clone(),
             declared_type: decl.output_type,
             value,
         });
@@ -386,7 +387,7 @@ pub(crate) struct RunStep {
         deserialize_with = "deserialize_step_condition"
     )]
     pub(crate) condition: StepCondition,
-    /// Typed output declarations for this step.
+    /// Typed output declarations for this step, keyed by output name.
     ///
     /// When the step runs, `BF_OUT` is set to a writable file; the step body
     /// emits `NAME=value` lines to it.  After execution the executor reads the
@@ -396,7 +397,7 @@ pub(crate) struct RunStep {
     /// On `uses:` steps the declarations come from the fragment's `outputs:`
     /// block instead (Stage 4+).  This field is empty for such steps.
     #[serde(default)]
-    pub(crate) outputs: Vec<OutputDecl>,
+    pub(crate) outputs: BTreeMap<String, OutputDecl>,
     /// Captured and coerced output values, populated after this step executes.
     ///
     /// `None` before the step runs; `Some(vec)` after.  Written by the step
@@ -453,19 +454,22 @@ pub(crate) struct ArchiveStep {
 
 /// A validated fragment output declaration, as stored on an [`InvokeStep`].
 ///
-/// Produced at load time after cross-reference validation: the referenced inner
-/// step id exists in the fragment scope, the referenced output name is declared on
-/// that step, the types match, and the required-or-default rule is satisfied.
+/// Produced at load time after validation: the `value:` expression is well-formed
+/// (and, for the trivially-checkable pure-ref shape, points at an inner step that
+/// exists with that output declared), and the required-or-default rule is satisfied.
+/// The `value:` expression is resolved at the fragment-output boundary — after the
+/// fragment's inner steps have executed — and the resolved value is coerced and
+/// validated against the declared `type:`.
 #[derive(Debug, Clone)]
 pub(crate) struct FragmentOutputDecl {
     /// The fragment-level output name (unique within the fragment's `outputs:` block).
     pub(crate) name: String,
-    /// The declared type; must equal the referenced inner step output's declared type.
+    /// The declared type; the resolved `value:` must coerce to it at the boundary.
     pub(crate) output_type: OutputType,
-    /// The `id:` of the inner run step whose output is re-exported.
-    pub(crate) from_step: String,
-    /// The output name on the inner step.
-    pub(crate) from_output: String,
+    /// The raw `value:` expression string (e.g. `${{ steps.emit.outputs.version }}`,
+    /// an interpolation, or a function call).  Resolved through the expression engine
+    /// at the fragment-output boundary against the fragment's executed inner steps.
+    pub(crate) value: String,
     /// When `true`, the re-exported value must not be `Null` (after default fallback).
     pub(crate) required: bool,
     /// Pre-validated default value (coerced to the declared type at load time).
@@ -495,10 +499,11 @@ pub(crate) struct InvokeStep {
     pub(crate) steps: Vec<TestStep>,
     /// Fragment output declarations (validated at load time).
     ///
-    /// Each entry re-exports a value from one of this fragment's direct inner run
-    /// steps.  The executor populates `captured_outputs` after the inner steps
-    /// finish by resolving these declarations against the inner steps' own
-    /// `captured_outputs` slots.
+    /// Each entry exports a value computed by resolving its `value:` expression
+    /// against this fragment's executed inner steps.  The executor populates
+    /// `captured_outputs` after the inner steps finish by resolving these
+    /// declarations at the fragment-output boundary and coercing the results to
+    /// their declared types.
     pub(crate) output_decls: Vec<FragmentOutputDecl>,
     /// `with:` values that contained deferred output references (`${{ steps.X.outputs.Y }}`).
     ///
@@ -1157,28 +1162,28 @@ expect:
 
         #[test]
         fn test_output_type_string_parses() {
-            let yaml = "name: my-output\ntype: string\n";
+            let yaml = "type: string\n";
             let decl: OutputDecl = serde_yaml::from_str(yaml).unwrap();
             assert_eq!(decl.output_type, OutputType::String);
         }
 
         #[test]
         fn test_output_type_number_parses() {
-            let yaml = "name: count\ntype: number\n";
+            let yaml = "type: number\n";
             let decl: OutputDecl = serde_yaml::from_str(yaml).unwrap();
             assert_eq!(decl.output_type, OutputType::Number);
         }
 
         #[test]
         fn test_output_type_bool_parses() {
-            let yaml = "name: flag\ntype: bool\n";
+            let yaml = "type: bool\n";
             let decl: OutputDecl = serde_yaml::from_str(yaml).unwrap();
             assert_eq!(decl.output_type, OutputType::Bool);
         }
 
         #[test]
         fn test_output_type_unknown_is_config_error() {
-            let yaml = "name: x\ntype: integer\n";
+            let yaml = "type: integer\n";
             let err = serde_yaml::from_str::<OutputDecl>(yaml).unwrap_err();
             let msg = err.to_string();
             assert!(
@@ -1191,7 +1196,7 @@ expect:
 
         #[test]
         fn test_output_type_object_is_config_error() {
-            let yaml = "name: x\ntype: object\n";
+            let yaml = "type: object\n";
             let err = serde_yaml::from_str::<OutputDecl>(yaml).unwrap_err();
             assert!(
                 !err.to_string().is_empty(),
@@ -1201,28 +1206,35 @@ expect:
 
         #[test]
         fn test_output_required_defaults_to_false() {
-            let yaml = "name: x\ntype: string\n";
+            let yaml = "type: string\n";
             let decl: OutputDecl = serde_yaml::from_str(yaml).unwrap();
             assert!(!decl.required, "required defaults to false");
         }
 
         #[test]
         fn test_output_required_true_parses() {
-            let yaml = "name: x\ntype: string\nrequired: true\n";
+            let yaml = "type: string\nrequired: true\n";
             let decl: OutputDecl = serde_yaml::from_str(yaml).unwrap();
             assert!(decl.required);
         }
 
         #[test]
         fn test_output_type_secret_parses() {
-            let yaml = "name: x\ntype: secret\nrequired: true\n";
+            let yaml = "type: secret\nrequired: true\n";
             let decl: OutputDecl = serde_yaml::from_str(yaml).unwrap();
             assert_eq!(decl.output_type, OutputType::Secret);
         }
 
         #[test]
+        fn test_output_type_defaults_to_string_when_omitted() {
+            let yaml = "required: true\n";
+            let decl: OutputDecl = serde_yaml::from_str(yaml).unwrap();
+            assert_eq!(decl.output_type, OutputType::String);
+        }
+
+        #[test]
         fn test_output_unknown_field_is_error() {
-            let yaml = "name: x\ntype: string\nfoo: bar\n";
+            let yaml = "type: string\nfoo: bar\n";
             let err = serde_yaml::from_str::<OutputDecl>(yaml).unwrap_err();
             assert!(
                 err.to_string().contains("unknown field") || err.to_string().contains("foo"),
@@ -1232,11 +1244,10 @@ expect:
 
         #[test]
         fn test_run_step_parses_outputs_list() {
-            let yaml = "name: s\nrun: echo ok\noutputs:\n  - name: result\n    type: string\n";
+            let yaml = "name: s\nrun: echo ok\noutputs:\n  result:\n    type: string\n";
             let step: RunStep = serde_yaml::from_str(yaml).unwrap();
             assert_eq!(step.outputs.len(), 1);
-            assert_eq!(step.outputs[0].name, "result");
-            assert_eq!(step.outputs[0].output_type, OutputType::String);
+            assert_eq!(step.outputs["result"].output_type, OutputType::String);
         }
 
         #[test]
@@ -1526,24 +1537,31 @@ expect:
 
     mod capture {
         use super::super::{capture_step_outputs, OutputDecl, OutputType, OutputValue};
+        use std::collections::BTreeMap;
 
-        fn decl(name: &str, t: OutputType, required: bool) -> OutputDecl {
+        fn decl(t: OutputType, required: bool) -> OutputDecl {
             OutputDecl {
-                name: name.to_string(),
                 output_type: t,
                 required,
             }
         }
 
+        fn decls(items: &[(&str, OutputType, bool)]) -> BTreeMap<String, OutputDecl> {
+            items
+                .iter()
+                .map(|(name, t, required)| (name.to_string(), decl(*t, *required)))
+                .collect()
+        }
+
         #[test]
         fn test_capture_empty_declarations_returns_empty() {
-            let captured = capture_step_outputs("step", &[], "FOO=bar\n").unwrap();
+            let captured = capture_step_outputs("step", &BTreeMap::new(), "FOO=bar\n").unwrap();
             assert!(captured.is_empty());
         }
 
         #[test]
         fn test_capture_string_output() {
-            let decls = vec![decl("result", OutputType::String, false)];
+            let decls = decls(&[("result", OutputType::String, false)]);
             let captured = capture_step_outputs("step", &decls, "result=hello\n").unwrap();
             assert_eq!(captured.len(), 1);
             assert_eq!(captured[0].name, "result");
@@ -1552,35 +1570,35 @@ expect:
 
         #[test]
         fn test_capture_number_output() {
-            let decls = vec![decl("count", OutputType::Number, false)];
+            let decls = decls(&[("count", OutputType::Number, false)]);
             let captured = capture_step_outputs("step", &decls, "count=99\n").unwrap();
             assert_eq!(captured[0].value, OutputValue::Number(99.0));
         }
 
         #[test]
         fn test_capture_bool_output_true() {
-            let decls = vec![decl("ok", OutputType::Bool, false)];
+            let decls = decls(&[("ok", OutputType::Bool, false)]);
             let captured = capture_step_outputs("step", &decls, "ok=true\n").unwrap();
             assert_eq!(captured[0].value, OutputValue::Bool(true));
         }
 
         #[test]
         fn test_capture_not_emitted_becomes_null() {
-            let decls = vec![decl("missing", OutputType::String, false)];
+            let decls = decls(&[("missing", OutputType::String, false)]);
             let captured = capture_step_outputs("step", &decls, "").unwrap();
             assert_eq!(captured[0].value, OutputValue::Null);
         }
 
         #[test]
         fn test_capture_emitted_as_empty_becomes_null() {
-            let decls = vec![decl("empty", OutputType::Number, false)];
+            let decls = decls(&[("empty", OutputType::Number, false)]);
             let captured = capture_step_outputs("step", &decls, "empty=\n").unwrap();
             assert_eq!(captured[0].value, OutputValue::Null);
         }
 
         #[test]
         fn test_capture_required_not_emitted_fails() {
-            let decls = vec![decl("must_have", OutputType::String, true)];
+            let decls = decls(&[("must_have", OutputType::String, true)]);
             let err = capture_step_outputs("step", &decls, "").unwrap_err();
             let msg = err.to_string();
             assert!(
@@ -1591,14 +1609,14 @@ expect:
 
         #[test]
         fn test_capture_required_emitted_empty_fails() {
-            let decls = vec![decl("must_have", OutputType::String, true)];
+            let decls = decls(&[("must_have", OutputType::String, true)]);
             let err = capture_step_outputs("step", &decls, "must_have=\n").unwrap_err();
             assert!(err.to_string().contains("required"));
         }
 
         #[test]
         fn test_capture_required_emitted_non_empty_succeeds() {
-            let decls = vec![decl("must_have", OutputType::String, true)];
+            let decls = decls(&[("must_have", OutputType::String, true)]);
             let captured = capture_step_outputs("step", &decls, "must_have=present\n").unwrap();
             assert_eq!(
                 captured[0].value,
@@ -1608,7 +1626,7 @@ expect:
 
         #[test]
         fn test_capture_coercion_failure_is_hard_fail() {
-            let decls = vec![decl("n", OutputType::Number, false)];
+            let decls = decls(&[("n", OutputType::Number, false)]);
             let err = capture_step_outputs("step", &decls, "n=not-a-number\n").unwrap_err();
             let msg = err.to_string();
             assert!(
@@ -1619,7 +1637,7 @@ expect:
 
         #[test]
         fn test_capture_undeclared_emissions_are_ignored() {
-            let decls = vec![decl("declared", OutputType::String, false)];
+            let decls = decls(&[("declared", OutputType::String, false)]);
             let captured =
                 capture_step_outputs("step", &decls, "declared=yes\nundeclared=ignored\n").unwrap();
             assert_eq!(captured.len(), 1);
@@ -1628,24 +1646,31 @@ expect:
 
         #[test]
         fn test_capture_declared_type_stored_on_result() {
-            let decls = vec![decl("count", OutputType::Number, false)];
+            let decls = decls(&[("count", OutputType::Number, false)]);
             let captured = capture_step_outputs("step", &decls, "count=5\n").unwrap();
             assert_eq!(captured[0].declared_type, OutputType::Number);
         }
 
         #[test]
         fn test_capture_multiple_outputs() {
-            let decls = vec![
-                decl("name", OutputType::String, false),
-                decl("count", OutputType::Number, false),
-                decl("ready", OutputType::Bool, false),
-            ];
+            let decls = decls(&[
+                ("name", OutputType::String, false),
+                ("count", OutputType::Number, false),
+                ("ready", OutputType::Bool, false),
+            ]);
             let contents = "name=alice\ncount=7\nready=true\n";
             let captured = capture_step_outputs("step", &decls, contents).unwrap();
             assert_eq!(captured.len(), 3);
-            assert_eq!(captured[0].value, OutputValue::String("alice".to_string()));
-            assert_eq!(captured[1].value, OutputValue::Number(7.0));
-            assert_eq!(captured[2].value, OutputValue::Bool(true));
+            let by_name: std::collections::BTreeMap<&str, &OutputValue> = captured
+                .iter()
+                .map(|c| (c.name.as_str(), &c.value))
+                .collect();
+            assert_eq!(
+                by_name.get("name"),
+                Some(&&OutputValue::String("alice".to_string()))
+            );
+            assert_eq!(by_name.get("count"), Some(&&OutputValue::Number(7.0)));
+            assert_eq!(by_name.get("ready"), Some(&&OutputValue::Bool(true)));
         }
     }
 }

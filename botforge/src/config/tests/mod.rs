@@ -44,7 +44,7 @@ fn make_step(target: StepTarget, name: &str) -> TestStep {
         id: None,
         expect: None,
         condition: StepCondition::Always,
-        outputs: vec![],
+        outputs: std::collections::BTreeMap::new(),
         captured_outputs: Default::default(),
     })
 }
@@ -4677,7 +4677,7 @@ mod outputs_validation {
     use super::*;
     use crate::step::{OutputDecl, OutputType};
 
-    fn make_run_step_with_outputs(name: &str, outputs: Vec<OutputDecl>) -> TestStep {
+    fn make_run_step_with_outputs(name: &str, outputs: Vec<(&str, OutputDecl)>) -> TestStep {
         TestStep::Run(RunStep {
             target: StepTarget::Guest,
             name: name.to_string(),
@@ -4688,14 +4688,16 @@ mod outputs_validation {
             id: None,
             expect: None,
             condition: StepCondition::Always,
-            outputs,
+            outputs: outputs
+                .into_iter()
+                .map(|(output_name, output_decl)| (output_name.to_string(), output_decl))
+                .collect(),
             captured_outputs: Default::default(),
         })
     }
 
-    fn decl(name: &str, t: OutputType) -> OutputDecl {
+    fn decl(t: OutputType) -> OutputDecl {
         OutputDecl {
-            name: name.to_string(),
             output_type: t,
             required: false,
         }
@@ -4705,25 +4707,25 @@ mod outputs_validation {
 
     #[test]
     fn test_output_type_string_accepted() {
-        let step = make_run_step_with_outputs("s", vec![decl("x", OutputType::String)]);
+        let step = make_run_step_with_outputs("s", vec![("x", decl(OutputType::String))]);
         assert!(validate_test_steps(&[step], &[]).is_ok());
     }
 
     #[test]
     fn test_output_type_number_accepted() {
-        let step = make_run_step_with_outputs("s", vec![decl("n", OutputType::Number)]);
+        let step = make_run_step_with_outputs("s", vec![("n", decl(OutputType::Number))]);
         assert!(validate_test_steps(&[step], &[]).is_ok());
     }
 
     #[test]
     fn test_output_type_secret_accepted() {
-        let step = make_run_step_with_outputs("s", vec![decl("token", OutputType::Secret)]);
+        let step = make_run_step_with_outputs("s", vec![("token", decl(OutputType::Secret))]);
         assert!(validate_test_steps(&[step], &[]).is_ok());
     }
 
     #[test]
     fn test_output_type_bool_accepted() {
-        let step = make_run_step_with_outputs("s", vec![decl("b", OutputType::Bool)]);
+        let step = make_run_step_with_outputs("s", vec![("b", decl(OutputType::Bool))]);
         assert!(validate_test_steps(&[step], &[]).is_ok());
     }
 
@@ -4749,42 +4751,6 @@ mod outputs_validation {
         );
     }
 
-    // --- duplicate output names ---
-
-    #[test]
-    fn test_duplicate_output_names_rejected() {
-        let step = make_run_step_with_outputs(
-            "my-step",
-            vec![
-                decl("result", OutputType::String),
-                decl("result", OutputType::Number),
-            ],
-        );
-        let err = validate_test_steps(&[step], &[]).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("result") || msg.contains("duplicate"),
-            "error should mention the duplicate name: {msg}"
-        );
-    }
-
-    #[test]
-    fn test_duplicate_output_names_rejected_in_build() {
-        let step = make_run_step_with_outputs(
-            "my-step",
-            vec![
-                decl("out", OutputType::Bool),
-                decl("out", OutputType::String),
-            ],
-        );
-        let err = validate_build_steps(&[step]).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("out") || msg.contains("duplicate"),
-            "error should mention the duplicate name: {msg}"
-        );
-    }
-
     #[test]
     fn test_no_outputs_is_valid() {
         let step = make_run_step_with_outputs("s", vec![]);
@@ -4796,9 +4762,9 @@ mod outputs_validation {
         let step = make_run_step_with_outputs(
             "s",
             vec![
-                decl("name", OutputType::String),
-                decl("count", OutputType::Number),
-                decl("ready", OutputType::Bool),
+                ("name", decl(OutputType::String)),
+                ("count", decl(OutputType::Number)),
+                ("ready", decl(OutputType::Bool)),
             ],
         );
         assert!(validate_test_steps(&[step], &[]).is_ok());
@@ -4808,18 +4774,27 @@ mod outputs_validation {
 
     #[test]
     fn test_output_required_parses_from_yaml() {
-        let yaml =
-            "name: s\nrun: echo ok\noutputs:\n  - name: x\n    type: string\n    required: true\n";
+        let yaml = "name: s\nrun: echo ok\noutputs:\n  x:\n    type: string\n    required: true\n";
         let step: RunStep = serde_yaml::from_str(yaml).unwrap();
-        assert!(step.outputs[0].required);
+        assert!(step.outputs["x"].required);
     }
 
     #[test]
     fn test_output_required_false_parses_from_yaml() {
+        let yaml = "name: s\nrun: echo ok\noutputs:\n  x:\n    type: number\n    required: false\n";
+        let step: RunStep = serde_yaml::from_str(yaml).unwrap();
+        assert!(!step.outputs["x"].required);
+    }
+
+    #[test]
+    fn test_output_list_shape_is_rejected() {
         let yaml =
             "name: s\nrun: echo ok\noutputs:\n  - name: x\n    type: number\n    required: false\n";
-        let step: RunStep = serde_yaml::from_str(yaml).unwrap();
-        assert!(!step.outputs[0].required);
+        let err = serde_yaml::from_str::<RunStep>(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid type"),
+            "list-shaped outputs should be rejected: {err}"
+        );
     }
 }
 
@@ -4880,14 +4855,13 @@ steps:
     name: emit
     run: echo "label=hi" >> "$BF_OUT"
     outputs:
-      - name: label
+      label:
         type: string
         required: true
 outputs:
-  - name: result
+  result:
     type: string
-    from-step: s1
-    from-output: label
+    value: ${{ steps.s1.outputs.label }}
     required: true
 "#,
         )
@@ -4897,8 +4871,10 @@ outputs:
         assert_eq!(invoke.output_decls.len(), 1);
         assert_eq!(invoke.output_decls[0].output_type, OutputType::String);
         assert_eq!(invoke.output_decls[0].name, "result");
-        assert_eq!(invoke.output_decls[0].from_step, "s1");
-        assert_eq!(invoke.output_decls[0].from_output, "label");
+        assert_eq!(
+            invoke.output_decls[0].value,
+            "${{ steps.s1.outputs.label }}"
+        );
         assert!(invoke.output_decls[0].required);
         assert!(invoke.output_decls[0].default.is_none());
     }
@@ -4916,14 +4892,13 @@ steps:
     name: count
     run: echo "n=5" >> "$BF_OUT"
     outputs:
-      - name: n
+      n:
         type: number
         required: true
 outputs:
-  - name: count
+  count:
     type: number
-    from-step: counter
-    from-output: n
+    value: ${{ steps.counter.outputs.n }}
     required: true
 "#,
         )
@@ -4946,14 +4921,13 @@ steps:
     name: chk
     run: echo "ok=true" >> "$BF_OUT"
     outputs:
-      - name: ok
+      ok:
         type: bool
         required: true
 outputs:
-  - name: ready
+  ready:
     type: bool
-    from-step: check
-    from-output: ok
+    value: ${{ steps.check.outputs.ok }}
     required: true
 "#,
         )
@@ -4976,14 +4950,13 @@ steps:
     name: emit
     run: echo "token=s3cr3t" >> "$BF_OUT"
     outputs:
-      - name: token
+      token:
         type: secret
         required: true
 outputs:
-  - name: token
+  token:
     type: secret
-    from-step: emit
-    from-output: token
+    value: ${{ steps.emit.outputs.token }}
     required: true
 "#,
         )
@@ -5006,14 +4979,13 @@ steps:
     name: s
     run: true
     outputs:
-      - name: x
+      x:
         type: string
         required: true
 outputs:
-  - name: x
+  x:
     type: integer
-    from-step: s1
-    from-output: x
+    value: ${{ steps.s1.outputs.x }}
     required: true
 "#,
         )
@@ -5041,14 +5013,13 @@ steps:
     name: s
     run: true
     outputs:
-      - name: x
+      x:
         type: string
         required: true
 outputs:
-  - name: x
+  x:
     type: string
-    from-step: s1
-    from-output: x
+    value: ${{ steps.s1.outputs.x }}
     required: true
     surprise: bad
 "#,
@@ -5079,14 +5050,13 @@ steps:
     name: s
     run: true
     outputs:
-      - name: x
+      x:
         type: string
         required: true
 outputs:
-  - name: x
+  x:
     type: string
-    from-step: s1
-    from-output: x
+    value: ${{ steps.s1.outputs.x }}
 "#,
         )
         .unwrap();
@@ -5111,14 +5081,13 @@ steps:
     name: s
     run: true
     outputs:
-      - name: x
+      x:
         type: string
         required: true
 outputs:
-  - name: x
+  x:
     type: string
-    from-step: s1
-    from-output: x
+    value: ${{ steps.s1.outputs.x }}
     required: true
 "#,
         )
@@ -5142,14 +5111,13 @@ steps:
     name: s
     run: true
     outputs:
-      - name: x
+      x:
         type: string
         required: false
 outputs:
-  - name: x
+  x:
     type: string
-    from-step: s1
-    from-output: x
+    value: ${{ steps.s1.outputs.x }}
     default: fallback
 "#,
         )
@@ -5176,14 +5144,13 @@ steps:
     name: s
     run: true
     outputs:
-      - name: x
+      x:
         type: string
         required: true
 outputs:
-  - name: x
+  x:
     type: string
-    from-step: s1
-    from-output: x
+    value: ${{ steps.s1.outputs.x }}
     required: true
     default: oops
 "#,
@@ -5210,14 +5177,13 @@ steps:
     name: s
     run: true
     outputs:
-      - name: n
+      n:
         type: number
         required: false
 outputs:
-  - name: count
+  count:
     type: number
-    from-step: s1
-    from-output: n
+    value: ${{ steps.s1.outputs.n }}
     default: 42
 "#,
         )
@@ -5243,14 +5209,13 @@ steps:
     name: s
     run: true
     outputs:
-      - name: flag
+      flag:
         type: bool
         required: false
 outputs:
-  - name: ready
+  ready:
     type: bool
-    from-step: s1
-    from-output: flag
+    value: ${{ steps.s1.outputs.flag }}
     default: false
 "#,
         )
@@ -5276,14 +5241,13 @@ steps:
     name: s
     run: true
     outputs:
-      - name: n
+      n:
         type: number
         required: false
 outputs:
-  - name: count
+  count:
     type: number
-    from-step: s1
-    from-output: n
+    value: ${{ steps.s1.outputs.n }}
     default: not-a-number
 "#,
         )
@@ -5313,14 +5277,13 @@ steps:
     name: s
     run: true
     outputs:
-      - name: x
+      x:
         type: string
         required: true
 outputs:
-  - name: x
+  x:
     type: string
-    from-step: ghost-step
-    from-output: x
+    value: ${{ steps.ghost-step.outputs.x }}
     required: true
 "#,
         )
@@ -5346,14 +5309,13 @@ steps:
     name: s
     run: true
     outputs:
-      - name: real-output
+      real-output:
         type: string
         required: true
 outputs:
-  - name: x
+  x:
     type: string
-    from-step: s1
-    from-output: ghost-output
+    value: ${{ steps.s1.outputs.ghost-output }}
     required: true
 "#,
         )
@@ -5367,11 +5329,12 @@ outputs:
     }
 
     // ────────────────────────────────────────────────────────────────
-    // Step↔fragment type-match
+    // `value:` expression validation (validity, not matching — no static
+    // type-match against any referenced step output's declared type)
     // ────────────────────────────────────────────────────────────────
 
     #[test]
-    fn test_fragment_output_type_match_succeeds() {
+    fn test_fragment_output_pure_ref_value_loads() {
         let repo = TempDir::new().unwrap();
         std::fs::write(
             repo.path().join("frag.yaml"),
@@ -5383,14 +5346,13 @@ steps:
     name: s
     run: echo "val=hello" >> "$BF_OUT"
     outputs:
-      - name: val
+      val:
         type: string
         required: true
 outputs:
-  - name: val
+  val:
     type: string
-    from-step: s1
-    from-output: val
+    value: ${{ steps.s1.outputs.val }}
     required: true
 "#,
         )
@@ -5399,10 +5361,14 @@ outputs:
         // Should succeed without error.
         let invoke = load_invoke(&repo);
         assert_eq!(invoke.output_decls[0].output_type, OutputType::String);
+        assert_eq!(invoke.output_decls[0].value, "${{ steps.s1.outputs.val }}");
     }
 
     #[test]
-    fn test_fragment_output_type_mismatch_is_error() {
+    fn test_fragment_output_declared_type_differs_from_step_output_type_loads() {
+        // There is NO static type-match between the fragment output's declared
+        // `type:` and a referenced step output's declared type: the resolved
+        // value is validated against the declared type at the boundary instead.
         let repo = TempDir::new().unwrap();
         std::fs::write(
             repo.path().join("frag.yaml"),
@@ -5414,28 +5380,26 @@ steps:
     name: s
     run: true
     outputs:
-      - name: n
+      n:
         type: number
         required: true
 outputs:
-  - name: n
+  n:
     type: string
-    from-step: s1
-    from-output: n
+    value: ${{ steps.s1.outputs.n }}
     required: true
 "#,
         )
         .unwrap();
         write_test_yaml(&repo, "frag.yaml");
-        let err = load_err(&repo);
-        assert!(
-            err.contains("mismatch") || (err.contains("string") && err.contains("number")),
-            "type mismatch should be an error naming both types: {err}"
-        );
+        let invoke = load_invoke(&repo);
+        assert_eq!(invoke.output_decls[0].output_type, OutputType::String);
     }
 
     #[test]
-    fn test_fragment_output_type_mismatch_error_names_both_sides() {
+    fn test_fragment_output_compound_expression_value_loads() {
+        // Compound/function expressions must NOT be rejected at load time;
+        // they are resolved and validated at the fragment-output boundary.
         let repo = TempDir::new().unwrap();
         std::fs::write(
             repo.path().join("frag.yaml"),
@@ -5445,31 +5409,38 @@ steps:
   - on: guest
     id: s1
     name: s
-    run: true
+    run: echo "n=7" >> "$BF_OUT"
     outputs:
-      - name: flag
-        type: bool
+      n:
+        type: string
         required: true
 outputs:
-  - name: flag
+  count:
     type: number
-    from-step: s1
-    from-output: flag
+    value: ${{ from_json(steps.s1.outputs.n) }}
+    required: true
+  label:
+    type: string
+    value: "I counted ${{ steps.s1.outputs.n }} chickens"
     required: true
 "#,
         )
         .unwrap();
         write_test_yaml(&repo, "frag.yaml");
-        let err = load_err(&repo);
-        // Error should name both the fragment-declared type and the step's type.
-        assert!(
-            err.contains("number") && err.contains("bool"),
-            "type mismatch error should name both sides (bool vs number): {err}"
+        let invoke = load_invoke(&repo);
+        assert_eq!(invoke.output_decls.len(), 2);
+        assert_eq!(
+            invoke.output_decls[0].value,
+            "${{ from_json(steps.s1.outputs.n) }}"
+        );
+        assert_eq!(
+            invoke.output_decls[1].value,
+            "I counted ${{ steps.s1.outputs.n }} chickens"
         );
     }
 
     #[test]
-    fn test_fragment_output_secret_type_mismatch_is_error() {
+    fn test_fragment_output_malformed_value_expression_is_error() {
         let repo = TempDir::new().unwrap();
         std::fs::write(
             repo.path().join("frag.yaml"),
@@ -5481,14 +5452,13 @@ steps:
     name: s
     run: true
     outputs:
-      - name: token
-        type: secret
+      x:
+        type: string
         required: true
 outputs:
-  - name: token
+  x:
     type: string
-    from-step: s1
-    from-output: token
+    value: "${{ steps.s1.outputs. }}"
     required: true
 "#,
         )
@@ -5496,8 +5466,8 @@ outputs:
         write_test_yaml(&repo, "frag.yaml");
         let err = load_err(&repo);
         assert!(
-            err.contains("mismatch") && err.contains("secret") && err.contains("string"),
-            "secret/string mismatch should fail load-time with both types named: {err}"
+            err.contains("invalid") || err.contains("expression"),
+            "malformed value expression should be rejected at load time: {err}"
         );
     }
 
@@ -5514,14 +5484,13 @@ steps:
     name: s
     run: true
     outputs:
-      - name: token
+      token:
         type: secret
         required: false
 outputs:
-  - name: token
+  token:
     type: secret
-    from-step: s1
-    from-output: token
+    value: ${{ steps.s1.outputs.token }}
     default:
       leaked: super-secret-value
 "#,
@@ -5556,22 +5525,20 @@ steps:
     name: s
     run: true
     outputs:
-      - name: x
+      x:
         type: string
         required: true
-      - name: y
+      y:
         type: string
         required: true
 outputs:
-  - name: x
+  x:
     type: string
-    from-step: s1
-    from-output: x
+    value: ${{ steps.s1.outputs.x }}
     required: true
-  - name: x
+  x:
     type: string
-    from-step: s1
-    from-output: y
+    value: ${{ steps.s1.outputs.y }}
     required: true
 "#,
         )
@@ -5604,30 +5571,27 @@ steps:
       echo "count=7" >> "$BF_OUT"
       echo "ok=true" >> "$BF_OUT"
     outputs:
-      - name: label
+      label:
         type: string
         required: true
-      - name: count
+      count:
         type: number
         required: true
-      - name: ok
+      ok:
         type: bool
         required: true
 outputs:
-  - name: label
+  label:
     type: string
-    from-step: s1
-    from-output: label
+    value: ${{ steps.s1.outputs.label }}
     required: true
-  - name: count
+  count:
     type: number
-    from-step: s1
-    from-output: count
+    value: ${{ steps.s1.outputs.count }}
     required: true
-  - name: ok
+  ok:
     type: bool
-    from-step: s1
-    from-output: ok
+    value: ${{ steps.s1.outputs.ok }}
     required: true
 "#,
         )
@@ -5635,12 +5599,14 @@ outputs:
         write_test_yaml(&repo, "frag.yaml");
         let invoke = load_invoke(&repo);
         assert_eq!(invoke.output_decls.len(), 3);
-        assert_eq!(invoke.output_decls[0].name, "label");
-        assert_eq!(invoke.output_decls[0].output_type, OutputType::String);
-        assert_eq!(invoke.output_decls[1].name, "count");
-        assert_eq!(invoke.output_decls[1].output_type, OutputType::Number);
-        assert_eq!(invoke.output_decls[2].name, "ok");
-        assert_eq!(invoke.output_decls[2].output_type, OutputType::Bool);
+        let by_name: std::collections::BTreeMap<&str, OutputType> = invoke
+            .output_decls
+            .iter()
+            .map(|decl| (decl.name.as_str(), decl.output_type))
+            .collect();
+        assert_eq!(by_name.get("label"), Some(&OutputType::String));
+        assert_eq!(by_name.get("count"), Some(&OutputType::Number));
+        assert_eq!(by_name.get("ok"), Some(&OutputType::Bool));
     }
 
     // ────────────────────────────────────────────────────────────────
@@ -5689,11 +5655,15 @@ steps:
             id: Some(inner_id.to_string()),
             expect: None,
             condition: StepCondition::Always,
-            outputs: vec![crate::step::OutputDecl {
-                name: output_name.to_string(),
-                output_type: decl.output_type,
-                required: true,
-            }],
+            outputs: [(
+                output_name.to_string(),
+                crate::step::OutputDecl {
+                    output_type: decl.output_type,
+                    required: true,
+                },
+            )]
+            .into_iter()
+            .collect(),
             captured_outputs: std::cell::RefCell::new(Some(vec![CapturedOutput {
                 name: output_name.to_string(),
                 declared_type: decl.output_type,
@@ -5715,8 +5685,7 @@ steps:
         let decl = FragmentOutputDecl {
             name: "result".to_string(),
             output_type: OutputType::String,
-            from_step: "inner".to_string(),
-            from_output: "label".to_string(),
+            value: "${{ steps.inner.outputs.label }}".to_string(),
             required: true,
             default: None,
         };
@@ -5740,8 +5709,7 @@ steps:
         let decl = FragmentOutputDecl {
             name: "count".to_string(),
             output_type: OutputType::Number,
-            from_step: "inner".to_string(),
-            from_output: "n".to_string(),
+            value: "${{ steps.inner.outputs.n }}".to_string(),
             required: true,
             default: None,
         };
@@ -5757,8 +5725,7 @@ steps:
         let decl = FragmentOutputDecl {
             name: "ok".to_string(),
             output_type: OutputType::Bool,
-            from_step: "inner".to_string(),
-            from_output: "flag".to_string(),
+            value: "${{ steps.inner.outputs.flag }}".to_string(),
             required: false,
             default: Some(OutputValue::Bool(false)),
         };
@@ -5775,8 +5742,7 @@ steps:
         let decl = FragmentOutputDecl {
             name: "label".to_string(),
             output_type: OutputType::String,
-            from_step: "inner".to_string(),
-            from_output: "x".to_string(),
+            value: "${{ steps.inner.outputs.x }}".to_string(),
             required: false,
             default: Some(OutputValue::String("default-val".to_string())),
         };
@@ -5795,17 +5761,107 @@ steps:
         let decl = FragmentOutputDecl {
             name: "must-have".to_string(),
             output_type: OutputType::String,
-            from_step: "inner".to_string(),
-            from_output: "x".to_string(),
+            value: "${{ steps.inner.outputs.x }}".to_string(),
             required: true,
             default: None,
         };
         let invoke = make_invoke_with_captured_inner("inner", "x", OutputValue::Null, decl);
         let err = resolve_invoke_outputs_for_test(&invoke).unwrap_err();
-        let msg = err.to_string();
+        let msg = format!("{err:#}");
         assert!(
             msg.contains("required") && msg.contains("must-have"),
             "error should mention required output name: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_invoke_outputs_interpolated_value_resolves_to_string() {
+        let decl = FragmentOutputDecl {
+            name: "label".to_string(),
+            output_type: OutputType::String,
+            value: "I counted ${{ steps.inner.outputs.count }} chickens".to_string(),
+            required: true,
+            default: None,
+        };
+        let invoke =
+            make_invoke_with_captured_inner("inner", "count", OutputValue::Number(7.0), decl);
+        resolve_invoke_outputs_for_test(&invoke).unwrap();
+        let captured = invoke.captured_outputs.borrow();
+        let outputs = captured.as_ref().unwrap();
+        assert_eq!(
+            outputs[0].value,
+            OutputValue::String("I counted 7 chickens".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_invoke_outputs_from_json_value_coerces_to_number() {
+        let decl = FragmentOutputDecl {
+            name: "count".to_string(),
+            output_type: OutputType::Number,
+            value: "${{ from_json(steps.inner.outputs.numbery_string) }}".to_string(),
+            required: true,
+            default: None,
+        };
+        let invoke = make_invoke_with_captured_inner(
+            "inner",
+            "numbery_string",
+            OutputValue::String("7".to_string()),
+            decl,
+        );
+        resolve_invoke_outputs_for_test(&invoke).unwrap();
+        let captured = invoke.captured_outputs.borrow();
+        let outputs = captured.as_ref().unwrap();
+        assert_eq!(outputs[0].value, OutputValue::Number(7.0));
+        assert_eq!(outputs[0].declared_type, OutputType::Number);
+    }
+
+    #[test]
+    fn test_resolve_invoke_outputs_type_invalid_value_is_boundary_error() {
+        // A resolved value that does not satisfy the declared type is a hard
+        // error at the fragment-output boundary, naming the fragment output.
+        let decl = FragmentOutputDecl {
+            name: "count".to_string(),
+            output_type: OutputType::Number,
+            value: "${{ steps.inner.outputs.some_text }}".to_string(),
+            required: true,
+            default: None,
+        };
+        let invoke = make_invoke_with_captured_inner(
+            "inner",
+            "some_text",
+            OutputValue::String("not-a-number".to_string()),
+            decl,
+        );
+        let err = resolve_invoke_outputs_for_test(&invoke).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("count") && msg.contains("number"),
+            "type-invalid value must hard-fail at the boundary naming the output: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_invoke_outputs_value_cannot_reference_fragment_outputs() {
+        // `outputs.*` self-references inside a `value:` expression are a hard error.
+        let decl = FragmentOutputDecl {
+            name: "loop".to_string(),
+            output_type: OutputType::String,
+            value: "${{ outputs.loop }}".to_string(),
+            required: true,
+            default: None,
+        };
+        let invoke = make_invoke_with_captured_inner(
+            "inner",
+            "x",
+            OutputValue::String("v".to_string()),
+            decl,
+        );
+        let err = resolve_invoke_outputs_for_test(&invoke).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("cannot reference"),
+            "outputs.* inside value: must be rejected: {msg}"
         );
     }
 
@@ -5829,8 +5885,7 @@ steps:
         let decl = FragmentOutputDecl {
             name: "result".to_string(),
             output_type: OutputType::String,
-            from_step: "s1".to_string(),
-            from_output: "val".to_string(),
+            value: "${{ steps.s1.outputs.val }}".to_string(),
             required: true,
             default: None,
         };

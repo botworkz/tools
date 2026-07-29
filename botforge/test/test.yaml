@@ -30,9 +30,9 @@ steps:
   run: |
     echo "count=11" >> "$BF_OUT"
   outputs:
-  - name: count
-    type: number
-    required: true
+    count:
+      type: number
+      required: true
 - on: host
   name: consume run-step output
   run: |

@@ -18,8 +18,8 @@ use self::cloud_init::{
     merge_cloud_init_mappings, validate_cloud_init_fragment, validate_cloud_init_schema_fragment,
 };
 use self::expressions::{
-    expand_raw_step, extract_fragment_input_declarations, resolve_fragment_inputs,
-    substitute_inputs_in_value,
+    expand_raw_step, extract_fragment_input_declarations, parse_pure_step_output_ref,
+    resolve_fragment_inputs, substitute_inputs_in_value, validate_expression_spans,
 };
 pub(crate) use self::expressions::{
     is_pure_deferred_output_ref, resolve_deferred_condition, resolve_deferred_refs_in_string,
@@ -270,26 +270,24 @@ struct LoadedFragment {
     steps: Vec<RawTestStep>,
     cloud_init: Option<serde_yaml::Mapping>,
     files: Vec<FileEntry>,
-    output_decls: Vec<RawFragmentOutputDecl>,
+    output_decls: BTreeMap<String, RawFragmentOutputDecl>,
 }
 
 /// The raw YAML form of a single fragment output declaration.
 ///
 /// This is only used during loading; the validated form is [`FragmentOutputDecl`] which
-/// is what gets stored on [`InvokeStep`] after load-time cross-reference checks.
+/// is what gets stored on [`InvokeStep`] after load-time validation.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawFragmentOutputDecl {
-    name: String,
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default = "default_output_type")]
     output_type: OutputType,
-    /// The `id:` of the inner run step whose output is re-exported.
-    #[serde(rename = "from-step")]
-    from_step: String,
-    /// The output name on the referenced inner step.
-    #[serde(rename = "from-output")]
-    from_output: String,
-    /// When `true`, the inner step must emit a non-null value (after default fallback).
+    /// The output's value, expressed as an expression string (e.g.
+    /// `${{ steps.emit.outputs.version }}`, an interpolation, or a function call).
+    /// Resolved at the fragment-output boundary and validated against the declared
+    /// `type`.  May be a typed YAML scalar after load-time input substitution.
+    value: Value,
+    /// When `true`, the resolved value must be non-null (after default fallback).
     #[serde(default)]
     required: bool,
     /// Optional default value, expressed as a YAML scalar.  Must be coercible to the
@@ -310,7 +308,11 @@ struct RawTestStepFragment {
     /// Optional fragment output declarations.  Re-export inner step outputs at the
     /// fragment boundary; validated and attached to the `InvokeStep` at load time.
     #[serde(default)]
-    outputs: Vec<RawFragmentOutputDecl>,
+    outputs: BTreeMap<String, RawFragmentOutputDecl>,
+}
+
+fn default_output_type() -> OutputType {
+    OutputType::String
 }
 
 fn deserialize_positive_seconds<'de, D>(deserializer: D) -> std::result::Result<u64, D::Error>
@@ -1140,40 +1142,34 @@ fn expand_test_steps(
 /// Validate raw fragment output declarations against the fragment's own expanded inner steps.
 ///
 /// Enforces:
-/// - Unique output names within the `outputs:` block.
 /// - Required-or-default rule (mirror of inputs R1): if `required` is not `true`, a `default:`
 ///   is mandatory; setting both `required: true` and `default:` together is a hard error.
 /// - The `default:` value is type-coerced against the declared `type`.
-/// - The referenced inner step `id:` (`from-step:`) must exist as a direct run step with that
-///   `id:` in the fragment's expanded step list.
-/// - The referenced output name (`from-output:`) must be declared on that step.
-/// - The fragment output's declared `type` must equal the referenced step output's declared
-///   `type` (step↔fragment type-match).
+/// - The `value:` expression must be well-formed (every `${{ }}` span parses).
+/// - Best-effort static check for the pure-ref shape only: when `value:` is exactly one
+///   `${{ steps.<id>.outputs.<name> }}`, the referenced inner step must exist as a direct
+///   run step with that output declared.  Compound/function expressions are not statically
+///   checked; they are resolved and validated against the declared `type` at the
+///   fragment-output boundary.
+///
+/// There is **no** static type-match between the declared `type` and any referenced step
+/// output's declared type: the resolved value is coerced and validated against the declared
+/// `type` at the boundary (validity, not matching).
 ///
 /// Returns the validated `Vec<FragmentOutputDecl>` ready to attach to the `InvokeStep`.
 fn validate_fragment_outputs(
-    raw_outputs: Vec<RawFragmentOutputDecl>,
+    raw_outputs: BTreeMap<String, RawFragmentOutputDecl>,
     inner_steps: &[TestStep],
     path: &Path,
 ) -> Result<Vec<FragmentOutputDecl>> {
-    let mut seen_names: HashSet<String> = HashSet::new();
     let mut validated: Vec<FragmentOutputDecl> = Vec::with_capacity(raw_outputs.len());
 
-    for raw in raw_outputs {
-        // Unique name check.
-        if !seen_names.insert(raw.name.clone()) {
-            anyhow::bail!(
-                "fragment output '{}': duplicate name in outputs: block ({})",
-                raw.name,
-                path.display()
-            );
-        }
-
+    for (name, raw) in raw_outputs {
         // Required-or-default rule (mirror of inputs R1).
         if !raw.required && raw.default.is_none() {
             anyhow::bail!(
                 "fragment output '{}' must set 'required: true' or provide a 'default:' ({})",
-                raw.name,
+                name,
                 path.display()
             );
         }
@@ -1181,7 +1177,7 @@ fn validate_fragment_outputs(
         if raw.required && raw.default.is_some() {
             anyhow::bail!(
                 "fragment output '{}' cannot set both 'required: true' and 'default' ({})",
-                raw.name,
+                name,
                 path.display()
             );
         }
@@ -1192,30 +1188,30 @@ fn validate_fragment_outputs(
                 if raw.output_type == OutputType::Secret {
                     anyhow::anyhow!(
                         "fragment output '{}': invalid default value for secret output ({})",
-                        raw.name,
+                        name,
                         path.display()
                     )
                 } else {
                     anyhow::anyhow!(
                         "fragment output '{}': invalid default value: {} ({})",
-                        raw.name,
+                        name,
                         e,
                         path.display()
                     )
                 }
             })?;
             let coerced =
-                coerce_output_value(&raw.name, &raw_str, raw.output_type).map_err(|e| {
+                coerce_output_value(&name, &raw_str, raw.output_type).map_err(|e| {
                     if raw.output_type == OutputType::Secret {
                         anyhow::anyhow!(
                             "fragment output '{}': default value type coercion failed for secret output ({})",
-                            raw.name,
+                            name,
                             path.display()
                         )
                     } else {
                         anyhow::anyhow!(
                             "fragment output '{}': default value type coercion failed: {} ({})",
-                            raw.name,
+                            name,
                             e,
                             path.display()
                         )
@@ -1226,29 +1222,37 @@ fn validate_fragment_outputs(
             None
         };
 
-        // Look up the referenced inner step and its declared output type.
-        let step_output_type =
-            find_inner_step_output_type(inner_steps, &raw.from_step, &raw.from_output, path)?;
-
-        // Step↔fragment type-match check.
-        if step_output_type != raw.output_type {
-            anyhow::bail!(
-                "fragment output '{}': type mismatch: fragment declares '{}' but inner step \
-                 '{}' output '{}' declares '{}' ({})",
-                raw.name,
-                raw.output_type,
-                raw.from_step,
-                raw.from_output,
-                step_output_type,
+        // Convert the raw `value:` scalar to its expression string form.
+        let value_expr = yaml_scalar_to_string(&raw.value).map_err(|e| {
+            anyhow::anyhow!(
+                "fragment output '{}': invalid 'value:' field: {} ({})",
+                name,
+                e,
                 path.display()
-            );
+            )
+        })?;
+
+        // The `value:` expression must be well-formed (every `${{ }}` span parses).
+        validate_expression_spans(&value_expr).with_context(|| {
+            format!(
+                "fragment output '{}': invalid 'value:' expression ({})",
+                name,
+                path.display()
+            )
+        })?;
+
+        // Best-effort static check: for the trivially-checkable pure-ref shape only,
+        // verify the referenced inner step exists with that output declared.  No
+        // type-match — the resolved value is validated against the declared type at
+        // the fragment-output boundary.
+        if let Some((step_id, output_name)) = parse_pure_step_output_ref(&value_expr) {
+            check_inner_step_output_declared(inner_steps, &step_id, &output_name, path)?;
         }
 
         validated.push(FragmentOutputDecl {
-            name: raw.name,
+            name,
             output_type: raw.output_type,
-            from_step: raw.from_step,
-            from_output: raw.from_output,
+            value: value_expr,
             required: raw.required,
             default: default_value,
         });
@@ -1257,27 +1261,27 @@ fn validate_fragment_outputs(
     Ok(validated)
 }
 
-/// Find the declared [`OutputType`] of a named output on a direct inner run step.
+/// Check that a direct inner run step with the given `id:` exists and declares the
+/// named output.
 ///
 /// Searches the **direct** children of `steps` (not recursively into nested `Invoke` steps)
-/// for a `Run` step whose `id:` equals `step_id`, then looks for an `OutputDecl` named
+/// for a `Run` step whose `id:` equals `step_id`, then looks for an output declaration named
 /// `output_name` on that step.
 ///
-/// Returns a hard error if the step id is not found, if the step does not declare the
-/// named output, or if more than one step carries the same id (should not happen after
-/// `validate_scope_step_ids`, but checked defensively).
-fn find_inner_step_output_type(
+/// Returns a hard error if the step id is not found or if the step does not declare the
+/// named output.
+fn check_inner_step_output_declared(
     steps: &[TestStep],
     step_id: &str,
     output_name: &str,
     path: &Path,
-) -> Result<OutputType> {
+) -> Result<()> {
     for step in steps {
         if let TestStep::Run(run) = step {
             if run.id.as_deref() == Some(step_id) {
                 // Found the step — look for the declared output.
-                return if let Some(decl) = run.outputs.iter().find(|o| o.name == output_name) {
-                    Ok(decl.output_type)
+                return if run.outputs.contains_key(output_name) {
+                    Ok(())
                 } else {
                     anyhow::bail!(
                         "fragment output references step '{}' output '{}', but step '{}' \
@@ -1705,7 +1709,7 @@ fn validate_deferred_output_references_in_scope(
                         id.to_string(),
                         ScopeOutputContract {
                             step_kind: "run step",
-                            output_names: run.outputs.iter().map(|o| o.name.clone()).collect(),
+                            output_names: run.outputs.keys().cloned().collect(),
                         },
                     );
                 }
@@ -1881,22 +1885,10 @@ fn validate_run_step_deferred_output_references(
 
 /// Validate the `outputs:` declarations on a single run step.
 ///
-/// Checks that:
-/// - Output names are unique within the step (duplicate = config error).
-///
-/// The `type:` field is validated implicitly by serde's enum deserialization
-/// (unknown type → error at parse time); there is nothing extra to check here.
+/// Output names are structural map keys, so duplicate-name validation is handled
+/// by the map shape itself.
 fn validate_run_step_outputs(step: &crate::step::RunStep) -> Result<()> {
-    let mut seen = HashSet::new();
-    for decl in &step.outputs {
-        if !seen.insert(decl.name.as_str()) {
-            anyhow::bail!(
-                "step '{}': duplicate output name '{}'; output names must be unique within a step",
-                step.name,
-                decl.name
-            );
-        }
-    }
+    let _ = step;
     Ok(())
 }
 
