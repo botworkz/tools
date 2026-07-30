@@ -149,7 +149,10 @@ fn evaluate_equality(
         EvaluatedSpan::Value(value) => value,
     };
     let same = match (&lhs, &rhs) {
-        (EvaluatedValue::String(a), EvaluatedValue::String(b)) => a == b,
+        (
+            EvaluatedValue::String(a) | EvaluatedValue::Secret(a),
+            EvaluatedValue::String(b) | EvaluatedValue::Secret(b),
+        ) => a == b,
         (EvaluatedValue::Number(a), EvaluatedValue::Number(b)) => a == b,
         (EvaluatedValue::Bool(a), EvaluatedValue::Bool(b)) => a == b,
         (EvaluatedValue::Empty, EvaluatedValue::Empty) => true,
@@ -190,7 +193,7 @@ fn evaluate_function_call(
                 EvaluatedSpan::Value(v) => v,
             };
             let json_str = match val {
-                EvaluatedValue::String(s) => s,
+                EvaluatedValue::String(s) | EvaluatedValue::Secret(s) => s,
                 other => anyhow::bail!("from_json() requires a string argument, got {:?}", other),
             };
             Ok(EvaluatedSpan::Value(parse_from_json(&json_str)?))
@@ -291,7 +294,7 @@ fn evaluate_node_runtime(
                 "to_json" => Ok(EvaluatedValue::String(val.to_json_string())),
                 "from_json" => {
                     let json_str = match val {
-                        EvaluatedValue::String(s) => s,
+                        EvaluatedValue::String(s) | EvaluatedValue::Secret(s) => s,
                         other => {
                             anyhow::bail!("from_json() requires a string argument, got {:?}", other)
                         }
@@ -340,7 +343,10 @@ fn evaluate_node_runtime(
 
 fn runtime_values_equal(lhs: &EvaluatedValue, rhs: &EvaluatedValue) -> bool {
     match (lhs, rhs) {
-        (EvaluatedValue::String(a), EvaluatedValue::String(b)) => a == b,
+        (
+            EvaluatedValue::String(a) | EvaluatedValue::Secret(a),
+            EvaluatedValue::String(b) | EvaluatedValue::Secret(b),
+        ) => a == b,
         (EvaluatedValue::Number(a), EvaluatedValue::Number(b)) => a == b,
         (EvaluatedValue::Bool(a), EvaluatedValue::Bool(b)) => a == b,
         (EvaluatedValue::Empty, EvaluatedValue::Empty) => true,

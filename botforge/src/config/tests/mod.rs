@@ -443,6 +443,46 @@ steps:
     }
 
     #[test]
+    fn test_load_test_config_masks_secret_input_in_display_name_but_not_run_body() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("frag.yaml"),
+            r#"
+type: botforge/fragment
+inputs:
+  token:
+    type: secret
+    required: true
+steps:
+  - on: guest
+    name: "masked-${{ inputs.token }}"
+    run: "echo ${{ inputs.token }}"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("test.yaml"),
+            r#"
+type: botforge/test
+name: test
+steps:
+  - uses: "@://frag.yaml"
+    with:
+      token: steel-toe-secret
+"#,
+        )
+        .unwrap();
+
+        let config = load_test_config(repo.path(), &repo.path().join("test.yaml")).unwrap();
+        let inner = &invoke_ref(&config.steps[0]).steps;
+        assert_eq!(inner.len(), 1);
+        let step = run_ref(&inner[0]);
+        assert_eq!(step.name, "masked-***");
+        assert!(step.run.contains("steel-toe-secret"));
+        assert!(!step.name.contains("steel-toe-secret"));
+    }
+
+    #[test]
     fn test_load_test_config_preserves_fragment_sudo_via_uses() {
         let repo = TempDir::new().unwrap();
         std::fs::write(

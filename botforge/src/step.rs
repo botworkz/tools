@@ -5,6 +5,7 @@ use serde_yaml::Value;
 use std::collections::BTreeMap;
 
 use crate::config::{is_pure_deferred_output_ref, yaml_scalar_to_string, yaml_scalar_truthiness};
+use crate::masking::display_string_for_secret;
 
 /// The declared type of a step output.
 ///
@@ -92,11 +93,7 @@ impl OutputValue {
     /// `secret` declarations always render as `"***"`; all other declarations
     /// render exactly as [`Self::to_use_string`].
     pub(crate) fn to_display_string(&self, declared_type: OutputType) -> String {
-        if declared_type == OutputType::Secret {
-            "***".to_string()
-        } else {
-            self.to_use_string()
-        }
+        display_string_for_secret(&self.to_use_string(), declared_type == OutputType::Secret)
     }
 }
 
