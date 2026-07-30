@@ -42,6 +42,7 @@ const DEFAULT_SENTINEL: &str = "__default__";
 #[serde(rename_all = "lowercase")]
 pub(super) enum InputType {
     String,
+    Secret,
     Number,
     Boolean,
 }
@@ -53,7 +54,8 @@ pub(super) struct InputDeclaration {
     #[serde(default)]
     pub(super) required: bool,
     /// Native-typed YAML default value for this input. Must match the declared `input_type`:
-    /// `boolean` inputs require a YAML bool, `number` inputs a YAML number, `string` a string.
+    /// `boolean` inputs require a YAML bool, `number` inputs a YAML number,
+    /// `string`/`secret` inputs require a YAML string.
     /// A string default for a `boolean`/`number` input is a hard load-time error (R2).
     pub(super) default: Option<Value>,
 }
@@ -284,7 +286,7 @@ pub(super) fn resolve_fragment_inputs(
 /// - `boolean` inputs accept only YAML `Bool`; any string (including `"true"`/`"false"`)
 ///   is a hard error — use unquoted `true`/`false` in YAML.
 /// - `number` inputs accept only YAML `Number` (finite); any string is a hard error.
-/// - `string` inputs accept only YAML `String`.
+/// - `string`/`secret` inputs accept only YAML `String`.
 ///
 /// The `__default__` sentinel must be stripped by the caller before invoking this function.
 fn yaml_value_to_evaluated(
@@ -297,6 +299,14 @@ fn yaml_value_to_evaluated(
             Value::String(s) => Ok(EvaluatedValue::String(s.clone())),
             other => anyhow::bail!(
                 "input '{}': expected a string value, got {}",
+                name,
+                yaml_type_name(other)
+            ),
+        },
+        InputType::Secret => match value {
+            Value::String(s) => Ok(EvaluatedValue::String(s.clone())),
+            other => anyhow::bail!(
+                "input '{}': expected a string value for secret input, got {}",
                 name,
                 yaml_type_name(other)
             ),
@@ -815,6 +825,7 @@ mod tests {
                 let ev = match t {
                     InputType::Boolean => EvaluatedValue::Bool(v.eq_ignore_ascii_case("true")),
                     InputType::Number => EvaluatedValue::Number(v.parse::<f64>().unwrap_or(0.0)),
+                    InputType::Secret => EvaluatedValue::String(v.to_string()),
                     InputType::String => EvaluatedValue::String(v.to_string()),
                 };
                 (k.to_string(), ev)
@@ -913,6 +924,37 @@ mod tests {
             assert_eq!(
                 resolved.get("shell"),
                 Some(&EvaluatedValue::String("bash".to_string()))
+            );
+        }
+
+        #[test]
+        fn test_resolve_inputs_secret_type_valid_native_string() {
+            let declarations = decl_map(&[("token", decl(InputType::Secret, true, None))]);
+            let with = with_map(&[("token", "steel-toe-secret")]);
+            let resolved = resolve_fragment_inputs(dummy_path(), &declarations, &with).unwrap();
+            assert_eq!(
+                resolved.get("token"),
+                Some(&EvaluatedValue::String("steel-toe-secret".to_string()))
+            );
+        }
+
+        #[test]
+        fn test_extract_fragment_input_declarations_unknown_input_type_variant_is_error() {
+            let value: Value = serde_yaml::from_str(
+                r#"
+inputs:
+  token:
+    type: integer
+    required: true
+"#,
+            )
+            .unwrap();
+            let err = extract_fragment_input_declarations(&value).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("invalid inputs: declaration")
+                    && (msg.contains("unknown variant") || msg.contains("integer")),
+                "error must include invalid input declaration context and bad type: {msg}"
             );
         }
 
