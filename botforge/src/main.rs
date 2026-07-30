@@ -5,6 +5,7 @@ mod commands;
 mod compress;
 mod config;
 mod iso;
+mod masking;
 mod plan;
 mod qemu;
 mod resolver;

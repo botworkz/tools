@@ -1,5 +1,7 @@
 use serde_yaml::Value as YamlValue;
 
+use crate::masking::display_string_for_secret;
+
 /// A fully typed value returned by the expression evaluator.
 ///
 /// Type is carried through evaluation and only flattened to a string at two moments:
@@ -10,6 +12,7 @@ use serde_yaml::Value as YamlValue;
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum EvaluatedValue {
     String(std::string::String),
+    Secret(std::string::String),
     Number(f64),
     Bool(bool),
     /// Represents an undefined/unset reference (soft-empty). Falsy.
@@ -26,23 +29,31 @@ impl EvaluatedValue {
             Self::Empty => false,
             Self::Bool(flag) => *flag,
             Self::Number(number) => *number != 0.0,
-            Self::String(text) => !text.is_empty(),
+            Self::String(text) | Self::Secret(text) => !text.is_empty(),
         }
     }
 
-    /// Faithful string rendering for **interpolation into surrounding text**.
+    pub(crate) fn to_use_string(&self) -> std::string::String {
+        match self {
+            Self::Empty => std::string::String::new(),
+            Self::Bool(b) => (if *b { "true" } else { "false" }).to_string(),
+            Self::Number(n) => format_number(*n),
+            Self::String(s) | Self::Secret(s) => s.clone(),
+        }
+    }
+
+    pub(crate) fn to_display_string(&self) -> std::string::String {
+        display_string_for_secret(&self.to_use_string(), matches!(self, Self::Secret(_)))
+    }
+
+    /// Faithful string rendering for **interpolation into surrounding text** at use sinks.
     ///
     /// Renders all typed values faithfully; ONLY `Empty` yields `""`.
     /// `Bool(false)` → `"false"`, `Number(0)` → `"0"`, `String(s)` → `s`.
     ///
     /// Must NOT be used for truthiness checks — use `truthy()` for that.
     pub(super) fn to_interpolated_string(&self) -> std::string::String {
-        match self {
-            Self::Empty => std::string::String::new(),
-            Self::Bool(b) => (if *b { "true" } else { "false" }).to_string(),
-            Self::Number(n) => format_number(*n),
-            Self::String(s) => s.clone(),
-        }
+        self.to_use_string()
     }
 
     /// Convert to a typed YAML `Value` for **single-expression typed assignment**.
@@ -66,7 +77,7 @@ impl EvaluatedValue {
                     serde_yaml::to_value(n).unwrap_or(YamlValue::String(format_number(*n)))
                 }
             }
-            Self::String(s) => YamlValue::String(s.clone()),
+            Self::String(s) | Self::Secret(s) => YamlValue::String(s.clone()),
             // Empty = undefined reference: treat as falsy empty string so that
             // `if:` sees a falsy value (empty string → Some(false)) rather than
             // Null (which deserialise_step_condition maps to None = "run normally").
@@ -84,7 +95,9 @@ impl EvaluatedValue {
         match self {
             Self::Bool(b) => if *b { "true" } else { "false" }.to_string(),
             Self::Number(n) => format_number(*n),
-            Self::String(s) => serde_json::to_string(s).unwrap_or_else(|_| format!("{:?}", s)),
+            Self::String(s) | Self::Secret(s) => {
+                serde_json::to_string(s).unwrap_or_else(|_| format!("{:?}", s))
+            }
             Self::Empty => "null".to_string(),
         }
     }
@@ -112,4 +125,23 @@ pub(super) enum EvaluatedSpan {
     /// being preserved verbatim. If a third namespace is ever added, ensure that namespace
     /// is processed last and resolves completely.
     Deferred,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EvaluatedValue;
+
+    #[test]
+    fn test_secret_value_use_and_display_projections() {
+        let value = EvaluatedValue::Secret("steel-toe-secret".to_string());
+        assert_eq!(value.to_use_string(), "steel-toe-secret");
+        assert_eq!(value.to_display_string(), "***");
+    }
+
+    #[test]
+    fn test_plain_string_value_display_is_not_masked() {
+        let value = EvaluatedValue::String("plain".to_string());
+        assert_eq!(value.to_use_string(), "plain");
+        assert_eq!(value.to_display_string(), "plain");
+    }
 }

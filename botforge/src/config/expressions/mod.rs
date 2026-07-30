@@ -304,7 +304,7 @@ fn yaml_value_to_evaluated(
             ),
         },
         InputType::Secret => match value {
-            Value::String(s) => Ok(EvaluatedValue::String(s.clone())),
+            Value::String(s) => Ok(EvaluatedValue::Secret(s.clone())),
             other => anyhow::bail!(
                 "input '{}': expected a string value for secret input, got {}",
                 name,
@@ -450,6 +450,14 @@ fn substitute_namespace_in_value(
                             args,
                         )?;
                     }
+                    Some("name") => {
+                        substitute_display_string_in_value(
+                            val,
+                            active_namespace,
+                            typed_inputs,
+                            args,
+                        )?;
+                    }
                     // All other fields (including `timeout:`) receive the typed YAML scalar
                     // emitted by `to_yaml_value()`. Each field's serde deserializer is
                     // responsible for accepting the appropriate type: `timeout:` uses
@@ -461,6 +469,39 @@ fn substitute_namespace_in_value(
             }
         }
         _ => {}
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum StringProjection {
+    Use,
+    Display,
+}
+
+fn substitute_display_string_in_value(
+    value: &mut Value,
+    active_namespace: &str,
+    typed_inputs: &TypedInputMap,
+    args: &BTreeMap<std::string::String, std::string::String>,
+) -> Result<()> {
+    if let Value::String(text) = value {
+        let text_clone = text.clone();
+        match try_substitute_pure_expression(&text_clone, active_namespace, typed_inputs, args)? {
+            PureResult::Typed(ev) => {
+                *value = Value::String(ev.to_display_string());
+            }
+            PureResult::Deferred => {}
+            PureResult::NotPure => {
+                *text = substitute_namespace_in_string_with_projection(
+                    &text_clone,
+                    active_namespace,
+                    typed_inputs,
+                    args,
+                    StringProjection::Display,
+                )?;
+            }
+        }
     }
     Ok(())
 }
@@ -551,6 +592,22 @@ fn substitute_namespace_in_string(
     typed_inputs: &TypedInputMap,
     args: &BTreeMap<std::string::String, std::string::String>,
 ) -> Result<std::string::String> {
+    substitute_namespace_in_string_with_projection(
+        text,
+        active_namespace,
+        typed_inputs,
+        args,
+        StringProjection::Use,
+    )
+}
+
+fn substitute_namespace_in_string_with_projection(
+    text: &str,
+    active_namespace: &str,
+    typed_inputs: &TypedInputMap,
+    args: &BTreeMap<std::string::String, std::string::String>,
+    projection: StringProjection,
+) -> Result<std::string::String> {
     let mut rendered = std::string::String::with_capacity(text.len());
     let mut rest = text;
     while let Some(start) = rest.find("${{") {
@@ -564,7 +621,10 @@ fn substitute_namespace_in_string(
         match evaluate_expression_span(expr, active_namespace, typed_inputs, args)
             .with_context(|| format!("while evaluating expression '${{{{{expr}}}}}' in '{text}'"))?
         {
-            EvaluatedSpan::Value(value) => rendered.push_str(&value.to_interpolated_string()),
+            EvaluatedSpan::Value(value) => match projection {
+                StringProjection::Use => rendered.push_str(&value.to_interpolated_string()),
+                StringProjection::Display => rendered.push_str(&value.to_display_string()),
+            },
             EvaluatedSpan::Deferred => rendered.push_str(placeholder),
         }
         rest = &after_open[end + 2..];
@@ -825,7 +885,7 @@ mod tests {
                 let ev = match t {
                     InputType::Boolean => EvaluatedValue::Bool(v.eq_ignore_ascii_case("true")),
                     InputType::Number => EvaluatedValue::Number(v.parse::<f64>().unwrap_or(0.0)),
-                    InputType::Secret => EvaluatedValue::String(v.to_string()),
+                    InputType::Secret => EvaluatedValue::Secret(v.to_string()),
                     InputType::String => EvaluatedValue::String(v.to_string()),
                 };
                 (k.to_string(), ev)
@@ -854,6 +914,47 @@ mod tests {
 
     fn substitute_args(text: &str, pairs: &[(&str, &str)]) -> std::string::String {
         substitute_namespace_in_string(text, "args", &TypedInputMap::new(), &map(pairs)).unwrap()
+    }
+
+    #[test]
+    fn test_secret_interpolation_uses_real_value_for_execution_sink() {
+        let tm: TypedInputMap = [(
+            "token".to_string(),
+            EvaluatedValue::Secret("steel-toe-secret".to_string()),
+        )]
+        .into_iter()
+        .collect();
+        let run = substitute_namespace_in_string(
+            "test '${{ inputs.token }}' = x",
+            "inputs",
+            &tm,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(run, "test 'steel-toe-secret' = x");
+    }
+
+    #[test]
+    fn test_secret_interpolation_masks_in_name_display_sink() {
+        let mut value: Value = serde_yaml::from_str(
+            r#"
+name: "deploy-${{ inputs.token }}"
+run: "echo ${{ inputs.token }}"
+"#,
+        )
+        .unwrap();
+        let tm: TypedInputMap = [(
+            "token".to_string(),
+            EvaluatedValue::Secret("steel-toe-secret".to_string()),
+        )]
+        .into_iter()
+        .collect();
+
+        substitute_namespace_in_value(&mut value, "inputs", &tm, &BTreeMap::new()).unwrap();
+        let name = value["name"].as_str().unwrap();
+        let run = value["run"].as_str().unwrap();
+        assert_eq!(name, "deploy-***");
+        assert_eq!(run, "echo steel-toe-secret");
     }
 
     // -----------------------------------------------------------------------
@@ -930,6 +1031,31 @@ mod tests {
         #[test]
         fn test_resolve_inputs_secret_type_valid_native_string() {
             let declarations = decl_map(&[("token", decl(InputType::Secret, true, None))]);
+            let with = with_map(&[("token", "steel-toe-secret")]);
+            let resolved = resolve_fragment_inputs(dummy_path(), &declarations, &with).unwrap();
+            assert_eq!(
+                resolved.get("token"),
+                Some(&EvaluatedValue::Secret("steel-toe-secret".to_string()))
+            );
+        }
+
+        #[test]
+        fn test_resolve_inputs_secret_default_sentinel_uses_default() {
+            let declarations = decl_map(&[(
+                "token",
+                decl(InputType::Secret, false, Some(yaml("\"sekret\""))),
+            )]);
+            let with = with_map(&[("token", "__default__")]);
+            let resolved = resolve_fragment_inputs(dummy_path(), &declarations, &with).unwrap();
+            assert_eq!(
+                resolved.get("token"),
+                Some(&EvaluatedValue::Secret("sekret".to_string()))
+            );
+        }
+
+        #[test]
+        fn test_resolve_inputs_string_type_same_text_is_non_secret() {
+            let declarations = decl_map(&[("token", decl(InputType::String, true, None))]);
             let with = with_map(&[("token", "steel-toe-secret")]);
             let resolved = resolve_fragment_inputs(dummy_path(), &declarations, &with).unwrap();
             assert_eq!(
